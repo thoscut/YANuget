@@ -100,12 +100,7 @@ async fn serve_tls(
         .install_default()
         .map_err(|_| anyhow::anyhow!("failed to install rustls crypto provider"))?;
 
-    let sans = config
-        .base_url
-        .as_deref()
-        .and_then(host_of)
-        .map(|h| vec![h, "localhost".to_string()])
-        .unwrap_or_else(|| vec!["localhost".to_string()]);
+    let sans = yanuget::tls::certificate_sans(config.base_url.as_deref());
     let paths =
         yanuget::tls::ensure_certificate(config.tls_pair(), &config.data_dir, &sans).await?;
 
@@ -128,19 +123,6 @@ async fn serve_tls(
         .serve(app.into_make_service())
         .await?;
     Ok(())
-}
-
-/// Extract the host portion of a base URL for use as a certificate SAN.
-fn host_of(base_url: &str) -> Option<String> {
-    let after_scheme = base_url.split("://").nth(1).unwrap_or(base_url);
-    let host = after_scheme
-        .split('/')
-        .next()
-        .unwrap_or("")
-        .split(':')
-        .next()
-        .unwrap_or("");
-    (!host.is_empty()).then(|| host.to_string())
 }
 
 fn init_tracing() {

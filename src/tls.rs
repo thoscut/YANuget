@@ -66,6 +66,28 @@ pub async fn ensure_certificate(
     Ok(TlsPaths { cert, key })
 }
 
+/// Subject alternative names for a generated certificate: `localhost` plus the
+/// host of the configured base URL, if any.
+pub fn certificate_sans(base_url: Option<&str>) -> Vec<String> {
+    match base_url.and_then(host_of) {
+        Some(host) if host != "localhost" => vec![host, "localhost".to_string()],
+        _ => vec!["localhost".to_string()],
+    }
+}
+
+/// Extract the host portion of a base URL (dropping scheme, path and port).
+pub fn host_of(base_url: &str) -> Option<String> {
+    let after_scheme = base_url.split("://").nth(1).unwrap_or(base_url);
+    let host = after_scheme
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .split(':')
+        .next()
+        .unwrap_or("");
+    (!host.is_empty()).then(|| host.to_string())
+}
+
 /// Generate a self-signed certificate and return `(cert_pem, key_pem)`.
 fn generate_self_signed(sans: &[String]) -> Result<(String, String)> {
     let mut names: Vec<String> = sans.to_vec();
@@ -125,6 +147,35 @@ mod tests {
         assert_eq!(
             tokio::fs::read_to_string(&again.cert).await.unwrap(),
             cert_pem
+        );
+    }
+
+    #[test]
+    fn host_of_strips_scheme_path_and_port() {
+        assert_eq!(
+            host_of("https://nuget.example.com").as_deref(),
+            Some("nuget.example.com")
+        );
+        assert_eq!(
+            host_of("https://nuget.example.com:8443/feed").as_deref(),
+            Some("nuget.example.com")
+        );
+        assert_eq!(host_of("host-only").as_deref(), Some("host-only"));
+        assert_eq!(host_of("https://"), None);
+        assert_eq!(host_of(""), None);
+    }
+
+    #[test]
+    fn certificate_sans_include_localhost_and_host() {
+        assert_eq!(certificate_sans(None), vec!["localhost".to_string()]);
+        assert_eq!(
+            certificate_sans(Some("https://feed.example.com")),
+            vec!["feed.example.com".to_string(), "localhost".to_string()]
+        );
+        // A localhost base URL is not duplicated.
+        assert_eq!(
+            certificate_sans(Some("http://localhost:5000")),
+            vec!["localhost".to_string()]
         );
     }
 

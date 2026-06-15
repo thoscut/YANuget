@@ -308,4 +308,85 @@ mod tests {
             vec!["1.0.0"]
         );
     }
+
+    // --- I/O paths: the body the scheduled sweep runs (#3) ---
+
+    use crate::database::SqliteDatabase;
+    use crate::storage::FilesystemStorage;
+
+    async fn store_dummy(storage: &FilesystemStorage, id: &str, version: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = dir.path().join("p.nupkg");
+        tokio::fs::write(&tmp, b"payload").await.unwrap();
+        storage.store_package(id, version, tmp).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn prune_all_sweeps_every_package() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FilesystemStorage::new(dir.path()).await.unwrap();
+        let db = SqliteDatabase::in_memory().await.unwrap();
+
+        for id in ["Sweep.A", "Sweep.B"] {
+            for v in ["1.0.0", "1.1.0", "1.2.0"] {
+                let mut p = pkg(v, 0);
+                p.id = id.to_string();
+                db.add(&p).await.unwrap();
+                store_dummy(&storage, id, v).await;
+            }
+        }
+
+        let policy = RetentionPolicy {
+            keep_latest_stable: Some(1),
+            ..Default::default()
+        };
+        let pruned = prune_all(&storage, &db, &policy).await.unwrap();
+        assert_eq!(pruned, 4); // two older versions per package
+
+        for id in ["sweep.a", "sweep.b"] {
+            let remaining = db.find_all_versions(id).await.unwrap();
+            assert_eq!(remaining.len(), 1);
+            assert_eq!(remaining[0].normalized_version(), "1.2.0");
+            // The pruned payloads are gone from storage.
+            assert!(!storage.package_exists(id, "1.0.0").await);
+            assert!(storage.package_exists(id, "1.2.0").await);
+        }
+    }
+
+    #[tokio::test]
+    async fn purge_version_also_removes_symbols() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FilesystemStorage::new(dir.path()).await.unwrap();
+        let db = SqliteDatabase::in_memory().await.unwrap();
+
+        let p = pkg("1.0.0", 0);
+        db.add(&p).await.unwrap();
+        store_dummy(&storage, "Pkg", "1.0.0").await;
+        db.add_symbol("KEYFFFFFFFF", "pkg.pdb", "Pkg", &p.version)
+            .await
+            .unwrap();
+        storage
+            .store_symbol("KEYFFFFFFFF", "pkg.pdb", b"pdb")
+            .await
+            .unwrap();
+
+        let removed = purge_version(&storage, &db, "Pkg", &p.version)
+            .await
+            .unwrap();
+        assert!(removed);
+        assert!(db.find_all_versions("pkg").await.unwrap().is_empty());
+        assert!(db
+            .find_symbol("KEYFFFFFFFF", "pkg.pdb")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(matches!(
+            storage.get_symbol("KEYFFFFFFFF", "pkg.pdb").await,
+            Err(crate::error::Error::PackageNotFound)
+        ));
+        // purge of a non-existent version reports "not removed".
+        assert!(!purge_version(&storage, &db, "Pkg", &p.version)
+            .await
+            .unwrap());
+    }
 }

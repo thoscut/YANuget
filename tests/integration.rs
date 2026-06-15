@@ -36,6 +36,9 @@ async fn spawn_with(customize: impl FnOnce(&mut Config)) -> TestServer {
         api_key: Some(API_KEY.to_string()),
         host: Ipv4Addr::LOCALHOST.into(),
         port: 0,
+        // The harness serves plain HTTP via axum::serve, so reflect that in the
+        // config (otherwise generated URLs would default to the https scheme).
+        tls_enabled: false,
         ..Config::default()
     };
     customize(&mut config);
@@ -964,4 +967,238 @@ async fn prune_on_push_keeps_newest_versions() {
         .await
         .unwrap();
     assert_eq!(gone.status(), reqwest::StatusCode::NOT_FOUND);
+}
+
+// ---------------------------------------------------------------------------
+// Reverse-proxy URL derivation (X-Forwarded-*)
+// ---------------------------------------------------------------------------
+
+fn package_base_address(index: &serde_json::Value) -> String {
+    index["resources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["@type"] == "PackageBaseAddress/3.0.0")
+        .unwrap()["@id"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+#[tokio::test]
+async fn forwarded_headers_drive_generated_urls() {
+    let server = spawn().await;
+    let index: serde_json::Value = server
+        .client
+        .get(server.url("/v3/index.json"))
+        .header("X-Forwarded-Proto", "https")
+        .header("X-Forwarded-Host", "nuget.example.com")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        package_base_address(&index),
+        "https://nuget.example.com/v3/package/"
+    );
+}
+
+#[tokio::test]
+async fn forwarded_host_takes_first_of_a_list() {
+    let server = spawn().await;
+    let index: serde_json::Value = server
+        .client
+        .get(server.url("/v3/index.json"))
+        .header("X-Forwarded-Proto", "https, http")
+        .header("X-Forwarded-Host", "first.example.com, second.example.com")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        package_base_address(&index),
+        "https://first.example.com/v3/package/"
+    );
+}
+
+#[tokio::test]
+async fn host_header_used_without_forwarded() {
+    // No forwarding headers: scheme follows config (http here) and host is the
+    // request's Host header (the test server's address).
+    let server = spawn().await;
+    let index: serde_json::Value = server
+        .client
+        .get(server.url("/v3/index.json"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(package_base_address(&index).starts_with("http://127.0.0.1"));
+}
+
+// ---------------------------------------------------------------------------
+// Graceful shutdown
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn graceful_shutdown_stops_the_server() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = Config {
+        data_dir: dir.path().to_path_buf(),
+        api_key: Some(API_KEY.to_string()),
+        tls_enabled: false,
+        ..Config::default()
+    };
+    let storage = Arc::new(FilesystemStorage::new(config.storage_path()).await.unwrap());
+    let db = Arc::new(
+        SqliteDatabase::connect(&config.database_path())
+            .await
+            .unwrap(),
+    );
+    let state = AppState::new(storage, db, Arc::new(config)).await.unwrap();
+    let app = web::router(state);
+
+    let listener = tokio::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                let _ = rx.await;
+            })
+            .await
+            .unwrap();
+    });
+
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    assert!(client
+        .get(format!("{base}/health"))
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .is_success());
+
+    // Trigger graceful shutdown; the serve task must complete on its own.
+    tx.send(()).unwrap();
+    server.await.unwrap();
+
+    // The listener is closed: new connections are refused.
+    let after = reqwest::Client::new()
+        .get(format!("{base}/health"))
+        .send()
+        .await;
+    assert!(after.is_err());
+}
+
+// ---------------------------------------------------------------------------
+// Concurrency
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn concurrent_distinct_pushes_all_succeed() {
+    let server = Arc::new(spawn().await);
+    let mut handles = Vec::new();
+    for i in 0..12 {
+        let s = server.clone();
+        handles.push(tokio::spawn(async move {
+            let nupkg = build_nupkg(&format!("Conc.P{i}"), "1.0.0", b"x");
+            push_multipart(s.as_ref(), API_KEY, nupkg).await.status()
+        }));
+    }
+    for h in handles {
+        assert_eq!(h.await.unwrap(), reqwest::StatusCode::CREATED);
+    }
+    // Every package is queryable afterwards.
+    for i in 0..12 {
+        let resp = server
+            .client
+            .get(server.url(&format!("/v3/package/conc.p{i}/index.json")))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success(), "Conc.P{i} missing");
+    }
+}
+
+#[tokio::test]
+async fn concurrent_same_version_push_one_wins() {
+    let server = Arc::new(spawn().await);
+    let mut handles = Vec::new();
+    for _ in 0..6 {
+        let s = server.clone();
+        handles.push(tokio::spawn(async move {
+            push_multipart(s.as_ref(), API_KEY, build_nupkg("Race.Pkg", "1.0.0", b"x"))
+                .await
+                .status()
+        }));
+    }
+    let mut created = 0;
+    let mut conflict = 0;
+    for h in handles {
+        match h.await.unwrap() {
+            reqwest::StatusCode::CREATED => created += 1,
+            reqwest::StatusCode::CONFLICT => conflict += 1,
+            other => panic!("unexpected status {other}"),
+        }
+    }
+    // The unique constraint guarantees exactly one winner under the race.
+    assert_eq!(created, 1);
+    assert_eq!(conflict, 5);
+}
+
+#[tokio::test]
+async fn concurrent_pushes_with_prune_on_push_stay_consistent() {
+    let server = Arc::new(
+        spawn_with(|c| {
+            c.retention.enabled = true;
+            c.retention.prune_on_push = true;
+            c.retention.keep_latest_stable = Some(2);
+        })
+        .await,
+    );
+    let mut handles = Vec::new();
+    for i in 0..8 {
+        let s = server.clone();
+        handles.push(tokio::spawn(async move {
+            let v = format!("1.{i}.0");
+            push_multipart(s.as_ref(), API_KEY, build_nupkg("Race.Prune", &v, b"x"))
+                .await
+                .status()
+        }));
+    }
+    for h in handles {
+        assert_eq!(h.await.unwrap(), reqwest::StatusCode::CREATED);
+    }
+
+    // The server stayed responsive; the newest version is never pruned.
+    let versions: serde_json::Value = server
+        .client
+        .get(server.url("/v3/package/race.prune/index.json"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let list: Vec<String> = versions["versions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        list.contains(&"1.7.0".to_string()),
+        "newest version was pruned: {list:?}"
+    );
+    assert!(list.len() <= 8);
 }
