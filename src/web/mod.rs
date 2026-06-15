@@ -97,6 +97,12 @@ pub fn router(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/v3/index.json", get(service_index))
         .route("/api/v2/package", put(push_package))
+        // The NuGet client appends a trailing slash to the publish endpoint
+        // (`PackageUpdateResource` calls `EnsureTrailingSlash` on the push
+        // source), so it `PUT`s `/api/v2/package/`. Axum treats that as a
+        // distinct route from `/api/v2/package` and offers no automatic
+        // redirect, so register the trailing-slash variant explicitly.
+        .route("/api/v2/package/", put(push_package))
         .route(
             "/api/v2/package/{id}/{version}",
             delete(delete_package).post(relist_package),
@@ -115,6 +121,8 @@ pub fn router(state: AppState) -> Router {
     if state.config.enable_symbol_server {
         router = router
             .route("/api/v2/symbol", put(push_symbol_package))
+            // Same trailing-slash handling as the package publish endpoint.
+            .route("/api/v2/symbol/", put(push_symbol_package))
             .route(
                 "/download/symbols/{file}/{key}/{file2}",
                 get(download_symbol),
