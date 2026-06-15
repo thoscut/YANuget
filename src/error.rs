@@ -27,6 +27,10 @@ pub enum Error {
     #[error("invalid package: {0}")]
     InvalidPackage(String),
 
+    /// The upload exceeded the configured maximum size.
+    #[error("payload too large: {0}")]
+    PayloadTooLarge(String),
+
     /// The supplied API key was missing or incorrect.
     #[error("unauthorized")]
     Unauthorized,
@@ -63,6 +67,7 @@ impl Error {
             Error::PackageNotFound => StatusCode::NOT_FOUND,
             Error::PackageAlreadyExists => StatusCode::CONFLICT,
             Error::InvalidPackage(_) => StatusCode::BAD_REQUEST,
+            Error::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             Error::Unauthorized => StatusCode::UNAUTHORIZED,
             Error::BadRequest(_) => StatusCode::BAD_REQUEST,
             Error::InvalidVersion(_) => StatusCode::BAD_REQUEST,

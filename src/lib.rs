@@ -24,6 +24,7 @@ pub mod storage;
 pub mod streaming;
 pub mod validation;
 pub mod version;
+pub mod web;
 
 pub use error::{Error, Result};
 pub use version::NuGetVersion;

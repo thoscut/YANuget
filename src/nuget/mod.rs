@@ -129,6 +129,12 @@ pub fn registration_index(urls: &UrlBuilder, id: &str, packages: &[Package]) -> 
     })
 }
 
+/// Build a standalone registration leaf document
+/// (`/v3/registration/{id}/{version}.json`).
+pub fn registration_leaf(urls: &UrlBuilder, id: &str, package: &Package) -> Value {
+    registration_leaf_item(urls, &id.to_lowercase(), package)
+}
+
 fn registration_leaf_item(urls: &UrlBuilder, lower_id: &str, p: &Package) -> Value {
     let version = p.normalized_version();
     let leaf_url = urls.registration_leaf(lower_id, &version);
