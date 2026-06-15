@@ -42,6 +42,14 @@ allow_overwrite = false    # YANUGET_ALLOW_OVERWRITE
 # unlists it (the NuGet client's "delete" semantics), keeping it restorable.
 hard_delete_enabled = false   # YANUGET_HARD_DELETE_ENABLED
 
+# TLS. On by default: YANuget serves HTTPS. If no certificate is configured, a
+# self-signed one is generated and cached under {data_dir}/tls (clients must be
+# told to trust it). Provide your own PEM cert + key for a trusted certificate,
+# or set tls_enabled = false to serve plain HTTP behind a TLS-terminating proxy.
+tls_enabled = true            # YANUGET_TLS_ENABLED
+# tls_cert_path = "/etc/yanuget/cert.pem"   # YANUGET_TLS_CERT_PATH
+# tls_key_path  = "/etc/yanuget/key.pem"    # YANUGET_TLS_KEY_PATH
+
 # Symbol server: accept `.snupkg` pushes at /api/v2/symbol and serve PDBs over
 # the SSQP path /download/symbols/{file}/{key}/{file}. Enabled by default.
 enable_symbol_server = true   # YANUGET_ENABLE_SYMBOL_SERVER

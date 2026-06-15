@@ -44,8 +44,13 @@ cargo build --release
 YANUGET_API_KEY=change-me ./target/release/yanuget
 ```
 
-The server prints its listen address and service index URL on startup
-(default `http://0.0.0.0:5000`, index at `/v3/index.json`).
+The server prints its listen address and service index URL on startup.
+**TLS is on by default**, so it listens on `https://0.0.0.0:5000` with an
+auto-generated self-signed certificate (cached under `{data_dir}/tls/`). For
+local testing, trust that certificate or pass `--insecure`/`-k` to your client;
+for production, provide a real cert via `tls_cert_path`/`tls_key_path`, or set
+`tls_enabled = false` to run plain HTTP behind a TLS-terminating reverse proxy.
+See [docs/configuration.md](docs/configuration.md#tls).
 
 ### Add the feed and push a package
 

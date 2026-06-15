@@ -48,6 +48,15 @@ pub struct Config {
     pub allow_overwrite: bool,
     /// Whether `DELETE` hard-deletes (true) or merely unlists (false).
     pub hard_delete_enabled: bool,
+    /// Serve over HTTPS. On by default; a self-signed certificate is generated
+    /// when no `tls_cert_path`/`tls_key_path` is configured. Set to `false` to
+    /// serve plain HTTP (e.g. behind a TLS-terminating reverse proxy).
+    pub tls_enabled: bool,
+    /// PEM certificate (chain) for TLS. When unset, a cached self-signed
+    /// certificate under `{data_dir}/tls` is used.
+    pub tls_cert_path: Option<PathBuf>,
+    /// PEM private key for TLS. Must be set together with `tls_cert_path`.
+    pub tls_key_path: Option<PathBuf>,
     /// Whether the symbol server (push `.snupkg`, serve PDBs) is enabled.
     pub enable_symbol_server: bool,
     /// Whether the human-facing web gallery (`/`, `/packages/...`) is enabled.
@@ -116,6 +125,9 @@ impl Default for Config {
             max_package_size_bytes: None,
             allow_overwrite: false,
             hard_delete_enabled: false,
+            tls_enabled: true,
+            tls_cert_path: None,
+            tls_key_path: None,
             enable_symbol_server: true,
             enable_web_ui: true,
             primary_client: "choco".to_string(),
@@ -186,6 +198,15 @@ impl Config {
         if let Ok(v) = std::env::var("YANUGET_HARD_DELETE_ENABLED") {
             self.hard_delete_enabled = truthy(&v);
         }
+        if let Ok(v) = std::env::var("YANUGET_TLS_ENABLED") {
+            self.tls_enabled = truthy(&v);
+        }
+        if let Ok(v) = std::env::var("YANUGET_TLS_CERT_PATH") {
+            self.tls_cert_path = (!v.is_empty()).then(|| PathBuf::from(v));
+        }
+        if let Ok(v) = std::env::var("YANUGET_TLS_KEY_PATH") {
+            self.tls_key_path = (!v.is_empty()).then(|| PathBuf::from(v));
+        }
         if let Ok(v) = std::env::var("YANUGET_ENABLE_SYMBOL_SERVER") {
             self.enable_symbol_server = truthy(&v);
         }
@@ -239,6 +260,23 @@ impl Config {
                 .to_string_lossy()
                 .into_owned()
         })
+    }
+
+    /// An explicit TLS certificate/key pair, when both paths are configured.
+    pub fn tls_pair(&self) -> Option<(PathBuf, PathBuf)> {
+        match (&self.tls_cert_path, &self.tls_key_path) {
+            (Some(cert), Some(key)) => Some((cert.clone(), key.clone())),
+            _ => None,
+        }
+    }
+
+    /// The default URL scheme the server is reachable on.
+    pub fn scheme(&self) -> &'static str {
+        if self.tls_enabled {
+            "https"
+        } else {
+            "http"
+        }
     }
 }
 

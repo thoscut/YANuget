@@ -72,16 +72,75 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let app = web::router(state);
-
     let addr = config.socket_addr();
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!("YANuget listening on http://{addr}");
-    tracing::info!("service index: http://{addr}/v3/index.json");
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+    if config.tls_enabled {
+        serve_tls(app, addr, &config).await?;
+    } else {
+        let listener = tokio::net::TcpListener::bind(addr).await?;
+        tracing::info!("YANuget listening on http://{addr} (TLS disabled)");
+        tracing::info!("service index: http://{addr}/v3/index.json");
+        axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown_signal())
+            .await?;
+    }
+    Ok(())
+}
+
+/// Serve over HTTPS, resolving (and if necessary generating a self-signed)
+/// certificate, with the same graceful-shutdown behaviour as the HTTP path.
+async fn serve_tls(
+    app: axum::Router,
+    addr: std::net::SocketAddr,
+    config: &Config,
+) -> anyhow::Result<()> {
+    // Install the ring crypto provider as the process default before any
+    // rustls configuration is built.
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .map_err(|_| anyhow::anyhow!("failed to install rustls crypto provider"))?;
+
+    let sans = config
+        .base_url
+        .as_deref()
+        .and_then(host_of)
+        .map(|h| vec![h, "localhost".to_string()])
+        .unwrap_or_else(|| vec!["localhost".to_string()]);
+    let paths =
+        yanuget::tls::ensure_certificate(config.tls_pair(), &config.data_dir, &sans).await?;
+
+    let tls = axum_server::tls_rustls::RustlsConfig::from_pem_file(&paths.cert, &paths.key)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to load TLS certificate: {e}"))?;
+
+    tracing::info!("YANuget listening on https://{addr}");
+    tracing::info!("service index: https://{addr}/v3/index.json");
+
+    let handle = axum_server::Handle::new();
+    let shutdown = handle.clone();
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        shutdown.graceful_shutdown(Some(std::time::Duration::from_secs(10)));
+    });
+
+    axum_server::bind_rustls(addr, tls)
+        .handle(handle)
+        .serve(app.into_make_service())
         .await?;
     Ok(())
+}
+
+/// Extract the host portion of a base URL for use as a certificate SAN.
+fn host_of(base_url: &str) -> Option<String> {
+    let after_scheme = base_url.split("://").nth(1).unwrap_or(base_url);
+    let host = after_scheme
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .split(':')
+        .next()
+        .unwrap_or("");
+    (!host.is_empty()).then(|| host.to_string())
 }
 
 fn init_tracing() {

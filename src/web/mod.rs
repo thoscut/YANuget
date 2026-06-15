@@ -70,7 +70,8 @@ impl AppState {
         if let Some(base) = &self.config.base_url {
             return UrlBuilder::new(base.clone());
         }
-        let scheme = forwarded(headers, "x-forwarded-proto").unwrap_or_else(|| "http".into());
+        let scheme = forwarded(headers, "x-forwarded-proto")
+            .unwrap_or_else(|| self.config.scheme().to_string());
         let host = forwarded(headers, "x-forwarded-host")
             .or_else(|| {
                 headers

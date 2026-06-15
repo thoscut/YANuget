@@ -25,6 +25,7 @@ pub mod retention;
 pub mod storage;
 pub mod streaming;
 pub mod symbols;
+pub mod tls;
 pub mod validation;
 pub mod version;
 pub mod web;
