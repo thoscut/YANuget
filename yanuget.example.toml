@@ -1,0 +1,35 @@
+# YANuget example configuration.
+#
+# Copy to `yanuget.toml` and pass with `--config yanuget.toml`, or set the
+# matching `YANUGET_*` environment variables (which override this file).
+
+# Interface and port to listen on.
+host = "0.0.0.0"            # YANUGET_HOST
+port = 5000                # YANUGET_PORT
+
+# Externally visible base URL. Leave unset to derive it per-request from the
+# Host / X-Forwarded-* headers (recommended behind a reverse proxy).
+# base_url = "https://nuget.example.com"   # YANUGET_BASE_URL
+
+# Where all server data lives. The package store and SQLite database default to
+# subpaths of this directory unless overridden below.
+data_dir = "./data"        # YANUGET_DATA_DIR
+# storage_path = "./data/packages"        # YANUGET_STORAGE_PATH
+# database_path = "./data/yanuget.db"     # YANUGET_DATABASE_PATH
+
+# API key required to push and delete packages. STRONGLY recommended.
+# If unset, those endpoints are unauthenticated.
+# api_key = "change-me"    # YANUGET_API_KEY
+
+# Maximum accepted upload size in bytes. Unset = unlimited (YANuget streams
+# uploads straight to disk, so 25 GiB+ packages work without extra memory).
+# 26843545600 = 25 GiB.
+# max_package_size_bytes = 26843545600    # YANUGET_MAX_PACKAGE_SIZE_BYTES
+
+# Allow re-pushing an existing id/version (off by default to preserve NuGet's
+# immutability guarantee).
+allow_overwrite = false    # YANUGET_ALLOW_OVERWRITE
+
+# When true, DELETE hard-deletes a package. When false (default), DELETE only
+# unlists it (the NuGet client's "delete" semantics), keeping it restorable.
+hard_delete_enabled = false   # YANUGET_HARD_DELETE_ENABLED
