@@ -223,17 +223,75 @@ stable version (or newest pre-release, if none is stable) is always kept.
 Retention runs on a schedule (`interval_hours`) and/or after each push
 (`prune_on_push`). See [`yanuget.example.toml`](yanuget.example.toml).
 
+## Feeds, mirroring & release rings
+
+By default YANuget serves a single feed at the root. Define `[[feeds]]` in the
+config to host several feeds at once — each mounted under `/{name}` (e.g.
+`/stable/v3/index.json`), with a feed index at `/`. A package version can belong
+to **many feeds simultaneously**; the payload and metadata are stored **once**
+and referenced by each feed's membership, so nothing is duplicated on disk.
+
+Each feed has its own put/get/delete configuration:
+
+* `api_key` (push), optional `read_api_key` (download/restore), `admin_api_key`
+  (moderation/promotion) — each falling back to the global key where sensible.
+* `requires_approval`: incoming versions (push, mirror or promotion) land
+  **pending** and are withheld from clients until an admin approves them in
+  `/admin` — turning a feed into a release-ring gate.
+* `promotes_to`: names the next ring; an admin can **promote** a version from
+  one feed into the next (pending if that ring also gates). Feeds without
+  `promotes_to` are simply independent sets.
+
+```toml
+[[feeds]]
+name = "dev"
+requires_approval = false
+promotes_to = "stable"
+
+  [feeds.dev.mirror]            # read-through cache of nuget.org
+  enabled = true
+
+[[feeds]]
+name = "stable"
+requires_approval = true        # versions are pending until approved
+
+  [feeds.stable.license_policy]
+  enabled = true
+  allowed = ["MIT", "Apache-2.0"]
+  action = "warn"               # or "block" to reject the push
+```
+
+### Upstream mirroring
+
+A feed with `[feeds.<name>.mirror] enabled = true` becomes a read-through cache:
+on a request for a package it does not have, YANuget fetches that package's
+versions from the upstream V3 feed (default `https://api.nuget.org/v3/index.json`),
+streams each `.nupkg` to disk and indexes it locally. Mirrored versions honour
+the feed's `requires_approval` gate and `license_policy`. Mirroring is
+best-effort: an upstream outage degrades to a normal cache miss.
+
+### Offline license policy
+
+A feed's `[feeds.<name>.license_policy]` evaluates each pushed/mirrored
+package's SPDX `licenseExpression` (or legacy `licenseUrl`) against `allowed` /
+`blocked` lists — no network access. With `action = "warn"` (default) a
+violation is accepted but **flagged** (visible in `/admin`); with
+`action = "block"` the push is rejected.
+
 ## Roadmap
 
 Implemented: NuGet v3 push/restore/search/registration/autocomplete, streaming
 large-package support, API-key auth, filesystem storage, SQLite index, unlist /
 relist / hard-delete, Range downloads, **symbol/PDB server**, a **web gallery**,
-and **package retention policies**.
+**package retention policies**, **multiple feeds** (a deduplicated store with
+per-feed membership), **upstream mirroring** (read-through caching of a public
+feed), **release-ring promotion & approval gates**, and an **offline license
+policy**.
 
-Not yet implemented (contributions welcome): upstream mirroring/caching of
-nuget.org, additional storage backends (S3/Azure Blob) and database backends
-(PostgreSQL/MySQL), and native (Windows) PDB indexing. These are deliberately
-behind trait boundaries so they can be added without touching the core.
+Not yet implemented (contributions welcome): additional storage backends
+(S3/Azure Blob) and database backends (PostgreSQL/MySQL), online vulnerability
+scanning, and native (Windows) PDB indexing. These are deliberately behind trait
+boundaries so they can be added without touching the core.
 
 ---
 
