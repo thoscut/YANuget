@@ -528,6 +528,11 @@ async fn gallery_lists_and_details_packages() {
     let body = detail.text().await.unwrap();
     assert!(body.contains("choco install Web.Ui.Pkg --version 1.2.3"));
     assert!(body.contains("Newtonsoft.Json")); // dependency rendered
+                                               // Accessibility + UX affordances.
+    assert!(body.contains("Skip to content"));
+    assert!(body.contains("role=\"search\""));
+    assert!(body.contains("class=\"copy\"")); // copy-to-clipboard button
+    assert!(body.contains("aria-label=\"Breadcrumb\""));
 
     // Unknown package detail is a 404.
     let missing = server
@@ -585,6 +590,25 @@ async fn settings_page_shows_policy_without_secrets() {
     assert!(body.contains("7"));
     // The actual API key must never appear on the unauthenticated page.
     assert!(!body.contains(API_KEY));
+}
+
+#[tokio::test]
+async fn gallery_paginates_results() {
+    let server = spawn().await;
+    for id in ["Pg.A", "Pg.B", "Pg.C"] {
+        push_multipart(&server, API_KEY, build_nupkg(id, "1.0.0", b"x")).await;
+    }
+    // One result per page → a pager with a Next link must appear.
+    let resp = server
+        .client
+        .get(server.url("/packages?take=1"))
+        .send()
+        .await
+        .unwrap();
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("class=\"pager\""));
+    assert!(body.contains("of 3"));
+    assert!(body.contains("skip=1")); // next page link
 }
 
 #[tokio::test]

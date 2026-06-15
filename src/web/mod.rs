@@ -554,7 +554,13 @@ async fn gallery(
     };
     let page = state.db.search(&request).await?;
     let urls = state.url_builder(&headers);
-    Ok(Html(ui::gallery_page(&urls, &page, query.trim())))
+    Ok(Html(ui::gallery_page(
+        &urls,
+        &page,
+        query.trim(),
+        request.skip,
+        request.take,
+    )))
 }
 
 async fn settings_page(State(state): State<AppState>, headers: HeaderMap) -> Html<String> {

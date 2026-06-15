@@ -15,12 +15,16 @@ use crate::nuget::UrlBuilder;
 /// Minimal, dependency-free styling, inlined so the UI needs no static assets
 /// and works fully offline.
 const STYLE: &str = "\
-:root{--bg:#0d1117;--card:#161b22;--border:#30363d;--fg:#e6edf3;--muted:#8b949e;\
---accent:#58a6ff;--accent2:#1f6feb;--code:#010409}\
+:root{--bg:#0d1117;--card:#161b22;--border:#30363d;--fg:#e6edf3;--muted:#9aa4af;\
+--accent:#58a6ff;--accent2:#1f6feb;--code:#010409;--warn:#d29922}\
 *{box-sizing:border-box}\
 body{margin:0;background:var(--bg);color:var(--fg);\
 font:15px/1.55 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif}\
 a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}\
+a:focus-visible,button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline-offset:2px}\
+.vh{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);border:0}\
+.skip{position:absolute;left:-999px;top:0;background:var(--accent2);color:#fff;padding:8px 12px;border-radius:0 0 6px 0;z-index:10}\
+.skip:focus{left:0}\
 header{background:var(--card);border-bottom:1px solid var(--border);padding:14px 0}\
 .wrap{max-width:980px;margin:0 auto;padding:0 20px}\
 header .wrap{display:flex;align-items:center;gap:16px}\
@@ -28,44 +32,64 @@ header .wrap{display:flex;align-items:center;gap:16px}\
 .logo span{color:var(--accent)}\
 form.search{flex:1;display:flex;gap:8px}\
 input[type=search]{flex:1;padding:9px 12px;border-radius:6px;border:1px solid var(--border);\
-background:var(--bg);color:var(--fg);font-size:15px}\
+background:var(--bg);color:var(--fg);font-size:15px;min-height:44px}\
+input[type=search]:focus{border-color:var(--accent)}\
 button{padding:9px 16px;border-radius:6px;border:1px solid var(--accent2);\
-background:var(--accent2);color:#fff;font-size:15px;cursor:pointer}\
+background:var(--accent2);color:#fff;font-size:15px;cursor:pointer;min-height:44px}\
 button:hover{background:#2d76f0}\
+@media(max-width:560px){header .wrap{flex-wrap:wrap}form.search{flex:1 0 100%}}\
 main{padding:26px 0 60px}\
 .card{background:var(--card);border:1px solid var(--border);border-radius:10px;\
 padding:18px 20px;margin:0 0 14px}\
-.card h2{margin:0 0 4px;font-size:18px}\
+.card h2{margin:0 0 4px;font-size:18px;overflow-wrap:anywhere}\
 .meta{color:var(--muted);font-size:13px;margin:2px 0}\
-.tags{margin-top:8px}\
+.crumbs{font-size:13px;color:var(--muted);margin:0 0 6px}\
+.tags{margin-top:8px;list-style:none;padding:0;display:flex;flex-wrap:wrap}\
 .tag{display:inline-block;background:#21262d;border:1px solid var(--border);border-radius:20px;\
 padding:1px 10px;font-size:12px;color:var(--muted);margin:0 4px 4px 0}\
+.badge{display:inline-block;font-size:11px;padding:0 7px;border-radius:20px;border:1px solid var(--border);vertical-align:middle}\
+.badge.pre{color:var(--warn);border-color:var(--warn)}\
+.badge.un{color:var(--muted)}\
 .muted{color:var(--muted)}\
 .grid{display:grid;grid-template-columns:1fr 280px;gap:22px}\
 @media(max-width:760px){.grid{grid-template-columns:1fr}}\
-.side .card{position:sticky;top:20px}\
-h1.title{font-size:26px;margin:0 0 2px}\
+@media(min-width:761px){.side .install{position:sticky;top:20px}}\
+h1.title{font-size:26px;margin:0 0 2px;overflow-wrap:anywhere}\
 pre{background:var(--code);border:1px solid var(--border);border-radius:8px;padding:12px 14px;\
 overflow:auto;font-size:13px;margin:6px 0}\
 code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}\
 .install h3{margin:14px 0 4px;font-size:13px;text-transform:uppercase;letter-spacing:.4px;color:var(--muted)}\
 .install .primary h3{color:var(--accent)}\
+.install pre{white-space:pre-wrap;overflow-wrap:anywhere}\
+.snip{position:relative}\
+.snip .copy{position:absolute;top:6px;right:6px;padding:3px 10px;font-size:12px;min-height:0;\
+background:#21262d;border:1px solid var(--border);color:var(--fg)}\
+.snip .copy:hover{background:#30363d}\
+.snip pre{padding-right:64px}\
 .versions{list-style:none;margin:0;padding:0;max-height:340px;overflow:auto}\
-.versions li{display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid var(--border)}\
+.versions li{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:5px 0;border-bottom:1px solid var(--border)}\
+.versions a{min-height:32px;display:inline-flex;align-items:center}\
 .versions a.sel{font-weight:700}\
 table.deps{width:100%;border-collapse:collapse;font-size:13px}\
 table.deps td{padding:3px 8px 3px 0}\
-.readme{white-space:pre-wrap;word-wrap:break-word}\
+.readme{white-space:pre-wrap;word-wrap:break-word;overflow-wrap:anywhere}\
+.links a[rel~=nofollow]::after{content:\" \u{2197}\";color:var(--muted);font-size:11px}\
 .empty{text-align:center;color:var(--muted);padding:60px 0}\
-.kv{font-size:13px}.kv div{padding:3px 0;border-bottom:1px solid var(--border)}\
-.kv b{color:var(--muted);font-weight:500;display:inline-block;min-width:150px}\
+.kv{font-size:13px}.kv div{display:flex;gap:10px;padding:3px 0;border-bottom:1px solid var(--border)}\
+.kv b{color:var(--muted);font-weight:500;min-width:120px;flex:0 0 auto}\
+@media(max-width:480px){.kv div{flex-direction:column;gap:0}.kv b{min-width:0}}\
 .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:14px;margin:0 0 8px}\
 .stat{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:16px 18px}\
 .stat .n{font-size:26px;font-weight:700}\
 .stat .l{color:var(--muted);font-size:13px}\
 .rank{list-style:none;margin:0;padding:0}\
-.rank li{display:flex;justify-content:space-between;gap:10px;padding:6px 0;border-bottom:1px solid var(--border)}\
+.rank li{display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;padding:6px 0;border-bottom:1px solid var(--border)}\
+.rank li>a{overflow-wrap:anywhere}\
+.pager{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:18px 0;flex-wrap:wrap}\
+.btn{border:1px solid var(--border);border-radius:6px;padding:8px 14px;color:var(--fg)}\
+.btn[aria-disabled=true]{opacity:.4;pointer-events:none}\
 footer{border-top:1px solid var(--border);color:var(--muted);font-size:13px;padding:18px 0}\
+footer a[aria-current=page]{color:var(--fg);font-weight:600}\
 ";
 
 /// Escape the five HTML-significant characters.
@@ -84,40 +108,73 @@ pub fn escape_html(s: &str) -> String {
     out
 }
 
+/// Tiny inline script giving the install-command "Copy" buttons their
+/// behaviour. It degrades gracefully: without JS the `<pre>` stays selectable
+/// and the button simply does nothing.
+const COPY_SCRIPT: &str = "<script>document.addEventListener('click',function(e){\
+var b=e.target.closest('.copy');if(!b)return;\
+var c=b.parentNode.querySelector('code');if(!c||!navigator.clipboard)return;\
+navigator.clipboard.writeText(c.innerText).then(function(){\
+var o=b.textContent;b.textContent='Copied';setTimeout(function(){b.textContent=o},1200)})});</script>";
+
 /// Wrap a page body in the shared layout (head, header bar, footer).
-fn layout(urls: &UrlBuilder, title: &str, query: &str, body: &str) -> String {
+///
+/// `active` marks the current footer nav item (`"stats"`, `"settings"`, or `""`).
+fn layout(urls: &UrlBuilder, title: &str, query: &str, active: &str, body: &str) -> String {
+    let cur = |name: &str| {
+        if name == active {
+            " aria-current=\"page\""
+        } else {
+            ""
+        }
+    };
     format!(
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
 <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
 <title>{title}</title><style>{STYLE}</style></head><body>\
+<a class=\"skip\" href=\"#main\">Skip to content</a>\
 <header><div class=\"wrap\">\
 <a class=\"logo\" href=\"/\">YA<span>NuGet</span></a>\
-<form class=\"search\" action=\"/packages\" method=\"get\">\
-<input type=\"search\" name=\"q\" placeholder=\"Search packages\u{2026}\" value=\"{q}\">\
+<form class=\"search\" action=\"/packages\" method=\"get\" role=\"search\">\
+<label for=\"q\" class=\"vh\">Search packages</label>\
+<input id=\"q\" type=\"search\" name=\"q\" placeholder=\"Search packages\u{2026}\" value=\"{q}\" autocomplete=\"off\">\
 <button type=\"submit\">Search</button></form>\
 </div></header>\
-<main><div class=\"wrap\">{body}</div></main>\
-<footer><div class=\"wrap\">Served by YANuget \u{2014} \
-<a href=\"{idx}\">v3 service index</a> \u{2022} <a href=\"/stats\">Stats</a> \u{2022} <a href=\"/settings\">Settings</a></div></footer>\
-</body></html>",
+<main id=\"main\" tabindex=\"-1\"><div class=\"wrap\">{body}</div></main>\
+<footer><div class=\"wrap\"><nav aria-label=\"Site\">Served by YANuget \u{2014} \
+<a href=\"{idx}\">v3 service index</a> \u{2022} <a href=\"/stats\"{cs}>Stats</a> \u{2022} \
+<a href=\"/settings\"{cg}>Settings</a></nav></div></footer>\
+{COPY_SCRIPT}</body></html>",
         title = escape_html(title),
         q = escape_html(query),
         idx = escape_html(&urls.service_index()),
+        cs = cur("stats"),
+        cg = cur("settings"),
     )
 }
 
-/// The gallery / search-results page.
-pub fn gallery_page(urls: &UrlBuilder, page: &crate::database::SearchPage, query: &str) -> String {
+/// The gallery / search-results page. `skip`/`take` drive pagination.
+pub fn gallery_page(
+    urls: &UrlBuilder,
+    page: &crate::database::SearchPage,
+    query: &str,
+    skip: i64,
+    take: i64,
+) -> String {
     let body = if page.groups.is_empty() {
         let what = if query.trim().is_empty() {
             "No packages have been published yet.".to_string()
         } else {
             format!("No packages match \u{201c}{}\u{201d}.", escape_html(query))
         };
-        format!(
-            "<div class=\"empty\"><p>{what}</p><p class=\"muted\">Push one with \
-            <code>dotnet nuget push</code> or <code>choco push</code>.</p></div>"
-        )
+        let clear = if query.trim().is_empty() {
+            "<p class=\"muted\">Push one with <code>dotnet nuget push</code> or \
+             <code>choco push</code>.</p>"
+                .to_string()
+        } else {
+            "<p><a href=\"/packages\">Clear search and browse all packages</a></p>".to_string()
+        };
+        format!("<div class=\"empty\"><p>{what}</p>{clear}</div>")
     } else {
         let mut cards = String::new();
         let heading = if query.trim().is_empty() {
@@ -134,6 +191,11 @@ pub fn gallery_page(urls: &UrlBuilder, page: &crate::database::SearchPage, query
             let p = group.latest();
             let id = escape_html(&p.id);
             let url = format!("/packages/{}", enc_path(&p.lower_id()));
+            let pre = if p.is_prerelease() {
+                " <span class=\"badge pre\">prerelease</span>"
+            } else {
+                ""
+            };
             let authors = if p.authors.is_empty() {
                 String::new()
             } else {
@@ -141,7 +203,7 @@ pub fn gallery_page(urls: &UrlBuilder, page: &crate::database::SearchPage, query
             };
             cards.push_str(&format!(
                 "<div class=\"card\"><h2><a href=\"{url}\">{id}</a> \
-                 <span class=\"muted\">{ver}</span></h2>\
+                 <span class=\"muted\">{ver}</span>{pre}</h2>\
                  <div class=\"meta\">{dl} downloads{authors}</div>\
                  <p>{desc}</p>{tags}</div>",
                 ver = escape_html(&p.normalized_version()),
@@ -150,9 +212,46 @@ pub fn gallery_page(urls: &UrlBuilder, page: &crate::database::SearchPage, query
                 tags = render_tags(&p.tags),
             ));
         }
+        cards.push_str(&pager(
+            query,
+            skip,
+            take,
+            page.groups.len() as i64,
+            page.total_hits,
+        ));
         cards
     };
-    layout(urls, "YANuget", query, &body)
+    layout(urls, "YANuget", query, "", &body)
+}
+
+/// Previous/next pagination control for the gallery.
+fn pager(query: &str, skip: i64, take: i64, shown: i64, total: i64) -> String {
+    let take = take.max(1);
+    let skip = skip.max(0);
+    // Only render when there is more than one page worth of results.
+    if total <= take && skip == 0 {
+        return String::new();
+    }
+    let q = enc_path(query);
+    let prev = (skip - take).max(0);
+    let has_prev = skip > 0;
+    let has_next = skip + shown < total;
+    let next = skip + take;
+    let from = if shown == 0 { 0 } else { skip + 1 };
+    let to = skip + shown;
+    let link = |target: i64, enabled: bool, label: &str| {
+        if enabled {
+            format!("<a class=\"btn\" href=\"/packages?q={q}&skip={target}\">{label}</a>")
+        } else {
+            format!("<span class=\"btn\" aria-disabled=\"true\">{label}</span>")
+        }
+    };
+    format!(
+        "<nav class=\"pager\" aria-label=\"Pagination\">{prev_l}\
+         <span class=\"muted\">{from}\u{2013}{to} of {total}</span>{next_l}</nav>",
+        prev_l = link(prev, has_prev, "\u{2190} Previous"),
+        next_l = link(next, has_next, "Next \u{2192}"),
+    )
 }
 
 /// The statistics page: feed-wide totals, the most-downloaded packages, and the
@@ -225,7 +324,7 @@ pub fn stats_page(
          <div class=\"card\"><h3 class=\"muted\">Recently published</h3>{recent_list}</div>\
          </div>"
     );
-    layout(urls, "Statistics \u{2014} YANuget", "", &body)
+    layout(urls, "Statistics \u{2014} YANuget", "", "stats", &body)
 }
 
 /// Group a non-negative integer into thousands with `,` separators.
@@ -329,7 +428,7 @@ pub fn settings_page(urls: &UrlBuilder, config: &Config) -> String {
             String::new()
         },
     );
-    layout(urls, "Settings \u{2014} YANuget", "", &body)
+    layout(urls, "Settings \u{2014} YANuget", "", "settings", &body)
 }
 
 /// A key/value row with an escaped text value.
@@ -369,26 +468,26 @@ pub fn detail_page(
     for p in ordered {
         let v = p.normalized_version();
         let sel = if v == version { " class=\"sel\"" } else { "" };
-        let unlisted = if p.listed {
-            ""
-        } else {
-            " <span class=\"muted\">(unlisted)</span>"
-        };
         versions.push_str(&format!(
-            "<li><a{sel} href=\"/packages/{lid}/{ev}\">{dv}</a>{unlisted}<span class=\"muted\">{dls}</span></li>",
+            "<li><span><a{sel} href=\"/packages/{lid}/{ev}\">{dv}</a>{badges}</span>\
+             <span class=\"muted\">{dls} dl</span></li>",
             lid = enc_path(&lower),
             ev = enc_path(&v),
             dv = escape_html(&v),
+            badges = status_badges(p),
             dls = p.downloads,
         ));
     }
     versions.push_str("</ul>");
 
     let main = format!(
-        "<h1 class=\"title\">{id}</h1>\
-         <div class=\"meta\">{version} \u{2022} {dl} downloads \u{2022} published {pub}</div>\
+        "<nav class=\"crumbs\" aria-label=\"Breadcrumb\">\
+         <a href=\"/packages\">Packages</a> <span aria-hidden=\"true\">/</span> <span>{id}</span></nav>\
+         <h1 class=\"title\">{id}</h1>\
+         <div class=\"meta\">{version}{badges} \u{2022} {dl} downloads \u{2022} published {pub}</div>\
          <p>{desc}</p>{tags}{links}{deps}{symbols}{readme}",
         version = escape_html(&version),
+        badges = status_badges(selected),
         dl = selected.downloads,
         pub = escape_html(&selected.published.format("%Y-%m-%d").to_string()),
         desc = escape_html(&selected.description),
@@ -414,7 +513,19 @@ pub fn detail_page(
     let body = format!(
         "<div class=\"grid\"><div class=\"content\">{main}</div><div class=\"side\">{side}</div></div>"
     );
-    layout(urls, &format!("{} {}", selected.id, version), "", &body)
+    layout(urls, &format!("{} {}", selected.id, version), "", "", &body)
+}
+
+/// Prerelease / unlisted status badges for a version (empty when stable+listed).
+fn status_badges(p: &Package) -> String {
+    let mut out = String::new();
+    if p.is_prerelease() {
+        out.push_str(" <span class=\"badge pre\">prerelease</span>");
+    }
+    if !p.listed {
+        out.push_str(" <span class=\"badge un\">unlisted</span>");
+    }
+    out
 }
 
 fn render_install(urls: &UrlBuilder, p: &Package, primary_client: &str) -> String {
@@ -445,7 +556,9 @@ fn render_install(urls: &UrlBuilder, p: &Package, primary_client: &str) -> Strin
     for (i, (label, cmd)) in snippets.drain(..).enumerate() {
         let cls = if i == 0 { " class=\"primary\"" } else { "" };
         out.push_str(&format!(
-            "<div{cls}><h3>{label}</h3><pre><code>{cmd}</code></pre></div>",
+            "<div{cls}><h3>{label}</h3><div class=\"snip\">\
+             <button type=\"button\" class=\"copy\" aria-label=\"Copy command\">Copy</button>\
+             <pre><code>{cmd}</code></pre></div></div>",
             cmd = escape_html(&cmd),
         ));
     }
@@ -482,28 +595,25 @@ fn render_info(p: &Package) -> String {
 
 fn render_links(p: &Package) -> String {
     let mut links = Vec::new();
-    if let Some(u) = &p.project_url {
+    let mut add = |url: &str, label: &str| {
         links.push(format!(
-            "<a href=\"{}\" rel=\"nofollow\">Project</a>",
-            escape_html(u)
+            "<a href=\"{}\" rel=\"nofollow noopener\">{label}</a>",
+            escape_html(url)
         ));
+    };
+    if let Some(u) = &p.project_url {
+        add(u, "Project");
     }
     if let Some(u) = &p.repository_url {
-        links.push(format!(
-            "<a href=\"{}\" rel=\"nofollow\">Repository</a>",
-            escape_html(u)
-        ));
+        add(u, "Repository");
     }
     if let Some(u) = &p.license_url {
-        links.push(format!(
-            "<a href=\"{}\" rel=\"nofollow\">License</a>",
-            escape_html(u)
-        ));
+        add(u, "License");
     }
     if links.is_empty() {
         String::new()
     } else {
-        format!("<p>{}</p>", links.join(" \u{2022} "))
+        format!("<p class=\"links\">{}</p>", links.join(" \u{2022} "))
     }
 }
 
