@@ -151,7 +151,14 @@ fn registration_leaf_item(urls: &UrlBuilder, lower_id: &str, p: &Package) -> Val
 
 fn catalog_entry(urls: &UrlBuilder, lower_id: &str, p: &Package, content_url: &str) -> Value {
     let version = p.normalized_version();
-    json!({
+    // NuGet signals an unlisted version by reporting a `published` date in the
+    // year 1900, in addition to the explicit `listed: false` flag.
+    let published = if p.listed {
+        p.published.to_rfc3339_opts(SecondsFormat::Millis, true)
+    } else {
+        "1900-01-01T00:00:00.000Z".to_string()
+    };
+    let mut entry = json!({
         "@id": urls.registration_leaf(lower_id, &version),
         "@type": "PackageDetails",
         "id": p.id,
@@ -166,14 +173,19 @@ fn catalog_entry(urls: &UrlBuilder, lower_id: &str, p: &Package, content_url: &s
         "minClientVersion": p.min_client_version,
         "packageContent": content_url,
         "projectUrl": p.project_url,
-        "published": p.published.to_rfc3339_opts(SecondsFormat::Millis, true),
+        "published": published,
         "releaseNotes": p.release_notes,
         "requireLicenseAcceptance": false,
         "summary": p.summary,
         "tags": p.tags,
         "title": p.title,
-        "dependencyGroups": dependency_groups(urls, lower_id, &version, &p.dependencies),
-    })
+    });
+    // `dependencyGroups` is omitted entirely when the package has no
+    // dependencies, matching nuget.org.
+    if !p.dependencies.is_empty() {
+        entry["dependencyGroups"] = dependency_groups(urls, lower_id, &version, &p.dependencies);
+    }
+    entry
 }
 
 fn dependency_groups(
@@ -378,6 +390,25 @@ mod tests {
         assert_eq!(entry["version"], "1.0.0");
         assert_eq!(entry["authors"], "Alice, Bob");
         assert_eq!(entry["licenseExpression"], "MIT");
+    }
+
+    #[test]
+    fn unlisted_version_reports_1900_and_listed_false() {
+        let mut p = pkg("Contoso.Utils", "1.0.0");
+        p.listed = false;
+        let reg = registration_index(&urls(), "Contoso.Utils", std::slice::from_ref(&p));
+        let entry = &reg["items"][0]["items"][0]["catalogEntry"];
+        assert_eq!(entry["listed"], false);
+        assert_eq!(entry["published"], "1900-01-01T00:00:00.000Z");
+    }
+
+    #[test]
+    fn dependency_groups_omitted_when_empty() {
+        // pkg() has no dependencies.
+        let p = pkg("No.Deps", "1.0.0");
+        let reg = registration_index(&urls(), "No.Deps", std::slice::from_ref(&p));
+        let entry = &reg["items"][0]["items"][0]["catalogEntry"];
+        assert!(entry.get("dependencyGroups").is_none());
     }
 
     #[test]

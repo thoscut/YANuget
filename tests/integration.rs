@@ -321,6 +321,27 @@ async fn delete_unlists_package() {
 }
 
 #[tokio::test]
+async fn nuspec_endpoint_serves_manifest() {
+    let server = spawn().await;
+    let nupkg = build_nupkg("Manifest.Test", "1.0.0", b"data");
+    push_multipart(&server, API_KEY, nupkg).await;
+
+    let resp = server
+        .client
+        .get(server.url("/v3/package/manifest.test/1.0.0/manifest.test.nuspec"))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+    assert!(resp.headers()["content-type"]
+        .to_str()
+        .unwrap()
+        .contains("xml"));
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("<id>Manifest.Test</id>"));
+}
+
+#[tokio::test]
 async fn missing_package_returns_404() {
     let server = spawn().await;
     let resp = server

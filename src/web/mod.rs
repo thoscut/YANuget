@@ -21,7 +21,7 @@ use crate::database::{PackageDatabase, SearchRequest};
 use crate::error::{Error, Result};
 use crate::indexing::{self, IndexOptions};
 use crate::nuget::{self, UrlBuilder};
-use crate::storage::{PackageContent, PackageStorage};
+use crate::storage::{AuxFile, PackageContent, PackageStorage};
 use crate::streaming::{self, StreamSummary};
 use crate::version::NuGetVersion;
 
@@ -290,10 +290,20 @@ async fn package_versions(
 async fn download_package(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path((id, version, _filename)): Path<(String, String, String)>,
+    Path((id, version, filename)): Path<(String, String, String)>,
 ) -> Result<Response> {
     let version = parse_version(&version)?;
     let normalized = version.normalized();
+
+    // The flat container exposes both the `.nupkg` and the bare `.nuspec` under
+    // the same path prefix; dispatch on the requested file's extension.
+    if filename.to_lowercase().ends_with(".nuspec") {
+        let nuspec = state
+            .storage
+            .get_aux(&id, &normalized, AuxFile::Nuspec)
+            .await?;
+        return Ok(([(header::CONTENT_TYPE, "application/xml")], nuspec).into_response());
+    }
 
     let content = state.storage.get_package(&id, &normalized).await?;
 

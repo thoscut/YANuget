@@ -67,6 +67,12 @@ Streams the `.nupkg`. Supports `Range: bytes=...` (responds `206 Partial
 Content` with `Content-Range`); always sends `Accept-Ranges: bytes`. Each
 successful fetch increments the download counter.
 
+```
+GET /v3/package/{id}/{version}/{id}.nuspec
+```
+
+Returns the package's `.nuspec` manifest as `application/xml`.
+
 ## Registration
 
 ```
@@ -75,7 +81,14 @@ GET /v3/registration/{id}/index.json
 
 A registration index with a single inlined page containing every version
 (listed and unlisted, with a `listed` flag) and full `catalogEntry` metadata,
-including `dependencyGroups`. `404` if unknown.
+including `dependencyGroups`. Unlisted versions additionally report
+`published` in the year 1900, per NuGet convention. `dependencyGroups` is
+omitted when a version has no dependencies. `404` if unknown.
+
+> All versions are currently inlined into one page. nuget.org pages packages
+> with ≥128 versions into pages of 64; YANuget does not yet do this, which is
+> only relevant for packages with an extreme number of versions (not large
+> package *size*). See the roadmap.
 
 ```
 GET /v3/registration/{id}/{version}.json
