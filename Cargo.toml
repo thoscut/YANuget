@@ -47,6 +47,7 @@ clap = { version = "4", features = ["derive", "env"] }
 async-trait = "0.1"
 mime = "0.3"
 percent-encoding = "2"
+toml = "0.8"
 
 [dev-dependencies]
 tempfile = "3"

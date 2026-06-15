@@ -91,6 +91,53 @@ fn read_archive_blocking(path: &Path) -> Result<ArchiveContents, Error> {
     })
 }
 
+/// Extract a single named entry (e.g. an embedded readme or icon) into memory,
+/// capped at `max_bytes`. Returns `None` if the entry is absent. Matching is
+/// case-insensitive and `\\`/`/`-insensitive.
+pub async fn extract_file(
+    path: impl AsRef<Path>,
+    entry_name: &str,
+    max_bytes: u64,
+) -> Result<Option<Vec<u8>>, Error> {
+    let path: PathBuf = path.as_ref().to_path_buf();
+    let needle = normalize_entry(entry_name);
+    tokio::task::spawn_blocking(move || extract_file_blocking(&path, &needle, max_bytes))
+        .await
+        .map_err(|e| Error::Other(anyhow::anyhow!("nupkg extract task panicked: {e}")))?
+}
+
+fn extract_file_blocking(
+    path: &Path,
+    needle: &str,
+    max_bytes: u64,
+) -> Result<Option<Vec<u8>>, Error> {
+    let file = std::fs::File::open(path)?;
+    let mut archive = zip::ZipArchive::new(file)
+        .map_err(|e| Error::InvalidPackage(format!("not a valid zip/nupkg: {e}")))?;
+
+    let mut found: Option<usize> = None;
+    for i in 0..archive.len() {
+        let entry = archive
+            .by_index(i)
+            .map_err(|e| Error::InvalidPackage(format!("corrupt zip entry: {e}")))?;
+        if normalize_entry(entry.name()) == *needle {
+            found = Some(i);
+            break;
+        }
+    }
+    let Some(idx) = found else { return Ok(None) };
+
+    let entry = archive
+        .by_index(idx)
+        .map_err(|e| Error::InvalidPackage(format!("could not open entry: {e}")))?;
+    let mut buf = Vec::new();
+    entry
+        .take(max_bytes)
+        .read_to_end(&mut buf)
+        .map_err(Error::Io)?;
+    Ok(Some(buf))
+}
+
 fn normalize_entry(name: &str) -> String {
     name.replace('\\', "/").to_ascii_lowercase()
 }

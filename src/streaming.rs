@@ -24,8 +24,24 @@ pub struct StreamSummary {
 /// Memory use is bounded by the size of the individual chunks yielded by the
 /// stream, regardless of the total payload size.
 pub async fn stream_to_writer<S, W>(
+    stream: S,
+    writer: &mut W,
+) -> std::io::Result<StreamSummary>
+where
+    S: Stream<Item = std::io::Result<Bytes>> + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    stream_to_writer_limited(stream, writer, None).await
+}
+
+/// Like [`stream_to_writer`], but aborts with [`std::io::ErrorKind::InvalidData`]
+/// as soon as more than `max_bytes` have been read. The check happens *before*
+/// any bytes beyond the limit are written, so a hostile client cannot fill the
+/// disk past the configured cap.
+pub async fn stream_to_writer_limited<S, W>(
     mut stream: S,
     writer: &mut W,
+    max_bytes: Option<u64>,
 ) -> std::io::Result<StreamSummary>
 where
     S: Stream<Item = std::io::Result<Bytes>> + Unpin,
@@ -36,8 +52,16 @@ where
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
-        hasher.update(&chunk);
         size += chunk.len() as u64;
+        if let Some(limit) = max_bytes {
+            if size > limit {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("payload exceeds the configured limit of {limit} bytes"),
+                ));
+            }
+        }
+        hasher.update(&chunk);
         writer.write_all(&chunk).await?;
     }
     writer.flush().await?;
@@ -80,6 +104,19 @@ mod tests {
         let mut sink = tokio::io::sink();
         let summary = stream_to_writer(stream, &mut sink).await.unwrap();
         assert_eq!(summary.size, 4 * 1024 * 1024);
+    }
+
+    #[tokio::test]
+    async fn enforces_size_limit() {
+        let chunks: Vec<std::io::Result<Bytes>> = (0..10)
+            .map(|_| Ok(Bytes::from(vec![1u8; 1000])))
+            .collect();
+        let stream = futures::stream::iter(chunks);
+        let mut sink = tokio::io::sink();
+        // Limit of 5 KiB; 10 KiB will be offered.
+        let result = stream_to_writer_limited(stream, &mut sink, Some(5000)).await;
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 
     #[tokio::test]

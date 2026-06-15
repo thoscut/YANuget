@@ -32,10 +32,12 @@ impl FilesystemStorage {
         Ok(Self { root })
     }
 
-    /// Directory holding a single package version's files.
+    /// Directory holding a single package version's files. The id and version
+    /// are lower-cased so lookups are case-insensitive regardless of the casing
+    /// the caller used (matching NuGet's normalized URLs).
     fn version_dir(&self, id: &str, version: &str) -> Result<PathBuf> {
-        let id = safe_segment(id)?;
-        let version = safe_segment(version)?;
+        let id = safe_segment(id)?.to_ascii_lowercase();
+        let version = safe_segment(version)?.to_ascii_lowercase();
         Ok(self.root.join(id).join(version))
     }
 

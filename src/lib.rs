@@ -11,14 +11,18 @@
 //! More modules (models, storage, database, protocol, web) are wired in as the
 //! server is built up.
 
+pub mod auth;
+pub mod config;
 pub mod database;
 pub mod error;
+pub mod indexing;
 pub mod models;
 pub mod nuget;
 pub mod nupkg;
 pub mod nuspec;
 pub mod storage;
 pub mod streaming;
+pub mod validation;
 pub mod version;
 
 pub use error::{Error, Result};
