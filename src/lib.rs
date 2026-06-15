@@ -12,6 +12,9 @@
 //! server is built up.
 
 pub mod error;
+pub mod models;
+pub mod nuspec;
+pub mod streaming;
 pub mod version;
 
 pub use error::{Error, Result};
