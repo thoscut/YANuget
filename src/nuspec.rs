@@ -322,7 +322,10 @@ mod tests {
         assert_eq!(net8.target_framework.as_deref(), Some("net8.0"));
         assert_eq!(net8.dependencies.len(), 2);
         assert_eq!(net8.dependencies[0].id, "Newtonsoft.Json");
-        assert_eq!(net8.dependencies[0].version_range.as_deref(), Some("[13.0.1, )"));
+        assert_eq!(
+            net8.dependencies[0].version_range.as_deref(),
+            Some("[13.0.1, )")
+        );
         assert_eq!(net8.dependencies[1].include.as_deref(), Some("all"));
         // Empty group is preserved with no dependencies.
         assert_eq!(n.dependency_groups[1].dependencies.len(), 0);
@@ -344,7 +347,10 @@ mod tests {
 
     #[test]
     fn rejects_missing_id_or_version() {
-        assert!(parse_nuspec("<package><metadata><version>1.0.0</version></metadata></package>").is_err());
+        assert!(
+            parse_nuspec("<package><metadata><version>1.0.0</version></metadata></package>")
+                .is_err()
+        );
         assert!(parse_nuspec("<package><metadata><id>A</id></metadata></package>").is_err());
         assert!(parse_nuspec("not xml at <<<").is_err());
     }

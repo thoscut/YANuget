@@ -175,7 +175,10 @@ mod tests {
             .store_aux("Pkg", "1.0.0", AuxFile::Nuspec, b"<nuspec/>")
             .await
             .unwrap();
-        let got = storage.get_aux("Pkg", "1.0.0", AuxFile::Nuspec).await.unwrap();
+        let got = storage
+            .get_aux("Pkg", "1.0.0", AuxFile::Nuspec)
+            .await
+            .unwrap();
         assert_eq!(got, b"<nuspec/>");
 
         let missing = storage.get_aux("Pkg", "1.0.0", AuxFile::Icon).await;

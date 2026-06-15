@@ -23,10 +23,7 @@ pub struct StreamSummary {
 /// The writer is flushed but **not** closed; the caller owns its lifecycle.
 /// Memory use is bounded by the size of the individual chunks yielded by the
 /// stream, regardless of the total payload size.
-pub async fn stream_to_writer<S, W>(
-    stream: S,
-    writer: &mut W,
-) -> std::io::Result<StreamSummary>
+pub async fn stream_to_writer<S, W>(stream: S, writer: &mut W) -> std::io::Result<StreamSummary>
 where
     S: Stream<Item = std::io::Result<Bytes>> + Unpin,
     W: AsyncWrite + Unpin,
@@ -108,9 +105,8 @@ mod tests {
 
     #[tokio::test]
     async fn enforces_size_limit() {
-        let chunks: Vec<std::io::Result<Bytes>> = (0..10)
-            .map(|_| Ok(Bytes::from(vec![1u8; 1000])))
-            .collect();
+        let chunks: Vec<std::io::Result<Bytes>> =
+            (0..10).map(|_| Ok(Bytes::from(vec![1u8; 1000]))).collect();
         let stream = futures::stream::iter(chunks);
         let mut sink = tokio::io::sink();
         // Limit of 5 KiB; 10 KiB will be offered.
@@ -121,7 +117,7 @@ mod tests {
 
     #[tokio::test]
     async fn propagates_stream_errors() {
-        let err = std::io::Error::new(std::io::ErrorKind::Other, "boom");
+        let err = std::io::Error::other("boom");
         let stream = Box::pin(futures::stream::once(async move { Err(err) }));
         let mut buf: Vec<u8> = Vec::new();
         let result = stream_to_writer(stream, &mut buf).await;

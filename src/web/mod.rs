@@ -96,11 +96,11 @@ pub fn router(state: AppState) -> Router {
             delete(delete_package).post(relist_package),
         )
         .route("/v3/package/{id}/index.json", get(package_versions))
-        .route("/v3/package/{id}/{version}/{filename}", get(download_package))
         .route(
-            "/v3/registration/{id}/index.json",
-            get(registration_index),
+            "/v3/package/{id}/{version}/{filename}",
+            get(download_package),
         )
+        .route("/v3/registration/{id}/index.json", get(registration_index))
         .route("/v3/registration/{id}/{version}", get(registration_leaf))
         .route("/v3/search", get(search))
         .route("/v3/autocomplete", get(autocomplete))
@@ -136,7 +136,10 @@ async fn index_page(State(state): State<AppState>, headers: HeaderMap) -> Html<S
     ))
 }
 
-async fn service_index(State(state): State<AppState>, headers: HeaderMap) -> Json<serde_json::Value> {
+async fn service_index(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Json<serde_json::Value> {
     let urls = state.url_builder(&headers);
     Json(nuget::service_index(&urls))
 }
@@ -197,19 +200,23 @@ async fn write_upload(
         let mut multipart = Multipart::from_request(request, state)
             .await
             .map_err(|e| Error::BadRequest(format!("invalid multipart body: {e}")))?;
-        while let Some(field) = multipart
+        // The package is the first field; NuGet sends exactly one file part.
+        let field = multipart
             .next_field()
             .await
             .map_err(|e| Error::BadRequest(format!("invalid multipart field: {e}")))?
-        {
-            let stream = Box::pin(field.map(|r| r.map_err(to_io_err)));
-            return streaming::stream_to_writer_limited(stream, file, limit)
-                .await
-                .map_err(map_upload_err);
-        }
-        Err(Error::BadRequest("multipart body contained no file".into()))
+            .ok_or_else(|| Error::BadRequest("multipart body contained no file".into()))?;
+        let stream = Box::pin(field.map(|r| r.map_err(to_io_err)));
+        streaming::stream_to_writer_limited(stream, file, limit)
+            .await
+            .map_err(map_upload_err)
     } else {
-        let stream = Box::pin(request.into_body().into_data_stream().map(|r| r.map_err(to_io_err)));
+        let stream = Box::pin(
+            request
+                .into_body()
+                .into_data_stream()
+                .map(|r| r.map_err(to_io_err)),
+        );
         streaming::stream_to_writer_limited(stream, file, limit)
             .await
             .map_err(map_upload_err)
@@ -445,7 +452,7 @@ fn forwarded(headers: &HeaderMap, name: &str) -> Option<String> {
 }
 
 fn to_io_err<E: std::fmt::Display>(e: E) -> std::io::Error {
-    std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
+    std::io::Error::other(e.to_string())
 }
 
 fn map_upload_err(e: std::io::Error) -> Error {

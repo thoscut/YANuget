@@ -59,22 +59,17 @@ fn read_archive_blocking(path: &Path) -> Result<ArchiveContents, Error> {
         let name = entry.name().to_string();
         let normalized = normalize_entry(&name);
         // The nuspec is a root-level `*.nuspec` (no directory separators).
-        if nuspec_index.is_none()
-            && normalized.ends_with(".nuspec")
-            && !normalized.contains('/')
-        {
+        if nuspec_index.is_none() && normalized.ends_with(".nuspec") && !normalized.contains('/') {
             if entry.size() > MAX_NUSPEC_BYTES {
-                return Err(Error::InvalidPackage(
-                    "nuspec is implausibly large".into(),
-                ));
+                return Err(Error::InvalidPackage("nuspec is implausibly large".into()));
             }
             nuspec_index = Some(i);
         }
         entry_names.insert(normalized);
     }
 
-    let idx = nuspec_index
-        .ok_or_else(|| Error::InvalidPackage("package contains no .nuspec".into()))?;
+    let idx =
+        nuspec_index.ok_or_else(|| Error::InvalidPackage("package contains no .nuspec".into()))?;
     let nuspec_entry = archive
         .by_index(idx)
         .map_err(|e| Error::InvalidPackage(format!("could not open nuspec: {e}")))?;
@@ -155,11 +150,11 @@ mod tests {
         let path = dir.path().join("test.nupkg");
         let file = std::fs::File::create(&path).unwrap();
         let mut zip = zip::ZipWriter::new(file);
-        let opts = SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Stored);
+        let opts = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
         zip.start_file("Contoso.Utils.nuspec", opts).unwrap();
         zip.write_all(nuspec.as_bytes()).unwrap();
-        zip.start_file("lib/net8.0/Contoso.Utils.dll", opts).unwrap();
+        zip.start_file("lib/net8.0/Contoso.Utils.dll", opts)
+            .unwrap();
         zip.write_all(b"\x4d\x5a fake assembly").unwrap();
         zip.start_file("docs/README.md", opts).unwrap();
         zip.write_all(b"# Readme").unwrap();
@@ -194,8 +189,7 @@ mod tests {
         let path = dir.path().join("nonuspec.nupkg");
         let file = std::fs::File::create(&path).unwrap();
         let mut zip = zip::ZipWriter::new(file);
-        let opts = SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Stored);
+        let opts = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
         zip.start_file("readme.txt", opts).unwrap();
         zip.write_all(b"hi").unwrap();
         zip.finish().unwrap();

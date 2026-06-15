@@ -197,9 +197,7 @@ fn compare_identifier(a: &str, b: &str) -> Ordering {
         (Ok(_), Err(_)) => Ordering::Less,
         (Err(_), Ok(_)) => Ordering::Greater,
         // Both alphanumeric: case-insensitive ordinal comparison.
-        (Err(_), Err(_)) => a
-            .to_ascii_lowercase()
-            .cmp(&b.to_ascii_lowercase()),
+        (Err(_), Err(_)) => a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase()),
     }
 }
 
@@ -340,7 +338,7 @@ mod tests {
 
     #[test]
     fn sorting_is_correct() {
-        let mut versions = vec![
+        let mut versions = [
             v("1.0.0"),
             v("1.0.0-alpha"),
             v("1.0.0-alpha.1"),

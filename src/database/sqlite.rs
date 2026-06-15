@@ -242,11 +242,12 @@ impl PackageDatabase for SqliteDatabase {
     }
 
     async fn find(&self, id: &str, version: &NuGetVersion) -> Result<Option<Package>> {
-        let row = sqlx::query("SELECT * FROM packages WHERE lower_id = ?1 AND normalized_version = ?2")
-            .bind(id.to_lowercase())
-            .bind(version.normalized())
-            .fetch_optional(&self.pool)
-            .await?;
+        let row =
+            sqlx::query("SELECT * FROM packages WHERE lower_id = ?1 AND normalized_version = ?2")
+                .bind(id.to_lowercase())
+                .bind(version.normalized())
+                .fetch_optional(&self.pool)
+                .await?;
         row.map(row_to_package).transpose()
     }
 
@@ -416,8 +417,8 @@ fn is_unique_violation(e: &sqlx::Error) -> bool {
 
 fn row_to_package(row: SqliteRow) -> Result<Package> {
     let original_version: String = row.try_get("original_version")?;
-    let version = NuGetVersion::parse(&original_version)
-        .map_err(|e| Error::InvalidVersion(e.to_string()))?;
+    let version =
+        NuGetVersion::parse(&original_version).map_err(|e| Error::InvalidVersion(e.to_string()))?;
     let published: String = row.try_get("published")?;
     let published = DateTime::parse_from_rfc3339(&published)
         .map_err(|e| Error::Other(anyhow::anyhow!("bad published timestamp: {e}")))?
@@ -425,10 +426,8 @@ fn row_to_package(row: SqliteRow) -> Result<Package> {
 
     let authors: Vec<String> = from_json(&row.try_get::<String, _>("authors")?)?;
     let tags: Vec<String> = from_json(&row.try_get::<String, _>("tags")?)?;
-    let package_types: Vec<PackageType> =
-        from_json(&row.try_get::<String, _>("package_types")?)?;
-    let dependencies: Vec<DependencyGroup> =
-        from_json(&row.try_get::<String, _>("dependencies")?)?;
+    let package_types: Vec<PackageType> = from_json(&row.try_get::<String, _>("package_types")?)?;
+    let dependencies: Vec<DependencyGroup> = from_json(&row.try_get::<String, _>("dependencies")?)?;
 
     Ok(Package {
         id: row.try_get("id")?,

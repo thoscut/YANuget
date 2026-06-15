@@ -220,11 +220,7 @@ fn dependency_groups(
 
 /// Build the search response (`/v3/search`).
 pub fn search_response(urls: &UrlBuilder, page: &SearchPage) -> Value {
-    let data: Vec<Value> = page
-        .groups
-        .iter()
-        .map(|g| search_result(urls, g))
-        .collect();
+    let data: Vec<Value> = page.groups.iter().map(|g| search_result(urls, g)).collect();
     json!({
         "@context": {
             "@vocab": "http://schema.nuget.org/schema#",

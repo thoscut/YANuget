@@ -87,7 +87,13 @@ async fn index_inner(
         _ => None,
     };
 
-    let package = build_package(&manifest, version.clone(), &summary, &readme_bytes, &icon_bytes);
+    let package = build_package(
+        &manifest,
+        version.clone(),
+        &summary,
+        &readme_bytes,
+        &icon_bytes,
+    );
 
     // 3. Honour immutability / overwrite policy.
     if db.exists(&id, &version).await? {
@@ -104,7 +110,12 @@ async fn index_inner(
         .store_package(&id, &normalized, temp_path.clone())
         .await?;
     storage
-        .store_aux(&id, &normalized, AuxFile::Nuspec, archive.nuspec_xml.as_bytes())
+        .store_aux(
+            &id,
+            &normalized,
+            AuxFile::Nuspec,
+            archive.nuspec_xml.as_bytes(),
+        )
         .await?;
     if let Some(bytes) = &readme_bytes {
         storage
@@ -226,7 +237,11 @@ mod tests {
         assert_eq!(result.version.normalized(), "1.2.3");
 
         // Metadata landed in the DB.
-        let pkg = db.find("contoso.utils", &result.version).await.unwrap().unwrap();
+        let pkg = db
+            .find("contoso.utils", &result.version)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(pkg.authors, vec!["Alice"]);
         assert!(pkg.has_readme);
         assert_eq!(pkg.package_hash_algorithm, "SHA512");
@@ -272,16 +287,26 @@ mod tests {
         let store_dir = tempfile::tempdir().unwrap();
         let storage = FilesystemStorage::new(store_dir.path()).await.unwrap();
         let db = SqliteDatabase::in_memory().await.unwrap();
-        let opts = IndexOptions { allow_overwrite: true };
+        let opts = IndexOptions {
+            allow_overwrite: true,
+        };
 
         let (_d1, temp1) = make_package(NUSPEC, false).await;
         let s1 = summary_for(&temp1).await;
-        index_package(&storage, &db, temp1, s1, &opts).await.unwrap();
+        index_package(&storage, &db, temp1, s1, &opts)
+            .await
+            .unwrap();
 
         let (_d2, temp2) = make_package(NUSPEC, true).await;
         let s2 = summary_for(&temp2).await;
-        let result = index_package(&storage, &db, temp2, s2, &opts).await.unwrap();
-        let pkg = db.find("contoso.utils", &result.version).await.unwrap().unwrap();
+        let result = index_package(&storage, &db, temp2, s2, &opts)
+            .await
+            .unwrap();
+        let pkg = db
+            .find("contoso.utils", &result.version)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(pkg.has_readme); // the second push had a readme
     }
 
@@ -291,7 +316,8 @@ mod tests {
         let storage = FilesystemStorage::new(store_dir.path()).await.unwrap();
         let db = SqliteDatabase::in_memory().await.unwrap();
 
-        let bad = r#"<package><metadata><id>Bad Id!</id><version>1.0.0</version></metadata></package>"#;
+        let bad =
+            r#"<package><metadata><id>Bad Id!</id><version>1.0.0</version></metadata></package>"#;
         let (_d, temp) = make_package(bad, false).await;
         let s = summary_for(&temp).await;
         let err = index_package(&storage, &db, temp, s, &IndexOptions::default())

@@ -8,7 +8,7 @@ use axum::body::Body;
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::Response;
 use std::path::PathBuf;
-use tokio::io::{AsyncSeekExt, AsyncReadExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
 
 use crate::error::{Error, Result};
@@ -120,12 +120,10 @@ fn parse_range(headers: &HeaderMap, total: u64) -> RangeResult {
         },
         // Explicit range.
         (start, end) => match (start.parse::<u64>(), end.parse::<u64>()) {
-            (Ok(start), Ok(end)) if start <= end && start <= last => {
-                RangeResult::Satisfiable {
-                    start,
-                    end: end.min(last),
-                }
-            }
+            (Ok(start), Ok(end)) if start <= end && start <= last => RangeResult::Satisfiable {
+                start,
+                end: end.min(last),
+            },
             (Ok(_), Ok(_)) => RangeResult::Unsatisfiable,
             _ => RangeResult::None,
         },
@@ -161,7 +159,10 @@ mod tests {
         // End clamped to last byte.
         assert_eq!(
             parse_range(&headers_with_range("bytes=500-100000"), 1000),
-            RangeResult::Satisfiable { start: 500, end: 999 }
+            RangeResult::Satisfiable {
+                start: 500,
+                end: 999
+            }
         );
     }
 
@@ -169,11 +170,17 @@ mod tests {
     fn open_ended_and_suffix() {
         assert_eq!(
             parse_range(&headers_with_range("bytes=900-"), 1000),
-            RangeResult::Satisfiable { start: 900, end: 999 }
+            RangeResult::Satisfiable {
+                start: 900,
+                end: 999
+            }
         );
         assert_eq!(
             parse_range(&headers_with_range("bytes=-100"), 1000),
-            RangeResult::Satisfiable { start: 900, end: 999 }
+            RangeResult::Satisfiable {
+                start: 900,
+                end: 999
+            }
         );
         // Suffix larger than file -> whole file.
         assert_eq!(

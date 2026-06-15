@@ -129,14 +129,20 @@ impl Config {
 
     /// Resolved SQLite database file path.
     pub fn database_path(&self) -> String {
-        self.database_path
-            .clone()
-            .unwrap_or_else(|| self.data_dir.join("yanuget.db").to_string_lossy().into_owned())
+        self.database_path.clone().unwrap_or_else(|| {
+            self.data_dir
+                .join("yanuget.db")
+                .to_string_lossy()
+                .into_owned()
+        })
     }
 }
 
 fn truthy(v: &str) -> bool {
-    matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+    matches!(
+        v.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }
 
 #[cfg(test)]
