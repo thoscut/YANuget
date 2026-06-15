@@ -1,12 +1,14 @@
 //! YANuget server binary.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use clap::Parser;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use yanuget::config::Config;
 use yanuget::database::SqliteDatabase;
+use yanuget::retention::{self, RetentionPolicy};
 use yanuget::storage::FilesystemStorage;
 use yanuget::web::{self, AppState};
 
@@ -43,15 +45,82 @@ async fn main() -> anyhow::Result<()> {
     let config = Arc::new(config);
 
     let state = AppState::new(storage, db, config.clone()).await?;
+
+    // Background retention sweep: periodically prune old versions per policy.
+    if config.retention.enabled
+        && config.retention.interval_hours > 0
+        && config.retention.has_limits()
+    {
+        let storage = state.storage.clone();
+        let db = state.db.clone();
+        let cfg = config.clone();
+        tracing::info!(
+            interval_hours = cfg.retention.interval_hours,
+            "package retention sweep enabled"
+        );
+        tokio::spawn(async move {
+            let policy = RetentionPolicy::from(&cfg.retention);
+            let mut tick =
+                tokio::time::interval(Duration::from_secs(cfg.retention.interval_hours * 3600));
+            loop {
+                tick.tick().await;
+                if let Err(e) = retention::prune_all(storage.as_ref(), db.as_ref(), &policy).await {
+                    tracing::error!(error = %e, "retention sweep failed");
+                }
+            }
+        });
+    }
+
     let app = web::router(state);
-
     let addr = config.socket_addr();
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!("YANuget listening on http://{addr}");
-    tracing::info!("service index: http://{addr}/v3/index.json");
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+    if config.tls_enabled {
+        serve_tls(app, addr, &config).await?;
+    } else {
+        let listener = tokio::net::TcpListener::bind(addr).await?;
+        tracing::info!("YANuget listening on http://{addr} (TLS disabled)");
+        tracing::info!("service index: http://{addr}/v3/index.json");
+        axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown_signal())
+            .await?;
+    }
+    Ok(())
+}
+
+/// Serve over HTTPS, resolving (and if necessary generating a self-signed)
+/// certificate, with the same graceful-shutdown behaviour as the HTTP path.
+async fn serve_tls(
+    app: axum::Router,
+    addr: std::net::SocketAddr,
+    config: &Config,
+) -> anyhow::Result<()> {
+    // Install the ring crypto provider as the process default before any
+    // rustls configuration is built.
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .map_err(|_| anyhow::anyhow!("failed to install rustls crypto provider"))?;
+
+    let sans = yanuget::tls::certificate_sans(config.base_url.as_deref());
+    let paths =
+        yanuget::tls::ensure_certificate(config.tls_pair(), &config.data_dir, &sans).await?;
+
+    let tls = axum_server::tls_rustls::RustlsConfig::from_pem_file(&paths.cert, &paths.key)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to load TLS certificate: {e}"))?;
+
+    tracing::info!("YANuget listening on https://{addr}");
+    tracing::info!("service index: https://{addr}/v3/index.json");
+
+    let handle = axum_server::Handle::new();
+    let shutdown = handle.clone();
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        shutdown.graceful_shutdown(Some(std::time::Duration::from_secs(10)));
+    });
+
+    axum_server::bind_rustls(addr, tls)
+        .handle(handle)
+        .serve(app.into_make_service())
         .await?;
     Ok(())
 }

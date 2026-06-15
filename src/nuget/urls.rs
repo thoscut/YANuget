@@ -95,6 +95,12 @@ impl UrlBuilder {
     pub fn symbol_publish(&self) -> String {
         format!("{}/api/v2/symbol", self.base)
     }
+
+    /// Symbol-server read base, with trailing slash. A debugger appends
+    /// `{file}/{key}/{file}` to fetch a PDB.
+    pub fn symbol_server(&self) -> String {
+        format!("{}/download/symbols/", self.base)
+    }
 }
 
 /// Percent-encode a single path segment. Ids/versions are already restricted to

@@ -15,8 +15,14 @@ pub struct Package {
     pub id: String,
     /// The parsed version.
     pub version: NuGetVersion,
-    /// Whether the version is listed (visible in search/registration).
+    /// Whether the version is listed (visible in search/registration). This is
+    /// the NuGet client's "unlist" flag: an unlisted version is hidden from
+    /// search but remains downloadable by exact version (restore semantics).
     pub listed: bool,
+    /// Whether the version is enabled. An admin-disabled version is withheld
+    /// entirely — hidden from every listing **and** not downloadable — until an
+    /// admin re-enables (or deletes) it. Distinct from [`Package::listed`].
+    pub enabled: bool,
     /// Authors, joined with `, ` as in the nuspec.
     pub authors: Vec<String>,
     pub description: String,

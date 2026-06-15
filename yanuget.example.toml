@@ -21,6 +21,14 @@ data_dir = "./data"        # YANUGET_DATA_DIR
 # If unset, those endpoints are unauthenticated.
 # api_key = "change-me"    # YANUGET_API_KEY
 
+# Admin key protecting the /admin area, where you can disable, re-enable or
+# delete individual package versions via the browser (HTTP Basic auth — any
+# username, this key as the password). When unset, the admin area is disabled.
+# admin_api_key = "change-me-too"   # YANUGET_ADMIN_API_KEY
+
+# Number of packages shown per gallery page (overridable per request with ?take=).
+gallery_page_size = 20     # YANUGET_GALLERY_PAGE_SIZE
+
 # Maximum accepted upload size in bytes. Unset = unlimited (YANuget streams
 # uploads straight to disk, so 25 GiB+ packages work without extra memory).
 # 26843545600 = 25 GiB.
@@ -33,3 +41,42 @@ allow_overwrite = false    # YANUGET_ALLOW_OVERWRITE
 # When true, DELETE hard-deletes a package. When false (default), DELETE only
 # unlists it (the NuGet client's "delete" semantics), keeping it restorable.
 hard_delete_enabled = false   # YANUGET_HARD_DELETE_ENABLED
+
+# TLS. On by default: YANuget serves HTTPS. If no certificate is configured, a
+# self-signed one is generated and cached under {data_dir}/tls (clients must be
+# told to trust it). Provide your own PEM cert + key for a trusted certificate,
+# or set tls_enabled = false to serve plain HTTP behind a TLS-terminating proxy.
+tls_enabled = true            # YANUGET_TLS_ENABLED
+# tls_cert_path = "/etc/yanuget/cert.pem"   # YANUGET_TLS_CERT_PATH
+# tls_key_path  = "/etc/yanuget/key.pem"    # YANUGET_TLS_KEY_PATH
+
+# Symbol server: accept `.snupkg` pushes at /api/v2/symbol and serve PDBs over
+# the SSQP path /download/symbols/{file}/{key}/{file}. Enabled by default.
+enable_symbol_server = true   # YANUGET_ENABLE_SYMBOL_SERVER
+
+# Human-facing web gallery at `/` and `/packages/...`. Enabled by default.
+enable_web_ui = true          # YANUGET_ENABLE_WEB_UI
+
+# Which client's install command the gallery shows first on a package page.
+# One of "choco", "dotnet", "nuget". Defaults to "choco" since YANuget is
+# primarily deployed as a Chocolatey feed.
+primary_client = "choco"      # YANUGET_PRIMARY_CLIENT
+
+# ---------------------------------------------------------------------------
+# Package retention — automatic pruning of old versions.
+#
+# Retention HARD-deletes versions (payload, sidecars and symbols), so it is
+# off by default. A version is pruned when it is beyond the newest-N of its
+# release channel OR older than max_age_days; the newest stable version (or
+# newest pre-release, if there is no stable) is always kept.
+# ---------------------------------------------------------------------------
+[retention]
+enabled = false               # YANUGET_RETENTION_ENABLED — master switch
+prune_on_push = false         # YANUGET_RETENTION_PRUNE_ON_PUSH — prune after each push
+interval_hours = 24           # YANUGET_RETENTION_INTERVAL_HOURS — background sweep (0 = off)
+
+# Leave a limit unset to not apply it. At least one limit must be set for the
+# sweep to do anything.
+# keep_latest_stable = 10       # YANUGET_RETENTION_KEEP_LATEST_STABLE
+# keep_latest_prerelease = 5    # YANUGET_RETENTION_KEEP_LATEST_PRERELEASE
+# max_age_days = 180            # YANUGET_RETENTION_MAX_AGE_DAYS

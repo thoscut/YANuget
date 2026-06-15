@@ -44,8 +44,13 @@ cargo build --release
 YANUGET_API_KEY=change-me ./target/release/yanuget
 ```
 
-The server prints its listen address and service index URL on startup
-(default `http://0.0.0.0:5000`, index at `/v3/index.json`).
+The server prints its listen address and service index URL on startup.
+**TLS is on by default**, so it listens on `https://0.0.0.0:5000` with an
+auto-generated self-signed certificate (cached under `{data_dir}/tls/`). For
+local testing, trust that certificate or pass `--insecure`/`-k` to your client;
+for production, provide a real cert via `tls_cert_path`/`tls_key_path`, or set
+`tls_enabled = false` to run plain HTTP behind a TLS-terminating reverse proxy.
+See [docs/configuration.md](docs/configuration.md#tls).
 
 ### Add the feed and push a package
 
@@ -103,6 +108,10 @@ YANuget implements the NuGet v3 protocol. Full reference in
 | Registration leaf | `GET /v3/registration/{id}/{version}.json` |
 | Search | `GET /v3/search?q=&skip=&take=&prerelease=&semVerLevel=&packageType=` |
 | Autocomplete / versions | `GET /v3/autocomplete?q=` / `?id=` |
+| Push symbols | `PUT /api/v2/symbol` |
+| Download symbol (SSQP) | `GET /download/symbols/{file}/{key}/{file}` |
+| Web gallery | `GET /` and `GET /packages/{id}[/{version}]` |
+| Admin (Basic auth) | `GET /admin`, `POST /admin/packages/{id}/{version}/{disable\|enable\|delete}` |
 | Health | `GET /health` |
 
 ---
@@ -129,7 +138,10 @@ HTTP (axum)  ──▶  indexing pipeline  ──▶  PackageStorage (trait)  �
 | `database` | `PackageDatabase` trait + SQLite backend |
 | `nuget` | Protocol: URL generation + JSON response builders |
 | `indexing` | Upload → validate → store → record (with rollback) |
-| `web` | axum router, handlers, Range-aware file serving |
+| `pdb` | Portable PDB parsing → SSQP symbol key |
+| `symbols` | `.snupkg` ingest: extract PDBs, index by symbol key |
+| `retention` | Pure prune policy + version pruning |
+| `web` | axum router, handlers, Range-aware file serving, HTML gallery |
 
 ---
 
@@ -147,17 +159,81 @@ full end-to-end HTTP flows (push, download, Range, search, unlist/relist).
 
 ---
 
+## Using YANuget with Chocolatey
+
+YANuget is primarily intended as a private [Chocolatey](https://chocolatey.org)
+feed. Chocolatey CLI v2+ speaks the NuGet v3 protocol, so point it at the
+service index:
+
+```powershell
+choco source add -n=yanuget -s="http://localhost:5000/v3/index.json"
+
+# Push (the API key is your YANUGET_API_KEY)
+choco push my-package.1.0.0.nupkg -s="http://localhost:5000/v3/index.json" -k="change-me"
+
+# Install
+choco install my-package --version 1.0.0 --source="http://localhost:5000/v3/index.json"
+```
+
+The web gallery's package page shows the exact `choco install` command for each
+version (configurable via `primary_client`).
+
+## Symbol server
+
+When `enable_symbol_server` is on (the default), YANuget accepts `.snupkg`
+symbol packages at `PUT /api/v2/symbol` (e.g. `dotnet nuget push … --source`
+with a `.snupkg`). It extracts every **Portable PDB**, computes its SSQP key
+(GUID + `FFFFFFFF`), and serves it at
+`GET /download/symbols/{file}/{key}/{file}` — the path the .NET debugger and
+Visual Studio use. Point your debugger's symbol settings at the server's
+`/download/symbols/` base. The owning package must be pushed before its
+symbols. Native (Windows) PDBs are stored but cannot be indexed.
+
+## Web gallery
+
+A self-contained, dependency-free HTML gallery (no external assets, works
+offline) lives at `/`:
+
+* a searchable package list (search box in the header),
+* a per-package detail page with versions, dependencies, links, readme and the
+  install command for Chocolatey / `dotnet` / `nuget.exe`,
+* a statistics page (`/stats`) with feed totals and the most-downloaded /
+  recently-published lists,
+* a read-only settings overview (`/settings`) that never exposes secrets,
+* a configurable page size (`gallery_page_size`, default 20) with pagination.
+
+Disable it with `enable_web_ui = false`.
+
+## Admin moderation
+
+When `admin_api_key` is set, an `/admin` area (HTTP Basic auth) lets an operator
+**disable**, **re-enable** or **delete** individual package versions from the
+browser. A *disabled* version is withheld from clients entirely — hidden from
+search/registration/versions **and** not downloadable — which is stronger than
+NuGet's *unlist* (an unlisted version stays downloadable for restore). Delete is
+a hard delete (payload, sidecars and symbols). The area is only mounted when an
+admin key is configured.
+
+## Package retention
+
+Opt-in automatic pruning of old versions, configured under `[retention]`. A
+version is hard-deleted (payload, sidecars and symbols) when it is beyond the
+newest *N* of its release channel **or** older than `max_age_days`; the newest
+stable version (or newest pre-release, if none is stable) is always kept.
+Retention runs on a schedule (`interval_hours`) and/or after each push
+(`prune_on_push`). See [`yanuget.example.toml`](yanuget.example.toml).
+
 ## Roadmap
 
 Implemented: NuGet v3 push/restore/search/registration/autocomplete, streaming
 large-package support, API-key auth, filesystem storage, SQLite index, unlist /
-relist / hard-delete, Range downloads.
+relist / hard-delete, Range downloads, **symbol/PDB server**, a **web gallery**,
+and **package retention policies**.
 
-Not yet implemented (contributions welcome): symbol/PDB server, upstream
-mirroring/caching of nuget.org, additional storage backends (S3/Azure Blob) and
-database backends (PostgreSQL/MySQL), a richer web UI, and package retention
-policies. These are deliberately behind trait boundaries so they can be added
-without touching the core.
+Not yet implemented (contributions welcome): upstream mirroring/caching of
+nuget.org, additional storage backends (S3/Azure Blob) and database backends
+(PostgreSQL/MySQL), and native (Windows) PDB indexing. These are deliberately
+behind trait boundaries so they can be added without touching the core.
 
 ---
 

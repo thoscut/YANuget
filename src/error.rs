@@ -35,6 +35,11 @@ pub enum Error {
     #[error("unauthorized")]
     Unauthorized,
 
+    /// Admin credentials were missing or incorrect. Surfaced as a Basic-auth
+    /// challenge so a browser prompts for the admin key.
+    #[error("admin authentication required")]
+    AdminUnauthorized,
+
     /// The request was syntactically or semantically invalid.
     #[error("invalid request: {0}")]
     BadRequest(String),
@@ -69,6 +74,7 @@ impl Error {
             Error::InvalidPackage(_) => StatusCode::BAD_REQUEST,
             Error::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             Error::Unauthorized => StatusCode::UNAUTHORIZED,
+            Error::AdminUnauthorized => StatusCode::UNAUTHORIZED,
             Error::BadRequest(_) => StatusCode::BAD_REQUEST,
             Error::InvalidVersion(_) => StatusCode::BAD_REQUEST,
             Error::Database(sqlx::Error::RowNotFound) => StatusCode::NOT_FOUND,
@@ -84,9 +90,73 @@ impl IntoResponse for Error {
         if status.is_server_error() {
             tracing::error!(error = %self, "request failed");
         }
+        // The admin area challenges via Basic auth so browsers prompt for it.
+        let challenge = matches!(self, Error::AdminUnauthorized);
         let body = Json(json!({
             "error": self.to_string(),
         }));
-        (status, body).into_response()
+        let mut response = (status, body).into_response();
+        if challenge {
+            response.headers_mut().insert(
+                axum::http::header::WWW_AUTHENTICATE,
+                axum::http::HeaderValue::from_static("Basic realm=\"YANuget Admin\""),
+            );
+        }
+        response
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_codes_map_as_expected() {
+        assert_eq!(Error::PackageNotFound.status(), StatusCode::NOT_FOUND);
+        assert_eq!(Error::PackageAlreadyExists.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            Error::InvalidPackage("x".into()).status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            Error::PayloadTooLarge("x".into()).status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        assert_eq!(Error::Unauthorized.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(Error::AdminUnauthorized.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            Error::InvalidVersion("x".into()).status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            Error::Database(sqlx::Error::RowNotFound).status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            Error::Other(anyhow::anyhow!("boom")).status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[test]
+    fn admin_unauthorized_sends_basic_challenge() {
+        let resp = Error::AdminUnauthorized.into_response();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let header = resp
+            .headers()
+            .get(axum::http::header::WWW_AUTHENTICATE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(header.contains("Basic"));
+    }
+
+    #[test]
+    fn plain_unauthorized_has_no_challenge() {
+        let resp = Error::Unauthorized.into_response();
+        assert!(resp
+            .headers()
+            .get(axum::http::header::WWW_AUTHENTICATE)
+            .is_none());
     }
 }

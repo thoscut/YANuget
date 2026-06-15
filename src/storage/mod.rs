@@ -66,6 +66,27 @@ pub trait PackageStorage: Send + Sync {
     /// Whether a `.nupkg` already exists for `id`/`version`.
     async fn package_exists(&self, id: &str, version: &str) -> bool;
 
+    /// Move an already-written temp file into storage as the `.snupkg` symbol
+    /// package for `id`/`version`. Stored next to the `.nupkg` so it is removed
+    /// together with the version on delete. Returns the stored size in bytes.
+    async fn store_symbol_package(
+        &self,
+        id: &str,
+        version: &str,
+        temp_path: PathBuf,
+    ) -> Result<u64>;
+
+    /// Store one extracted symbol file (a `.pdb`) addressed by its SSQP `key`
+    /// and `filename`, so a debugger can fetch it directly. Symbol files are
+    /// bounded in size and already in memory, so bytes are passed directly.
+    async fn store_symbol(&self, key: &str, filename: &str, bytes: &[u8]) -> Result<()>;
+
+    /// Resolve a stored symbol file for serving.
+    async fn get_symbol(&self, key: &str, filename: &str) -> Result<PackageContent>;
+
+    /// Delete a stored symbol file. Succeeds even if it is already gone.
+    async fn delete_symbol(&self, key: &str, filename: &str) -> Result<()>;
+
     /// Store a small auxiliary file.
     async fn store_aux(&self, id: &str, version: &str, kind: AuxFile, bytes: &[u8]) -> Result<()>;
 

@@ -77,6 +77,11 @@ pub fn service_index(urls: &UrlBuilder) -> Value {
         &["SymbolPackagePublish/4.9.0"],
         "Endpoint for pushing symbol packages.",
     );
+    push(
+        urls.symbol_server(),
+        &["SymbolServer/4.9.0"],
+        "Base URL for downloading symbols (SSQP).",
+    );
 
     json!({
         "version": "3.0.0",
@@ -322,6 +327,7 @@ mod tests {
             id: id.to_string(),
             version: NuGetVersion::parse(version).unwrap(),
             listed: true,
+            enabled: true,
             authors: vec!["Alice".into(), "Bob".into()],
             description: "A test package".into(),
             icon_url: None,

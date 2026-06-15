@@ -51,6 +51,22 @@ impl FilesystemStorage {
     fn aux_path(&self, id: &str, version: &str, kind: AuxFile) -> Result<PathBuf> {
         Ok(self.version_dir(id, version)?.join(kind.file_name()))
     }
+
+    fn symbol_package_path(&self, id: &str, version: &str) -> Result<PathBuf> {
+        let dir = self.version_dir(id, version)?;
+        let lid = id.to_ascii_lowercase();
+        let lver = version.to_ascii_lowercase();
+        Ok(dir.join(format!("{lid}.{lver}.snupkg")))
+    }
+
+    /// Directory holding one symbol file, addressed by its SSQP key. Kept under
+    /// a `.symbols` root, separate from the per-version package directories,
+    /// because symbols are looked up by key rather than by id/version.
+    fn symbol_path(&self, key: &str, filename: &str) -> Result<PathBuf> {
+        let key = safe_segment(key)?.to_ascii_lowercase();
+        let filename = safe_segment(filename)?.to_ascii_lowercase();
+        Ok(self.root.join(".symbols").join(key).join(filename))
+    }
 }
 
 #[async_trait]
@@ -89,6 +105,56 @@ impl PackageStorage for FilesystemStorage {
             Ok(path) => tokio::fs::try_exists(&path).await.unwrap_or(false),
             Err(_) => false,
         }
+    }
+
+    async fn store_symbol_package(
+        &self,
+        id: &str,
+        version: &str,
+        temp_path: PathBuf,
+    ) -> Result<u64> {
+        let dir = self.version_dir(id, version)?;
+        tokio::fs::create_dir_all(&dir).await?;
+        let dest = self.symbol_package_path(id, version)?;
+        match tokio::fs::rename(&temp_path, &dest).await {
+            Ok(()) => {}
+            Err(_) => {
+                tokio::fs::copy(&temp_path, &dest).await?;
+                let _ = tokio::fs::remove_file(&temp_path).await;
+            }
+        }
+        let meta = tokio::fs::metadata(&dest).await?;
+        Ok(meta.len())
+    }
+
+    async fn store_symbol(&self, key: &str, filename: &str, bytes: &[u8]) -> Result<()> {
+        let dest = self.symbol_path(key, filename)?;
+        if let Some(parent) = dest.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        tokio::fs::write(&dest, bytes).await?;
+        Ok(())
+    }
+
+    async fn get_symbol(&self, key: &str, filename: &str) -> Result<PackageContent> {
+        let path = self.symbol_path(key, filename)?;
+        if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+            Ok(PackageContent::LocalPath(path))
+        } else {
+            Err(Error::PackageNotFound)
+        }
+    }
+
+    async fn delete_symbol(&self, key: &str, filename: &str) -> Result<()> {
+        let path = self.symbol_path(key, filename)?;
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) | Err(_) => {}
+        }
+        // Best-effort: remove the now-empty key directory.
+        if let Some(parent) = path.parent() {
+            let _ = tokio::fs::remove_dir(parent).await;
+        }
+        Ok(())
     }
 
     async fn store_aux(&self, id: &str, version: &str, kind: AuxFile, bytes: &[u8]) -> Result<()> {
@@ -201,5 +267,56 @@ mod tests {
         let (_d, storage) = temp_storage().await;
         assert!(storage.get_package("..", "1.0.0").await.is_err());
         assert!(storage.package_path("a/b", "1.0.0").is_err());
+        // Symbol keys/filenames are validated too.
+        assert!(storage.symbol_path("../etc", "x.pdb").is_err());
+        assert!(storage.symbol_path("KEY", "a/b.pdb").is_err());
+    }
+
+    #[tokio::test]
+    async fn symbols_round_trip_and_delete() {
+        let (_d, storage) = temp_storage().await;
+        storage
+            .store_symbol("ABCDEF01FFFFFFFF", "App.pdb", b"pdb-bytes")
+            .await
+            .unwrap();
+
+        // Lookup is case-insensitive (the key/filename are lower-cased on disk).
+        let content = storage
+            .get_symbol("abcdef01ffffffff", "app.pdb")
+            .await
+            .unwrap();
+        let PackageContent::LocalPath(path) = content;
+        assert_eq!(tokio::fs::read(path).await.unwrap(), b"pdb-bytes");
+
+        storage
+            .delete_symbol("ABCDEF01FFFFFFFF", "App.pdb")
+            .await
+            .unwrap();
+        assert!(storage
+            .get_symbol("abcdef01ffffffff", "app.pdb")
+            .await
+            .is_err());
+        // Deleting a missing symbol is a no-op.
+        storage.delete_symbol("nope", "x.pdb").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn symbol_package_is_stored_next_to_version() {
+        let (_d, storage) = temp_storage().await;
+        let (_td, temp) = write_temp(b"snupkg-bytes").await;
+        let size = storage
+            .store_symbol_package("Sym.Lib", "1.0.0", temp)
+            .await
+            .unwrap();
+        assert_eq!(size, b"snupkg-bytes".len() as u64);
+        // It lives in the same version directory and is removed with it.
+        storage.delete("sym.lib", "1.0.0").await.unwrap();
+        let (_td2, temp2) = write_temp(b"x").await;
+        storage
+            .store_package("Sym.Lib", "1.0.0", temp2)
+            .await
+            .unwrap();
+        // (sanity) the version dir is usable again after delete.
+        assert!(storage.package_exists("sym.lib", "1.0.0").await);
     }
 }

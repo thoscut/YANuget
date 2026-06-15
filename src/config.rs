@@ -34,6 +34,12 @@ pub struct Config {
     /// API key required for push/delete. When `None`, those endpoints are open
     /// (a loud warning is logged at startup).
     pub api_key: Option<String>,
+    /// Admin key protecting the `/admin` area (disable/enable/delete versions),
+    /// presented via HTTP Basic auth. When `None`, the admin area is disabled.
+    pub admin_api_key: Option<String>,
+    /// Default number of packages shown per gallery page. Overridable per
+    /// request with `?take=`.
+    pub gallery_page_size: i64,
     /// Maximum accepted upload size in bytes. `None` means unlimited, which is
     /// the point of YANuget — it streams 25 GiB+ packages straight to disk.
     pub max_package_size_bytes: Option<u64>,
@@ -42,6 +48,66 @@ pub struct Config {
     pub allow_overwrite: bool,
     /// Whether `DELETE` hard-deletes (true) or merely unlists (false).
     pub hard_delete_enabled: bool,
+    /// Serve over HTTPS. On by default; a self-signed certificate is generated
+    /// when no `tls_cert_path`/`tls_key_path` is configured. Set to `false` to
+    /// serve plain HTTP (e.g. behind a TLS-terminating reverse proxy).
+    pub tls_enabled: bool,
+    /// PEM certificate (chain) for TLS. When unset, a cached self-signed
+    /// certificate under `{data_dir}/tls` is used.
+    pub tls_cert_path: Option<PathBuf>,
+    /// PEM private key for TLS. Must be set together with `tls_cert_path`.
+    pub tls_key_path: Option<PathBuf>,
+    /// Whether the symbol server (push `.snupkg`, serve PDBs) is enabled.
+    pub enable_symbol_server: bool,
+    /// Whether the human-facing web gallery (`/`, `/packages/...`) is enabled.
+    pub enable_web_ui: bool,
+    /// Which client the gallery shows first in its "install" snippet. One of
+    /// `choco`, `dotnet`, `nuget`. Defaults to `choco`.
+    pub primary_client: String,
+    /// Automatic pruning of old package versions.
+    pub retention: RetentionConfig,
+}
+
+/// Configuration for the package retention sweep.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RetentionConfig {
+    /// Master switch. Off by default — retention is destructive.
+    pub enabled: bool,
+    /// Also run the policy for a package id immediately after each push.
+    pub prune_on_push: bool,
+    /// How often the background sweep runs, in hours. `0` disables the sweep
+    /// (push-time pruning, if enabled, still applies).
+    pub interval_hours: u64,
+    /// Keep at most this many of the newest stable versions per id.
+    pub keep_latest_stable: Option<usize>,
+    /// Keep at most this many of the newest pre-release versions per id.
+    pub keep_latest_prerelease: Option<usize>,
+    /// Delete versions published more than this many days ago.
+    pub max_age_days: Option<u64>,
+}
+
+impl Default for RetentionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            prune_on_push: false,
+            interval_hours: 24,
+            keep_latest_stable: None,
+            keep_latest_prerelease: None,
+            max_age_days: None,
+        }
+    }
+}
+
+impl RetentionConfig {
+    /// Whether any actual limit is configured. With none set, the sweep would
+    /// never prune anything, so callers can skip it entirely.
+    pub fn has_limits(&self) -> bool {
+        self.keep_latest_stable.is_some()
+            || self.keep_latest_prerelease.is_some()
+            || self.max_age_days.is_some()
+    }
 }
 
 impl Default for Config {
@@ -54,9 +120,18 @@ impl Default for Config {
             storage_path: None,
             database_path: None,
             api_key: None,
+            admin_api_key: None,
+            gallery_page_size: 20,
             max_package_size_bytes: None,
             allow_overwrite: false,
             hard_delete_enabled: false,
+            tls_enabled: true,
+            tls_cert_path: None,
+            tls_key_path: None,
+            enable_symbol_server: true,
+            enable_web_ui: true,
+            primary_client: "choco".to_string(),
+            retention: RetentionConfig::default(),
         }
     }
 }
@@ -104,6 +179,16 @@ impl Config {
         if let Ok(v) = std::env::var("YANUGET_API_KEY") {
             self.api_key = (!v.is_empty()).then_some(v);
         }
+        if let Ok(v) = std::env::var("YANUGET_ADMIN_API_KEY") {
+            self.admin_api_key = (!v.is_empty()).then_some(v);
+        }
+        if let Ok(v) = std::env::var("YANUGET_GALLERY_PAGE_SIZE") {
+            if let Ok(n) = v.parse::<i64>() {
+                if n > 0 {
+                    self.gallery_page_size = n;
+                }
+            }
+        }
         if let Ok(v) = std::env::var("YANUGET_MAX_PACKAGE_SIZE_BYTES") {
             self.max_package_size_bytes = v.parse().ok();
         }
@@ -112,6 +197,46 @@ impl Config {
         }
         if let Ok(v) = std::env::var("YANUGET_HARD_DELETE_ENABLED") {
             self.hard_delete_enabled = truthy(&v);
+        }
+        if let Ok(v) = std::env::var("YANUGET_TLS_ENABLED") {
+            self.tls_enabled = truthy(&v);
+        }
+        if let Ok(v) = std::env::var("YANUGET_TLS_CERT_PATH") {
+            self.tls_cert_path = (!v.is_empty()).then(|| PathBuf::from(v));
+        }
+        if let Ok(v) = std::env::var("YANUGET_TLS_KEY_PATH") {
+            self.tls_key_path = (!v.is_empty()).then(|| PathBuf::from(v));
+        }
+        if let Ok(v) = std::env::var("YANUGET_ENABLE_SYMBOL_SERVER") {
+            self.enable_symbol_server = truthy(&v);
+        }
+        if let Ok(v) = std::env::var("YANUGET_ENABLE_WEB_UI") {
+            self.enable_web_ui = truthy(&v);
+        }
+        if let Ok(v) = std::env::var("YANUGET_PRIMARY_CLIENT") {
+            if !v.trim().is_empty() {
+                self.primary_client = v.trim().to_ascii_lowercase();
+            }
+        }
+        if let Ok(v) = std::env::var("YANUGET_RETENTION_ENABLED") {
+            self.retention.enabled = truthy(&v);
+        }
+        if let Ok(v) = std::env::var("YANUGET_RETENTION_PRUNE_ON_PUSH") {
+            self.retention.prune_on_push = truthy(&v);
+        }
+        if let Ok(v) = std::env::var("YANUGET_RETENTION_INTERVAL_HOURS") {
+            if let Ok(n) = v.parse() {
+                self.retention.interval_hours = n;
+            }
+        }
+        if let Ok(v) = std::env::var("YANUGET_RETENTION_KEEP_LATEST_STABLE") {
+            self.retention.keep_latest_stable = v.parse().ok();
+        }
+        if let Ok(v) = std::env::var("YANUGET_RETENTION_KEEP_LATEST_PRERELEASE") {
+            self.retention.keep_latest_prerelease = v.parse().ok();
+        }
+        if let Ok(v) = std::env::var("YANUGET_RETENTION_MAX_AGE_DAYS") {
+            self.retention.max_age_days = v.parse().ok();
         }
     }
 
@@ -135,6 +260,23 @@ impl Config {
                 .to_string_lossy()
                 .into_owned()
         })
+    }
+
+    /// An explicit TLS certificate/key pair, when both paths are configured.
+    pub fn tls_pair(&self) -> Option<(PathBuf, PathBuf)> {
+        match (&self.tls_cert_path, &self.tls_key_path) {
+            (Some(cert), Some(key)) => Some((cert.clone(), key.clone())),
+            _ => None,
+        }
+    }
+
+    /// The default URL scheme the server is reachable on.
+    pub fn scheme(&self) -> &'static str {
+        if self.tls_enabled {
+            "https"
+        } else {
+            "http"
+        }
     }
 }
 
@@ -173,5 +315,81 @@ mod tests {
         assert_eq!(c.api_key.as_deref(), Some("secret"));
         assert!(c.allow_overwrite);
         assert_eq!(c.max_package_size_bytes, Some(26_843_545_600));
+    }
+
+    #[test]
+    fn tls_defaults_on_and_scheme_follows() {
+        let c = Config::default();
+        assert!(c.tls_enabled);
+        assert_eq!(c.scheme(), "https");
+        assert!(c.tls_pair().is_none()); // self-signed fallback
+
+        let http = Config {
+            tls_enabled: false,
+            ..Config::default()
+        };
+        assert_eq!(http.scheme(), "http");
+    }
+
+    #[test]
+    fn tls_pair_requires_both_paths() {
+        let only_cert = Config {
+            tls_cert_path: Some(PathBuf::from("/c.pem")),
+            ..Config::default()
+        };
+        assert!(only_cert.tls_pair().is_none());
+
+        let both = Config {
+            tls_cert_path: Some(PathBuf::from("/c.pem")),
+            tls_key_path: Some(PathBuf::from("/k.pem")),
+            ..Config::default()
+        };
+        assert_eq!(
+            both.tls_pair(),
+            Some((PathBuf::from("/c.pem"), PathBuf::from("/k.pem")))
+        );
+    }
+
+    #[test]
+    fn parses_new_toml_options() {
+        let toml = r#"
+            admin_api_key = "adm"
+            gallery_page_size = 7
+            tls_enabled = false
+            tls_cert_path = "/tls/cert.pem"
+            tls_key_path = "/tls/key.pem"
+
+            [retention]
+            enabled = true
+            keep_latest_stable = 5
+            max_age_days = 90
+        "#;
+        let c: Config = toml::from_str(toml).unwrap();
+        assert_eq!(c.admin_api_key.as_deref(), Some("adm"));
+        assert_eq!(c.gallery_page_size, 7);
+        assert!(!c.tls_enabled);
+        assert!(c.tls_pair().is_some());
+        assert!(c.retention.enabled);
+        assert_eq!(c.retention.keep_latest_stable, Some(5));
+        assert_eq!(c.retention.max_age_days, Some(90));
+        assert!(c.retention.has_limits());
+    }
+
+    #[test]
+    fn path_overrides_resolve() {
+        let c = Config {
+            data_dir: PathBuf::from("/data"),
+            ..Config::default()
+        };
+        assert_eq!(c.storage_path(), PathBuf::from("/data/packages"));
+        assert!(c.database_path().ends_with("yanuget.db"));
+
+        let overridden = Config {
+            storage_path: Some(PathBuf::from("/mnt/pkgs")),
+            database_path: Some("/mnt/db.sqlite".into()),
+            ..Config::default()
+        };
+        assert_eq!(overridden.storage_path(), PathBuf::from("/mnt/pkgs"));
+        assert_eq!(overridden.database_path(), "/mnt/db.sqlite");
     }
 }

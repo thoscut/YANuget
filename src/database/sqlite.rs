@@ -23,7 +23,9 @@ use crate::error::{Error, Result};
 use crate::models::{DependencyGroup, Package, PackageType};
 use crate::version::NuGetVersion;
 
-use super::{PackageDatabase, SearchGroup, SearchPage, SearchRequest};
+use super::{
+    DatabaseStats, PackageDatabase, SearchGroup, SearchPage, SearchRequest, SymbolKey, SymbolRef,
+};
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS packages (
@@ -38,6 +40,7 @@ CREATE TABLE IF NOT EXISTS packages (
     is_prerelease             INTEGER NOT NULL,
     is_semver2                INTEGER NOT NULL,
     listed                    INTEGER NOT NULL,
+    enabled                   INTEGER NOT NULL DEFAULT 1,
     authors                   TEXT    NOT NULL,
     description               TEXT    NOT NULL,
     icon_url                  TEXT,
@@ -67,6 +70,16 @@ CREATE TABLE IF NOT EXISTS packages (
 CREATE INDEX IF NOT EXISTS idx_packages_lower_id ON packages (lower_id);
 CREATE INDEX IF NOT EXISTS idx_packages_search
     ON packages (lower_id, listed, is_prerelease, is_semver2);
+
+CREATE TABLE IF NOT EXISTS symbols (
+    ssqp_key           TEXT NOT NULL,   -- upper-case {GUID}{age}
+    filename           TEXT NOT NULL,   -- the .pdb file name, lower-cased
+    lower_id           TEXT NOT NULL,   -- owning package, for cleanup
+    normalized_version TEXT NOT NULL,
+    PRIMARY KEY (ssqp_key, filename)
+);
+CREATE INDEX IF NOT EXISTS idx_symbols_owner
+    ON symbols (lower_id, normalized_version);
 "#;
 
 /// A SQLite package index.
@@ -109,6 +122,8 @@ impl SqliteDatabase {
 
     async fn from_pool(pool: SqlitePool) -> Result<Self> {
         sqlx::raw_sql(SCHEMA).execute(&pool).await?;
+        // Migrate databases created before the admin `enabled` column existed.
+        ensure_column(&pool, "packages", "enabled", "INTEGER NOT NULL DEFAULT 1").await?;
         Ok(Self { pool })
     }
 
@@ -140,9 +155,11 @@ impl SqliteDatabase {
         include_semver2: bool,
         listed_only: bool,
     ) -> Result<Vec<Package>> {
+        // Public listings never include admin-disabled versions.
         let rows = sqlx::query(
             r#"SELECT * FROM packages
                WHERE lower_id = ?1
+                 AND enabled = 1
                  AND (?2 = 1 OR listed = 1)
                  AND (?3 = 1 OR is_prerelease = 0)
                  AND (?4 = 1 OR is_semver2 = 0)"#,
@@ -171,7 +188,7 @@ impl PackageDatabase for SqliteDatabase {
             r#"INSERT INTO packages (
                 id, lower_id, normalized_version, original_version,
                 version_major, version_minor, version_patch, version_revision,
-                is_prerelease, is_semver2, listed,
+                is_prerelease, is_semver2, listed, enabled,
                 authors, description, icon_url, license_url, license_expression,
                 project_url, repository_url, repository_type, min_client_version,
                 release_notes, language, title, summary, tags,
@@ -179,10 +196,10 @@ impl PackageDatabase for SqliteDatabase {
                 package_size, package_hash, package_hash_algorithm,
                 published, downloads, package_types, dependencies
             ) VALUES (
-                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
-                ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20,
-                ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28,
-                ?29, ?30, ?31, ?32, ?33, ?34, ?35
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21,
+                ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29,
+                ?30, ?31, ?32, ?33, ?34, ?35, ?36
             )"#,
         )
         .bind(&p.id)
@@ -196,6 +213,7 @@ impl PackageDatabase for SqliteDatabase {
         .bind(i64::from(p.is_prerelease()))
         .bind(i64::from(p.is_semver2))
         .bind(i64::from(p.listed))
+        .bind(i64::from(p.enabled))
         .bind(json(&p.authors)?)
         .bind(&p.description)
         .bind(&p.icon_url)
@@ -242,12 +260,14 @@ impl PackageDatabase for SqliteDatabase {
     }
 
     async fn find(&self, id: &str, version: &NuGetVersion) -> Result<Option<Package>> {
-        let row =
-            sqlx::query("SELECT * FROM packages WHERE lower_id = ?1 AND normalized_version = ?2")
-                .bind(id.to_lowercase())
-                .bind(version.normalized())
-                .fetch_optional(&self.pool)
-                .await?;
+        // Public lookup: admin-disabled versions are treated as absent.
+        let row = sqlx::query(
+            "SELECT * FROM packages WHERE lower_id = ?1 AND normalized_version = ?2 AND enabled = 1",
+        )
+        .bind(id.to_lowercase())
+        .bind(version.normalized())
+        .fetch_optional(&self.pool)
+        .await?;
         row.map(row_to_package).transpose()
     }
 
@@ -266,6 +286,43 @@ impl PackageDatabase for SqliteDatabase {
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() > 0)
+    }
+
+    async fn set_enabled(&self, id: &str, version: &NuGetVersion, enabled: bool) -> Result<bool> {
+        let result = sqlx::query(
+            "UPDATE packages SET enabled = ?3 WHERE lower_id = ?1 AND normalized_version = ?2",
+        )
+        .bind(id.to_lowercase())
+        .bind(version.normalized())
+        .bind(i64::from(enabled))
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn is_servable(&self, id: &str, version: &NuGetVersion) -> Result<bool> {
+        let row = sqlx::query(
+            "SELECT 1 FROM packages
+             WHERE lower_id = ?1 AND normalized_version = ?2 AND enabled = 1 LIMIT 1",
+        )
+        .bind(id.to_lowercase())
+        .bind(version.normalized())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.is_some())
+    }
+
+    async fn find_all_versions(&self, id: &str) -> Result<Vec<Package>> {
+        let rows = sqlx::query("SELECT * FROM packages WHERE lower_id = ?1")
+            .bind(id.to_lowercase())
+            .fetch_all(&self.pool)
+            .await?;
+        let mut packages = rows
+            .into_iter()
+            .map(row_to_package)
+            .collect::<Result<Vec<_>>>()?;
+        packages.sort_by(|a, b| a.version.cmp(&b.version));
+        Ok(packages)
     }
 
     async fn delete(&self, id: &str, version: &NuGetVersion) -> Result<bool> {
@@ -297,7 +354,7 @@ impl PackageDatabase for SqliteDatabase {
         let id_rows = sqlx::query(
             r#"SELECT lower_id, SUM(downloads) AS total
                FROM packages
-               WHERE listed = 1
+               WHERE listed = 1 AND enabled = 1
                  AND (?1 = 1 OR is_prerelease = 0)
                  AND (?2 = 1 OR is_semver2 = 0)
                  AND (?3 = ''
@@ -326,7 +383,7 @@ impl PackageDatabase for SqliteDatabase {
         let total_hits: i64 = sqlx::query_scalar(
             r#"SELECT COUNT(*) FROM (
                    SELECT lower_id FROM packages
-                   WHERE listed = 1
+                   WHERE listed = 1 AND enabled = 1
                      AND (?1 = 1 OR is_prerelease = 0)
                      AND (?2 = 1 OR is_semver2 = 0)
                      AND (?3 = ''
@@ -372,7 +429,8 @@ impl PackageDatabase for SqliteDatabase {
         let pattern = like_pattern(&q);
         let rows = sqlx::query(
             r#"SELECT MAX(id) AS id FROM packages
-               WHERE listed = 1 AND (?1 = '' OR lower_id LIKE ?2 ESCAPE '\')
+               WHERE listed = 1 AND enabled = 1
+                 AND (?1 = '' OR lower_id LIKE ?2 ESCAPE '\')
                GROUP BY lower_id
                ORDER BY lower_id ASC
                LIMIT ?3 OFFSET ?4"#,
@@ -384,6 +442,114 @@ impl PackageDatabase for SqliteDatabase {
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.iter().map(|r| r.get::<String, _>("id")).collect())
+    }
+
+    async fn all_package_ids(&self) -> Result<Vec<String>> {
+        let rows = sqlx::query(
+            "SELECT MAX(id) AS id FROM packages GROUP BY lower_id ORDER BY lower_id ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.iter().map(|r| r.get::<String, _>("id")).collect())
+    }
+
+    async fn add_symbol(
+        &self,
+        key: &str,
+        filename: &str,
+        id: &str,
+        version: &NuGetVersion,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"INSERT INTO symbols (ssqp_key, filename, lower_id, normalized_version)
+               VALUES (?1, ?2, ?3, ?4)
+               ON CONFLICT(ssqp_key, filename) DO UPDATE SET
+                   lower_id = excluded.lower_id,
+                   normalized_version = excluded.normalized_version"#,
+        )
+        .bind(key.to_uppercase())
+        .bind(filename.to_lowercase())
+        .bind(id.to_lowercase())
+        .bind(version.normalized())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn find_symbol(&self, key: &str, filename: &str) -> Result<Option<SymbolRef>> {
+        let row = sqlx::query(
+            "SELECT lower_id, normalized_version FROM symbols
+             WHERE ssqp_key = ?1 AND filename = ?2",
+        )
+        .bind(key.to_uppercase())
+        .bind(filename.to_lowercase())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| SymbolRef {
+            lower_id: r.get::<String, _>("lower_id"),
+            normalized_version: r.get::<String, _>("normalized_version"),
+        }))
+    }
+
+    async fn find_symbols(&self, id: &str, version: &NuGetVersion) -> Result<Vec<SymbolKey>> {
+        let rows = sqlx::query(
+            "SELECT ssqp_key, filename FROM symbols
+             WHERE lower_id = ?1 AND normalized_version = ?2",
+        )
+        .bind(id.to_lowercase())
+        .bind(version.normalized())
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .iter()
+            .map(|r| SymbolKey {
+                key: r.get::<String, _>("ssqp_key"),
+                filename: r.get::<String, _>("filename"),
+            })
+            .collect())
+    }
+
+    async fn delete_symbols(&self, id: &str, version: &NuGetVersion) -> Result<u64> {
+        let result =
+            sqlx::query("DELETE FROM symbols WHERE lower_id = ?1 AND normalized_version = ?2")
+                .bind(id.to_lowercase())
+                .bind(version.normalized())
+                .execute(&self.pool)
+                .await?;
+        Ok(result.rows_affected())
+    }
+
+    async fn stats(&self) -> Result<DatabaseStats> {
+        let row = sqlx::query(
+            r#"SELECT
+                   COUNT(DISTINCT lower_id)       AS package_count,
+                   COUNT(*)                       AS version_count,
+                   COALESCE(SUM(listed), 0)       AS listed_count,
+                   COALESCE(SUM(downloads), 0)    AS total_downloads,
+                   COALESCE(SUM(package_size), 0) AS total_size
+               FROM packages"#,
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        let symbol_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM symbols")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(DatabaseStats {
+            package_count: row.try_get("package_count")?,
+            version_count: row.try_get("version_count")?,
+            listed_count: row.try_get("listed_count")?,
+            total_downloads: row.try_get("total_downloads")?,
+            total_size: row.try_get("total_size")?,
+            symbol_count,
+        })
+    }
+
+    async fn recent_packages(&self, limit: i64) -> Result<Vec<Package>> {
+        let rows = sqlx::query("SELECT * FROM packages ORDER BY published DESC LIMIT ?1")
+            .bind(limit.max(0))
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter().map(row_to_package).collect()
     }
 }
 
@@ -407,6 +573,24 @@ fn json<T: serde::Serialize>(value: &T) -> Result<String> {
 
 fn from_json<T: serde::de::DeserializeOwned>(s: &str) -> Result<T> {
     serde_json::from_str(s).map_err(|e| Error::Other(e.into()))
+}
+
+/// Idempotently add a column to an existing table (SQLite has no
+/// `ADD COLUMN IF NOT EXISTS`). Checks `PRAGMA table_info` first so re-running
+/// migrations is a no-op.
+async fn ensure_column(pool: &SqlitePool, table: &str, column: &str, def: &str) -> Result<()> {
+    let rows = sqlx::query(&format!("PRAGMA table_info({table})"))
+        .fetch_all(pool)
+        .await?;
+    let exists = rows
+        .iter()
+        .any(|r| r.get::<String, _>("name").eq_ignore_ascii_case(column));
+    if !exists {
+        sqlx::query(&format!("ALTER TABLE {table} ADD COLUMN {column} {def}"))
+            .execute(pool)
+            .await?;
+    }
+    Ok(())
 }
 
 fn is_unique_violation(e: &sqlx::Error) -> bool {
@@ -433,6 +617,7 @@ fn row_to_package(row: SqliteRow) -> Result<Package> {
         id: row.try_get("id")?,
         version,
         listed: row.try_get::<i64, _>("listed")? != 0,
+        enabled: row.try_get::<i64, _>("enabled")? != 0,
         authors,
         description: row.try_get("description")?,
         icon_url: row.try_get("icon_url")?,
@@ -470,6 +655,7 @@ mod tests {
             id: id.to_string(),
             version: NuGetVersion::parse(version).unwrap(),
             listed: true,
+            enabled: true,
             authors: vec!["Alice".into()],
             description: format!("description for {id}"),
             icon_url: None,
@@ -598,5 +784,128 @@ mod tests {
         assert!(!db.exists("contoso.cli", &v).await.unwrap());
         let ac = db.autocomplete("contoso", 0, 20).await.unwrap();
         assert_eq!(ac, vec!["Contoso.Core".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn disabled_versions_are_hidden_but_present() {
+        let db = SqliteDatabase::in_memory().await.unwrap();
+        db.add(&sample("Pkg", "1.0.0")).await.unwrap();
+        db.add(&sample("Pkg", "2.0.0")).await.unwrap();
+        let v1 = NuGetVersion::parse("1.0.0").unwrap();
+
+        // Disable 1.0.0 — hidden from public listings, search and serving.
+        assert!(db.set_enabled("pkg", &v1, false).await.unwrap());
+        assert!(!db.is_servable("pkg", &v1).await.unwrap());
+        assert!(db
+            .is_servable("pkg", &NuGetVersion::parse("2.0.0").unwrap())
+            .await
+            .unwrap());
+        assert!(db.find("pkg", &v1).await.unwrap().is_none());
+
+        let listed = db.find_versions("pkg", true).await.unwrap();
+        assert_eq!(listed.len(), 1); // only 2.0.0
+        let page = db.search(&SearchRequest::default()).await.unwrap();
+        assert_eq!(page.groups[0].packages.len(), 1);
+
+        // But it still exists and admin listing shows it.
+        assert!(db.exists("pkg", &v1).await.unwrap());
+        let all = db.find_all_versions("pkg").await.unwrap();
+        assert_eq!(all.len(), 2);
+        assert!(all.iter().any(|p| !p.enabled));
+
+        // Re-enable restores visibility.
+        assert!(db.set_enabled("pkg", &v1, true).await.unwrap());
+        assert!(db.is_servable("pkg", &v1).await.unwrap());
+        assert_eq!(db.find_versions("pkg", true).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn all_package_ids_and_stats() {
+        let db = SqliteDatabase::in_memory().await.unwrap();
+        db.add(&sample("Alpha", "1.0.0")).await.unwrap();
+        db.add(&sample("Alpha", "1.1.0")).await.unwrap();
+        db.add(&sample("Beta", "2.0.0")).await.unwrap();
+        let v = NuGetVersion::parse("2.0.0").unwrap();
+        db.increment_downloads("beta", &v).await.unwrap();
+
+        let ids = db.all_package_ids().await.unwrap();
+        assert_eq!(ids, vec!["Alpha".to_string(), "Beta".to_string()]);
+
+        let stats = db.stats().await.unwrap();
+        assert_eq!(stats.package_count, 2);
+        assert_eq!(stats.version_count, 3);
+        assert_eq!(stats.listed_count, 3);
+        assert_eq!(stats.total_downloads, 1);
+        assert!(stats.total_size > 0);
+        assert_eq!(stats.symbol_count, 0);
+    }
+
+    #[tokio::test]
+    async fn recent_packages_orders_by_publish_time() {
+        let db = SqliteDatabase::in_memory().await.unwrap();
+        let mut older = sample("Old", "1.0.0");
+        older.published = Utc::now() - chrono::Duration::days(5);
+        let newer = sample("New", "1.0.0");
+        db.add(&older).await.unwrap();
+        db.add(&newer).await.unwrap();
+        let recent = db.recent_packages(10).await.unwrap();
+        assert_eq!(recent[0].id, "New");
+        assert_eq!(recent[1].id, "Old");
+        assert_eq!(db.recent_packages(1).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn symbol_mappings_round_trip_and_clean_up() {
+        let db = SqliteDatabase::in_memory().await.unwrap();
+        db.add(&sample("Sym", "1.0.0")).await.unwrap();
+        let v = NuGetVersion::parse("1.0.0").unwrap();
+
+        db.add_symbol("ABCDEF01FFFFFFFF", "sym.pdb", "Sym", &v)
+            .await
+            .unwrap();
+        // Lookup is case-insensitive on the key.
+        let found = db.find_symbol("abcdef01ffffffff", "sym.pdb").await.unwrap();
+        let found = found.unwrap();
+        assert_eq!(found.lower_id, "sym");
+        assert_eq!(found.normalized_version, "1.0.0");
+        assert!(db.find_symbol("nope", "sym.pdb").await.unwrap().is_none());
+
+        let owned = db.find_symbols("sym", &v).await.unwrap();
+        assert_eq!(owned.len(), 1);
+        assert_eq!(owned[0].filename, "sym.pdb");
+
+        assert_eq!(db.delete_symbols("sym", &v).await.unwrap(), 1);
+        assert!(db
+            .find_symbol("ABCDEF01FFFFFFFF", "sym.pdb")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn ensure_column_is_idempotent() {
+        // Re-opening (which re-runs migrations) must not fail or drop data.
+        let db = SqliteDatabase::in_memory().await.unwrap();
+        db.add(&sample("Keep", "1.0.0")).await.unwrap();
+        ensure_column(
+            &db.pool,
+            "packages",
+            "enabled",
+            "INTEGER NOT NULL DEFAULT 1",
+        )
+        .await
+        .unwrap();
+        // Adding a genuinely new column then re-running is a no-op the 2nd time.
+        ensure_column(&db.pool, "packages", "extra_col", "TEXT")
+            .await
+            .unwrap();
+        ensure_column(&db.pool, "packages", "extra_col", "TEXT")
+            .await
+            .unwrap();
+        assert!(db
+            .find("keep", &NuGetVersion::parse("1.0.0").unwrap())
+            .await
+            .unwrap()
+            .is_some());
     }
 }
