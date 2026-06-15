@@ -170,7 +170,11 @@ async fn index_inner(
     }
 
     // 6. Record global metadata (idempotent) and this feed's membership; roll
-    //    freshly stored payload back on failure.
+    //    freshly stored payload back on failure. The global per-version lock
+    //    above plus the `feed_count == 0` guard mean a concurrent push that won
+    //    the same-feed race (or another feed) keeps the shared payload alive —
+    //    deleting it on a duplicate would yank the version directory out from
+    //    under the winner.
     db.upsert_package_data(&package).await?;
     let membership = Membership {
         feed: feed.to_string(),
@@ -183,9 +187,6 @@ async fn index_inner(
         flag_reason: outcome.violation.clone(),
     };
     if let Err(e) = db.add_membership(&membership).await {
-        // Only roll storage/data back when the version is now truly orphaned —
-        // a concurrent push that won the same-feed race (or another feed) keeps
-        // the shared payload alive.
         if stored_now && db.feed_count(&id, &version).await.unwrap_or(0) == 0 {
             let _ = db.delete_package_data(&id, &version).await;
             let _ = storage.delete(&id, &normalized).await;
