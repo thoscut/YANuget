@@ -11,6 +11,7 @@
 //! More modules (models, storage, database, protocol, web) are wired in as the
 //! server is built up.
 
+pub mod database;
 pub mod error;
 pub mod models;
 pub mod nupkg;
