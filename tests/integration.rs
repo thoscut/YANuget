@@ -271,6 +271,39 @@ async fn raw_body_push_is_supported() {
 }
 
 #[tokio::test]
+async fn push_accepts_trailing_slash() {
+    // The NuGet client appends a trailing slash to the publish endpoint, so it
+    // PUTs to `/api/v2/package/` rather than `/api/v2/package`. Both must work.
+    let server = spawn().await;
+    let nupkg = build_nupkg("Trailing.Slash", "1.0.0", b"slash");
+    let part = reqwest::multipart::Part::bytes(nupkg)
+        .file_name("package.nupkg")
+        .mime_str("application/octet-stream")
+        .unwrap();
+    let form = reqwest::multipart::Form::new().part("package", part);
+    let resp = server
+        .client
+        .put(server.url("/api/v2/package/"))
+        .header("X-NuGet-ApiKey", API_KEY)
+        .multipart(form)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+
+    let versions: serde_json::Value = server
+        .client
+        .get(server.url("/v3/package/trailing.slash/index.json"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(versions["versions"][0], "1.0.0");
+}
+
+#[tokio::test]
 async fn delete_unlists_package() {
     let server = spawn().await;
     let nupkg = build_nupkg("Unlist.Me", "1.0.0", b"data");
