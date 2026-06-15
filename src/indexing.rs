@@ -128,9 +128,17 @@ async fn index_inner(
             .await?;
     }
 
-    // 5. Record metadata; roll storage back on failure.
+    // 5. Record metadata; roll storage back on failure — but *not* on a
+    //    duplicate. Under a concurrent same-version push, the losers all hit the
+    //    unique constraint here; the winner already owns the stored files (the
+    //    payload bytes are identical), so deleting them would yank the shared
+    //    version directory out from under the winner (data loss) and from under
+    //    other in-flight pushes (an ENOENT surfacing as a 500 instead of a clean
+    //    409). Only roll back for errors that leave genuinely orphaned files.
     if let Err(e) = db.add(&package).await {
-        let _ = storage.delete(&id, &normalized).await;
+        if !matches!(e, Error::PackageAlreadyExists) {
+            let _ = storage.delete(&id, &normalized).await;
+        }
         return Err(e);
     }
 

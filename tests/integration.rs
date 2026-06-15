@@ -1187,6 +1187,16 @@ async fn concurrent_same_version_push_one_wins() {
     // The unique constraint guarantees exactly one winner under the race.
     assert_eq!(created, 1);
     assert_eq!(conflict, 5);
+
+    // The winner's payload must survive: a loser's rollback must never delete
+    // the shared version directory the winner owns.
+    let download = server
+        .client
+        .get(server.url("/v3/package/race.pkg/1.0.0/race.pkg.1.0.0.nupkg"))
+        .send()
+        .await
+        .unwrap();
+    assert!(download.status().is_success(), "winner payload was deleted");
 }
 
 #[tokio::test]
