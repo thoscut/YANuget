@@ -169,6 +169,28 @@ exposes the API key or storage paths.
 Requires `enable_web_ui` (on by default); when disabled, `/` serves a minimal
 info page and `/packages/*` return `404`.
 
+## Admin area (HTTP Basic auth)
+
+Mounted only when `admin_api_key` is set; protected by HTTP Basic auth (any
+username, the admin key as the password). Lets an operator moderate versions
+from the browser.
+
+```
+GET  /admin                                       # dashboard: all package ids
+GET  /admin/packages/{id}                          # versions + actions
+POST /admin/packages/{id}/{version}/disable        # withhold a version
+POST /admin/packages/{id}/{version}/enable         # restore a disabled version
+POST /admin/packages/{id}/{version}/delete         # hard-delete a version
+```
+
+A **disabled** version is withheld from clients entirely — hidden from search,
+registration and the flat container, **and** not downloadable (`404`) — until an
+admin re-enables it. This is stronger than the NuGet client's *unlist* (which
+keeps a version downloadable for restore). `delete` hard-removes the payload,
+sidecars and any indexed symbols. The POST actions return `303 See Other` back
+to the package page; without credentials they return `401` with a
+`WWW-Authenticate: Basic` challenge.
+
 ## Health
 
 ```

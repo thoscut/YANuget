@@ -40,6 +40,7 @@ CREATE TABLE IF NOT EXISTS packages (
     is_prerelease             INTEGER NOT NULL,
     is_semver2                INTEGER NOT NULL,
     listed                    INTEGER NOT NULL,
+    enabled                   INTEGER NOT NULL DEFAULT 1,
     authors                   TEXT    NOT NULL,
     description               TEXT    NOT NULL,
     icon_url                  TEXT,
@@ -121,6 +122,8 @@ impl SqliteDatabase {
 
     async fn from_pool(pool: SqlitePool) -> Result<Self> {
         sqlx::raw_sql(SCHEMA).execute(&pool).await?;
+        // Migrate databases created before the admin `enabled` column existed.
+        ensure_column(&pool, "packages", "enabled", "INTEGER NOT NULL DEFAULT 1").await?;
         Ok(Self { pool })
     }
 
@@ -152,9 +155,11 @@ impl SqliteDatabase {
         include_semver2: bool,
         listed_only: bool,
     ) -> Result<Vec<Package>> {
+        // Public listings never include admin-disabled versions.
         let rows = sqlx::query(
             r#"SELECT * FROM packages
                WHERE lower_id = ?1
+                 AND enabled = 1
                  AND (?2 = 1 OR listed = 1)
                  AND (?3 = 1 OR is_prerelease = 0)
                  AND (?4 = 1 OR is_semver2 = 0)"#,
@@ -183,7 +188,7 @@ impl PackageDatabase for SqliteDatabase {
             r#"INSERT INTO packages (
                 id, lower_id, normalized_version, original_version,
                 version_major, version_minor, version_patch, version_revision,
-                is_prerelease, is_semver2, listed,
+                is_prerelease, is_semver2, listed, enabled,
                 authors, description, icon_url, license_url, license_expression,
                 project_url, repository_url, repository_type, min_client_version,
                 release_notes, language, title, summary, tags,
@@ -191,10 +196,10 @@ impl PackageDatabase for SqliteDatabase {
                 package_size, package_hash, package_hash_algorithm,
                 published, downloads, package_types, dependencies
             ) VALUES (
-                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
-                ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20,
-                ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28,
-                ?29, ?30, ?31, ?32, ?33, ?34, ?35
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21,
+                ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29,
+                ?30, ?31, ?32, ?33, ?34, ?35, ?36
             )"#,
         )
         .bind(&p.id)
@@ -208,6 +213,7 @@ impl PackageDatabase for SqliteDatabase {
         .bind(i64::from(p.is_prerelease()))
         .bind(i64::from(p.is_semver2))
         .bind(i64::from(p.listed))
+        .bind(i64::from(p.enabled))
         .bind(json(&p.authors)?)
         .bind(&p.description)
         .bind(&p.icon_url)
@@ -254,12 +260,14 @@ impl PackageDatabase for SqliteDatabase {
     }
 
     async fn find(&self, id: &str, version: &NuGetVersion) -> Result<Option<Package>> {
-        let row =
-            sqlx::query("SELECT * FROM packages WHERE lower_id = ?1 AND normalized_version = ?2")
-                .bind(id.to_lowercase())
-                .bind(version.normalized())
-                .fetch_optional(&self.pool)
-                .await?;
+        // Public lookup: admin-disabled versions are treated as absent.
+        let row = sqlx::query(
+            "SELECT * FROM packages WHERE lower_id = ?1 AND normalized_version = ?2 AND enabled = 1",
+        )
+        .bind(id.to_lowercase())
+        .bind(version.normalized())
+        .fetch_optional(&self.pool)
+        .await?;
         row.map(row_to_package).transpose()
     }
 
@@ -278,6 +286,43 @@ impl PackageDatabase for SqliteDatabase {
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() > 0)
+    }
+
+    async fn set_enabled(&self, id: &str, version: &NuGetVersion, enabled: bool) -> Result<bool> {
+        let result = sqlx::query(
+            "UPDATE packages SET enabled = ?3 WHERE lower_id = ?1 AND normalized_version = ?2",
+        )
+        .bind(id.to_lowercase())
+        .bind(version.normalized())
+        .bind(i64::from(enabled))
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn is_servable(&self, id: &str, version: &NuGetVersion) -> Result<bool> {
+        let row = sqlx::query(
+            "SELECT 1 FROM packages
+             WHERE lower_id = ?1 AND normalized_version = ?2 AND enabled = 1 LIMIT 1",
+        )
+        .bind(id.to_lowercase())
+        .bind(version.normalized())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.is_some())
+    }
+
+    async fn find_all_versions(&self, id: &str) -> Result<Vec<Package>> {
+        let rows = sqlx::query("SELECT * FROM packages WHERE lower_id = ?1")
+            .bind(id.to_lowercase())
+            .fetch_all(&self.pool)
+            .await?;
+        let mut packages = rows
+            .into_iter()
+            .map(row_to_package)
+            .collect::<Result<Vec<_>>>()?;
+        packages.sort_by(|a, b| a.version.cmp(&b.version));
+        Ok(packages)
     }
 
     async fn delete(&self, id: &str, version: &NuGetVersion) -> Result<bool> {
@@ -309,7 +354,7 @@ impl PackageDatabase for SqliteDatabase {
         let id_rows = sqlx::query(
             r#"SELECT lower_id, SUM(downloads) AS total
                FROM packages
-               WHERE listed = 1
+               WHERE listed = 1 AND enabled = 1
                  AND (?1 = 1 OR is_prerelease = 0)
                  AND (?2 = 1 OR is_semver2 = 0)
                  AND (?3 = ''
@@ -338,7 +383,7 @@ impl PackageDatabase for SqliteDatabase {
         let total_hits: i64 = sqlx::query_scalar(
             r#"SELECT COUNT(*) FROM (
                    SELECT lower_id FROM packages
-                   WHERE listed = 1
+                   WHERE listed = 1 AND enabled = 1
                      AND (?1 = 1 OR is_prerelease = 0)
                      AND (?2 = 1 OR is_semver2 = 0)
                      AND (?3 = ''
@@ -384,7 +429,8 @@ impl PackageDatabase for SqliteDatabase {
         let pattern = like_pattern(&q);
         let rows = sqlx::query(
             r#"SELECT MAX(id) AS id FROM packages
-               WHERE listed = 1 AND (?1 = '' OR lower_id LIKE ?2 ESCAPE '\')
+               WHERE listed = 1 AND enabled = 1
+                 AND (?1 = '' OR lower_id LIKE ?2 ESCAPE '\')
                GROUP BY lower_id
                ORDER BY lower_id ASC
                LIMIT ?3 OFFSET ?4"#,
@@ -529,6 +575,24 @@ fn from_json<T: serde::de::DeserializeOwned>(s: &str) -> Result<T> {
     serde_json::from_str(s).map_err(|e| Error::Other(e.into()))
 }
 
+/// Idempotently add a column to an existing table (SQLite has no
+/// `ADD COLUMN IF NOT EXISTS`). Checks `PRAGMA table_info` first so re-running
+/// migrations is a no-op.
+async fn ensure_column(pool: &SqlitePool, table: &str, column: &str, def: &str) -> Result<()> {
+    let rows = sqlx::query(&format!("PRAGMA table_info({table})"))
+        .fetch_all(pool)
+        .await?;
+    let exists = rows
+        .iter()
+        .any(|r| r.get::<String, _>("name").eq_ignore_ascii_case(column));
+    if !exists {
+        sqlx::query(&format!("ALTER TABLE {table} ADD COLUMN {column} {def}"))
+            .execute(pool)
+            .await?;
+    }
+    Ok(())
+}
+
 fn is_unique_violation(e: &sqlx::Error) -> bool {
     e.as_database_error()
         .map(|d| d.is_unique_violation())
@@ -553,6 +617,7 @@ fn row_to_package(row: SqliteRow) -> Result<Package> {
         id: row.try_get("id")?,
         version,
         listed: row.try_get::<i64, _>("listed")? != 0,
+        enabled: row.try_get::<i64, _>("enabled")? != 0,
         authors,
         description: row.try_get("description")?,
         icon_url: row.try_get("icon_url")?,
@@ -590,6 +655,7 @@ mod tests {
             id: id.to_string(),
             version: NuGetVersion::parse(version).unwrap(),
             listed: true,
+            enabled: true,
             authors: vec!["Alice".into()],
             description: format!("description for {id}"),
             icon_url: None,

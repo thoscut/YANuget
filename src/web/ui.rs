@@ -88,6 +88,16 @@ table.deps td{padding:3px 8px 3px 0}\
 .pager{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:18px 0;flex-wrap:wrap}\
 .btn{border:1px solid var(--border);border-radius:6px;padding:8px 14px;color:var(--fg)}\
 .btn[aria-disabled=true]{opacity:.4;pointer-events:none}\
+.badge.ok{color:#3fb950;border-color:#3fb950}\
+.atbl{width:100%;border-collapse:collapse}\
+.atbl th,.atbl td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--border);font-size:14px;vertical-align:middle}\
+.atbl th{color:var(--muted);font-weight:500;font-size:12px;text-transform:uppercase;letter-spacing:.4px}\
+.actions{display:flex;gap:8px;flex-wrap:wrap}\
+.actions form{margin:0}\
+.actions button{padding:5px 12px;font-size:13px;min-height:0;background:#21262d;border:1px solid var(--border);color:var(--fg)}\
+.actions button:hover{background:#30363d}\
+.actions button.danger{border-color:#b62324;color:#ff7b72}\
+.actions button.danger:hover{background:#b62324;color:#fff}\
 footer{border-top:1px solid var(--border);color:var(--muted);font-size:13px;padding:18px 0}\
 footer a[aria-current=page]{color:var(--fg);font-weight:600}\
 ";
@@ -404,6 +414,14 @@ pub fn settings_page(urls: &UrlBuilder, config: &Config) -> String {
     }
     retention.push_str("</div>");
 
+    let admin = if config.admin_api_key.is_some() {
+        "<div class=\"card\"><h3 class=\"muted\">Administration</h3>\
+         <p>Manage package versions (disable / enable / delete) in the \
+         <a href=\"/admin\">admin area</a>. Sign in with the admin key.</p></div>"
+    } else {
+        ""
+    };
+
     let body = format!(
         "<h1 class=\"title\">Settings</h1>\
          <p class=\"muted\">Read-only overview of this feed's policy. \
@@ -411,7 +429,7 @@ pub fn settings_page(urls: &UrlBuilder, config: &Config) -> String {
          <div class=\"card\"><h3 class=\"muted\">Server</h3>{server}</div>\
          <div class=\"card\"><h3 class=\"muted\">Retention</h3>{retention}</div>\
          <div class=\"card\"><h3 class=\"muted\">Endpoints</h3><div class=\"kv\">\
-         {svc}{sym}</div></div>",
+         {svc}{sym}</div></div>{admin}",
         svc = kv_html(
             "Service index",
             &format!(
@@ -429,6 +447,92 @@ pub fn settings_page(urls: &UrlBuilder, config: &Config) -> String {
         },
     );
     layout(urls, "Settings \u{2014} YANuget", "", "settings", &body)
+}
+
+/// The admin dashboard: every package id, linking to its management page.
+pub fn admin_dashboard_page(urls: &UrlBuilder, ids: &[String]) -> String {
+    let body = if ids.is_empty() {
+        "<h1 class=\"title\">Admin</h1><p class=\"muted\">No packages published yet.</p>"
+            .to_string()
+    } else {
+        let mut list = String::from("<ul class=\"rank\">");
+        for id in ids {
+            list.push_str(&format!(
+                "<li><a href=\"/admin/packages/{lid}\">{id}</a></li>",
+                lid = enc_path(&id.to_lowercase()),
+                id = escape_html(id),
+            ));
+        }
+        list.push_str("</ul>");
+        format!(
+            "<h1 class=\"title\">Admin</h1>\
+             <p class=\"muted\">Select a package to disable, enable or delete its versions.</p>\
+             <div class=\"card\">{list}</div>"
+        )
+    };
+    layout(urls, "Admin \u{2014} YANuget", "", "", &body)
+}
+
+/// The per-package admin page: every version (incl. disabled) with actions.
+pub fn admin_package_page(urls: &UrlBuilder, id: &str, versions: &[Package]) -> String {
+    let mut ordered: Vec<&Package> = versions.iter().collect();
+    ordered.sort_by(|a, b| b.version.cmp(&a.version));
+
+    let mut rows = String::new();
+    for p in ordered {
+        let v = p.normalized_version();
+        let ev = enc_path(&v);
+        let lid = enc_path(&id.to_lowercase());
+        let status = if !p.enabled {
+            "<span class=\"badge un\">disabled</span>"
+        } else if p.listed {
+            "<span class=\"badge ok\">active</span>"
+        } else {
+            "<span class=\"badge\">unlisted</span>"
+        };
+        // Enable/disable toggle depending on current state.
+        let toggle = if p.enabled {
+            format!(
+                "<form method=\"post\" action=\"/admin/packages/{lid}/{ev}/disable\">\
+                 <button type=\"submit\">Disable</button></form>"
+            )
+        } else {
+            format!(
+                "<form method=\"post\" action=\"/admin/packages/{lid}/{ev}/enable\">\
+                 <button type=\"submit\">Enable</button></form>"
+            )
+        };
+        let delete = format!(
+            "<form method=\"post\" action=\"/admin/packages/{lid}/{ev}/delete\" \
+             onsubmit=\"return confirm('Permanently delete {dv} {dvv}? This cannot be undone.')\">\
+             <button type=\"submit\" class=\"danger\">Delete</button></form>",
+            dv = escape_html(&id.replace('\'', "")),
+            dvv = escape_html(&v.replace('\'', "")),
+        );
+        rows.push_str(&format!(
+            "<tr><td>{pre}{dv}</td><td>{status}</td><td class=\"muted\">{dl}</td>\
+             <td><div class=\"actions\">{toggle}{delete}</div></td></tr>",
+            pre = if p.is_prerelease() {
+                "<span class=\"badge pre\">pre</span> "
+            } else {
+                ""
+            },
+            dv = escape_html(&v),
+            dl = p.downloads,
+        ));
+    }
+
+    let body = format!(
+        "<nav class=\"crumbs\" aria-label=\"Breadcrumb\">\
+         <a href=\"/admin\">Admin</a> <span aria-hidden=\"true\">/</span> <span>{id}</span></nav>\
+         <h1 class=\"title\">{id}</h1>\
+         <p class=\"muted\">Disabled versions are hidden from clients and not downloadable.</p>\
+         <div class=\"card\"><table class=\"atbl\">\
+         <thead><tr><th>Version</th><th>Status</th><th>Downloads</th><th>Actions</th></tr></thead>\
+         <tbody>{rows}</tbody></table></div>",
+        id = escape_html(id),
+    );
+    layout(urls, &format!("Admin \u{2014} {id}"), "", "", &body)
 }
 
 /// A key/value row with an escaped text value.
@@ -771,6 +875,7 @@ mod tests {
             id: "Contoso.Utils".into(),
             version: NuGetVersion::parse("1.0.0").unwrap(),
             listed: true,
+            enabled: true,
             authors: vec!["Alice".into()],
             description: "Helpers".into(),
             icon_url: None,

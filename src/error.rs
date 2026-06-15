@@ -35,6 +35,11 @@ pub enum Error {
     #[error("unauthorized")]
     Unauthorized,
 
+    /// Admin credentials were missing or incorrect. Surfaced as a Basic-auth
+    /// challenge so a browser prompts for the admin key.
+    #[error("admin authentication required")]
+    AdminUnauthorized,
+
     /// The request was syntactically or semantically invalid.
     #[error("invalid request: {0}")]
     BadRequest(String),
@@ -69,6 +74,7 @@ impl Error {
             Error::InvalidPackage(_) => StatusCode::BAD_REQUEST,
             Error::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             Error::Unauthorized => StatusCode::UNAUTHORIZED,
+            Error::AdminUnauthorized => StatusCode::UNAUTHORIZED,
             Error::BadRequest(_) => StatusCode::BAD_REQUEST,
             Error::InvalidVersion(_) => StatusCode::BAD_REQUEST,
             Error::Database(sqlx::Error::RowNotFound) => StatusCode::NOT_FOUND,
@@ -84,9 +90,18 @@ impl IntoResponse for Error {
         if status.is_server_error() {
             tracing::error!(error = %self, "request failed");
         }
+        // The admin area challenges via Basic auth so browsers prompt for it.
+        let challenge = matches!(self, Error::AdminUnauthorized);
         let body = Json(json!({
             "error": self.to_string(),
         }));
-        (status, body).into_response()
+        let mut response = (status, body).into_response();
+        if challenge {
+            response.headers_mut().insert(
+                axum::http::header::WWW_AUTHENTICATE,
+                axum::http::HeaderValue::from_static("Basic realm=\"YANuget Admin\""),
+            );
+        }
+        response
     }
 }

@@ -20,6 +20,8 @@ A fully commented template lives in
 | `storage_path` | `YANUGET_STORAGE_PATH` | path | `{data_dir}/packages` | Package store. |
 | `database_path` | `YANUGET_DATABASE_PATH` | path | `{data_dir}/yanuget.db` | SQLite file. |
 | `api_key` | `YANUGET_API_KEY` | string | *(none)* | Required to push/delete. |
+| `admin_api_key` | `YANUGET_ADMIN_API_KEY` | string | *(none)* | Protects `/admin` (Basic auth). Unset ⇒ admin area off. |
+| `gallery_page_size` | `YANUGET_GALLERY_PAGE_SIZE` | int | `20` | Packages per gallery page (`?take=` overrides). |
 | `max_package_size_bytes` | `YANUGET_MAX_PACKAGE_SIZE_BYTES` | int | *(unlimited)* | Upload cap; streamed either way. |
 | `allow_overwrite` | `YANUGET_ALLOW_OVERWRITE` | bool | `false` | Re-push an existing version. |
 | `hard_delete_enabled` | `YANUGET_HARD_DELETE_ENABLED` | bool | `false` | DELETE removes vs. unlists. |

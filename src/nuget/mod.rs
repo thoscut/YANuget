@@ -327,6 +327,7 @@ mod tests {
             id: id.to_string(),
             version: NuGetVersion::parse(version).unwrap(),
             listed: true,
+            enabled: true,
             authors: vec!["Alice".into(), "Bob".into()],
             description: "A test package".into(),
             icon_url: None,

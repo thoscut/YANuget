@@ -149,6 +149,7 @@ fn build_package(
         is_semver2: version.is_semver2(),
         version,
         listed: true,
+        enabled: true,
         authors: n.author_list(),
         description: n.description.clone().unwrap_or_default(),
         icon_url: n.icon_url.clone(),

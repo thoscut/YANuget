@@ -8,15 +8,15 @@ use std::sync::Arc;
 
 use axum::extract::{DefaultBodyLimit, FromRequest, Multipart, Path, Query, Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
-use axum::response::{Html, IntoResponse, Json, Response};
-use axum::routing::{delete, get, put};
+use axum::response::{Html, IntoResponse, Json, Redirect, Response};
+use axum::routing::{delete, get, post, put};
 use axum::Router;
 use futures::StreamExt;
 use serde::Deserialize;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
-use crate::auth::ApiKeyAuth;
+use crate::auth::{AdminAuth, ApiKeyAuth};
 use crate::config::Config;
 use crate::database::{PackageDatabase, SearchRequest};
 use crate::error::{Error, Result};
@@ -38,6 +38,7 @@ pub struct AppState {
     pub db: Arc<dyn PackageDatabase>,
     pub config: Arc<Config>,
     pub auth: ApiKeyAuth,
+    pub admin: AdminAuth,
     temp_dir: PathBuf,
 }
 
@@ -49,6 +50,7 @@ impl AppState {
         config: Arc<Config>,
     ) -> Result<Self> {
         let auth = ApiKeyAuth::new(config.api_key.clone());
+        let admin = AdminAuth::new(config.admin_api_key.clone());
         // Keep temp uploads on the same filesystem as storage so the final
         // move is an atomic rename rather than a multi-gigabyte copy.
         let temp_dir = config.storage_path().join(".uploads");
@@ -58,6 +60,7 @@ impl AppState {
             db,
             config,
             auth,
+            admin,
             temp_dir,
         })
     }
@@ -126,6 +129,20 @@ pub fn router(state: AppState) -> Router {
             .route("/packages/{id}/{version}", get(package_detail_version))
             .route("/stats", get(stats_page))
             .route("/settings", get(settings_page));
+
+        // Admin area (disable/enable/delete versions), behind HTTP Basic auth.
+        // Only mounted when an admin key is configured.
+        if state.admin.is_enabled() {
+            router = router
+                .route("/admin", get(admin_dashboard))
+                .route("/admin/packages/{id}", get(admin_package))
+                .route(
+                    "/admin/packages/{id}/{version}/disable",
+                    post(admin_disable),
+                )
+                .route("/admin/packages/{id}/{version}/enable", post(admin_enable))
+                .route("/admin/packages/{id}/{version}/delete", post(admin_delete));
+        }
     } else {
         router = router.route("/", get(index_page));
     }
@@ -340,6 +357,12 @@ async fn download_package(
     let version = parse_version(&version)?;
     let normalized = version.normalized();
 
+    // Admin-disabled versions are withheld from clients entirely. Unlisted
+    // (but enabled) versions remain downloadable for restore.
+    if !state.db.is_servable(&id, &version).await? {
+        return Err(Error::PackageNotFound);
+    }
+
     // The flat container exposes both the `.nupkg` and the bare `.nuspec` under
     // the same path prefix; dispatch on the requested file's extension.
     if filename.to_lowercase().ends_with(".nuspec") {
@@ -544,10 +567,14 @@ async fn gallery(
     Query(params): Query<SearchParams>,
 ) -> Result<Html<String>> {
     let query = params.q.unwrap_or_default();
+    let default_take = state.config.gallery_page_size.max(1);
     let request = SearchRequest {
         query: query.clone(),
         skip: params.skip.unwrap_or(0).max(0),
-        take: params.take.unwrap_or(50).clamp(1, MAX_SEARCH_TAKE),
+        take: params
+            .take
+            .unwrap_or(default_take)
+            .clamp(1, MAX_SEARCH_TAKE),
         include_prerelease: params.prerelease.unwrap_or(true),
         include_semver2: true,
         package_type: params.package_type.filter(|s| !s.is_empty()),
@@ -657,6 +684,99 @@ async fn render_detail(
         &state.config.primary_client,
         has_symbols,
     )))
+}
+
+// ---------------------------------------------------------------------------
+// Admin area (HTTP Basic auth)
+// ---------------------------------------------------------------------------
+
+/// Reject the request with a Basic-auth challenge unless valid admin
+/// credentials are presented.
+fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<()> {
+    if state.admin.check_headers(headers) {
+        Ok(())
+    } else {
+        Err(Error::AdminUnauthorized)
+    }
+}
+
+async fn admin_dashboard(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Html<String>> {
+    require_admin(&state, &headers)?;
+    let ids = state.db.all_package_ids().await?;
+    let urls = state.url_builder(&headers);
+    Ok(Html(ui::admin_dashboard_page(&urls, &ids)))
+}
+
+async fn admin_package(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Html<String>> {
+    require_admin(&state, &headers)?;
+    let versions = state.db.find_all_versions(&id).await?;
+    if versions.is_empty() {
+        return Err(Error::PackageNotFound);
+    }
+    let urls = state.url_builder(&headers);
+    Ok(Html(ui::admin_package_page(&urls, &id, &versions)))
+}
+
+async fn admin_disable(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((id, version)): Path<(String, String)>,
+) -> Result<Response> {
+    admin_set_enabled(&state, &headers, &id, &version, false).await
+}
+
+async fn admin_enable(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((id, version)): Path<(String, String)>,
+) -> Result<Response> {
+    admin_set_enabled(&state, &headers, &id, &version, true).await
+}
+
+async fn admin_set_enabled(
+    state: &AppState,
+    headers: &HeaderMap,
+    id: &str,
+    version: &str,
+    enabled: bool,
+) -> Result<Response> {
+    require_admin(state, headers)?;
+    let v = parse_version(version)?;
+    if !state.db.set_enabled(id, &v, enabled).await? {
+        return Err(Error::PackageNotFound);
+    }
+    Ok(Redirect::to(&admin_package_url(id)).into_response())
+}
+
+async fn admin_delete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((id, version)): Path<(String, String)>,
+) -> Result<Response> {
+    require_admin(&state, &headers)?;
+    let v = parse_version(&version)?;
+    if !retention::purge_version(state.storage.as_ref(), state.db.as_ref(), &id, &v).await? {
+        return Err(Error::PackageNotFound);
+    }
+    // Back to the package page if other versions remain, else the dashboard.
+    let remaining = state.db.find_all_versions(&id).await?;
+    let target = if remaining.is_empty() {
+        "/admin".to_string()
+    } else {
+        admin_package_url(&id)
+    };
+    Ok(Redirect::to(&target).into_response())
+}
+
+fn admin_package_url(id: &str) -> String {
+    format!("/admin/packages/{}", id.to_lowercase())
 }
 
 // ---------------------------------------------------------------------------

@@ -124,7 +124,7 @@ pub async fn prune_package(
     if !policy.has_limits() {
         return Ok(0);
     }
-    let packages = db.find_versions(id, true).await?;
+    let packages = db.find_all_versions(id).await?;
     let to_prune = versions_to_prune(&packages, policy, Utc::now());
     let mut pruned = 0;
     for version in &to_prune {
@@ -170,6 +170,7 @@ mod tests {
             id: "Pkg".into(),
             version: NuGetVersion::parse(version).unwrap(),
             listed: true,
+            enabled: true,
             authors: vec![],
             description: String::new(),
             icon_url: None,

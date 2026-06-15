@@ -21,6 +21,14 @@ data_dir = "./data"        # YANUGET_DATA_DIR
 # If unset, those endpoints are unauthenticated.
 # api_key = "change-me"    # YANUGET_API_KEY
 
+# Admin key protecting the /admin area, where you can disable, re-enable or
+# delete individual package versions via the browser (HTTP Basic auth — any
+# username, this key as the password). When unset, the admin area is disabled.
+# admin_api_key = "change-me-too"   # YANUGET_ADMIN_API_KEY
+
+# Number of packages shown per gallery page (overridable per request with ?take=).
+gallery_page_size = 20     # YANUGET_GALLERY_PAGE_SIZE
+
 # Maximum accepted upload size in bytes. Unset = unlimited (YANuget streams
 # uploads straight to disk, so 25 GiB+ packages work without extra memory).
 # 26843545600 = 25 GiB.

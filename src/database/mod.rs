@@ -89,6 +89,18 @@ pub trait PackageDatabase: Send + Sync {
     /// Set the listed flag. Returns `true` if a row was updated.
     async fn set_listed(&self, id: &str, version: &NuGetVersion, listed: bool) -> Result<bool>;
 
+    /// Set the admin `enabled` flag. A disabled version is withheld entirely.
+    /// Returns `true` if a row was updated.
+    async fn set_enabled(&self, id: &str, version: &NuGetVersion, enabled: bool) -> Result<bool>;
+
+    /// Whether a version may be served to clients: it exists and is enabled.
+    /// (Unlisted-but-enabled versions are still servable by exact version.)
+    async fn is_servable(&self, id: &str, version: &NuGetVersion) -> Result<bool>;
+
+    /// Every version of a package id — including unlisted **and disabled** —
+    /// sorted ascending. For admin views and the retention sweep.
+    async fn find_all_versions(&self, id: &str) -> Result<Vec<Package>>;
+
     /// Permanently remove a version. Returns `true` if a row was deleted.
     async fn delete(&self, id: &str, version: &NuGetVersion) -> Result<bool>;
 

@@ -106,6 +106,7 @@ YANuget implements the NuGet v3 protocol. Full reference in
 | Push symbols | `PUT /api/v2/symbol` |
 | Download symbol (SSQP) | `GET /download/symbols/{file}/{key}/{file}` |
 | Web gallery | `GET /` and `GET /packages/{id}[/{version}]` |
+| Admin (Basic auth) | `GET /admin`, `POST /admin/packages/{id}/{version}/{disable\|enable\|delete}` |
 | Health | `GET /health` |
 
 ---
@@ -193,9 +194,20 @@ offline) lives at `/`:
   install command for Chocolatey / `dotnet` / `nuget.exe`,
 * a statistics page (`/stats`) with feed totals and the most-downloaded /
   recently-published lists,
-* a read-only settings overview (`/settings`) that never exposes secrets.
+* a read-only settings overview (`/settings`) that never exposes secrets,
+* a configurable page size (`gallery_page_size`, default 20) with pagination.
 
 Disable it with `enable_web_ui = false`.
+
+## Admin moderation
+
+When `admin_api_key` is set, an `/admin` area (HTTP Basic auth) lets an operator
+**disable**, **re-enable** or **delete** individual package versions from the
+browser. A *disabled* version is withheld from clients entirely — hidden from
+search/registration/versions **and** not downloadable — which is stronger than
+NuGet's *unlist* (an unlisted version stays downloadable for restore). Delete is
+a hard delete (payload, sidecars and symbols). The area is only mounted when an
+admin key is configured.
 
 ## Package retention
 

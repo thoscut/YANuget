@@ -569,6 +569,159 @@ async fn stats_page_aggregates_the_feed() {
     assert!(body.contains("Stat.A"));
 }
 
+// ---------------------------------------------------------------------------
+// Admin area
+// ---------------------------------------------------------------------------
+
+const ADMIN_KEY: &str = "admin-key";
+
+async fn spawn_admin() -> TestServer {
+    spawn_with(|c| c.admin_api_key = Some(ADMIN_KEY.to_string())).await
+}
+
+/// A client that does not auto-follow redirects, so 303s can be asserted.
+fn no_redirect() -> reqwest::Client {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn admin_requires_authentication() {
+    let server = spawn_admin().await;
+    // No credentials -> 401 with a Basic-auth challenge.
+    let resp = server
+        .client
+        .get(server.url("/admin"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+    assert!(resp.headers()["www-authenticate"]
+        .to_str()
+        .unwrap()
+        .contains("Basic"));
+    // Correct credentials -> 200.
+    let ok = server
+        .client
+        .get(server.url("/admin"))
+        .basic_auth("admin", Some(ADMIN_KEY))
+        .send()
+        .await
+        .unwrap();
+    assert!(ok.status().is_success());
+}
+
+#[tokio::test]
+async fn admin_area_absent_without_key() {
+    let server = spawn().await; // no admin key configured
+    let resp = server
+        .client
+        .get(server.url("/admin"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn admin_disable_withholds_then_enable_restores() {
+    let server = spawn_admin().await;
+    push_multipart(&server, API_KEY, build_nupkg("Adm.Pkg", "1.0.0", b"data")).await;
+    let client = no_redirect();
+    let dl_url = "/v3/package/adm.pkg/1.0.0/adm.pkg.1.0.0.nupkg";
+
+    // Disable the version.
+    let resp = client
+        .post(server.url("/admin/packages/adm.pkg/1.0.0/disable"))
+        .basic_auth("admin", Some(ADMIN_KEY))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::SEE_OTHER);
+
+    // Disabled: not downloadable, and gone from the flat container / search.
+    let dl = server.client.get(server.url(dl_url)).send().await.unwrap();
+    assert_eq!(dl.status(), reqwest::StatusCode::NOT_FOUND);
+    let fc = server
+        .client
+        .get(server.url("/v3/package/adm.pkg/index.json"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(fc.status(), reqwest::StatusCode::NOT_FOUND);
+
+    // The admin page still shows it as disabled.
+    let adm = server
+        .client
+        .get(server.url("/admin/packages/adm.pkg"))
+        .basic_auth("admin", Some(ADMIN_KEY))
+        .send()
+        .await
+        .unwrap();
+    assert!(adm.text().await.unwrap().contains("disabled"));
+
+    // Disable requires auth, too.
+    let unauth = client
+        .post(server.url("/admin/packages/adm.pkg/1.0.0/enable"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unauth.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    // Re-enable: downloadable again.
+    let resp = client
+        .post(server.url("/admin/packages/adm.pkg/1.0.0/enable"))
+        .basic_auth("admin", Some(ADMIN_KEY))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::SEE_OTHER);
+    let dl = server.client.get(server.url(dl_url)).send().await.unwrap();
+    assert!(dl.status().is_success());
+}
+
+#[tokio::test]
+async fn admin_delete_removes_version() {
+    let server = spawn_admin().await;
+    push_multipart(&server, API_KEY, build_nupkg("Del.Pkg", "1.0.0", b"data")).await;
+    let resp = no_redirect()
+        .post(server.url("/admin/packages/del.pkg/1.0.0/delete"))
+        .basic_auth("admin", Some(ADMIN_KEY))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::SEE_OTHER);
+    let dl = server
+        .client
+        .get(server.url("/v3/package/del.pkg/1.0.0/del.pkg.1.0.0.nupkg"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(dl.status(), reqwest::StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn gallery_page_size_is_configurable() {
+    let server = spawn_with(|c| c.gallery_page_size = 1).await;
+    for id in ["Sz.A", "Sz.B"] {
+        push_multipart(&server, API_KEY, build_nupkg(id, "1.0.0", b"x")).await;
+    }
+    // With a page size of 1 and 2 packages, a pager must appear.
+    let body = server
+        .client
+        .get(server.url("/"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(body.contains("class=\"pager\""));
+    assert!(body.contains("of 2"));
+}
+
 #[tokio::test]
 async fn settings_page_shows_policy_without_secrets() {
     let server = spawn_with(|c| {

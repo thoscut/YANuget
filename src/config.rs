@@ -34,6 +34,12 @@ pub struct Config {
     /// API key required for push/delete. When `None`, those endpoints are open
     /// (a loud warning is logged at startup).
     pub api_key: Option<String>,
+    /// Admin key protecting the `/admin` area (disable/enable/delete versions),
+    /// presented via HTTP Basic auth. When `None`, the admin area is disabled.
+    pub admin_api_key: Option<String>,
+    /// Default number of packages shown per gallery page. Overridable per
+    /// request with `?take=`.
+    pub gallery_page_size: i64,
     /// Maximum accepted upload size in bytes. `None` means unlimited, which is
     /// the point of YANuget — it streams 25 GiB+ packages straight to disk.
     pub max_package_size_bytes: Option<u64>,
@@ -105,6 +111,8 @@ impl Default for Config {
             storage_path: None,
             database_path: None,
             api_key: None,
+            admin_api_key: None,
+            gallery_page_size: 20,
             max_package_size_bytes: None,
             allow_overwrite: false,
             hard_delete_enabled: false,
@@ -158,6 +166,16 @@ impl Config {
         }
         if let Ok(v) = std::env::var("YANUGET_API_KEY") {
             self.api_key = (!v.is_empty()).then_some(v);
+        }
+        if let Ok(v) = std::env::var("YANUGET_ADMIN_API_KEY") {
+            self.admin_api_key = (!v.is_empty()).then_some(v);
+        }
+        if let Ok(v) = std::env::var("YANUGET_GALLERY_PAGE_SIZE") {
+            if let Ok(n) = v.parse::<i64>() {
+                if n > 0 {
+                    self.gallery_page_size = n;
+                }
+            }
         }
         if let Ok(v) = std::env::var("YANUGET_MAX_PACKAGE_SIZE_BYTES") {
             self.max_package_size_bytes = v.parse().ok();
