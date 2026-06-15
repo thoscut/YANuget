@@ -13,7 +13,9 @@
 
 pub mod error;
 pub mod models;
+pub mod nupkg;
 pub mod nuspec;
+pub mod storage;
 pub mod streaming;
 pub mod version;
 
