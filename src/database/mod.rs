@@ -229,8 +229,9 @@ pub trait PackageDatabase: Send + Sync {
     /// **and pending** — sorted ascending. For admin views and retention.
     async fn find_all_versions(&self, feed: &str, id: &str) -> Result<Vec<FeedVersion>>;
 
-    /// Atomically increment the (global) download counter for a version.
-    async fn increment_downloads(&self, id: &str, version: &NuGetVersion) -> Result<()>;
+    /// Atomically increment the per-feed download counter for a version.
+    async fn increment_downloads(&self, feed: &str, id: &str, version: &NuGetVersion)
+        -> Result<()>;
 
     /// Execute a search query within `feed`.
     async fn search(&self, feed: &str, request: &SearchRequest) -> Result<SearchPage>;

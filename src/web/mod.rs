@@ -222,7 +222,7 @@ pub fn build_app(states: Vec<AppState>) -> Router {
     } else {
         let index: Vec<(String, String)> = states
             .iter()
-            .map(|s| (s.feed.name.clone(), format!("{}/", s.feed.prefix)))
+            .map(|s| (s.feed.name.clone(), s.feed.prefix.clone()))
             .collect();
         let html = ui::feeds_index_page(&index);
         top = top.route(
@@ -234,6 +234,9 @@ pub fn build_app(states: Vec<AppState>) -> Router {
         );
         for s in states {
             let prefix = s.feed.prefix.clone();
+            // Nested under `/{name}`: a feed's own routes (including its `/`
+            // gallery) live at `/{name}/...`. The feed index links use the
+            // trailing-slash form accordingly.
             top = top.nest(&prefix, feed_routes(s));
         }
     }
@@ -571,7 +574,10 @@ async fn download_package(
     let content = state.storage.get_package(&id, &normalized).await?;
 
     // Count the download (best effort — never block the response on it).
-    let _ = state.db.increment_downloads(&id, &version).await;
+    let _ = state
+        .db
+        .increment_downloads(state.feed(), &id, &version)
+        .await;
 
     match content {
         PackageContent::LocalPath(path) => {
@@ -775,6 +781,7 @@ async fn gallery(
     headers: HeaderMap,
     Query(params): Query<SearchParams>,
 ) -> Result<Html<String>> {
+    state.require_read(&headers)?;
     let query = params.q.unwrap_or_default();
     let default_take = state.config.gallery_page_size.max(1);
     let request = SearchRequest {
@@ -805,6 +812,7 @@ async fn settings_page(State(state): State<AppState>, headers: HeaderMap) -> Htm
 }
 
 async fn stats_page(State(state): State<AppState>, headers: HeaderMap) -> Result<Html<String>> {
+    state.require_read(&headers)?;
     let stats = state.db.stats(state.feed()).await?;
     // Reuse the download-ranked search for the "most downloaded" list.
     let top = state
@@ -844,6 +852,7 @@ async fn render_detail(
     id: &str,
     version: Option<&str>,
 ) -> Result<Html<String>> {
+    state.require_read(headers)?;
     let packages = state.db.find_versions(state.feed(), id, true).await?;
     if packages.is_empty() {
         return Err(Error::PackageNotFound);
@@ -997,19 +1006,23 @@ async fn admin_promote(
         ));
     };
     let v = parse_version(&version)?;
-    // The version's global data already exists (it is in this feed); promoting
-    // just adds a membership to the next ring, pending if that ring gates.
+    // You can only promote what *this* ring holds — not any globally-known
+    // version that happens to live in some other feed.
+    if !state.db.exists(state.feed(), &id, &v).await? {
+        return Err(Error::PackageNotFound);
+    }
     let package = state
         .db
         .get_package_data(&id, &v)
         .await?
         .ok_or(Error::PackageNotFound)?;
+    // The target must be a known feed; gate the promoted membership if it does.
     let target_gates = state
         .feeds
         .iter()
         .find(|m| &m.name == target)
-        .map(|m| m.requires_approval)
-        .unwrap_or(false);
+        .ok_or_else(|| Error::BadRequest(format!("unknown promotion target {target:?}")))?
+        .requires_approval;
     let membership = Membership {
         pending: target_gates,
         ..Membership::active(target, &package)

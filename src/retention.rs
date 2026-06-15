@@ -109,6 +109,9 @@ pub async fn purge_version(
     id: &str,
     version: &NuGetVersion,
 ) -> Result<bool> {
+    // Serialize against a concurrent push of the same version into another feed,
+    // so the feed-count check and global GC see a consistent snapshot.
+    let _guard = crate::locks::lock_version(id, &version.normalized()).await;
     let removed = db.remove_membership(feed, id, version).await?;
     if db.feed_count(id, version).await? == 0 {
         for sym in db.find_symbols(id, version).await.unwrap_or_default() {

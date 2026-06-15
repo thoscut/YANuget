@@ -120,6 +120,11 @@ async fn index_inner(
         ));
     }
 
+    // Serialize the store/dedup/membership sequence against any concurrent push
+    // or purge of the *same* version (the payload and metadata are shared across
+    // feeds), so a racing purge can never delete a payload we just adopted.
+    let _guard = crate::locks::lock_version(&id, &normalized).await;
+
     // 4. Honour immutability / overwrite policy *within this feed*.
     if db.exists(feed, &id, &version).await? {
         if options.allow_overwrite {

@@ -46,10 +46,16 @@ impl UrlBuilder {
     }
 
     /// Build an app-relative link within the current feed. `path` must start
-    /// with `/`; the feed prefix is prepended (so `/` maps to the feed root).
+    /// with `/`; the feed prefix is prepended. The feed root (`/`) maps to the
+    /// bare prefix (e.g. `/stable`) for a prefixed feed — which is where a
+    /// nested feed's index route lives — or to `/` for the root feed.
     pub fn app(&self, path: &str) -> String {
         if path == "/" {
-            format!("{}/", self.prefix)
+            if self.prefix.is_empty() {
+                "/".to_string()
+            } else {
+                self.prefix.clone()
+            }
         } else {
             format!("{}{}", self.prefix, path)
         }

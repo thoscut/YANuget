@@ -634,15 +634,16 @@ pub fn admin_package_page(
     layout(urls, &format!("Admin \u{2014} {id}"), "", "", &body)
 }
 
-/// The root feed index, shown when more than one feed is hosted.
+/// The root feed index, shown when more than one feed is hosted. Each entry is
+/// `(feed name, path prefix)` where the prefix is e.g. `/stable`.
 pub fn feeds_index_page(feeds: &[(String, String)]) -> String {
     let urls = UrlBuilder::new("");
     let mut list = String::from("<ul class=\"rank\">");
-    for (name, href) in feeds {
+    for (name, prefix) in feeds {
         list.push_str(&format!(
-            "<li><a href=\"{href}\">{name}</a> \
-             <span class=\"muted\"><a href=\"{href}v3/index.json\">service index</a></span></li>",
-            href = escape_html(href),
+            "<li><a href=\"{prefix}\">{name}</a> \
+             <span class=\"muted\"><a href=\"{prefix}/v3/index.json\">service index</a></span></li>",
+            prefix = escape_html(prefix),
             name = escape_html(name),
         ));
     }
@@ -1130,10 +1131,10 @@ mod tests {
     #[test]
     fn feeds_index_lists_feeds() {
         let html = feeds_index_page(&[
-            ("stable".into(), "/stable/".into()),
-            ("dev".into(), "/dev/".into()),
+            ("stable".into(), "/stable".into()),
+            ("dev".into(), "/dev".into()),
         ]);
-        assert!(html.contains("/stable/"));
+        assert!(html.contains("href=\"/stable\""));
         assert!(html.contains("/dev/v3/index.json"));
     }
 

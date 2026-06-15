@@ -84,6 +84,7 @@ CREATE TABLE IF NOT EXISTS feed_packages (
     flagged            INTEGER NOT NULL DEFAULT 0,
     flag_reason        TEXT,
     added              TEXT    NOT NULL,
+    downloads          INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (feed, lower_id, normalized_version)
 );
 CREATE INDEX IF NOT EXISTS idx_feed_packages_feed ON feed_packages (feed, lower_id);
@@ -104,7 +105,8 @@ CREATE INDEX IF NOT EXISTS idx_symbols_owner
 /// The feed-scoped projection: every `packages` column plus the membership's
 /// state aliased so it does not collide with the package's own template flags.
 const FEED_SELECT: &str = "SELECT p.*, fp.listed AS m_listed, fp.enabled AS m_enabled, \
-     fp.pending AS m_pending, fp.flagged AS m_flagged, fp.flag_reason AS m_flag_reason \
+     fp.pending AS m_pending, fp.flagged AS m_flagged, fp.flag_reason AS m_flag_reason, \
+     fp.downloads AS m_downloads \
      FROM packages p \
      JOIN feed_packages fp \
        ON fp.lower_id = p.lower_id AND fp.normalized_version = p.normalized_version";
@@ -151,18 +153,30 @@ impl SqliteDatabase {
         sqlx::raw_sql(SCHEMA).execute(&pool).await?;
         // Migrate databases created before the admin `enabled` column existed.
         ensure_column(&pool, "packages", "enabled", "INTEGER NOT NULL DEFAULT 1").await?;
-        // Migrate single-feed databases created before feeds existed: seed each
-        // existing package into the implicit `default` feed, copying its state.
-        sqlx::query(
-            r#"INSERT INTO feed_packages
-                   (feed, lower_id, normalized_version, listed, enabled, pending,
-                    flagged, flag_reason, added)
-               SELECT 'default', lower_id, normalized_version, listed, enabled, 0, 0, NULL, published
-               FROM packages
-               WHERE NOT EXISTS (SELECT 1 FROM feed_packages)"#,
-        )
-        .execute(&pool)
-        .await?;
+
+        // One-shot migration of single-feed databases created before feeds
+        // existed: seed each existing package into the implicit `default` feed,
+        // copying its state. Gated by `PRAGMA user_version` so it runs exactly
+        // once on a pre-feeds database and never resurrects memberships that
+        // were later deleted (which an "is feed_packages empty?" guard would).
+        let schema_version: i64 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(&pool)
+            .await?;
+        if schema_version < 1 {
+            sqlx::query(
+                r#"INSERT INTO feed_packages
+                       (feed, lower_id, normalized_version, listed, enabled, pending,
+                        flagged, flag_reason, added, downloads)
+                   SELECT 'default', lower_id, normalized_version, listed, enabled, 0, 0, NULL,
+                          published, downloads
+                   FROM packages"#,
+            )
+            .execute(&pool)
+            .await?;
+            sqlx::query("PRAGMA user_version = 1")
+                .execute(&pool)
+                .await?;
+        }
         Ok(Self { pool })
     }
 
@@ -339,8 +353,8 @@ impl PackageDatabase for SqliteDatabase {
         let result = sqlx::query(
             r#"INSERT INTO feed_packages
                    (feed, lower_id, normalized_version, listed, enabled, pending,
-                    flagged, flag_reason, added)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"#,
+                    flagged, flag_reason, added, downloads)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0)"#,
         )
         .bind(&m.feed)
         .bind(m.lower_id.to_lowercase())
@@ -525,10 +539,17 @@ impl PackageDatabase for SqliteDatabase {
         Ok(versions)
     }
 
-    async fn increment_downloads(&self, id: &str, version: &NuGetVersion) -> Result<()> {
+    async fn increment_downloads(
+        &self,
+        feed: &str,
+        id: &str,
+        version: &NuGetVersion,
+    ) -> Result<()> {
         sqlx::query(
-            "UPDATE packages SET downloads = downloads + 1 WHERE lower_id = ?1 AND normalized_version = ?2",
+            "UPDATE feed_packages SET downloads = downloads + 1
+             WHERE feed = ?1 AND lower_id = ?2 AND normalized_version = ?3",
         )
+        .bind(feed)
         .bind(id.to_lowercase())
         .bind(version.normalized())
         .execute(&self.pool)
@@ -551,7 +572,7 @@ impl PackageDatabase for SqliteDatabase {
                   OR lower(IFNULL(p.title, '')) LIKE ?5 ESCAPE '\\')";
 
         let id_sql = format!(
-            "SELECT p.lower_id AS lower_id, SUM(p.downloads) AS total \
+            "SELECT p.lower_id AS lower_id, SUM(fp.downloads) AS total \
              FROM packages p JOIN feed_packages fp \
                ON fp.lower_id = p.lower_id AND fp.normalized_version = p.normalized_version \
              WHERE {filter} \
@@ -659,7 +680,7 @@ impl PackageDatabase for SqliteDatabase {
                    COUNT(DISTINCT p.lower_id)       AS package_count,
                    COUNT(*)                         AS version_count,
                    COALESCE(SUM(fp.listed), 0)      AS listed_count,
-                   COALESCE(SUM(p.downloads), 0)    AS total_downloads,
+                   COALESCE(SUM(fp.downloads), 0)   AS total_downloads,
                    COALESCE(SUM(p.package_size), 0) AS total_size
                FROM packages p JOIN feed_packages fp
                    ON fp.lower_id = p.lower_id AND fp.normalized_version = p.normalized_version
@@ -816,8 +837,9 @@ fn is_unique_violation(e: &sqlx::Error) -> bool {
 }
 
 /// Build a [`Package`] from a `packages` row, taking the listed/enabled flags
-/// from explicitly named columns so it works for both global and feed reads.
-fn build_package(row: &SqliteRow, listed: bool, enabled: bool) -> Result<Package> {
+/// and download count from explicit arguments so it works for both global and
+/// feed reads (each of which sources those values from a different column).
+fn build_package(row: &SqliteRow, listed: bool, enabled: bool, downloads: u64) -> Result<Package> {
     let original_version: String = row.try_get("original_version")?;
     let version =
         NuGetVersion::parse(&original_version).map_err(|e| Error::InvalidVersion(e.to_string()))?;
@@ -858,25 +880,27 @@ fn build_package(row: &SqliteRow, listed: bool, enabled: bool) -> Result<Package
         package_hash: row.try_get("package_hash")?,
         package_hash_algorithm: row.try_get("package_hash_algorithm")?,
         published,
-        downloads: row.try_get::<i64, _>("downloads")? as u64,
+        downloads,
         package_types,
         dependencies,
     })
 }
 
-/// A global `packages` row: listed/enabled come from the package's own columns.
+/// A global `packages` row: listed/enabled/downloads come from its own columns.
 fn row_to_package(row: &SqliteRow) -> Result<Package> {
     let listed = row.try_get::<i64, _>("listed")? != 0;
     let enabled = row.try_get::<i64, _>("enabled")? != 0;
-    build_package(row, listed, enabled)
+    let downloads = row.try_get::<i64, _>("downloads")? as u64;
+    build_package(row, listed, enabled, downloads)
 }
 
 /// A feed-scoped row (package joined to a membership): listed/enabled/pending/
-/// flagged come from the membership's aliased columns.
+/// flagged/downloads come from the membership's aliased columns.
 fn row_to_feed_package(row: &SqliteRow) -> Result<FeedVersion> {
     let listed = row.try_get::<i64, _>("m_listed")? != 0;
     let enabled = row.try_get::<i64, _>("m_enabled")? != 0;
-    let package = build_package(row, listed, enabled)?;
+    let downloads = row.try_get::<i64, _>("m_downloads")? as u64;
+    let package = build_package(row, listed, enabled, downloads)?;
     Ok(FeedVersion {
         package,
         pending: row.try_get::<i64, _>("m_pending")? != 0,
@@ -1084,7 +1108,7 @@ mod tests {
         // Give Beta.Lib more downloads so it ranks first.
         let v = NuGetVersion::parse("2.0.0").unwrap();
         for _ in 0..5 {
-            db.increment_downloads("beta.lib", &v).await.unwrap();
+            db.increment_downloads(FEED, "beta.lib", &v).await.unwrap();
         }
 
         let page = db
@@ -1203,7 +1227,7 @@ mod tests {
             .await
             .unwrap();
         let v = NuGetVersion::parse("2.0.0").unwrap();
-        db.increment_downloads("beta", &v).await.unwrap();
+        db.increment_downloads(FEED, "beta", &v).await.unwrap();
 
         let ids = db.all_package_ids(FEED).await.unwrap();
         assert_eq!(ids, vec!["Alpha".to_string(), "Beta".to_string()]);

@@ -158,6 +158,12 @@ pub async fn ensure_package(
     id: &str,
     options: &MirrorOptions,
 ) -> Result<usize> {
+    // Only mirror well-formed package ids. This rejects anything (path
+    // traversal, slashes, control characters) that could escape the upstream's
+    // PackageBaseAddress path when interpolated into the request URL.
+    if crate::validation::validate_package_id(id).is_err() {
+        return Ok(0);
+    }
     let lower_id = id.to_lowercase();
     let versions = client.upstream_versions(&lower_id).await?;
     let mut mirrored = 0;
