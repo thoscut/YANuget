@@ -10,7 +10,7 @@ use yanuget::config::Config;
 use yanuget::database::SqliteDatabase;
 use yanuget::retention::{self, RetentionPolicy};
 use yanuget::storage::FilesystemStorage;
-use yanuget::web::{self, AppState};
+use yanuget::web::{self, AppState, FeedMeta};
 
 /// Command-line options.
 #[derive(Debug, Parser)]
@@ -31,47 +31,78 @@ async fn main() -> anyhow::Result<()> {
     tokio::fs::create_dir_all(&config.data_dir).await?;
     tokio::fs::create_dir_all(config.storage_path()).await?;
 
-    if config.api_key.is_none() {
-        tracing::warn!(
-            "no API key configured (YANUGET_API_KEY) — package push and delete are UNAUTHENTICATED"
-        );
+    let feeds = config.resolved_feeds()?;
+    for feed in &feeds {
+        if feed.api_key.is_none() {
+            tracing::warn!(
+                feed = %feed.name,
+                "no API key configured — package push and delete are UNAUTHENTICATED for this feed"
+            );
+        }
     }
     if config.max_package_size_bytes.is_none() {
         tracing::info!("package size limit: unlimited (uploads stream to disk)");
     }
+    tracing::info!(
+        feeds = feeds.len(),
+        names = ?feeds.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(),
+        "configured feeds"
+    );
 
     let storage = Arc::new(FilesystemStorage::new(config.storage_path()).await?);
     let db = Arc::new(SqliteDatabase::connect(&config.database_path()).await?);
     let config = Arc::new(config);
 
-    let state = AppState::new(storage, db, config.clone()).await?;
+    let feeds_meta = Arc::new(
+        feeds
+            .iter()
+            .map(|f| FeedMeta {
+                name: f.name.clone(),
+                prefix: f.prefix.clone(),
+                requires_approval: f.requires_approval,
+            })
+            .collect::<Vec<_>>(),
+    );
 
-    // Background retention sweep: periodically prune old versions per policy.
-    if config.retention.enabled
-        && config.retention.interval_hours > 0
-        && config.retention.has_limits()
-    {
-        let storage = state.storage.clone();
-        let db = state.db.clone();
-        let cfg = config.clone();
-        tracing::info!(
-            interval_hours = cfg.retention.interval_hours,
-            "package retention sweep enabled"
-        );
-        tokio::spawn(async move {
-            let policy = RetentionPolicy::from(&cfg.retention);
-            let mut tick =
-                tokio::time::interval(Duration::from_secs(cfg.retention.interval_hours * 3600));
-            loop {
-                tick.tick().await;
-                if let Err(e) = retention::prune_all(storage.as_ref(), db.as_ref(), &policy).await {
-                    tracing::error!(error = %e, "retention sweep failed");
+    let mut states = Vec::with_capacity(feeds.len());
+    for feed in &feeds {
+        let state = AppState::for_feed(
+            storage.clone(),
+            db.clone(),
+            config.clone(),
+            feed,
+            feeds_meta.clone(),
+        )
+        .await?;
+        states.push(state);
+
+        // Background retention sweep per feed, when enabled.
+        if feed.retention.enabled
+            && feed.retention.interval_hours > 0
+            && feed.retention.has_limits()
+        {
+            let storage = storage.clone();
+            let db = db.clone();
+            let policy = RetentionPolicy::from(&feed.retention);
+            let interval = feed.retention.interval_hours;
+            let feed_name = feed.name.clone();
+            tracing::info!(feed = %feed_name, interval_hours = interval, "retention sweep enabled");
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(Duration::from_secs(interval * 3600));
+                loop {
+                    tick.tick().await;
+                    if let Err(e) =
+                        retention::prune_all(storage.as_ref(), db.as_ref(), &feed_name, &policy)
+                            .await
+                    {
+                        tracing::error!(feed = %feed_name, error = %e, "retention sweep failed");
+                    }
                 }
-            }
-        });
+            });
+        }
     }
 
-    let app = web::router(state);
+    let app = web::build_app(states);
     let addr = config.socket_addr();
 
     if config.tls_enabled {

@@ -37,9 +37,10 @@ pub struct SymbolResult {
 pub async fn index_symbol_package(
     storage: &dyn PackageStorage,
     db: &dyn PackageDatabase,
+    feed: &str,
     temp_path: PathBuf,
 ) -> Result<SymbolResult> {
-    let result = index_inner(storage, db, &temp_path).await;
+    let result = index_inner(storage, db, feed, &temp_path).await;
     if result.is_err() {
         let _ = tokio::fs::remove_file(&temp_path).await;
     }
@@ -49,6 +50,7 @@ pub async fn index_symbol_package(
 async fn index_inner(
     storage: &dyn PackageStorage,
     db: &dyn PackageDatabase,
+    feed: &str,
     temp_path: &PathBuf,
 ) -> Result<SymbolResult> {
     // 1. Read the manifest to learn which package these symbols belong to.
@@ -59,8 +61,9 @@ async fn index_inner(
     let id = manifest.id.clone();
     let normalized = version.normalized();
 
-    // 2. The owning package must already exist (NuGet's ordering rule).
-    if !db.exists(&id, &version).await? {
+    // 2. The owning package must already be a member of this feed (NuGet's
+    //    ordering rule). Symbols themselves are stored globally by SSQP key.
+    if !db.exists(feed, &id, &version).await? {
         return Err(Error::PackageNotFound);
     }
 
@@ -220,13 +223,17 @@ mod tests {
         }
     }
 
+    const FEED: &str = "default";
+
     #[tokio::test]
     async fn indexes_portable_skips_native() {
         let (_d, storage, db) = fixtures().await;
-        db.add(&owning_package()).await.unwrap();
+        db.add_to_feed(FEED, &owning_package()).await.unwrap();
 
         let (_sd, snupkg) = make_snupkg(true, true);
-        let result = index_symbol_package(&storage, &db, snupkg).await.unwrap();
+        let result = index_symbol_package(&storage, &db, FEED, snupkg)
+            .await
+            .unwrap();
         assert_eq!(result.indexed, 1);
         assert_eq!(result.skipped, 1);
 
@@ -241,7 +248,7 @@ mod tests {
         let (_d, storage, db) = fixtures().await;
         // No package added first.
         let (_sd, snupkg) = make_snupkg(true, false);
-        let err = index_symbol_package(&storage, &db, snupkg.clone())
+        let err = index_symbol_package(&storage, &db, FEED, snupkg.clone())
             .await
             .unwrap_err();
         assert!(matches!(err, Error::PackageNotFound));

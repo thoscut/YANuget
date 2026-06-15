@@ -9,10 +9,12 @@ use std::path::PathBuf;
 
 use chrono::Utc;
 
-use crate::database::PackageDatabase;
+use crate::config::LicensePolicyConfig;
+use crate::database::{Membership, PackageDatabase};
 use crate::error::{Error, Result};
 use crate::models::Package;
 use crate::nuspec::{self, Nuspec};
+use crate::policy;
 use crate::storage::{AuxFile, PackageStorage};
 use crate::streaming::StreamSummary;
 use crate::version::NuGetVersion;
@@ -22,32 +24,45 @@ use crate::{nupkg, validation};
 const MAX_README_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_ICON_BYTES: u64 = 4 * 1024 * 1024;
 
-/// Options influencing how a package is indexed.
+/// Options influencing how a package is indexed into a feed.
 #[derive(Debug, Clone, Default)]
 pub struct IndexOptions {
     /// Replace an existing id/version instead of rejecting the push.
     pub allow_overwrite: bool,
+    /// The new membership starts pending (withheld until an admin approves it).
+    pub pending: bool,
+    /// The feed's offline license policy, evaluated against the package.
+    pub license_policy: LicensePolicyConfig,
 }
 
-/// The identity of a successfully indexed package.
+/// The identity (and outcome) of a successfully indexed package.
 #[derive(Debug, Clone)]
 pub struct IndexResult {
     pub id: String,
     pub version: NuGetVersion,
+    /// Whether the new membership is pending approval.
+    pub pending: bool,
+    /// A policy-violation reason recorded on the membership, if any.
+    pub flag_reason: Option<String>,
 }
 
-/// Index a package whose bytes already live at `temp_path`, with `summary`
-/// describing its size and hash. On success the temp file has been moved into
-/// permanent storage; on failure it is removed.
+/// Index a package whose bytes already live at `temp_path` into `feed`, with
+/// `summary` describing its size and hash. On success the temp file has been
+/// moved into permanent storage (or removed when the payload was already
+/// stored by another feed); on failure it is removed.
+///
+/// The package metadata and payload are stored once and shared across feeds;
+/// this only adds (or refreshes) `feed`'s membership.
 pub async fn index_package(
     storage: &dyn PackageStorage,
     db: &dyn PackageDatabase,
+    feed: &str,
     temp_path: PathBuf,
     summary: StreamSummary,
     options: &IndexOptions,
 ) -> Result<IndexResult> {
     // Any early error must clean up the temp file.
-    let result = index_inner(storage, db, &temp_path, summary, options).await;
+    let result = index_inner(storage, db, feed, &temp_path, summary, options).await;
     if result.is_err() {
         let _ = tokio::fs::remove_file(&temp_path).await;
     }
@@ -57,6 +72,7 @@ pub async fn index_package(
 async fn index_inner(
     storage: &dyn PackageStorage,
     db: &dyn PackageDatabase,
+    feed: &str,
     temp_path: &PathBuf,
     summary: StreamSummary,
     options: &IndexOptions,
@@ -95,46 +111,89 @@ async fn index_inner(
         &icon_bytes,
     );
 
-    // 3. Honour immutability / overwrite policy.
-    if db.exists(&id, &version).await? {
+    // 3. Evaluate the feed's license policy. Under "block" this rejects the
+    //    push; under "warn" it records a flag on the new membership.
+    let outcome = policy::evaluate_license(&options.license_policy, &package);
+    if !outcome.allowed {
+        return Err(Error::PolicyViolation(
+            outcome.violation.unwrap_or_else(|| "license policy".into()),
+        ));
+    }
+
+    // 4. Honour immutability / overwrite policy *within this feed*.
+    if db.exists(feed, &id, &version).await? {
         if options.allow_overwrite {
-            let _ = db.delete(&id, &version).await?;
-            let _ = storage.delete(&id, &normalized).await;
+            db.remove_membership(feed, &id, &version).await?;
+            // If no other feed references the version, drop the orphaned global
+            // data and payload so the re-push stores fresh content.
+            if db.feed_count(&id, &version).await? == 0 {
+                let _ = db.delete_package_data(&id, &version).await;
+                let _ = storage.delete(&id, &normalized).await;
+            }
         } else {
             return Err(Error::PackageAlreadyExists);
         }
     }
 
-    // 4. Move the payload into storage, then write the sidecars.
-    storage
-        .store_package(&id, &normalized, temp_path.clone())
-        .await?;
-    storage
-        .store_aux(
-            &id,
-            &normalized,
-            AuxFile::Nuspec,
-            archive.nuspec_xml.as_bytes(),
-        )
-        .await?;
-    if let Some(bytes) = &readme_bytes {
+    // 5. Store the payload + sidecars once. If another feed already holds this
+    //    version, the bytes are present — drop our temp copy instead.
+    let stored_now = !db.package_data_exists(&id, &version).await?;
+    if stored_now {
         storage
-            .store_aux(&id, &normalized, AuxFile::Readme, bytes)
+            .store_package(&id, &normalized, temp_path.clone())
             .await?;
-    }
-    if let Some(bytes) = &icon_bytes {
         storage
-            .store_aux(&id, &normalized, AuxFile::Icon, bytes)
+            .store_aux(
+                &id,
+                &normalized,
+                AuxFile::Nuspec,
+                archive.nuspec_xml.as_bytes(),
+            )
             .await?;
+        if let Some(bytes) = &readme_bytes {
+            storage
+                .store_aux(&id, &normalized, AuxFile::Readme, bytes)
+                .await?;
+        }
+        if let Some(bytes) = &icon_bytes {
+            storage
+                .store_aux(&id, &normalized, AuxFile::Icon, bytes)
+                .await?;
+        }
+    } else {
+        let _ = tokio::fs::remove_file(temp_path).await;
     }
 
-    // 5. Record metadata; roll storage back on failure.
-    if let Err(e) = db.add(&package).await {
-        let _ = storage.delete(&id, &normalized).await;
+    // 6. Record global metadata (idempotent) and this feed's membership; roll
+    //    freshly stored payload back on failure.
+    db.upsert_package_data(&package).await?;
+    let membership = Membership {
+        feed: feed.to_string(),
+        lower_id: package.lower_id(),
+        normalized_version: normalized.clone(),
+        listed: true,
+        enabled: true,
+        pending: options.pending,
+        flagged: outcome.violation.is_some(),
+        flag_reason: outcome.violation.clone(),
+    };
+    if let Err(e) = db.add_membership(&membership).await {
+        // Only roll storage/data back when the version is now truly orphaned —
+        // a concurrent push that won the same-feed race (or another feed) keeps
+        // the shared payload alive.
+        if stored_now && db.feed_count(&id, &version).await.unwrap_or(0) == 0 {
+            let _ = db.delete_package_data(&id, &version).await;
+            let _ = storage.delete(&id, &normalized).await;
+        }
         return Err(e);
     }
 
-    Ok(IndexResult { id, version })
+    Ok(IndexResult {
+        id,
+        version,
+        pending: options.pending,
+        flag_reason: outcome.violation,
+    })
 }
 
 fn build_package(
@@ -222,6 +281,8 @@ mod tests {
             <tags>util helper</tags>
         </metadata></package>"#;
 
+    const FEED: &str = "default";
+
     #[tokio::test]
     async fn indexes_a_package_end_to_end() {
         let store_dir = tempfile::tempdir().unwrap();
@@ -231,7 +292,7 @@ mod tests {
         let (_d, temp) = make_package(NUSPEC, true).await;
         let summary = summary_for(&temp).await;
 
-        let result = index_package(&storage, &db, temp, summary, &IndexOptions::default())
+        let result = index_package(&storage, &db, FEED, temp, summary, &IndexOptions::default())
             .await
             .unwrap();
         assert_eq!(result.id, "Contoso.Utils");
@@ -239,7 +300,7 @@ mod tests {
 
         // Metadata landed in the DB.
         let pkg = db
-            .find("contoso.utils", &result.version)
+            .find(FEED, "contoso.utils", &result.version)
             .await
             .unwrap()
             .unwrap();
@@ -269,15 +330,22 @@ mod tests {
 
         let (_d1, temp1) = make_package(NUSPEC, false).await;
         let s1 = summary_for(&temp1).await;
-        index_package(&storage, &db, temp1, s1, &IndexOptions::default())
+        index_package(&storage, &db, FEED, temp1, s1, &IndexOptions::default())
             .await
             .unwrap();
 
         let (_d2, temp2) = make_package(NUSPEC, false).await;
         let s2 = summary_for(&temp2).await;
-        let err = index_package(&storage, &db, temp2.clone(), s2, &IndexOptions::default())
-            .await
-            .unwrap_err();
+        let err = index_package(
+            &storage,
+            &db,
+            FEED,
+            temp2.clone(),
+            s2,
+            &IndexOptions::default(),
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, Error::PackageAlreadyExists));
         // The rejected temp file was cleaned up.
         assert!(!temp2.exists());
@@ -290,21 +358,22 @@ mod tests {
         let db = SqliteDatabase::in_memory().await.unwrap();
         let opts = IndexOptions {
             allow_overwrite: true,
+            ..Default::default()
         };
 
         let (_d1, temp1) = make_package(NUSPEC, false).await;
         let s1 = summary_for(&temp1).await;
-        index_package(&storage, &db, temp1, s1, &opts)
+        index_package(&storage, &db, FEED, temp1, s1, &opts)
             .await
             .unwrap();
 
         let (_d2, temp2) = make_package(NUSPEC, true).await;
         let s2 = summary_for(&temp2).await;
-        let result = index_package(&storage, &db, temp2, s2, &opts)
+        let result = index_package(&storage, &db, FEED, temp2, s2, &opts)
             .await
             .unwrap();
         let pkg = db
-            .find("contoso.utils", &result.version)
+            .find(FEED, "contoso.utils", &result.version)
             .await
             .unwrap()
             .unwrap();
@@ -321,9 +390,100 @@ mod tests {
             r#"<package><metadata><id>Bad Id!</id><version>1.0.0</version></metadata></package>"#;
         let (_d, temp) = make_package(bad, false).await;
         let s = summary_for(&temp).await;
-        let err = index_package(&storage, &db, temp, s, &IndexOptions::default())
+        let err = index_package(&storage, &db, FEED, temp, s, &IndexOptions::default())
             .await
             .unwrap_err();
         assert!(matches!(err, Error::InvalidPackage(_)));
+    }
+
+    #[tokio::test]
+    async fn shared_payload_is_not_duplicated_across_feeds() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let storage = FilesystemStorage::new(store_dir.path()).await.unwrap();
+        let db = SqliteDatabase::in_memory().await.unwrap();
+
+        let (_d1, temp1) = make_package(NUSPEC, false).await;
+        let s1 = summary_for(&temp1).await;
+        index_package(&storage, &db, "dev", temp1, s1, &IndexOptions::default())
+            .await
+            .unwrap();
+
+        // Pushing the same version into a second feed succeeds and adds only a
+        // membership — the payload is already present.
+        let (_d2, temp2) = make_package(NUSPEC, false).await;
+        let s2 = summary_for(&temp2).await;
+        let res = index_package(
+            &storage,
+            &db,
+            "stable",
+            temp2.clone(),
+            s2,
+            &IndexOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert!(!temp2.exists(), "second temp should be dropped, not stored");
+        let v = res.version.clone();
+        assert_eq!(db.feed_count("contoso.utils", &v).await.unwrap(), 2);
+        assert!(db.find("dev", "contoso.utils", &v).await.unwrap().is_some());
+        assert!(db
+            .find("stable", "contoso.utils", &v)
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn blocking_license_policy_rejects_push() {
+        use crate::config::{LicensePolicyConfig, PolicyAction};
+        let store_dir = tempfile::tempdir().unwrap();
+        let storage = FilesystemStorage::new(store_dir.path()).await.unwrap();
+        let db = SqliteDatabase::in_memory().await.unwrap();
+
+        // NUSPEC declares no license; block unlicensed packages.
+        let opts = IndexOptions {
+            license_policy: LicensePolicyConfig {
+                enabled: true,
+                allow_unlicensed: false,
+                action: PolicyAction::Block,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let (_d, temp) = make_package(NUSPEC, false).await;
+        let s = summary_for(&temp).await;
+        let err = index_package(&storage, &db, FEED, temp, s, &opts)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::PolicyViolation(_)));
+        // Nothing was stored.
+        assert!(!storage.package_exists("contoso.utils", "1.2.3").await);
+    }
+
+    #[tokio::test]
+    async fn warning_license_policy_flags_membership() {
+        use crate::config::{LicensePolicyConfig, PolicyAction};
+        let store_dir = tempfile::tempdir().unwrap();
+        let storage = FilesystemStorage::new(store_dir.path()).await.unwrap();
+        let db = SqliteDatabase::in_memory().await.unwrap();
+
+        let opts = IndexOptions {
+            license_policy: LicensePolicyConfig {
+                enabled: true,
+                allow_unlicensed: false,
+                action: PolicyAction::Warn,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let (_d, temp) = make_package(NUSPEC, false).await;
+        let s = summary_for(&temp).await;
+        let res = index_package(&storage, &db, FEED, temp, s, &opts)
+            .await
+            .unwrap();
+        assert!(res.flag_reason.is_some());
+        let all = db.find_all_versions(FEED, "contoso.utils").await.unwrap();
+        assert_eq!(all.len(), 1);
+        assert!(all[0].flagged);
     }
 }

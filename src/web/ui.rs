@@ -144,20 +144,24 @@ fn layout(urls: &UrlBuilder, title: &str, query: &str, active: &str, body: &str)
 <title>{title}</title><style>{STYLE}</style></head><body>\
 <a class=\"skip\" href=\"#main\">Skip to content</a>\
 <header><div class=\"wrap\">\
-<a class=\"logo\" href=\"/\">YA<span>NuGet</span></a>\
-<form class=\"search\" action=\"/packages\" method=\"get\" role=\"search\">\
+<a class=\"logo\" href=\"{home}\">YA<span>NuGet</span></a>\
+<form class=\"search\" action=\"{packages}\" method=\"get\" role=\"search\">\
 <label for=\"q\" class=\"vh\">Search packages</label>\
 <input id=\"q\" type=\"search\" name=\"q\" placeholder=\"Search packages\u{2026}\" value=\"{q}\" autocomplete=\"off\">\
 <button type=\"submit\">Search</button></form>\
 </div></header>\
 <main id=\"main\" tabindex=\"-1\"><div class=\"wrap\">{body}</div></main>\
 <footer><div class=\"wrap\"><nav aria-label=\"Site\">Served by YANuget \u{2014} \
-<a href=\"{idx}\">v3 service index</a> \u{2022} <a href=\"/stats\"{cs}>Stats</a> \u{2022} \
-<a href=\"/settings\"{cg}>Settings</a></nav></div></footer>\
+<a href=\"{idx}\">v3 service index</a> \u{2022} <a href=\"{stats}\"{cs}>Stats</a> \u{2022} \
+<a href=\"{settings}\"{cg}>Settings</a></nav></div></footer>\
 {COPY_SCRIPT}</body></html>",
         title = escape_html(title),
         q = escape_html(query),
+        home = escape_html(&urls.app("/")),
+        packages = escape_html(&urls.app("/packages")),
         idx = escape_html(&urls.service_index()),
+        stats = escape_html(&urls.app("/stats")),
+        settings = escape_html(&urls.app("/settings")),
         cs = cur("stats"),
         cg = cur("settings"),
     )
@@ -182,7 +186,10 @@ pub fn gallery_page(
              <code>choco push</code>.</p>"
                 .to_string()
         } else {
-            "<p><a href=\"/packages\">Clear search and browse all packages</a></p>".to_string()
+            format!(
+                "<p><a href=\"{}\">Clear search and browse all packages</a></p>",
+                escape_html(&urls.app("/packages"))
+            )
         };
         format!("<div class=\"empty\"><p>{what}</p>{clear}</div>")
     } else {
@@ -200,7 +207,7 @@ pub fn gallery_page(
         for group in &page.groups {
             let p = group.latest();
             let id = escape_html(&p.id);
-            let url = format!("/packages/{}", enc_path(&p.lower_id()));
+            let url = escape_html(&urls.app(&format!("/packages/{}", enc_path(&p.lower_id()))));
             let pre = if p.is_prerelease() {
                 " <span class=\"badge pre\">prerelease</span>"
             } else {
@@ -223,6 +230,7 @@ pub fn gallery_page(
             ));
         }
         cards.push_str(&pager(
+            urls,
             query,
             skip,
             take,
@@ -235,7 +243,7 @@ pub fn gallery_page(
 }
 
 /// Previous/next pagination control for the gallery.
-fn pager(query: &str, skip: i64, take: i64, shown: i64, total: i64) -> String {
+fn pager(urls: &UrlBuilder, query: &str, skip: i64, take: i64, shown: i64, total: i64) -> String {
     let take = take.max(1);
     let skip = skip.max(0);
     // Only render when there is more than one page worth of results.
@@ -243,6 +251,7 @@ fn pager(query: &str, skip: i64, take: i64, shown: i64, total: i64) -> String {
         return String::new();
     }
     let q = enc_path(query);
+    let base = urls.app("/packages");
     let prev = (skip - take).max(0);
     let has_prev = skip > 0;
     let has_next = skip + shown < total;
@@ -251,7 +260,7 @@ fn pager(query: &str, skip: i64, take: i64, shown: i64, total: i64) -> String {
     let to = skip + shown;
     let link = |target: i64, enabled: bool, label: &str| {
         if enabled {
-            format!("<a class=\"btn\" href=\"/packages?q={q}&skip={target}\">{label}</a>")
+            format!("<a class=\"btn\" href=\"{base}?q={q}&skip={target}\">{label}</a>")
         } else {
             format!("<span class=\"btn\" aria-disabled=\"true\">{label}</span>")
         }
@@ -297,9 +306,9 @@ pub fn stats_page(
         for g in &top.groups {
             let p = g.latest();
             out.push_str(&format!(
-                "<li><a href=\"/packages/{lid}\">{id}</a>\
+                "<li><a href=\"{href}\">{id}</a>\
                  <span class=\"muted\">{dl} downloads</span></li>",
-                lid = enc_path(&p.lower_id()),
+                href = escape_html(&urls.app(&format!("/packages/{}", enc_path(&p.lower_id())))),
                 id = escape_html(&p.id),
                 dl = group_digits(g.total_downloads() as i64),
             ));
@@ -314,10 +323,13 @@ pub fn stats_page(
         let mut out = String::from("<ul class=\"rank\">");
         for p in recent {
             out.push_str(&format!(
-                "<li><a href=\"/packages/{lid}/{ev}\">{id} {dv}</a>\
+                "<li><a href=\"{href}\">{id} {dv}</a>\
                  <span class=\"muted\">{when}</span></li>",
-                lid = enc_path(&p.lower_id()),
-                ev = enc_path(&p.normalized_version()),
+                href = escape_html(&urls.app(&format!(
+                    "/packages/{}/{}",
+                    enc_path(&p.lower_id()),
+                    enc_path(&p.normalized_version())
+                ))),
                 id = escape_html(&p.id),
                 dv = escape_html(&p.normalized_version()),
                 when = escape_html(&p.published.format("%Y-%m-%d").to_string()),
@@ -356,39 +368,77 @@ fn group_digits(n: i64) -> String {
 /// Deliberately omits secrets and infrastructure details (the API key, data
 /// paths and bind address) because the gallery is unauthenticated — it only
 /// surfaces policy that affects how clients interact with the feed.
-pub fn settings_page(urls: &UrlBuilder, config: &Config) -> String {
+pub fn settings_page(urls: &UrlBuilder, config: &Config, feed: &super::FeedContext) -> String {
     let yes_no = |b: bool| if b { "Yes" } else { "No" };
     let on_off = |b: bool| if b { "Enabled" } else { "Disabled" };
 
-    let auth = if config.api_key.is_some() {
+    let auth = if feed.auth.is_enabled() {
         "Required (API key)"
     } else {
         "Open \u{2014} no API key set"
+    };
+    let read_auth = if feed.read_auth.is_enabled() {
+        "Required (credential)"
+    } else {
+        "Open"
     };
     let max_size = match config.max_package_size_bytes {
         Some(n) => human_size(n),
         None => "Unlimited".to_string(),
     };
-    let delete_mode = if config.hard_delete_enabled {
+    let delete_mode = if feed.hard_delete_enabled {
         "Hard delete (removes files)"
     } else {
         "Unlist (restorable)"
     };
 
     let mut server = String::from("<div class=\"kv\">");
+    server.push_str(&kv("Feed", &feed.name));
     server.push_str(&kv("Push / delete auth", auth));
+    server.push_str(&kv("Download auth", read_auth));
     server.push_str(&kv("Max package size", &max_size));
     server.push_str(&kv(
         "Overwrite existing version",
-        yes_no(config.allow_overwrite),
+        yes_no(feed.allow_overwrite),
     ));
     server.push_str(&kv("Delete behaviour", delete_mode));
+    server.push_str(&kv("Approval required", yes_no(feed.requires_approval)));
+    if let Some(target) = &feed.promotes_to {
+        server.push_str(&kv("Promotes to", target));
+    }
     server.push_str(&kv("Symbol server", on_off(config.enable_symbol_server)));
     server.push_str(&kv("Web gallery", on_off(config.enable_web_ui)));
     server.push_str(&kv("Preferred client", &config.primary_client));
     server.push_str("</div>");
 
-    let r = &config.retention;
+    // Upstream mirroring + license policy (per feed).
+    let mut policy = String::from("<div class=\"kv\">");
+    match &feed.mirror {
+        Some(m) => {
+            policy.push_str(&kv("Upstream mirror", "Enabled"));
+            policy.push_str(&kv("Upstream", m.upstream()));
+        }
+        None => policy.push_str(&kv("Upstream mirror", "Disabled")),
+    }
+    let lp = &feed.license_policy;
+    policy.push_str(&kv("License policy", on_off(lp.enabled)));
+    if lp.enabled {
+        let action = match lp.action {
+            crate::config::PolicyAction::Block => "Block",
+            crate::config::PolicyAction::Warn => "Warn (flag)",
+        };
+        policy.push_str(&kv("On violation", action));
+        if !lp.allowed.is_empty() {
+            policy.push_str(&kv("Allowed", &lp.allowed.join(", ")));
+        }
+        if !lp.blocked.is_empty() {
+            policy.push_str(&kv("Blocked", &lp.blocked.join(", ")));
+        }
+        policy.push_str(&kv("Allow unlicensed", yes_no(lp.allow_unlicensed)));
+    }
+    policy.push_str("</div>");
+
+    let r = &feed.retention;
     let mut retention = String::from("<div class=\"kv\">");
     retention.push_str(&kv("Retention", on_off(r.enabled)));
     if r.enabled {
@@ -414,12 +464,15 @@ pub fn settings_page(urls: &UrlBuilder, config: &Config) -> String {
     }
     retention.push_str("</div>");
 
-    let admin = if config.admin_api_key.is_some() {
-        "<div class=\"card\"><h3 class=\"muted\">Administration</h3>\
-         <p>Manage package versions (disable / enable / delete) in the \
-         <a href=\"/admin\">admin area</a>. Sign in with the admin key.</p></div>"
+    let admin = if feed.admin.is_enabled() {
+        format!(
+            "<div class=\"card\"><h3 class=\"muted\">Administration</h3>\
+             <p>Manage package versions (approve / promote / disable / delete) in the \
+             <a href=\"{}\">admin area</a>. Sign in with the admin key.</p></div>",
+            escape_html(&urls.app("/admin"))
+        )
     } else {
-        ""
+        String::new()
     };
 
     let body = format!(
@@ -427,6 +480,7 @@ pub fn settings_page(urls: &UrlBuilder, config: &Config) -> String {
          <p class=\"muted\">Read-only overview of this feed's policy. \
          Secrets and storage paths are not shown.</p>\
          <div class=\"card\"><h3 class=\"muted\">Server</h3>{server}</div>\
+         <div class=\"card\"><h3 class=\"muted\">Mirror &amp; policy</h3>{policy}</div>\
          <div class=\"card\"><h3 class=\"muted\">Retention</h3>{retention}</div>\
          <div class=\"card\"><h3 class=\"muted\">Endpoints</h3><div class=\"kv\">\
          {svc}{sym}</div></div>{admin}",
@@ -458,8 +512,10 @@ pub fn admin_dashboard_page(urls: &UrlBuilder, ids: &[String]) -> String {
         let mut list = String::from("<ul class=\"rank\">");
         for id in ids {
             list.push_str(&format!(
-                "<li><a href=\"/admin/packages/{lid}\">{id}</a></li>",
-                lid = enc_path(&id.to_lowercase()),
+                "<li><a href=\"{href}\">{id}</a></li>",
+                href = escape_html(
+                    &urls.app(&format!("/admin/packages/{}", enc_path(&id.to_lowercase())))
+                ),
                 id = escape_html(id),
             ));
         }
@@ -473,45 +529,86 @@ pub fn admin_dashboard_page(urls: &UrlBuilder, ids: &[String]) -> String {
     layout(urls, "Admin \u{2014} YANuget", "", "", &body)
 }
 
-/// The per-package admin page: every version (incl. disabled) with actions.
-pub fn admin_package_page(urls: &UrlBuilder, id: &str, versions: &[Package]) -> String {
-    let mut ordered: Vec<&Package> = versions.iter().collect();
-    ordered.sort_by(|a, b| b.version.cmp(&a.version));
+/// The per-package admin page: every version (incl. disabled, pending and
+/// flagged) with moderation actions. `promote_target`, when set, names the next
+/// release ring an admin can promote a version into.
+pub fn admin_package_page(
+    urls: &UrlBuilder,
+    id: &str,
+    versions: &[crate::database::FeedVersion],
+    promote_target: Option<&str>,
+) -> String {
+    let mut ordered: Vec<&crate::database::FeedVersion> = versions.iter().collect();
+    ordered.sort_by(|a, b| b.package.version.cmp(&a.package.version));
+
+    let action = |v: &str, op: &str| {
+        escape_html(&urls.app(&format!(
+            "/admin/packages/{}/{}/{}",
+            enc_path(&id.to_lowercase()),
+            enc_path(v),
+            op
+        )))
+    };
 
     let mut rows = String::new();
-    for p in ordered {
+    for fv in ordered {
+        let p = &fv.package;
         let v = p.normalized_version();
-        let ev = enc_path(&v);
-        let lid = enc_path(&id.to_lowercase());
-        let status = if !p.enabled {
-            "<span class=\"badge un\">disabled</span>"
+        let mut status = if fv.pending {
+            "<span class=\"badge pre\">pending</span>".to_string()
+        } else if !p.enabled {
+            "<span class=\"badge un\">disabled</span>".to_string()
         } else if p.listed {
-            "<span class=\"badge ok\">active</span>"
+            "<span class=\"badge ok\">active</span>".to_string()
         } else {
-            "<span class=\"badge\">unlisted</span>"
+            "<span class=\"badge\">unlisted</span>".to_string()
         };
+        if fv.flagged {
+            status.push_str(" <span class=\"badge\" title=\"policy\">flagged</span>");
+        }
+
+        let mut actions = String::new();
+        if fv.pending {
+            actions.push_str(&format!(
+                "<form method=\"post\" action=\"{}\"><button type=\"submit\">Approve</button></form>",
+                action(&v, "approve")
+            ));
+        }
+        if let Some(target) = promote_target {
+            actions.push_str(&format!(
+                "<form method=\"post\" action=\"{}\"><button type=\"submit\">Promote \u{2192} {}</button></form>",
+                action(&v, "promote"),
+                escape_html(target),
+            ));
+        }
         // Enable/disable toggle depending on current state.
-        let toggle = if p.enabled {
-            format!(
-                "<form method=\"post\" action=\"/admin/packages/{lid}/{ev}/disable\">\
-                 <button type=\"submit\">Disable</button></form>"
-            )
+        if p.enabled {
+            actions.push_str(&format!(
+                "<form method=\"post\" action=\"{}\"><button type=\"submit\">Disable</button></form>",
+                action(&v, "disable")
+            ));
         } else {
-            format!(
-                "<form method=\"post\" action=\"/admin/packages/{lid}/{ev}/enable\">\
-                 <button type=\"submit\">Enable</button></form>"
-            )
-        };
-        let delete = format!(
-            "<form method=\"post\" action=\"/admin/packages/{lid}/{ev}/delete\" \
-             onsubmit=\"return confirm('Permanently delete {dv} {dvv}? This cannot be undone.')\">\
+            actions.push_str(&format!(
+                "<form method=\"post\" action=\"{}\"><button type=\"submit\">Enable</button></form>",
+                action(&v, "enable")
+            ));
+        }
+        actions.push_str(&format!(
+            "<form method=\"post\" action=\"{a}\" \
+             onsubmit=\"return confirm('Remove {dv} {dvv} from this feed? If no other feed uses it, the files are deleted.')\">\
              <button type=\"submit\" class=\"danger\">Delete</button></form>",
+            a = action(&v, "delete"),
             dv = escape_html(&id.replace('\'', "")),
             dvv = escape_html(&v.replace('\'', "")),
-        );
+        ));
+
+        let reason = match (fv.flagged, fv.flag_reason.as_deref()) {
+            (true, Some(r)) => format!("<div class=\"meta\">{}</div>", escape_html(r)),
+            _ => String::new(),
+        };
         rows.push_str(&format!(
-            "<tr><td>{pre}{dv}</td><td>{status}</td><td class=\"muted\">{dl}</td>\
-             <td><div class=\"actions\">{toggle}{delete}</div></td></tr>",
+            "<tr><td>{pre}{dv}{reason}</td><td>{status}</td><td class=\"muted\">{dl}</td>\
+             <td><div class=\"actions\">{actions}</div></td></tr>",
             pre = if p.is_prerelease() {
                 "<span class=\"badge pre\">pre</span> "
             } else {
@@ -524,15 +621,38 @@ pub fn admin_package_page(urls: &UrlBuilder, id: &str, versions: &[Package]) -> 
 
     let body = format!(
         "<nav class=\"crumbs\" aria-label=\"Breadcrumb\">\
-         <a href=\"/admin\">Admin</a> <span aria-hidden=\"true\">/</span> <span>{id}</span></nav>\
+         <a href=\"{admin}\">Admin</a> <span aria-hidden=\"true\">/</span> <span>{id}</span></nav>\
          <h1 class=\"title\">{id}</h1>\
-         <p class=\"muted\">Disabled versions are hidden from clients and not downloadable.</p>\
+         <p class=\"muted\">Disabled and pending versions are hidden from clients and not \
+         downloadable. Delete removes this feed's membership.</p>\
          <div class=\"card\"><table class=\"atbl\">\
          <thead><tr><th>Version</th><th>Status</th><th>Downloads</th><th>Actions</th></tr></thead>\
          <tbody>{rows}</tbody></table></div>",
+        admin = escape_html(&urls.app("/admin")),
         id = escape_html(id),
     );
     layout(urls, &format!("Admin \u{2014} {id}"), "", "", &body)
+}
+
+/// The root feed index, shown when more than one feed is hosted.
+pub fn feeds_index_page(feeds: &[(String, String)]) -> String {
+    let urls = UrlBuilder::new("");
+    let mut list = String::from("<ul class=\"rank\">");
+    for (name, href) in feeds {
+        list.push_str(&format!(
+            "<li><a href=\"{href}\">{name}</a> \
+             <span class=\"muted\"><a href=\"{href}v3/index.json\">service index</a></span></li>",
+            href = escape_html(href),
+            name = escape_html(name),
+        ));
+    }
+    list.push_str("</ul>");
+    let body = format!(
+        "<h1 class=\"title\">Feeds</h1>\
+         <p class=\"muted\">This server hosts several NuGet feeds. Pick one:</p>\
+         <div class=\"card\">{list}</div>"
+    );
+    layout(&urls, "Feeds \u{2014} YANuget", "", "", &body)
 }
 
 /// A key/value row with an escaped text value.
@@ -573,10 +693,10 @@ pub fn detail_page(
         let v = p.normalized_version();
         let sel = if v == version { " class=\"sel\"" } else { "" };
         versions.push_str(&format!(
-            "<li><span><a{sel} href=\"/packages/{lid}/{ev}\">{dv}</a>{badges}</span>\
+            "<li><span><a{sel} href=\"{href}\">{dv}</a>{badges}</span>\
              <span class=\"muted\">{dls} dl</span></li>",
-            lid = enc_path(&lower),
-            ev = enc_path(&v),
+            href =
+                escape_html(&urls.app(&format!("/packages/{}/{}", enc_path(&lower), enc_path(&v)))),
             dv = escape_html(&v),
             badges = status_badges(p),
             dls = p.downloads,
@@ -586,10 +706,11 @@ pub fn detail_page(
 
     let main = format!(
         "<nav class=\"crumbs\" aria-label=\"Breadcrumb\">\
-         <a href=\"/packages\">Packages</a> <span aria-hidden=\"true\">/</span> <span>{id}</span></nav>\
+         <a href=\"{packages}\">Packages</a> <span aria-hidden=\"true\">/</span> <span>{id}</span></nav>\
          <h1 class=\"title\">{id}</h1>\
          <div class=\"meta\">{version}{badges} \u{2022} {dl} downloads \u{2022} published {pub}</div>\
          <p>{desc}</p>{tags}{links}{deps}{symbols}{readme}",
+        packages = escape_html(&urls.app("/packages")),
         version = escape_html(&version),
         badges = status_badges(selected),
         dl = selected.downloads,
@@ -597,7 +718,7 @@ pub fn detail_page(
         desc = escape_html(&selected.description),
         tags = render_tags(&selected.tags),
         links = render_links(selected),
-        deps = render_dependencies(selected),
+        deps = render_dependencies(urls, selected),
         symbols = if has_symbols {
             "<p class=\"muted\">\u{1f50e} Debug symbols are available for this package.</p>"
         } else {
@@ -721,7 +842,7 @@ fn render_links(p: &Package) -> String {
     }
 }
 
-fn render_dependencies(p: &Package) -> String {
+fn render_dependencies(urls: &UrlBuilder, p: &Package) -> String {
     if p.dependencies.is_empty() {
         return String::new();
     }
@@ -739,8 +860,10 @@ fn render_dependencies(p: &Package) -> String {
         out.push_str("<table class=\"deps\">");
         for d in &group.dependencies {
             out.push_str(&format!(
-                "<tr><td><a href=\"/packages/{lid}\">{id}</a></td><td class=\"muted\">{range}</td></tr>",
-                lid = enc_path(&d.id.to_lowercase()),
+                "<tr><td><a href=\"{href}\">{id}</a></td><td class=\"muted\">{range}</td></tr>",
+                href = escape_html(
+                    &urls.app(&format!("/packages/{}", enc_path(&d.id.to_lowercase())))
+                ),
                 id = escape_html(&d.id),
                 range = escape_html(d.version_range.as_deref().unwrap_or("")),
             ));
@@ -932,25 +1055,45 @@ mod tests {
         assert!(html.contains("Recently published"));
     }
 
+    fn feed_ctx(api: Option<&str>, admin: Option<&str>) -> super::super::FeedContext {
+        super::super::FeedContext {
+            name: "default".into(),
+            prefix: String::new(),
+            auth: crate::auth::ApiKeyAuth::new(api.map(str::to_string)),
+            read_auth: crate::auth::ReadAuth::new(None),
+            admin: crate::auth::AdminAuth::new(admin.map(str::to_string)),
+            allow_overwrite: false,
+            hard_delete_enabled: false,
+            requires_approval: false,
+            promotes_to: None,
+            mirror: None,
+            license_policy: crate::config::LicensePolicyConfig::default(),
+            retention: crate::config::RetentionConfig::default(),
+        }
+    }
+
+    fn feed_version(p: Package, pending: bool, flagged: bool) -> crate::database::FeedVersion {
+        crate::database::FeedVersion {
+            package: p,
+            pending,
+            flagged,
+            flag_reason: flagged.then(|| "license MIT is blocked".to_string()),
+        }
+    }
+
     #[test]
     fn settings_page_hides_secrets_and_shows_admin_link() {
         let urls = UrlBuilder::new("https://host");
-        let config = crate::config::Config {
-            api_key: Some("super-secret".into()),
-            admin_api_key: Some("admin-secret".into()),
-            ..Default::default()
-        };
-        let html = settings_page(&urls, &config);
+        let config = crate::config::Config::default();
+        let feed = feed_ctx(Some("super-secret"), Some("admin-secret"));
+        let html = settings_page(&urls, &config, &feed);
         assert!(html.contains("Required (API key)"));
         assert!(!html.contains("super-secret"));
         assert!(!html.contains("admin-secret"));
         assert!(html.contains("/admin")); // admin link present when configured
 
-        let no_admin = crate::config::Config {
-            admin_api_key: None,
-            ..Default::default()
-        };
-        assert!(!settings_page(&urls, &no_admin).contains("admin area"));
+        let no_admin = feed_ctx(None, None);
+        assert!(!settings_page(&urls, &config, &no_admin).contains("admin area"));
     }
 
     #[test]
@@ -961,12 +1104,37 @@ mod tests {
 
         let mut disabled = sample();
         disabled.enabled = false;
-        let pkg = admin_package_page(&urls, "Contoso.Utils", &[sample(), disabled]);
+        let versions = vec![
+            feed_version(sample(), false, false),
+            feed_version(disabled, false, false),
+        ];
+        let pkg = admin_package_page(&urls, "Contoso.Utils", &versions, None);
         assert!(pkg.contains("/disable"));
         assert!(pkg.contains("/enable"));
         assert!(pkg.contains("/delete"));
         assert!(pkg.contains("badge un")); // the disabled one
         assert!(pkg.contains("badge ok")); // the active one
+    }
+
+    #[test]
+    fn admin_page_shows_pending_and_promote() {
+        let urls = UrlBuilder::new("https://host");
+        let versions = vec![feed_version(sample(), true, true)];
+        let pkg = admin_package_page(&urls, "Contoso.Utils", &versions, Some("stable"));
+        assert!(pkg.contains("/approve"));
+        assert!(pkg.contains("/promote"));
+        assert!(pkg.contains("pending"));
+        assert!(pkg.contains("flagged"));
+    }
+
+    #[test]
+    fn feeds_index_lists_feeds() {
+        let html = feeds_index_page(&[
+            ("stable".into(), "/stable/".into()),
+            ("dev".into(), "/dev/".into()),
+        ]);
+        assert!(html.contains("/stable/"));
+        assert!(html.contains("/dev/v3/index.json"));
     }
 
     fn sample() -> Package {

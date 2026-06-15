@@ -8,6 +8,10 @@
 //! components for fast SQL ordering of the version *core*. Pre-release ordering,
 //! which SQL cannot express faithfully, is finished in Rust via
 //! [`NuGetVersion`]'s `Ord`.
+//!
+//! Package metadata lives once in `packages`. Which feeds expose a version, and
+//! that version's per-feed state (listed / enabled / pending / flagged), lives
+//! in `feed_packages`. Feed-scoped reads join the two.
 
 use std::str::FromStr;
 use std::time::Duration;
@@ -24,7 +28,8 @@ use crate::models::{DependencyGroup, Package, PackageType};
 use crate::version::NuGetVersion;
 
 use super::{
-    DatabaseStats, PackageDatabase, SearchGroup, SearchPage, SearchRequest, SymbolKey, SymbolRef,
+    DatabaseStats, FeedVersion, Membership, PackageDatabase, SearchGroup, SearchPage,
+    SearchRequest, SymbolKey, SymbolRef,
 };
 
 const SCHEMA: &str = r#"
@@ -68,8 +73,22 @@ CREATE TABLE IF NOT EXISTS packages (
     PRIMARY KEY (lower_id, normalized_version)
 );
 CREATE INDEX IF NOT EXISTS idx_packages_lower_id ON packages (lower_id);
-CREATE INDEX IF NOT EXISTS idx_packages_search
-    ON packages (lower_id, listed, is_prerelease, is_semver2);
+
+CREATE TABLE IF NOT EXISTS feed_packages (
+    feed               TEXT    NOT NULL,
+    lower_id           TEXT    NOT NULL,
+    normalized_version TEXT    NOT NULL,
+    listed             INTEGER NOT NULL DEFAULT 1,
+    enabled            INTEGER NOT NULL DEFAULT 1,
+    pending            INTEGER NOT NULL DEFAULT 0,
+    flagged            INTEGER NOT NULL DEFAULT 0,
+    flag_reason        TEXT,
+    added              TEXT    NOT NULL,
+    PRIMARY KEY (feed, lower_id, normalized_version)
+);
+CREATE INDEX IF NOT EXISTS idx_feed_packages_feed ON feed_packages (feed, lower_id);
+CREATE INDEX IF NOT EXISTS idx_feed_packages_pkg
+    ON feed_packages (lower_id, normalized_version);
 
 CREATE TABLE IF NOT EXISTS symbols (
     ssqp_key           TEXT NOT NULL,   -- upper-case {GUID}{age}
@@ -81,6 +100,14 @@ CREATE TABLE IF NOT EXISTS symbols (
 CREATE INDEX IF NOT EXISTS idx_symbols_owner
     ON symbols (lower_id, normalized_version);
 "#;
+
+/// The feed-scoped projection: every `packages` column plus the membership's
+/// state aliased so it does not collide with the package's own template flags.
+const FEED_SELECT: &str = "SELECT p.*, fp.listed AS m_listed, fp.enabled AS m_enabled, \
+     fp.pending AS m_pending, fp.flagged AS m_flagged, fp.flag_reason AS m_flag_reason \
+     FROM packages p \
+     JOIN feed_packages fp \
+       ON fp.lower_id = p.lower_id AND fp.normalized_version = p.normalized_version";
 
 /// A SQLite package index.
 #[derive(Debug, Clone)]
@@ -124,13 +151,26 @@ impl SqliteDatabase {
         sqlx::raw_sql(SCHEMA).execute(&pool).await?;
         // Migrate databases created before the admin `enabled` column existed.
         ensure_column(&pool, "packages", "enabled", "INTEGER NOT NULL DEFAULT 1").await?;
+        // Migrate single-feed databases created before feeds existed: seed each
+        // existing package into the implicit `default` feed, copying its state.
+        sqlx::query(
+            r#"INSERT INTO feed_packages
+                   (feed, lower_id, normalized_version, listed, enabled, pending,
+                    flagged, flag_reason, added)
+               SELECT 'default', lower_id, normalized_version, listed, enabled, 0, 0, NULL, published
+               FROM packages
+               WHERE NOT EXISTS (SELECT 1 FROM feed_packages)"#,
+        )
+        .execute(&pool)
+        .await?;
         Ok(Self { pool })
     }
 
-    /// Load all versions for a set of lower-cased ids, applying visibility
-    /// filters, grouped and version-sorted, preserving the order of `ids`.
+    /// Load every visible version for a set of lower-cased ids in `feed`,
+    /// grouped and version-sorted, preserving the order of `ids`.
     async fn load_groups(
         &self,
+        feed: &str,
         ids: &[String],
         include_prerelease: bool,
         include_semver2: bool,
@@ -139,7 +179,7 @@ impl SqliteDatabase {
         let mut groups = Vec::with_capacity(ids.len());
         for id in ids {
             let packages = self
-                .find_versions_filtered(id, include_prerelease, include_semver2, listed_only)
+                .find_versions_filtered(feed, id, include_prerelease, include_semver2, listed_only)
                 .await?;
             if !packages.is_empty() {
                 groups.push(SearchGroup { packages });
@@ -150,30 +190,32 @@ impl SqliteDatabase {
 
     async fn find_versions_filtered(
         &self,
+        feed: &str,
         lower_id: &str,
         include_prerelease: bool,
         include_semver2: bool,
         listed_only: bool,
     ) -> Result<Vec<Package>> {
-        // Public listings never include admin-disabled versions.
-        let rows = sqlx::query(
-            r#"SELECT * FROM packages
-               WHERE lower_id = ?1
-                 AND enabled = 1
-                 AND (?2 = 1 OR listed = 1)
-                 AND (?3 = 1 OR is_prerelease = 0)
-                 AND (?4 = 1 OR is_semver2 = 0)"#,
-        )
-        .bind(lower_id)
-        .bind(i64::from(!listed_only))
-        .bind(i64::from(include_prerelease))
-        .bind(i64::from(include_semver2))
-        .fetch_all(&self.pool)
-        .await?;
+        // Public listings never include disabled or pending memberships.
+        let sql = format!(
+            "{FEED_SELECT} WHERE fp.feed = ?1 AND fp.lower_id = ?2 \
+               AND fp.enabled = 1 AND fp.pending = 0 \
+               AND (?3 = 1 OR fp.listed = 1) \
+               AND (?4 = 1 OR p.is_prerelease = 0) \
+               AND (?5 = 1 OR p.is_semver2 = 0)"
+        );
+        let rows = sqlx::query(&sql)
+            .bind(feed)
+            .bind(lower_id)
+            .bind(i64::from(!listed_only))
+            .bind(i64::from(include_prerelease))
+            .bind(i64::from(include_semver2))
+            .fetch_all(&self.pool)
+            .await?;
 
         let mut packages = rows
-            .into_iter()
-            .map(row_to_package)
+            .iter()
+            .map(|r| row_to_feed_package(r).map(|fv| fv.package))
             .collect::<Result<Vec<_>>>()?;
         packages.sort_by(|a, b| a.version.cmp(&b.version));
         Ok(packages)
@@ -182,7 +224,7 @@ impl SqliteDatabase {
 
 #[async_trait]
 impl PackageDatabase for SqliteDatabase {
-    async fn add(&self, p: &Package) -> Result<()> {
+    async fn upsert_package_data(&self, p: &Package) -> Result<bool> {
         let (major, minor, patch, revision) = p.version.core();
         let result = sqlx::query(
             r#"INSERT INTO packages (
@@ -200,7 +242,8 @@ impl PackageDatabase for SqliteDatabase {
                 ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21,
                 ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29,
                 ?30, ?31, ?32, ?33, ?34, ?35, ?36
-            )"#,
+            )
+            ON CONFLICT(lower_id, normalized_version) DO NOTHING"#,
         )
         .bind(&p.id)
         .bind(p.lower_id())
@@ -239,16 +282,11 @@ impl PackageDatabase for SqliteDatabase {
         .bind(json(&p.package_types)?)
         .bind(json(&p.dependencies)?)
         .execute(&self.pool)
-        .await;
-
-        match result {
-            Ok(_) => Ok(()),
-            Err(e) if is_unique_violation(&e) => Err(Error::PackageAlreadyExists),
-            Err(e) => Err(Error::Database(e)),
-        }
+        .await?;
+        Ok(result.rows_affected() > 0)
     }
 
-    async fn exists(&self, id: &str, version: &NuGetVersion) -> Result<bool> {
+    async fn package_data_exists(&self, id: &str, version: &NuGetVersion) -> Result<bool> {
         let row = sqlx::query(
             "SELECT 1 FROM packages WHERE lower_id = ?1 AND normalized_version = ?2 LIMIT 1",
         )
@@ -259,27 +297,178 @@ impl PackageDatabase for SqliteDatabase {
         Ok(row.is_some())
     }
 
-    async fn find(&self, id: &str, version: &NuGetVersion) -> Result<Option<Package>> {
-        // Public lookup: admin-disabled versions are treated as absent.
-        let row = sqlx::query(
-            "SELECT * FROM packages WHERE lower_id = ?1 AND normalized_version = ?2 AND enabled = 1",
+    async fn get_package_data(&self, id: &str, version: &NuGetVersion) -> Result<Option<Package>> {
+        let row =
+            sqlx::query("SELECT * FROM packages WHERE lower_id = ?1 AND normalized_version = ?2")
+                .bind(id.to_lowercase())
+                .bind(version.normalized())
+                .fetch_optional(&self.pool)
+                .await?;
+        row.as_ref().map(row_to_package).transpose()
+    }
+
+    async fn delete_package_data(&self, id: &str, version: &NuGetVersion) -> Result<bool> {
+        let lower = id.to_lowercase();
+        let normalized = version.normalized();
+        sqlx::query("DELETE FROM feed_packages WHERE lower_id = ?1 AND normalized_version = ?2")
+            .bind(&lower)
+            .bind(&normalized)
+            .execute(&self.pool)
+            .await?;
+        let result =
+            sqlx::query("DELETE FROM packages WHERE lower_id = ?1 AND normalized_version = ?2")
+                .bind(&lower)
+                .bind(&normalized)
+                .execute(&self.pool)
+                .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn feed_count(&self, id: &str, version: &NuGetVersion) -> Result<i64> {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM feed_packages WHERE lower_id = ?1 AND normalized_version = ?2",
         )
+        .bind(id.to_lowercase())
+        .bind(version.normalized())
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(n)
+    }
+
+    async fn add_membership(&self, m: &Membership) -> Result<()> {
+        let result = sqlx::query(
+            r#"INSERT INTO feed_packages
+                   (feed, lower_id, normalized_version, listed, enabled, pending,
+                    flagged, flag_reason, added)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"#,
+        )
+        .bind(&m.feed)
+        .bind(m.lower_id.to_lowercase())
+        .bind(&m.normalized_version)
+        .bind(i64::from(m.listed))
+        .bind(i64::from(m.enabled))
+        .bind(i64::from(m.pending))
+        .bind(i64::from(m.flagged))
+        .bind(&m.flag_reason)
+        .bind(Utc::now().to_rfc3339())
+        .execute(&self.pool)
+        .await;
+        match result {
+            Ok(_) => Ok(()),
+            Err(e) if is_unique_violation(&e) => Err(Error::PackageAlreadyExists),
+            Err(e) => Err(Error::Database(e)),
+        }
+    }
+
+    async fn remove_membership(
+        &self,
+        feed: &str,
+        id: &str,
+        version: &NuGetVersion,
+    ) -> Result<bool> {
+        let result = sqlx::query(
+            "DELETE FROM feed_packages WHERE feed = ?1 AND lower_id = ?2 AND normalized_version = ?3",
+        )
+        .bind(feed)
+        .bind(id.to_lowercase())
+        .bind(version.normalized())
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn get_membership(
+        &self,
+        feed: &str,
+        id: &str,
+        version: &NuGetVersion,
+    ) -> Result<Option<Membership>> {
+        let row = sqlx::query(
+            "SELECT * FROM feed_packages WHERE feed = ?1 AND lower_id = ?2 AND normalized_version = ?3",
+        )
+        .bind(feed)
         .bind(id.to_lowercase())
         .bind(version.normalized())
         .fetch_optional(&self.pool)
         .await?;
-        row.map(row_to_package).transpose()
+        Ok(row.map(|r| Membership {
+            feed: r.get("feed"),
+            lower_id: r.get("lower_id"),
+            normalized_version: r.get("normalized_version"),
+            listed: r.get::<i64, _>("listed") != 0,
+            enabled: r.get::<i64, _>("enabled") != 0,
+            pending: r.get::<i64, _>("pending") != 0,
+            flagged: r.get::<i64, _>("flagged") != 0,
+            flag_reason: r.get("flag_reason"),
+        }))
     }
 
-    async fn find_versions(&self, id: &str, include_unlisted: bool) -> Result<Vec<Package>> {
-        self.find_versions_filtered(&id.to_lowercase(), true, true, !include_unlisted)
+    async fn approve_membership(
+        &self,
+        feed: &str,
+        id: &str,
+        version: &NuGetVersion,
+    ) -> Result<bool> {
+        let result = sqlx::query(
+            "UPDATE feed_packages SET pending = 0 WHERE feed = ?1 AND lower_id = ?2 AND normalized_version = ?3",
+        )
+        .bind(feed)
+        .bind(id.to_lowercase())
+        .bind(version.normalized())
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn exists(&self, feed: &str, id: &str, version: &NuGetVersion) -> Result<bool> {
+        let row = sqlx::query(
+            "SELECT 1 FROM feed_packages WHERE feed = ?1 AND lower_id = ?2 AND normalized_version = ?3 LIMIT 1",
+        )
+        .bind(feed)
+        .bind(id.to_lowercase())
+        .bind(version.normalized())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.is_some())
+    }
+
+    async fn find(&self, feed: &str, id: &str, version: &NuGetVersion) -> Result<Option<Package>> {
+        let sql = format!(
+            "{FEED_SELECT} WHERE fp.feed = ?1 AND fp.lower_id = ?2 \
+               AND p.normalized_version = ?3 AND fp.enabled = 1 AND fp.pending = 0"
+        );
+        let row = sqlx::query(&sql)
+            .bind(feed)
+            .bind(id.to_lowercase())
+            .bind(version.normalized())
+            .fetch_optional(&self.pool)
+            .await?;
+        row.as_ref()
+            .map(|r| row_to_feed_package(r).map(|fv| fv.package))
+            .transpose()
+    }
+
+    async fn find_versions(
+        &self,
+        feed: &str,
+        id: &str,
+        include_unlisted: bool,
+    ) -> Result<Vec<Package>> {
+        self.find_versions_filtered(feed, &id.to_lowercase(), true, true, !include_unlisted)
             .await
     }
 
-    async fn set_listed(&self, id: &str, version: &NuGetVersion, listed: bool) -> Result<bool> {
+    async fn set_listed(
+        &self,
+        feed: &str,
+        id: &str,
+        version: &NuGetVersion,
+        listed: bool,
+    ) -> Result<bool> {
         let result = sqlx::query(
-            "UPDATE packages SET listed = ?3 WHERE lower_id = ?1 AND normalized_version = ?2",
+            "UPDATE feed_packages SET listed = ?4 WHERE feed = ?1 AND lower_id = ?2 AND normalized_version = ?3",
         )
+        .bind(feed)
         .bind(id.to_lowercase())
         .bind(version.normalized())
         .bind(i64::from(listed))
@@ -288,10 +477,17 @@ impl PackageDatabase for SqliteDatabase {
         Ok(result.rows_affected() > 0)
     }
 
-    async fn set_enabled(&self, id: &str, version: &NuGetVersion, enabled: bool) -> Result<bool> {
+    async fn set_enabled(
+        &self,
+        feed: &str,
+        id: &str,
+        version: &NuGetVersion,
+        enabled: bool,
+    ) -> Result<bool> {
         let result = sqlx::query(
-            "UPDATE packages SET enabled = ?3 WHERE lower_id = ?1 AND normalized_version = ?2",
+            "UPDATE feed_packages SET enabled = ?4 WHERE feed = ?1 AND lower_id = ?2 AND normalized_version = ?3",
         )
+        .bind(feed)
         .bind(id.to_lowercase())
         .bind(version.normalized())
         .bind(i64::from(enabled))
@@ -300,11 +496,13 @@ impl PackageDatabase for SqliteDatabase {
         Ok(result.rows_affected() > 0)
     }
 
-    async fn is_servable(&self, id: &str, version: &NuGetVersion) -> Result<bool> {
+    async fn is_servable(&self, feed: &str, id: &str, version: &NuGetVersion) -> Result<bool> {
         let row = sqlx::query(
-            "SELECT 1 FROM packages
-             WHERE lower_id = ?1 AND normalized_version = ?2 AND enabled = 1 LIMIT 1",
+            "SELECT 1 FROM feed_packages
+             WHERE feed = ?1 AND lower_id = ?2 AND normalized_version = ?3
+               AND enabled = 1 AND pending = 0 LIMIT 1",
         )
+        .bind(feed)
         .bind(id.to_lowercase())
         .bind(version.normalized())
         .fetch_optional(&self.pool)
@@ -312,27 +510,19 @@ impl PackageDatabase for SqliteDatabase {
         Ok(row.is_some())
     }
 
-    async fn find_all_versions(&self, id: &str) -> Result<Vec<Package>> {
-        let rows = sqlx::query("SELECT * FROM packages WHERE lower_id = ?1")
+    async fn find_all_versions(&self, feed: &str, id: &str) -> Result<Vec<FeedVersion>> {
+        let sql = format!("{FEED_SELECT} WHERE fp.feed = ?1 AND fp.lower_id = ?2");
+        let rows = sqlx::query(&sql)
+            .bind(feed)
             .bind(id.to_lowercase())
             .fetch_all(&self.pool)
             .await?;
-        let mut packages = rows
-            .into_iter()
-            .map(row_to_package)
+        let mut versions = rows
+            .iter()
+            .map(row_to_feed_package)
             .collect::<Result<Vec<_>>>()?;
-        packages.sort_by(|a, b| a.version.cmp(&b.version));
-        Ok(packages)
-    }
-
-    async fn delete(&self, id: &str, version: &NuGetVersion) -> Result<bool> {
-        let result =
-            sqlx::query("DELETE FROM packages WHERE lower_id = ?1 AND normalized_version = ?2")
-                .bind(id.to_lowercase())
-                .bind(version.normalized())
-                .execute(&self.pool)
-                .await?;
-        Ok(result.rows_affected() > 0)
+        versions.sort_by(|a, b| a.package.version.cmp(&b.package.version));
+        Ok(versions)
     }
 
     async fn increment_downloads(&self, id: &str, version: &NuGetVersion) -> Result<()> {
@@ -346,64 +536,62 @@ impl PackageDatabase for SqliteDatabase {
         Ok(())
     }
 
-    async fn search(&self, request: &SearchRequest) -> Result<SearchPage> {
+    async fn search(&self, feed: &str, request: &SearchRequest) -> Result<SearchPage> {
         let query = request.query.trim().to_lowercase();
         let pattern = like_pattern(&query);
 
         // Phase 1: pick the page of matching package ids, ranked by downloads.
-        let id_rows = sqlx::query(
-            r#"SELECT lower_id, SUM(downloads) AS total
-               FROM packages
-               WHERE listed = 1 AND enabled = 1
-                 AND (?1 = 1 OR is_prerelease = 0)
-                 AND (?2 = 1 OR is_semver2 = 0)
-                 AND (?3 = ''
-                      OR lower_id LIKE ?4 ESCAPE '\'
-                      OR lower(description) LIKE ?4 ESCAPE '\'
-                      OR lower(tags) LIKE ?4 ESCAPE '\'
-                      OR lower(IFNULL(title, '')) LIKE ?4 ESCAPE '\')
-               GROUP BY lower_id
-               ORDER BY total DESC, lower_id ASC
-               LIMIT ?5 OFFSET ?6"#,
-        )
-        .bind(i64::from(request.include_prerelease))
-        .bind(i64::from(request.include_semver2))
-        .bind(&query)
-        .bind(&pattern)
-        .bind(request.take.max(0))
-        .bind(request.skip.max(0))
-        .fetch_all(&self.pool)
-        .await?;
+        let filter = "fp.feed = ?1 AND fp.listed = 1 AND fp.enabled = 1 AND fp.pending = 0 \
+             AND (?2 = 1 OR p.is_prerelease = 0) \
+             AND (?3 = 1 OR p.is_semver2 = 0) \
+             AND (?4 = '' \
+                  OR p.lower_id LIKE ?5 ESCAPE '\\' \
+                  OR lower(p.description) LIKE ?5 ESCAPE '\\' \
+                  OR lower(p.tags) LIKE ?5 ESCAPE '\\' \
+                  OR lower(IFNULL(p.title, '')) LIKE ?5 ESCAPE '\\')";
+
+        let id_sql = format!(
+            "SELECT p.lower_id AS lower_id, SUM(p.downloads) AS total \
+             FROM packages p JOIN feed_packages fp \
+               ON fp.lower_id = p.lower_id AND fp.normalized_version = p.normalized_version \
+             WHERE {filter} \
+             GROUP BY p.lower_id ORDER BY total DESC, p.lower_id ASC LIMIT ?6 OFFSET ?7"
+        );
+        let id_rows = sqlx::query(&id_sql)
+            .bind(feed)
+            .bind(i64::from(request.include_prerelease))
+            .bind(i64::from(request.include_semver2))
+            .bind(&query)
+            .bind(&pattern)
+            .bind(request.take.max(0))
+            .bind(request.skip.max(0))
+            .fetch_all(&self.pool)
+            .await?;
 
         let ids: Vec<String> = id_rows
             .iter()
             .map(|r| r.get::<String, _>("lower_id"))
             .collect();
 
-        let total_hits: i64 = sqlx::query_scalar(
-            r#"SELECT COUNT(*) FROM (
-                   SELECT lower_id FROM packages
-                   WHERE listed = 1 AND enabled = 1
-                     AND (?1 = 1 OR is_prerelease = 0)
-                     AND (?2 = 1 OR is_semver2 = 0)
-                     AND (?3 = ''
-                          OR lower_id LIKE ?4 ESCAPE '\'
-                          OR lower(description) LIKE ?4 ESCAPE '\'
-                          OR lower(tags) LIKE ?4 ESCAPE '\'
-                          OR lower(IFNULL(title, '')) LIKE ?4 ESCAPE '\')
-                   GROUP BY lower_id
-               )"#,
-        )
-        .bind(i64::from(request.include_prerelease))
-        .bind(i64::from(request.include_semver2))
-        .bind(&query)
-        .bind(&pattern)
-        .fetch_one(&self.pool)
-        .await?;
+        let count_sql = format!(
+            "SELECT COUNT(*) FROM ( \
+                 SELECT p.lower_id FROM packages p JOIN feed_packages fp \
+                   ON fp.lower_id = p.lower_id AND fp.normalized_version = p.normalized_version \
+                 WHERE {filter} GROUP BY p.lower_id )"
+        );
+        let total_hits: i64 = sqlx::query_scalar(&count_sql)
+            .bind(feed)
+            .bind(i64::from(request.include_prerelease))
+            .bind(i64::from(request.include_semver2))
+            .bind(&query)
+            .bind(&pattern)
+            .fetch_one(&self.pool)
+            .await?;
 
         // Phase 2: load every visible version for the chosen ids.
         let mut groups = self
             .load_groups(
+                feed,
                 &ids,
                 request.include_prerelease,
                 request.include_semver2,
@@ -424,17 +612,25 @@ impl PackageDatabase for SqliteDatabase {
         Ok(SearchPage { total_hits, groups })
     }
 
-    async fn autocomplete(&self, query: &str, skip: i64, take: i64) -> Result<Vec<String>> {
+    async fn autocomplete(
+        &self,
+        feed: &str,
+        query: &str,
+        skip: i64,
+        take: i64,
+    ) -> Result<Vec<String>> {
         let q = query.trim().to_lowercase();
         let pattern = like_pattern(&q);
         let rows = sqlx::query(
-            r#"SELECT MAX(id) AS id FROM packages
-               WHERE listed = 1 AND enabled = 1
-                 AND (?1 = '' OR lower_id LIKE ?2 ESCAPE '\')
-               GROUP BY lower_id
-               ORDER BY lower_id ASC
-               LIMIT ?3 OFFSET ?4"#,
+            r#"SELECT MAX(p.id) AS id FROM packages p JOIN feed_packages fp
+                   ON fp.lower_id = p.lower_id AND fp.normalized_version = p.normalized_version
+               WHERE fp.feed = ?1 AND fp.listed = 1 AND fp.enabled = 1 AND fp.pending = 0
+                 AND (?2 = '' OR p.lower_id LIKE ?3 ESCAPE '\')
+               GROUP BY p.lower_id
+               ORDER BY p.lower_id ASC
+               LIMIT ?4 OFFSET ?5"#,
         )
+        .bind(feed)
         .bind(&q)
         .bind(&pattern)
         .bind(take.max(0))
@@ -444,13 +640,66 @@ impl PackageDatabase for SqliteDatabase {
         Ok(rows.iter().map(|r| r.get::<String, _>("id")).collect())
     }
 
-    async fn all_package_ids(&self) -> Result<Vec<String>> {
+    async fn all_package_ids(&self, feed: &str) -> Result<Vec<String>> {
         let rows = sqlx::query(
-            "SELECT MAX(id) AS id FROM packages GROUP BY lower_id ORDER BY lower_id ASC",
+            r#"SELECT MAX(p.id) AS id FROM packages p JOIN feed_packages fp
+                   ON fp.lower_id = p.lower_id AND fp.normalized_version = p.normalized_version
+               WHERE fp.feed = ?1
+               GROUP BY p.lower_id ORDER BY p.lower_id ASC"#,
         )
+        .bind(feed)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.iter().map(|r| r.get::<String, _>("id")).collect())
+    }
+
+    async fn stats(&self, feed: &str) -> Result<DatabaseStats> {
+        let row = sqlx::query(
+            r#"SELECT
+                   COUNT(DISTINCT p.lower_id)       AS package_count,
+                   COUNT(*)                         AS version_count,
+                   COALESCE(SUM(fp.listed), 0)      AS listed_count,
+                   COALESCE(SUM(p.downloads), 0)    AS total_downloads,
+                   COALESCE(SUM(p.package_size), 0) AS total_size
+               FROM packages p JOIN feed_packages fp
+                   ON fp.lower_id = p.lower_id AND fp.normalized_version = p.normalized_version
+               WHERE fp.feed = ?1 AND fp.enabled = 1 AND fp.pending = 0"#,
+        )
+        .bind(feed)
+        .fetch_one(&self.pool)
+        .await?;
+        let symbol_count: i64 = sqlx::query_scalar(
+            r#"SELECT COUNT(*) FROM symbols s WHERE EXISTS (
+                   SELECT 1 FROM feed_packages fp
+                   WHERE fp.feed = ?1 AND fp.lower_id = s.lower_id
+                     AND fp.normalized_version = s.normalized_version)"#,
+        )
+        .bind(feed)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(DatabaseStats {
+            package_count: row.try_get("package_count")?,
+            version_count: row.try_get("version_count")?,
+            listed_count: row.try_get("listed_count")?,
+            total_downloads: row.try_get("total_downloads")?,
+            total_size: row.try_get("total_size")?,
+            symbol_count,
+        })
+    }
+
+    async fn recent_packages(&self, feed: &str, limit: i64) -> Result<Vec<Package>> {
+        let sql = format!(
+            "{FEED_SELECT} WHERE fp.feed = ?1 AND fp.enabled = 1 AND fp.pending = 0 \
+             ORDER BY p.published DESC LIMIT ?2"
+        );
+        let rows = sqlx::query(&sql)
+            .bind(feed)
+            .bind(limit.max(0))
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter()
+            .map(|r| row_to_feed_package(r).map(|fv| fv.package))
+            .collect()
     }
 
     async fn add_symbol(
@@ -518,39 +767,6 @@ impl PackageDatabase for SqliteDatabase {
                 .await?;
         Ok(result.rows_affected())
     }
-
-    async fn stats(&self) -> Result<DatabaseStats> {
-        let row = sqlx::query(
-            r#"SELECT
-                   COUNT(DISTINCT lower_id)       AS package_count,
-                   COUNT(*)                       AS version_count,
-                   COALESCE(SUM(listed), 0)       AS listed_count,
-                   COALESCE(SUM(downloads), 0)    AS total_downloads,
-                   COALESCE(SUM(package_size), 0) AS total_size
-               FROM packages"#,
-        )
-        .fetch_one(&self.pool)
-        .await?;
-        let symbol_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM symbols")
-            .fetch_one(&self.pool)
-            .await?;
-        Ok(DatabaseStats {
-            package_count: row.try_get("package_count")?,
-            version_count: row.try_get("version_count")?,
-            listed_count: row.try_get("listed_count")?,
-            total_downloads: row.try_get("total_downloads")?,
-            total_size: row.try_get("total_size")?,
-            symbol_count,
-        })
-    }
-
-    async fn recent_packages(&self, limit: i64) -> Result<Vec<Package>> {
-        let rows = sqlx::query("SELECT * FROM packages ORDER BY published DESC LIMIT ?1")
-            .bind(limit.max(0))
-            .fetch_all(&self.pool)
-            .await?;
-        rows.into_iter().map(row_to_package).collect()
-    }
 }
 
 /// Build a `%...%` LIKE pattern, escaping the LIKE metacharacters in `query`.
@@ -599,7 +815,9 @@ fn is_unique_violation(e: &sqlx::Error) -> bool {
         .unwrap_or(false)
 }
 
-fn row_to_package(row: SqliteRow) -> Result<Package> {
+/// Build a [`Package`] from a `packages` row, taking the listed/enabled flags
+/// from explicitly named columns so it works for both global and feed reads.
+fn build_package(row: &SqliteRow, listed: bool, enabled: bool) -> Result<Package> {
     let original_version: String = row.try_get("original_version")?;
     let version =
         NuGetVersion::parse(&original_version).map_err(|e| Error::InvalidVersion(e.to_string()))?;
@@ -616,8 +834,8 @@ fn row_to_package(row: SqliteRow) -> Result<Package> {
     Ok(Package {
         id: row.try_get("id")?,
         version,
-        listed: row.try_get::<i64, _>("listed")? != 0,
-        enabled: row.try_get::<i64, _>("enabled")? != 0,
+        listed,
+        enabled,
         authors,
         description: row.try_get("description")?,
         icon_url: row.try_get("icon_url")?,
@@ -646,9 +864,32 @@ fn row_to_package(row: SqliteRow) -> Result<Package> {
     })
 }
 
+/// A global `packages` row: listed/enabled come from the package's own columns.
+fn row_to_package(row: &SqliteRow) -> Result<Package> {
+    let listed = row.try_get::<i64, _>("listed")? != 0;
+    let enabled = row.try_get::<i64, _>("enabled")? != 0;
+    build_package(row, listed, enabled)
+}
+
+/// A feed-scoped row (package joined to a membership): listed/enabled/pending/
+/// flagged come from the membership's aliased columns.
+fn row_to_feed_package(row: &SqliteRow) -> Result<FeedVersion> {
+    let listed = row.try_get::<i64, _>("m_listed")? != 0;
+    let enabled = row.try_get::<i64, _>("m_enabled")? != 0;
+    let package = build_package(row, listed, enabled)?;
+    Ok(FeedVersion {
+        package,
+        pending: row.try_get::<i64, _>("m_pending")? != 0,
+        flagged: row.try_get::<i64, _>("m_flagged")? != 0,
+        flag_reason: row.try_get("m_flag_reason")?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const FEED: &str = "default";
 
     fn sample(id: &str, version: &str) -> Package {
         Package {
@@ -688,43 +929,158 @@ mod tests {
     async fn add_find_and_duplicate() {
         let db = SqliteDatabase::in_memory().await.unwrap();
         let p = sample("Contoso.Utils", "1.0.0");
-        db.add(&p).await.unwrap();
+        db.add_to_feed(FEED, &p).await.unwrap();
 
-        let found = db.find("contoso.utils", &p.version).await.unwrap().unwrap();
+        let found = db
+            .find(FEED, "contoso.utils", &p.version)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(found.id, "Contoso.Utils");
         assert_eq!(found.package_size, 25_000_000_000);
         assert_eq!(found.license_expression.as_deref(), Some("MIT"));
 
-        // Duplicate insert is rejected.
-        let err = db.add(&p).await.unwrap_err();
+        // Duplicate membership in the same feed is rejected.
+        let err = db.add_to_feed(FEED, &p).await.unwrap_err();
         assert!(matches!(err, Error::PackageAlreadyExists));
+    }
+
+    #[tokio::test]
+    async fn version_in_multiple_feeds_is_not_duplicated() {
+        let db = SqliteDatabase::in_memory().await.unwrap();
+        let p = sample("Shared.Pkg", "1.0.0");
+        db.add_to_feed("dev", &p).await.unwrap();
+        // Same version into a second feed: a new membership, no new package row.
+        db.add_to_feed("stable", &p).await.unwrap();
+
+        assert!(db.exists("dev", "shared.pkg", &p.version).await.unwrap());
+        assert!(db.exists("stable", "shared.pkg", &p.version).await.unwrap());
+        assert!(!db.exists("other", "shared.pkg", &p.version).await.unwrap());
+        assert_eq!(db.feed_count("shared.pkg", &p.version).await.unwrap(), 2);
+
+        // Removing one membership leaves the other (and the global data) intact.
+        assert!(db
+            .remove_membership("dev", "shared.pkg", &p.version)
+            .await
+            .unwrap());
+        assert_eq!(db.feed_count("shared.pkg", &p.version).await.unwrap(), 1);
+        assert!(db
+            .package_data_exists("shared.pkg", &p.version)
+            .await
+            .unwrap());
+        assert!(db
+            .find("stable", "shared.pkg", &p.version)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(db
+            .find("dev", "shared.pkg", &p.version)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn feeds_are_isolated_in_listings() {
+        let db = SqliteDatabase::in_memory().await.unwrap();
+        db.add_to_feed("a", &sample("Only.A", "1.0.0"))
+            .await
+            .unwrap();
+        db.add_to_feed("b", &sample("Only.B", "1.0.0"))
+            .await
+            .unwrap();
+
+        assert_eq!(db.all_package_ids("a").await.unwrap(), vec!["Only.A"]);
+        assert_eq!(db.all_package_ids("b").await.unwrap(), vec!["Only.B"]);
+        let page_a = db.search("a", &SearchRequest::default()).await.unwrap();
+        assert_eq!(page_a.total_hits, 1);
+        assert_eq!(page_a.groups[0].latest().id, "Only.A");
+    }
+
+    #[tokio::test]
+    async fn pending_membership_is_withheld_until_approved() {
+        let db = SqliteDatabase::in_memory().await.unwrap();
+        let p = sample("Ring.Pkg", "1.0.0");
+        db.upsert_package_data(&p).await.unwrap();
+        db.add_membership(&Membership {
+            pending: true,
+            ..Membership::active("stable", &p)
+        })
+        .await
+        .unwrap();
+
+        // Pending: present, but not servable and hidden from listings/search.
+        assert!(db.exists("stable", "ring.pkg", &p.version).await.unwrap());
+        assert!(!db
+            .is_servable("stable", "ring.pkg", &p.version)
+            .await
+            .unwrap());
+        assert!(db
+            .find("stable", "ring.pkg", &p.version)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            db.search("stable", &SearchRequest::default())
+                .await
+                .unwrap()
+                .total_hits,
+            0
+        );
+        // Admin still sees it (as pending).
+        let all = db.find_all_versions("stable", "ring.pkg").await.unwrap();
+        assert_eq!(all.len(), 1);
+        assert!(all[0].pending);
+
+        // Approving clears the gate.
+        assert!(db
+            .approve_membership("stable", "ring.pkg", &p.version)
+            .await
+            .unwrap());
+        assert!(db
+            .is_servable("stable", "ring.pkg", &p.version)
+            .await
+            .unwrap());
+        assert_eq!(
+            db.search("stable", &SearchRequest::default())
+                .await
+                .unwrap()
+                .total_hits,
+            1
+        );
     }
 
     #[tokio::test]
     async fn versions_are_sorted_and_filtered() {
         let db = SqliteDatabase::in_memory().await.unwrap();
         for v in ["1.0.0", "1.0.1", "2.0.0-rc.1", "0.9.0"] {
-            db.add(&sample("Pkg", v)).await.unwrap();
+            db.add_to_feed(FEED, &sample("Pkg", v)).await.unwrap();
         }
-        let all = db.find_versions("pkg", false).await.unwrap();
+        let all = db.find_versions(FEED, "pkg", false).await.unwrap();
         let versions: Vec<String> = all.iter().map(|p| p.normalized_version()).collect();
         assert_eq!(versions, vec!["0.9.0", "1.0.0", "1.0.1", "2.0.0-rc.1"]);
 
         // Hide an unlisted version.
         let v = NuGetVersion::parse("1.0.1").unwrap();
-        assert!(db.set_listed("pkg", &v, false).await.unwrap());
-        let listed = db.find_versions("pkg", false).await.unwrap();
+        assert!(db.set_listed(FEED, "pkg", &v, false).await.unwrap());
+        let listed = db.find_versions(FEED, "pkg", false).await.unwrap();
         assert_eq!(listed.len(), 3);
-        let with_unlisted = db.find_versions("pkg", true).await.unwrap();
+        let with_unlisted = db.find_versions(FEED, "pkg", true).await.unwrap();
         assert_eq!(with_unlisted.len(), 4);
     }
 
     #[tokio::test]
     async fn search_groups_and_ranks() {
         let db = SqliteDatabase::in_memory().await.unwrap();
-        db.add(&sample("Alpha.Tools", "1.0.0")).await.unwrap();
-        db.add(&sample("Alpha.Tools", "1.1.0")).await.unwrap();
-        db.add(&sample("Beta.Lib", "2.0.0")).await.unwrap();
+        db.add_to_feed(FEED, &sample("Alpha.Tools", "1.0.0"))
+            .await
+            .unwrap();
+        db.add_to_feed(FEED, &sample("Alpha.Tools", "1.1.0"))
+            .await
+            .unwrap();
+        db.add_to_feed(FEED, &sample("Beta.Lib", "2.0.0"))
+            .await
+            .unwrap();
         // Give Beta.Lib more downloads so it ranks first.
         let v = NuGetVersion::parse("2.0.0").unwrap();
         for _ in 0..5 {
@@ -732,10 +1088,13 @@ mod tests {
         }
 
         let page = db
-            .search(&SearchRequest {
-                query: String::new(),
-                ..Default::default()
-            })
+            .search(
+                FEED,
+                &SearchRequest {
+                    query: String::new(),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(page.total_hits, 2);
@@ -745,10 +1104,13 @@ mod tests {
 
         // Targeted query.
         let page = db
-            .search(&SearchRequest {
-                query: "alpha".into(),
-                ..Default::default()
-            })
+            .search(
+                FEED,
+                &SearchRequest {
+                    query: "alpha".into(),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(page.total_hits, 1);
@@ -758,12 +1120,17 @@ mod tests {
     #[tokio::test]
     async fn prerelease_filter_hides_prereleases() {
         let db = SqliteDatabase::in_memory().await.unwrap();
-        db.add(&sample("Only.Pre", "1.0.0-alpha")).await.unwrap();
+        db.add_to_feed(FEED, &sample("Only.Pre", "1.0.0-alpha"))
+            .await
+            .unwrap();
         let page = db
-            .search(&SearchRequest {
-                include_prerelease: false,
-                ..Default::default()
-            })
+            .search(
+                FEED,
+                &SearchRequest {
+                    include_prerelease: false,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(page.total_hits, 0);
@@ -772,66 +1139,76 @@ mod tests {
     #[tokio::test]
     async fn delete_and_autocomplete() {
         let db = SqliteDatabase::in_memory().await.unwrap();
-        db.add(&sample("Contoso.Cli", "1.0.0")).await.unwrap();
-        db.add(&sample("Contoso.Core", "1.0.0")).await.unwrap();
+        db.add_to_feed(FEED, &sample("Contoso.Cli", "1.0.0"))
+            .await
+            .unwrap();
+        db.add_to_feed(FEED, &sample("Contoso.Core", "1.0.0"))
+            .await
+            .unwrap();
 
-        let ac = db.autocomplete("contoso", 0, 20).await.unwrap();
+        let ac = db.autocomplete(FEED, "contoso", 0, 20).await.unwrap();
         assert_eq!(ac.len(), 2);
         assert!(ac.contains(&"Contoso.Cli".to_string()));
 
         let v = NuGetVersion::parse("1.0.0").unwrap();
-        assert!(db.delete("contoso.cli", &v).await.unwrap());
-        assert!(!db.exists("contoso.cli", &v).await.unwrap());
-        let ac = db.autocomplete("contoso", 0, 20).await.unwrap();
+        assert!(db.delete_package_data("contoso.cli", &v).await.unwrap());
+        assert!(!db.exists(FEED, "contoso.cli", &v).await.unwrap());
+        let ac = db.autocomplete(FEED, "contoso", 0, 20).await.unwrap();
         assert_eq!(ac, vec!["Contoso.Core".to_string()]);
     }
 
     #[tokio::test]
     async fn disabled_versions_are_hidden_but_present() {
         let db = SqliteDatabase::in_memory().await.unwrap();
-        db.add(&sample("Pkg", "1.0.0")).await.unwrap();
-        db.add(&sample("Pkg", "2.0.0")).await.unwrap();
+        db.add_to_feed(FEED, &sample("Pkg", "1.0.0")).await.unwrap();
+        db.add_to_feed(FEED, &sample("Pkg", "2.0.0")).await.unwrap();
         let v1 = NuGetVersion::parse("1.0.0").unwrap();
 
         // Disable 1.0.0 — hidden from public listings, search and serving.
-        assert!(db.set_enabled("pkg", &v1, false).await.unwrap());
-        assert!(!db.is_servable("pkg", &v1).await.unwrap());
+        assert!(db.set_enabled(FEED, "pkg", &v1, false).await.unwrap());
+        assert!(!db.is_servable(FEED, "pkg", &v1).await.unwrap());
         assert!(db
-            .is_servable("pkg", &NuGetVersion::parse("2.0.0").unwrap())
+            .is_servable(FEED, "pkg", &NuGetVersion::parse("2.0.0").unwrap())
             .await
             .unwrap());
-        assert!(db.find("pkg", &v1).await.unwrap().is_none());
+        assert!(db.find(FEED, "pkg", &v1).await.unwrap().is_none());
 
-        let listed = db.find_versions("pkg", true).await.unwrap();
+        let listed = db.find_versions(FEED, "pkg", true).await.unwrap();
         assert_eq!(listed.len(), 1); // only 2.0.0
-        let page = db.search(&SearchRequest::default()).await.unwrap();
+        let page = db.search(FEED, &SearchRequest::default()).await.unwrap();
         assert_eq!(page.groups[0].packages.len(), 1);
 
         // But it still exists and admin listing shows it.
-        assert!(db.exists("pkg", &v1).await.unwrap());
-        let all = db.find_all_versions("pkg").await.unwrap();
+        assert!(db.exists(FEED, "pkg", &v1).await.unwrap());
+        let all = db.find_all_versions(FEED, "pkg").await.unwrap();
         assert_eq!(all.len(), 2);
-        assert!(all.iter().any(|p| !p.enabled));
+        assert!(all.iter().any(|p| !p.package.enabled));
 
         // Re-enable restores visibility.
-        assert!(db.set_enabled("pkg", &v1, true).await.unwrap());
-        assert!(db.is_servable("pkg", &v1).await.unwrap());
-        assert_eq!(db.find_versions("pkg", true).await.unwrap().len(), 2);
+        assert!(db.set_enabled(FEED, "pkg", &v1, true).await.unwrap());
+        assert!(db.is_servable(FEED, "pkg", &v1).await.unwrap());
+        assert_eq!(db.find_versions(FEED, "pkg", true).await.unwrap().len(), 2);
     }
 
     #[tokio::test]
     async fn all_package_ids_and_stats() {
         let db = SqliteDatabase::in_memory().await.unwrap();
-        db.add(&sample("Alpha", "1.0.0")).await.unwrap();
-        db.add(&sample("Alpha", "1.1.0")).await.unwrap();
-        db.add(&sample("Beta", "2.0.0")).await.unwrap();
+        db.add_to_feed(FEED, &sample("Alpha", "1.0.0"))
+            .await
+            .unwrap();
+        db.add_to_feed(FEED, &sample("Alpha", "1.1.0"))
+            .await
+            .unwrap();
+        db.add_to_feed(FEED, &sample("Beta", "2.0.0"))
+            .await
+            .unwrap();
         let v = NuGetVersion::parse("2.0.0").unwrap();
         db.increment_downloads("beta", &v).await.unwrap();
 
-        let ids = db.all_package_ids().await.unwrap();
+        let ids = db.all_package_ids(FEED).await.unwrap();
         assert_eq!(ids, vec!["Alpha".to_string(), "Beta".to_string()]);
 
-        let stats = db.stats().await.unwrap();
+        let stats = db.stats(FEED).await.unwrap();
         assert_eq!(stats.package_count, 2);
         assert_eq!(stats.version_count, 3);
         assert_eq!(stats.listed_count, 3);
@@ -846,18 +1223,18 @@ mod tests {
         let mut older = sample("Old", "1.0.0");
         older.published = Utc::now() - chrono::Duration::days(5);
         let newer = sample("New", "1.0.0");
-        db.add(&older).await.unwrap();
-        db.add(&newer).await.unwrap();
-        let recent = db.recent_packages(10).await.unwrap();
+        db.add_to_feed(FEED, &older).await.unwrap();
+        db.add_to_feed(FEED, &newer).await.unwrap();
+        let recent = db.recent_packages(FEED, 10).await.unwrap();
         assert_eq!(recent[0].id, "New");
         assert_eq!(recent[1].id, "Old");
-        assert_eq!(db.recent_packages(1).await.unwrap().len(), 1);
+        assert_eq!(db.recent_packages(FEED, 1).await.unwrap().len(), 1);
     }
 
     #[tokio::test]
     async fn symbol_mappings_round_trip_and_clean_up() {
         let db = SqliteDatabase::in_memory().await.unwrap();
-        db.add(&sample("Sym", "1.0.0")).await.unwrap();
+        db.add_to_feed(FEED, &sample("Sym", "1.0.0")).await.unwrap();
         let v = NuGetVersion::parse("1.0.0").unwrap();
 
         db.add_symbol("ABCDEF01FFFFFFFF", "sym.pdb", "Sym", &v)
@@ -886,7 +1263,9 @@ mod tests {
     async fn ensure_column_is_idempotent() {
         // Re-opening (which re-runs migrations) must not fail or drop data.
         let db = SqliteDatabase::in_memory().await.unwrap();
-        db.add(&sample("Keep", "1.0.0")).await.unwrap();
+        db.add_to_feed(FEED, &sample("Keep", "1.0.0"))
+            .await
+            .unwrap();
         ensure_column(
             &db.pool,
             "packages",
@@ -903,7 +1282,7 @@ mod tests {
             .await
             .unwrap();
         assert!(db
-            .find("keep", &NuGetVersion::parse("1.0.0").unwrap())
+            .find(FEED, "keep", &NuGetVersion::parse("1.0.0").unwrap())
             .await
             .unwrap()
             .is_some());
