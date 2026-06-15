@@ -1,12 +1,14 @@
 //! YANuget server binary.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use clap::Parser;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use yanuget::config::Config;
 use yanuget::database::SqliteDatabase;
+use yanuget::retention::{self, RetentionPolicy};
 use yanuget::storage::FilesystemStorage;
 use yanuget::web::{self, AppState};
 
@@ -43,6 +45,32 @@ async fn main() -> anyhow::Result<()> {
     let config = Arc::new(config);
 
     let state = AppState::new(storage, db, config.clone()).await?;
+
+    // Background retention sweep: periodically prune old versions per policy.
+    if config.retention.enabled
+        && config.retention.interval_hours > 0
+        && config.retention.has_limits()
+    {
+        let storage = state.storage.clone();
+        let db = state.db.clone();
+        let cfg = config.clone();
+        tracing::info!(
+            interval_hours = cfg.retention.interval_hours,
+            "package retention sweep enabled"
+        );
+        tokio::spawn(async move {
+            let policy = RetentionPolicy::from(&cfg.retention);
+            let mut tick =
+                tokio::time::interval(Duration::from_secs(cfg.retention.interval_hours * 3600));
+            loop {
+                tick.tick().await;
+                if let Err(e) = retention::prune_all(storage.as_ref(), db.as_ref(), &policy).await {
+                    tracing::error!(error = %e, "retention sweep failed");
+                }
+            }
+        });
+    }
+
     let app = web::router(state);
 
     let addr = config.socket_addr();

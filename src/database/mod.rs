@@ -100,4 +100,43 @@ pub trait PackageDatabase: Send + Sync {
 
     /// Autocomplete package ids by prefix/substring.
     async fn autocomplete(&self, query: &str, skip: i64, take: i64) -> Result<Vec<String>>;
+
+    /// Every distinct package id (original casing), ascending. Used by the
+    /// retention sweep, which must visit packages search would not rank/return.
+    async fn all_package_ids(&self) -> Result<Vec<String>>;
+
+    /// Record a symbol-file mapping: its SSQP `key`/`filename` and the owning
+    /// package version (for cleanup on delete/retention).
+    async fn add_symbol(
+        &self,
+        key: &str,
+        filename: &str,
+        id: &str,
+        version: &NuGetVersion,
+    ) -> Result<()>;
+
+    /// Resolve a symbol file by its SSQP key and filename, returning the owning
+    /// package's lower-cased id and normalized version when present.
+    async fn find_symbol(&self, key: &str, filename: &str) -> Result<Option<SymbolRef>>;
+
+    /// All symbol `(key, filename)` pairs owned by a package version.
+    async fn find_symbols(&self, id: &str, version: &NuGetVersion) -> Result<Vec<SymbolKey>>;
+
+    /// Remove all symbol mappings for a package version. Returns how many rows
+    /// were removed.
+    async fn delete_symbols(&self, id: &str, version: &NuGetVersion) -> Result<u64>;
+}
+
+/// A symbol file's owning package, resolved from an SSQP lookup.
+#[derive(Debug, Clone)]
+pub struct SymbolRef {
+    pub lower_id: String,
+    pub normalized_version: String,
+}
+
+/// The storage address of one symbol file.
+#[derive(Debug, Clone)]
+pub struct SymbolKey {
+    pub key: String,
+    pub filename: String,
 }

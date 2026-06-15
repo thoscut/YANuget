@@ -1,6 +1,7 @@
 //! The HTTP layer: application state, routing and request handlers.
 
 mod files;
+mod ui;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -21,8 +22,10 @@ use crate::database::{PackageDatabase, SearchRequest};
 use crate::error::{Error, Result};
 use crate::indexing::{self, IndexOptions};
 use crate::nuget::{self, UrlBuilder};
+use crate::retention::{self, RetentionPolicy};
 use crate::storage::{AuxFile, PackageContent, PackageStorage};
 use crate::streaming::{self, StreamSummary};
+use crate::symbols;
 use crate::version::NuGetVersion;
 
 const NUPKG_CONTENT_TYPE: &str = "application/octet-stream";
@@ -86,8 +89,7 @@ impl AppState {
 
 /// Build the application router.
 pub fn router(state: AppState) -> Router {
-    Router::new()
-        .route("/", get(index_page))
+    let mut router = Router::new()
         .route("/health", get(health))
         .route("/v3/index.json", get(service_index))
         .route("/api/v2/package", put(push_package))
@@ -103,7 +105,30 @@ pub fn router(state: AppState) -> Router {
         .route("/v3/registration/{id}/index.json", get(registration_index))
         .route("/v3/registration/{id}/{version}", get(registration_leaf))
         .route("/v3/search", get(search))
-        .route("/v3/autocomplete", get(autocomplete))
+        .route("/v3/autocomplete", get(autocomplete));
+
+    // Symbol server: push `.snupkg` and serve PDBs over the SSQP path.
+    if state.config.enable_symbol_server {
+        router = router
+            .route("/api/v2/symbol", put(push_symbol_package))
+            .route(
+                "/download/symbols/{file}/{key}/{file2}",
+                get(download_symbol),
+            );
+    }
+
+    // Human-facing gallery. When disabled, `/` falls back to a minimal page.
+    if state.config.enable_web_ui {
+        router = router
+            .route("/", get(gallery))
+            .route("/packages", get(gallery))
+            .route("/packages/{id}", get(package_detail))
+            .route("/packages/{id}/{version}", get(package_detail_version));
+    } else {
+        router = router.route("/", get(index_page));
+    }
+
+    router
         // Uploads stream straight to disk; remove axum's small default cap so
         // multi-gigabyte packages are accepted (the configured size limit is
         // still enforced while streaming).
@@ -176,7 +201,7 @@ async fn push_package(State(state): State<AppState>, request: Request) -> Result
     let options = IndexOptions {
         allow_overwrite: state.config.allow_overwrite,
     };
-    indexing::index_package(
+    let result = indexing::index_package(
         state.storage.as_ref(),
         state.db.as_ref(),
         temp_path,
@@ -184,6 +209,22 @@ async fn push_package(State(state): State<AppState>, request: Request) -> Result
         &options,
     )
     .await?;
+
+    // Optionally prune older versions of this id (best-effort: never fail the
+    // push because of retention).
+    if state.config.retention.enabled && state.config.retention.prune_on_push {
+        let policy = RetentionPolicy::from(&state.config.retention);
+        if let Err(e) = retention::prune_package(
+            state.storage.as_ref(),
+            state.db.as_ref(),
+            &result.id,
+            &policy,
+        )
+        .await
+        {
+            tracing::error!(id = %result.id, error = %e, "prune-on-push failed");
+        }
+    }
 
     Ok(StatusCode::CREATED.into_response())
 }
@@ -234,8 +275,10 @@ async fn delete_package(
     let version = parse_version(&version)?;
 
     if state.config.hard_delete_enabled {
-        let removed = state.db.delete(&id, &version).await?;
-        let _ = state.storage.delete(&id, &version.normalized()).await;
+        // Hard delete removes the payload, sidecars and any indexed symbols.
+        let removed =
+            retention::purge_version(state.storage.as_ref(), state.db.as_ref(), &id, &version)
+                .await?;
         if removed {
             Ok(StatusCode::NO_CONTENT)
         } else {
@@ -433,6 +476,159 @@ async fn autocomplete(
         .await?;
     let total = ids.len() as i64;
     Ok(Json(nuget::autocomplete_response(&ids, total)))
+}
+
+// ---------------------------------------------------------------------------
+// Symbol server
+// ---------------------------------------------------------------------------
+
+async fn push_symbol_package(State(state): State<AppState>, request: Request) -> Result<Response> {
+    let headers = request.headers().clone();
+    if !state.auth.check_headers(&headers) {
+        return Err(Error::Unauthorized);
+    }
+
+    let is_multipart = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.starts_with("multipart/"))
+        .unwrap_or(false);
+
+    let (temp_path, mut file) = state.create_temp().await?;
+    let limit = state.config.max_package_size_bytes;
+
+    if let Err(e) = write_upload(request, &mut file, is_multipart, limit, &state).await {
+        let _ = tokio::fs::remove_file(&temp_path).await;
+        return Err(e);
+    }
+    drop(file);
+
+    let result =
+        symbols::index_symbol_package(state.storage.as_ref(), state.db.as_ref(), temp_path).await?;
+    tracing::info!(
+        id = %result.id,
+        version = %result.version.normalized(),
+        indexed = result.indexed,
+        skipped = result.skipped,
+        "indexed symbol package",
+    );
+    Ok(StatusCode::CREATED.into_response())
+}
+
+async fn download_symbol(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((file, key, file2)): Path<(String, String, String)>,
+) -> Result<Response> {
+    // The SSQP path repeats the file name; both segments must agree.
+    if !file.eq_ignore_ascii_case(&file2) {
+        return Err(Error::PackageNotFound);
+    }
+    let content = state.storage.get_symbol(&key, &file).await?;
+    match content {
+        PackageContent::LocalPath(path) => {
+            files::serve_local_file(path, &headers, NUPKG_CONTENT_TYPE, None).await
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Web gallery (HTML)
+// ---------------------------------------------------------------------------
+
+async fn gallery(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<SearchParams>,
+) -> Result<Html<String>> {
+    let query = params.q.unwrap_or_default();
+    let request = SearchRequest {
+        query: query.clone(),
+        skip: params.skip.unwrap_or(0).max(0),
+        take: params.take.unwrap_or(50).clamp(1, MAX_SEARCH_TAKE),
+        include_prerelease: params.prerelease.unwrap_or(true),
+        include_semver2: true,
+        package_type: params.package_type.filter(|s| !s.is_empty()),
+    };
+    let page = state.db.search(&request).await?;
+    let urls = state.url_builder(&headers);
+    Ok(Html(ui::gallery_page(&urls, &page, query.trim())))
+}
+
+async fn package_detail(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Html<String>> {
+    render_detail(&state, &headers, &id, None).await
+}
+
+async fn package_detail_version(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((id, version)): Path<(String, String)>,
+) -> Result<Html<String>> {
+    render_detail(&state, &headers, &id, Some(&version)).await
+}
+
+async fn render_detail(
+    state: &AppState,
+    headers: &HeaderMap,
+    id: &str,
+    version: Option<&str>,
+) -> Result<Html<String>> {
+    let packages = state.db.find_versions(id, true).await?;
+    if packages.is_empty() {
+        return Err(Error::PackageNotFound);
+    }
+
+    // `find_versions` returns ascending; the selected version is the requested
+    // one, or otherwise the newest listed version (falling back to the newest).
+    let selected = match version {
+        Some(v) => {
+            let want = parse_version(v)?;
+            packages
+                .iter()
+                .find(|p| p.version == want)
+                .cloned()
+                .ok_or(Error::PackageNotFound)?
+        }
+        None => packages
+            .iter()
+            .rev()
+            .find(|p| p.listed)
+            .or_else(|| packages.last())
+            .cloned()
+            .ok_or(Error::PackageNotFound)?,
+    };
+
+    let readme = if selected.has_readme {
+        state
+            .storage
+            .get_aux(id, &selected.normalized_version(), AuxFile::Readme)
+            .await
+            .ok()
+            .and_then(|b| String::from_utf8(b).ok())
+    } else {
+        None
+    };
+
+    let has_symbols = !state
+        .db
+        .find_symbols(id, &selected.version)
+        .await
+        .unwrap_or_default()
+        .is_empty();
+
+    let urls = state.url_builder(headers);
+    Ok(Html(ui::detail_page(
+        &urls,
+        &packages,
+        &selected,
+        readme.as_deref(),
+        &state.config.primary_client,
+        has_symbols,
+    )))
 }
 
 // ---------------------------------------------------------------------------

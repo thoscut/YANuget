@@ -42,6 +42,57 @@ pub struct Config {
     pub allow_overwrite: bool,
     /// Whether `DELETE` hard-deletes (true) or merely unlists (false).
     pub hard_delete_enabled: bool,
+    /// Whether the symbol server (push `.snupkg`, serve PDBs) is enabled.
+    pub enable_symbol_server: bool,
+    /// Whether the human-facing web gallery (`/`, `/packages/...`) is enabled.
+    pub enable_web_ui: bool,
+    /// Which client the gallery shows first in its "install" snippet. One of
+    /// `choco`, `dotnet`, `nuget`. Defaults to `choco`.
+    pub primary_client: String,
+    /// Automatic pruning of old package versions.
+    pub retention: RetentionConfig,
+}
+
+/// Configuration for the package retention sweep.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RetentionConfig {
+    /// Master switch. Off by default — retention is destructive.
+    pub enabled: bool,
+    /// Also run the policy for a package id immediately after each push.
+    pub prune_on_push: bool,
+    /// How often the background sweep runs, in hours. `0` disables the sweep
+    /// (push-time pruning, if enabled, still applies).
+    pub interval_hours: u64,
+    /// Keep at most this many of the newest stable versions per id.
+    pub keep_latest_stable: Option<usize>,
+    /// Keep at most this many of the newest pre-release versions per id.
+    pub keep_latest_prerelease: Option<usize>,
+    /// Delete versions published more than this many days ago.
+    pub max_age_days: Option<u64>,
+}
+
+impl Default for RetentionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            prune_on_push: false,
+            interval_hours: 24,
+            keep_latest_stable: None,
+            keep_latest_prerelease: None,
+            max_age_days: None,
+        }
+    }
+}
+
+impl RetentionConfig {
+    /// Whether any actual limit is configured. With none set, the sweep would
+    /// never prune anything, so callers can skip it entirely.
+    pub fn has_limits(&self) -> bool {
+        self.keep_latest_stable.is_some()
+            || self.keep_latest_prerelease.is_some()
+            || self.max_age_days.is_some()
+    }
 }
 
 impl Default for Config {
@@ -57,6 +108,10 @@ impl Default for Config {
             max_package_size_bytes: None,
             allow_overwrite: false,
             hard_delete_enabled: false,
+            enable_symbol_server: true,
+            enable_web_ui: true,
+            primary_client: "choco".to_string(),
+            retention: RetentionConfig::default(),
         }
     }
 }
@@ -112,6 +167,37 @@ impl Config {
         }
         if let Ok(v) = std::env::var("YANUGET_HARD_DELETE_ENABLED") {
             self.hard_delete_enabled = truthy(&v);
+        }
+        if let Ok(v) = std::env::var("YANUGET_ENABLE_SYMBOL_SERVER") {
+            self.enable_symbol_server = truthy(&v);
+        }
+        if let Ok(v) = std::env::var("YANUGET_ENABLE_WEB_UI") {
+            self.enable_web_ui = truthy(&v);
+        }
+        if let Ok(v) = std::env::var("YANUGET_PRIMARY_CLIENT") {
+            if !v.trim().is_empty() {
+                self.primary_client = v.trim().to_ascii_lowercase();
+            }
+        }
+        if let Ok(v) = std::env::var("YANUGET_RETENTION_ENABLED") {
+            self.retention.enabled = truthy(&v);
+        }
+        if let Ok(v) = std::env::var("YANUGET_RETENTION_PRUNE_ON_PUSH") {
+            self.retention.prune_on_push = truthy(&v);
+        }
+        if let Ok(v) = std::env::var("YANUGET_RETENTION_INTERVAL_HOURS") {
+            if let Ok(n) = v.parse() {
+                self.retention.interval_hours = n;
+            }
+        }
+        if let Ok(v) = std::env::var("YANUGET_RETENTION_KEEP_LATEST_STABLE") {
+            self.retention.keep_latest_stable = v.parse().ok();
+        }
+        if let Ok(v) = std::env::var("YANUGET_RETENTION_KEEP_LATEST_PRERELEASE") {
+            self.retention.keep_latest_prerelease = v.parse().ok();
+        }
+        if let Ok(v) = std::env::var("YANUGET_RETENTION_MAX_AGE_DAYS") {
+            self.retention.max_age_days = v.parse().ok();
         }
     }
 

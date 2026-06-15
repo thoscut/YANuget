@@ -1,0 +1,482 @@
+//! Server-rendered HTML for the human-facing package gallery.
+//!
+//! These are pure functions that turn domain types into HTML strings, mirroring
+//! how [`crate::nuget`] turns them into JSON. There is no template engine; HTML
+//! is assembled with `format!` and **every** value derived from package data is
+//! run through [`escape_html`] to prevent stored XSS.
+//!
+//! The gallery is geared towards Chocolatey: the install snippet shown first is
+//! the `choco install` command (configurable via `primary_client`).
+
+use crate::models::{Package, PackageType};
+use crate::nuget::UrlBuilder;
+
+/// Minimal, dependency-free styling, inlined so the UI needs no static assets
+/// and works fully offline.
+const STYLE: &str = "\
+:root{--bg:#0d1117;--card:#161b22;--border:#30363d;--fg:#e6edf3;--muted:#8b949e;\
+--accent:#58a6ff;--accent2:#1f6feb;--code:#010409}\
+*{box-sizing:border-box}\
+body{margin:0;background:var(--bg);color:var(--fg);\
+font:15px/1.55 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif}\
+a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}\
+header{background:var(--card);border-bottom:1px solid var(--border);padding:14px 0}\
+.wrap{max-width:980px;margin:0 auto;padding:0 20px}\
+header .wrap{display:flex;align-items:center;gap:16px}\
+.logo{font-weight:700;font-size:20px;color:var(--fg)}\
+.logo span{color:var(--accent)}\
+form.search{flex:1;display:flex;gap:8px}\
+input[type=search]{flex:1;padding:9px 12px;border-radius:6px;border:1px solid var(--border);\
+background:var(--bg);color:var(--fg);font-size:15px}\
+button{padding:9px 16px;border-radius:6px;border:1px solid var(--accent2);\
+background:var(--accent2);color:#fff;font-size:15px;cursor:pointer}\
+button:hover{background:#2d76f0}\
+main{padding:26px 0 60px}\
+.card{background:var(--card);border:1px solid var(--border);border-radius:10px;\
+padding:18px 20px;margin:0 0 14px}\
+.card h2{margin:0 0 4px;font-size:18px}\
+.meta{color:var(--muted);font-size:13px;margin:2px 0}\
+.tags{margin-top:8px}\
+.tag{display:inline-block;background:#21262d;border:1px solid var(--border);border-radius:20px;\
+padding:1px 10px;font-size:12px;color:var(--muted);margin:0 4px 4px 0}\
+.muted{color:var(--muted)}\
+.grid{display:grid;grid-template-columns:1fr 280px;gap:22px}\
+@media(max-width:760px){.grid{grid-template-columns:1fr}}\
+.side .card{position:sticky;top:20px}\
+h1.title{font-size:26px;margin:0 0 2px}\
+pre{background:var(--code);border:1px solid var(--border);border-radius:8px;padding:12px 14px;\
+overflow:auto;font-size:13px;margin:6px 0}\
+code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}\
+.install h3{margin:14px 0 4px;font-size:13px;text-transform:uppercase;letter-spacing:.4px;color:var(--muted)}\
+.install .primary h3{color:var(--accent)}\
+.versions{list-style:none;margin:0;padding:0;max-height:340px;overflow:auto}\
+.versions li{display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid var(--border)}\
+.versions a.sel{font-weight:700}\
+table.deps{width:100%;border-collapse:collapse;font-size:13px}\
+table.deps td{padding:3px 8px 3px 0}\
+.readme{white-space:pre-wrap;word-wrap:break-word}\
+.empty{text-align:center;color:var(--muted);padding:60px 0}\
+.kv{font-size:13px}.kv div{padding:3px 0;border-bottom:1px solid var(--border)}\
+.kv b{color:var(--muted);font-weight:500;display:inline-block;min-width:96px}\
+footer{border-top:1px solid var(--border);color:var(--muted);font-size:13px;padding:18px 0}\
+";
+
+/// Escape the five HTML-significant characters.
+pub fn escape_html(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Wrap a page body in the shared layout (head, header bar, footer).
+fn layout(urls: &UrlBuilder, title: &str, query: &str, body: &str) -> String {
+    format!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
+<title>{title}</title><style>{STYLE}</style></head><body>\
+<header><div class=\"wrap\">\
+<a class=\"logo\" href=\"/\">YA<span>NuGet</span></a>\
+<form class=\"search\" action=\"/packages\" method=\"get\">\
+<input type=\"search\" name=\"q\" placeholder=\"Search packages\u{2026}\" value=\"{q}\">\
+<button type=\"submit\">Search</button></form>\
+</div></header>\
+<main><div class=\"wrap\">{body}</div></main>\
+<footer><div class=\"wrap\">Served by YANuget \u{2014} \
+<a href=\"{idx}\">v3 service index</a></div></footer>\
+</body></html>",
+        title = escape_html(title),
+        q = escape_html(query),
+        idx = escape_html(&urls.service_index()),
+    )
+}
+
+/// The gallery / search-results page.
+pub fn gallery_page(urls: &UrlBuilder, page: &crate::database::SearchPage, query: &str) -> String {
+    let body = if page.groups.is_empty() {
+        let what = if query.trim().is_empty() {
+            "No packages have been published yet.".to_string()
+        } else {
+            format!("No packages match \u{201c}{}\u{201d}.", escape_html(query))
+        };
+        format!(
+            "<div class=\"empty\"><p>{what}</p><p class=\"muted\">Push one with \
+            <code>dotnet nuget push</code> or <code>choco push</code>.</p></div>"
+        )
+    } else {
+        let mut cards = String::new();
+        let heading = if query.trim().is_empty() {
+            format!("{} package(s)", page.total_hits)
+        } else {
+            format!(
+                "{} result(s) for \u{201c}{}\u{201d}",
+                page.total_hits,
+                escape_html(query)
+            )
+        };
+        cards.push_str(&format!("<p class=\"muted\">{heading}</p>"));
+        for group in &page.groups {
+            let p = group.latest();
+            let id = escape_html(&p.id);
+            let url = format!("/packages/{}", enc_path(&p.lower_id()));
+            let authors = if p.authors.is_empty() {
+                String::new()
+            } else {
+                format!(" \u{2022} by {}", escape_html(&p.authors.join(", ")))
+            };
+            cards.push_str(&format!(
+                "<div class=\"card\"><h2><a href=\"{url}\">{id}</a> \
+                 <span class=\"muted\">{ver}</span></h2>\
+                 <div class=\"meta\">{dl} downloads{authors}</div>\
+                 <p>{desc}</p>{tags}</div>",
+                ver = escape_html(&p.normalized_version()),
+                dl = group.total_downloads(),
+                desc = escape_html(&truncate(&p.description, 240)),
+                tags = render_tags(&p.tags),
+            ));
+        }
+        cards
+    };
+    layout(urls, "YANuget", query, &body)
+}
+
+/// The package detail page for one selected version.
+pub fn detail_page(
+    urls: &UrlBuilder,
+    packages: &[Package],
+    selected: &Package,
+    readme: Option<&str>,
+    primary_client: &str,
+    has_symbols: bool,
+) -> String {
+    let id = escape_html(&selected.id);
+    let version = selected.normalized_version();
+    let lower = selected.lower_id();
+
+    // Version list (newest first), linking each to its own detail page.
+    let mut versions = String::from("<ul class=\"versions\">");
+    let mut ordered: Vec<&Package> = packages.iter().collect();
+    ordered.sort_by(|a, b| b.version.cmp(&a.version));
+    for p in ordered {
+        let v = p.normalized_version();
+        let sel = if v == version { " class=\"sel\"" } else { "" };
+        let unlisted = if p.listed {
+            ""
+        } else {
+            " <span class=\"muted\">(unlisted)</span>"
+        };
+        versions.push_str(&format!(
+            "<li><a{sel} href=\"/packages/{lid}/{ev}\">{dv}</a>{unlisted}<span class=\"muted\">{dls}</span></li>",
+            lid = enc_path(&lower),
+            ev = enc_path(&v),
+            dv = escape_html(&v),
+            dls = p.downloads,
+        ));
+    }
+    versions.push_str("</ul>");
+
+    let main = format!(
+        "<h1 class=\"title\">{id}</h1>\
+         <div class=\"meta\">{version} \u{2022} {dl} downloads \u{2022} published {pub}</div>\
+         <p>{desc}</p>{tags}{links}{deps}{symbols}{readme}",
+        version = escape_html(&version),
+        dl = selected.downloads,
+        pub = escape_html(&selected.published.format("%Y-%m-%d").to_string()),
+        desc = escape_html(&selected.description),
+        tags = render_tags(&selected.tags),
+        links = render_links(selected),
+        deps = render_dependencies(selected),
+        symbols = if has_symbols {
+            "<p class=\"muted\">\u{1f50e} Debug symbols are available for this package.</p>"
+        } else {
+            ""
+        },
+        readme = render_readme(readme),
+    );
+
+    let side = format!(
+        "<div class=\"card install\">{install}</div>\
+         <div class=\"card\"><h3 class=\"muted\">Info</h3>{info}</div>\
+         <div class=\"card\"><h3 class=\"muted\">Versions</h3>{versions}</div>",
+        install = render_install(urls, selected, primary_client),
+        info = render_info(selected),
+    );
+
+    let body = format!(
+        "<div class=\"grid\"><div class=\"content\">{main}</div><div class=\"side\">{side}</div></div>"
+    );
+    layout(urls, &format!("{} {}", selected.id, version), "", &body)
+}
+
+fn render_install(urls: &UrlBuilder, p: &Package, primary_client: &str) -> String {
+    let idx = escape_html(&urls.service_index());
+    let id = escape_html(&p.id);
+    let ver = escape_html(&p.normalized_version());
+
+    let choco = (
+        "Chocolatey",
+        format!("choco install {id} --version {ver} --source {idx}"),
+    );
+    let dotnet = (
+        "dotnet CLI",
+        format!("dotnet add package {id} --version {ver} --source {idx}"),
+    );
+    let nuget = (
+        "nuget.exe",
+        format!("nuget install {id} -Version {ver} -Source {idx}"),
+    );
+
+    let mut snippets = match primary_client {
+        "dotnet" => vec![dotnet, choco, nuget],
+        "nuget" => vec![nuget, choco, dotnet],
+        _ => vec![choco, dotnet, nuget],
+    };
+    // The first snippet is highlighted as the primary one.
+    let mut out = String::new();
+    for (i, (label, cmd)) in snippets.drain(..).enumerate() {
+        let cls = if i == 0 { " class=\"primary\"" } else { "" };
+        out.push_str(&format!(
+            "<div{cls}><h3>{label}</h3><pre><code>{cmd}</code></pre></div>",
+            cmd = escape_html(&cmd),
+        ));
+    }
+    out
+}
+
+fn render_info(p: &Package) -> String {
+    let mut rows = String::from("<div class=\"kv\">");
+    rows.push_str(&format!(
+        "<div><b>Version</b>{}</div>",
+        escape_html(&p.normalized_version())
+    ));
+    if !p.authors.is_empty() {
+        rows.push_str(&format!(
+            "<div><b>Authors</b>{}</div>",
+            escape_html(&p.authors.join(", "))
+        ));
+    }
+    if let Some(lic) = p.license_expression.as_deref().or(p.license_url.as_deref()) {
+        rows.push_str(&format!("<div><b>License</b>{}</div>", escape_html(lic)));
+    }
+    rows.push_str(&format!(
+        "<div><b>Size</b>{}</div>",
+        escape_html(&human_size(p.package_size))
+    ));
+    rows.push_str(&format!("<div><b>Downloads</b>{}</div>", p.downloads));
+    let types = package_type_names(&p.package_types);
+    if !types.is_empty() {
+        rows.push_str(&format!("<div><b>Type</b>{}</div>", escape_html(&types)));
+    }
+    rows.push_str("</div>");
+    rows
+}
+
+fn render_links(p: &Package) -> String {
+    let mut links = Vec::new();
+    if let Some(u) = &p.project_url {
+        links.push(format!(
+            "<a href=\"{}\" rel=\"nofollow\">Project</a>",
+            escape_html(u)
+        ));
+    }
+    if let Some(u) = &p.repository_url {
+        links.push(format!(
+            "<a href=\"{}\" rel=\"nofollow\">Repository</a>",
+            escape_html(u)
+        ));
+    }
+    if let Some(u) = &p.license_url {
+        links.push(format!(
+            "<a href=\"{}\" rel=\"nofollow\">License</a>",
+            escape_html(u)
+        ));
+    }
+    if links.is_empty() {
+        String::new()
+    } else {
+        format!("<p>{}</p>", links.join(" \u{2022} "))
+    }
+}
+
+fn render_dependencies(p: &Package) -> String {
+    if p.dependencies.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("<h3 class=\"muted\">Dependencies</h3>");
+    for group in &p.dependencies {
+        let tfm = group
+            .target_framework
+            .as_deref()
+            .unwrap_or("All frameworks");
+        out.push_str(&format!("<p class=\"meta\">{}</p>", escape_html(tfm)));
+        if group.dependencies.is_empty() {
+            out.push_str("<p class=\"muted\">No dependencies</p>");
+            continue;
+        }
+        out.push_str("<table class=\"deps\">");
+        for d in &group.dependencies {
+            out.push_str(&format!(
+                "<tr><td><a href=\"/packages/{lid}\">{id}</a></td><td class=\"muted\">{range}</td></tr>",
+                lid = enc_path(&d.id.to_lowercase()),
+                id = escape_html(&d.id),
+                range = escape_html(d.version_range.as_deref().unwrap_or("")),
+            ));
+        }
+        out.push_str("</table>");
+    }
+    out
+}
+
+fn render_readme(readme: Option<&str>) -> String {
+    match readme {
+        Some(text) if !text.trim().is_empty() => {
+            format!(
+                "<h3 class=\"muted\">Readme</h3><div class=\"card readme\">{}</div>",
+                escape_html(text)
+            )
+        }
+        _ => String::new(),
+    }
+}
+
+fn render_tags(tags: &[String]) -> String {
+    if tags.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("<div class=\"tags\">");
+    for t in tags {
+        out.push_str(&format!("<span class=\"tag\">{}</span>", escape_html(t)));
+    }
+    out.push_str("</div>");
+    out
+}
+
+fn package_type_names(types: &[PackageType]) -> String {
+    types
+        .iter()
+        .map(|t| t.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Percent-encode a path segment for use in our own `/packages/...` URLs.
+fn enc_path(segment: &str) -> String {
+    use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
+    const KEEP: &percent_encoding::AsciiSet = &NON_ALPHANUMERIC
+        .remove(b'.')
+        .remove(b'-')
+        .remove(b'_')
+        .remove(b'~');
+    utf8_percent_encode(segment, KEEP).to_string()
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let mut t: String = s.chars().take(max).collect();
+        t.push('\u{2026}');
+        t
+    }
+}
+
+fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut size = bytes as f64;
+    let mut unit = 0;
+    while size >= 1024.0 && unit < UNITS.len() - 1 {
+        size /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{size:.1} {}", UNITS[unit])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn escapes_dangerous_characters() {
+        assert_eq!(
+            escape_html("<script>\"&'"),
+            "&lt;script&gt;&quot;&amp;&#39;"
+        );
+    }
+
+    #[test]
+    fn human_size_scales() {
+        assert_eq!(human_size(512), "512 B");
+        assert_eq!(human_size(1024), "1.0 KB");
+        assert_eq!(human_size(25 * 1024 * 1024 * 1024), "25.0 GB");
+    }
+
+    #[test]
+    fn install_snippet_orders_primary_first() {
+        let urls = UrlBuilder::new("https://nuget.example.com");
+        let p = sample();
+        let choco_first = render_install(&urls, &p, "choco");
+        assert!(choco_first.find("Chocolatey").unwrap() < choco_first.find("dotnet CLI").unwrap());
+        assert!(choco_first.contains("choco install Contoso.Utils --version 1.0.0"));
+        let dotnet_first = render_install(&urls, &p, "dotnet");
+        assert!(
+            dotnet_first.find("dotnet CLI").unwrap() < dotnet_first.find("Chocolatey").unwrap()
+        );
+    }
+
+    #[test]
+    fn detail_page_escapes_package_fields() {
+        let urls = UrlBuilder::new("https://host");
+        let mut p = sample();
+        p.description = "<img src=x onerror=alert(1)>".into();
+        let html = detail_page(&urls, std::slice::from_ref(&p), &p, None, "choco", false);
+        assert!(!html.contains("<img src=x"));
+        assert!(html.contains("&lt;img src=x"));
+    }
+
+    fn sample() -> Package {
+        use crate::version::NuGetVersion;
+        use chrono::Utc;
+        Package {
+            id: "Contoso.Utils".into(),
+            version: NuGetVersion::parse("1.0.0").unwrap(),
+            listed: true,
+            authors: vec!["Alice".into()],
+            description: "Helpers".into(),
+            icon_url: None,
+            license_url: None,
+            license_expression: Some("MIT".into()),
+            project_url: None,
+            repository_url: None,
+            repository_type: None,
+            min_client_version: None,
+            release_notes: None,
+            language: None,
+            title: None,
+            summary: None,
+            tags: vec!["util".into()],
+            has_readme: false,
+            has_embedded_icon: false,
+            is_development_dependency: false,
+            is_semver2: false,
+            package_size: 2048,
+            package_hash: "h".into(),
+            package_hash_algorithm: "SHA512".into(),
+            published: Utc::now(),
+            downloads: 5,
+            package_types: vec![],
+            dependencies: vec![],
+        }
+    }
+}

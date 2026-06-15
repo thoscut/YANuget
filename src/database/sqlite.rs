@@ -23,7 +23,7 @@ use crate::error::{Error, Result};
 use crate::models::{DependencyGroup, Package, PackageType};
 use crate::version::NuGetVersion;
 
-use super::{PackageDatabase, SearchGroup, SearchPage, SearchRequest};
+use super::{PackageDatabase, SearchGroup, SearchPage, SearchRequest, SymbolKey, SymbolRef};
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS packages (
@@ -67,6 +67,16 @@ CREATE TABLE IF NOT EXISTS packages (
 CREATE INDEX IF NOT EXISTS idx_packages_lower_id ON packages (lower_id);
 CREATE INDEX IF NOT EXISTS idx_packages_search
     ON packages (lower_id, listed, is_prerelease, is_semver2);
+
+CREATE TABLE IF NOT EXISTS symbols (
+    ssqp_key           TEXT NOT NULL,   -- upper-case {GUID}{age}
+    filename           TEXT NOT NULL,   -- the .pdb file name, lower-cased
+    lower_id           TEXT NOT NULL,   -- owning package, for cleanup
+    normalized_version TEXT NOT NULL,
+    PRIMARY KEY (ssqp_key, filename)
+);
+CREATE INDEX IF NOT EXISTS idx_symbols_owner
+    ON symbols (lower_id, normalized_version);
 "#;
 
 /// A SQLite package index.
@@ -384,6 +394,81 @@ impl PackageDatabase for SqliteDatabase {
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.iter().map(|r| r.get::<String, _>("id")).collect())
+    }
+
+    async fn all_package_ids(&self) -> Result<Vec<String>> {
+        let rows = sqlx::query(
+            "SELECT MAX(id) AS id FROM packages GROUP BY lower_id ORDER BY lower_id ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.iter().map(|r| r.get::<String, _>("id")).collect())
+    }
+
+    async fn add_symbol(
+        &self,
+        key: &str,
+        filename: &str,
+        id: &str,
+        version: &NuGetVersion,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"INSERT INTO symbols (ssqp_key, filename, lower_id, normalized_version)
+               VALUES (?1, ?2, ?3, ?4)
+               ON CONFLICT(ssqp_key, filename) DO UPDATE SET
+                   lower_id = excluded.lower_id,
+                   normalized_version = excluded.normalized_version"#,
+        )
+        .bind(key.to_uppercase())
+        .bind(filename.to_lowercase())
+        .bind(id.to_lowercase())
+        .bind(version.normalized())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn find_symbol(&self, key: &str, filename: &str) -> Result<Option<SymbolRef>> {
+        let row = sqlx::query(
+            "SELECT lower_id, normalized_version FROM symbols
+             WHERE ssqp_key = ?1 AND filename = ?2",
+        )
+        .bind(key.to_uppercase())
+        .bind(filename.to_lowercase())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| SymbolRef {
+            lower_id: r.get::<String, _>("lower_id"),
+            normalized_version: r.get::<String, _>("normalized_version"),
+        }))
+    }
+
+    async fn find_symbols(&self, id: &str, version: &NuGetVersion) -> Result<Vec<SymbolKey>> {
+        let rows = sqlx::query(
+            "SELECT ssqp_key, filename FROM symbols
+             WHERE lower_id = ?1 AND normalized_version = ?2",
+        )
+        .bind(id.to_lowercase())
+        .bind(version.normalized())
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .iter()
+            .map(|r| SymbolKey {
+                key: r.get::<String, _>("ssqp_key"),
+                filename: r.get::<String, _>("filename"),
+            })
+            .collect())
+    }
+
+    async fn delete_symbols(&self, id: &str, version: &NuGetVersion) -> Result<u64> {
+        let result =
+            sqlx::query("DELETE FROM symbols WHERE lower_id = ?1 AND normalized_version = ?2")
+                .bind(id.to_lowercase())
+                .bind(version.normalized())
+                .execute(&self.pool)
+                .await?;
+        Ok(result.rows_affected())
     }
 }
 

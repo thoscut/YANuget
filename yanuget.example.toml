@@ -33,3 +33,34 @@ allow_overwrite = false    # YANUGET_ALLOW_OVERWRITE
 # When true, DELETE hard-deletes a package. When false (default), DELETE only
 # unlists it (the NuGet client's "delete" semantics), keeping it restorable.
 hard_delete_enabled = false   # YANUGET_HARD_DELETE_ENABLED
+
+# Symbol server: accept `.snupkg` pushes at /api/v2/symbol and serve PDBs over
+# the SSQP path /download/symbols/{file}/{key}/{file}. Enabled by default.
+enable_symbol_server = true   # YANUGET_ENABLE_SYMBOL_SERVER
+
+# Human-facing web gallery at `/` and `/packages/...`. Enabled by default.
+enable_web_ui = true          # YANUGET_ENABLE_WEB_UI
+
+# Which client's install command the gallery shows first on a package page.
+# One of "choco", "dotnet", "nuget". Defaults to "choco" since YANuget is
+# primarily deployed as a Chocolatey feed.
+primary_client = "choco"      # YANUGET_PRIMARY_CLIENT
+
+# ---------------------------------------------------------------------------
+# Package retention — automatic pruning of old versions.
+#
+# Retention HARD-deletes versions (payload, sidecars and symbols), so it is
+# off by default. A version is pruned when it is beyond the newest-N of its
+# release channel OR older than max_age_days; the newest stable version (or
+# newest pre-release, if there is no stable) is always kept.
+# ---------------------------------------------------------------------------
+[retention]
+enabled = false               # YANUGET_RETENTION_ENABLED — master switch
+prune_on_push = false         # YANUGET_RETENTION_PRUNE_ON_PUSH — prune after each push
+interval_hours = 24           # YANUGET_RETENTION_INTERVAL_HOURS — background sweep (0 = off)
+
+# Leave a limit unset to not apply it. At least one limit must be set for the
+# sweep to do anything.
+# keep_latest_stable = 10       # YANUGET_RETENTION_KEEP_LATEST_STABLE
+# keep_latest_prerelease = 5    # YANUGET_RETENTION_KEEP_LATEST_PRERELEASE
+# max_age_days = 180            # YANUGET_RETENTION_MAX_AGE_DAYS

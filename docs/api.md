@@ -17,7 +17,7 @@ GET /v3/index.json
 Returns `{ "version": "3.0.0", "resources": [...] }`. Advertised resource
 `@type`s include `PackageBaseAddress/3.0.0`, `RegistrationsBaseUrl` (and the
 SemVer2 aliases), `SearchQueryService`, `SearchAutocompleteService`,
-`PackagePublish/2.0.0`, and `SymbolPackagePublish/4.9.0`.
+`PackagePublish/2.0.0`, `SymbolPackagePublish/4.9.0`, and `SymbolServer/4.9.0`.
 
 ## Push a package
 
@@ -123,6 +123,44 @@ GET /v3/autocomplete?id={id}&prerelease=     # versions of one package
 
 Both return `{ "@context": {...}, "totalHits": N, "data": [...] }` — a list of
 package ids, or of versions when `id` is supplied.
+
+## Symbol server
+
+```
+PUT /api/v2/symbol
+X-NuGet-ApiKey: <key>
+Content-Type: multipart/form-data        (raw body also accepted)
+```
+
+Streams a `.snupkg` to disk, reads its `.nuspec` to identify the owning package
+(which **must already exist** — `404` otherwise), then extracts every **Portable
+PDB** and indexes it by its SSQP key. Responses mirror package push (`201`,
+`400`, `401`, `404`, `413`). Requires `enable_symbol_server` (on by default).
+Native (Windows) PDBs are stored within the `.snupkg` but cannot be indexed.
+
+```
+GET /download/symbols/{file}/{key}/{file}
+```
+
+Serves an indexed PDB to a debugger (the Simple Symbol Query Protocol path).
+`{key}` is the upper-case `{GUID}{age}` signature; for Portable PDBs the age is
+`FFFFFFFF`. Streams with `Range` support. `404` for an unknown file/key so the
+debugger falls through to the next symbol source.
+
+## Web gallery (HTML)
+
+```
+GET /                                  # searchable package list
+GET /packages?q=&skip=&take=           # same, as a search page
+GET /packages/{id}                     # detail for the newest version
+GET /packages/{id}/{version}           # detail for a specific version
+```
+
+Human-facing HTML (not part of the NuGet protocol). The detail page shows
+versions, dependencies, links, readme, symbol availability, and the install
+command for Chocolatey / `dotnet` / `nuget.exe` (ordered by `primary_client`).
+Requires `enable_web_ui` (on by default); when disabled, `/` serves a minimal
+info page and `/packages/*` return `404`.
 
 ## Health
 
