@@ -1,0 +1,408 @@
+//! The NuGet V3 HTTP protocol: URL generation and JSON response shapes.
+//!
+//! This module is pure data transformation — it turns domain [`Package`]s and
+//! [`SearchPage`]s into the exact JSON documents the NuGet client expects,
+//! given a [`UrlBuilder`] that knows the server's externally visible base URL.
+//! Keeping it free of I/O makes the protocol easy to unit-test.
+
+mod urls;
+
+pub use urls::UrlBuilder;
+
+use chrono::SecondsFormat;
+use serde_json::{json, Value};
+
+use crate::database::{SearchGroup, SearchPage};
+use crate::models::{DependencyGroup, Package};
+
+/// Build the `/v3/index.json` service index document.
+pub fn service_index(urls: &UrlBuilder) -> Value {
+    // Each logical resource is advertised under every `@type` alias clients
+    // look up, so old and new clients alike resolve them.
+    let mut resources = Vec::new();
+    let mut push = |url: String, types: &[&str], comment: &str| {
+        for t in types {
+            resources.push(json!({
+                "@id": url,
+                "@type": t,
+                "comment": comment,
+            }));
+        }
+    };
+
+    push(
+        urls.package_base_address(),
+        &["PackageBaseAddress/3.0.0"],
+        "Base URL of where NuGet packages are stored.",
+    );
+    push(
+        urls.registration_base(),
+        &[
+            "RegistrationsBaseUrl",
+            "RegistrationsBaseUrl/3.0.0-beta",
+            "RegistrationsBaseUrl/3.0.0-rc",
+            "RegistrationsBaseUrl/3.4.0",
+            "RegistrationsBaseUrl/3.6.0",
+            "RegistrationsBaseUrl/Versioned",
+        ],
+        "Base URL of package registration info (SemVer2 supported).",
+    );
+    push(
+        urls.search(),
+        &[
+            "SearchQueryService",
+            "SearchQueryService/3.0.0-beta",
+            "SearchQueryService/3.0.0-rc",
+            "SearchQueryService/3.5.0",
+        ],
+        "Query endpoint of NuGet Search service.",
+    );
+    push(
+        urls.autocomplete(),
+        &[
+            "SearchAutocompleteService",
+            "SearchAutocompleteService/3.0.0-beta",
+            "SearchAutocompleteService/3.0.0-rc",
+            "SearchAutocompleteService/3.5.0",
+        ],
+        "Autocomplete endpoint of NuGet Search service.",
+    );
+    push(
+        urls.publish(),
+        &["PackagePublish/2.0.0"],
+        "Endpoint for pushing packages.",
+    );
+    push(
+        urls.symbol_publish(),
+        &["SymbolPackagePublish/4.9.0"],
+        "Endpoint for pushing symbol packages.",
+    );
+
+    json!({
+        "version": "3.0.0",
+        "resources": resources,
+    })
+}
+
+/// Build the flat-container versions document
+/// (`/v3/package/{id}/index.json`).
+///
+/// `versions` should already be the visible versions, sorted ascending.
+pub fn flat_container_index(versions: &[String]) -> Value {
+    json!({ "versions": versions })
+}
+
+/// Build the registration index (`/v3/registration/{id}/index.json`) with all
+/// leaves inlined into a single page. `packages` must be sorted ascending by
+/// version and contain at least one element.
+pub fn registration_index(urls: &UrlBuilder, id: &str, packages: &[Package]) -> Value {
+    let lower_id = id.to_lowercase();
+    let index_url = urls.registration_index(&lower_id);
+
+    let leaves: Vec<Value> = packages
+        .iter()
+        .map(|p| registration_leaf_item(urls, &lower_id, p))
+        .collect();
+
+    let lower = packages
+        .first()
+        .map(|p| p.normalized_version())
+        .unwrap_or_default();
+    let upper = packages
+        .last()
+        .map(|p| p.normalized_version())
+        .unwrap_or_default();
+
+    json!({
+        "@id": index_url,
+        "@type": ["catalog:CatalogRoot", "PackageRegistration", "catalog:Permalink"],
+        "count": 1,
+        "items": [
+            {
+                "@id": format!("{index_url}#page/{lower}/{upper}"),
+                "count": packages.len(),
+                "lower": lower,
+                "upper": upper,
+                "items": leaves,
+            }
+        ],
+    })
+}
+
+fn registration_leaf_item(urls: &UrlBuilder, lower_id: &str, p: &Package) -> Value {
+    let version = p.normalized_version();
+    let leaf_url = urls.registration_leaf(lower_id, &version);
+    let content_url = urls.package_download(lower_id, &version);
+
+    json!({
+        "@id": leaf_url,
+        "@type": "Package",
+        "packageContent": content_url,
+        "registration": urls.registration_index(lower_id),
+        "catalogEntry": catalog_entry(urls, lower_id, p, &content_url),
+    })
+}
+
+fn catalog_entry(urls: &UrlBuilder, lower_id: &str, p: &Package, content_url: &str) -> Value {
+    let version = p.normalized_version();
+    json!({
+        "@id": urls.registration_leaf(lower_id, &version),
+        "@type": "PackageDetails",
+        "id": p.id,
+        "version": version,
+        "authors": p.authors.join(", "),
+        "description": p.description,
+        "iconUrl": p.icon_url,
+        "language": p.language,
+        "licenseExpression": p.license_expression,
+        "licenseUrl": p.license_url,
+        "listed": p.listed,
+        "minClientVersion": p.min_client_version,
+        "packageContent": content_url,
+        "projectUrl": p.project_url,
+        "published": p.published.to_rfc3339_opts(SecondsFormat::Millis, true),
+        "releaseNotes": p.release_notes,
+        "requireLicenseAcceptance": false,
+        "summary": p.summary,
+        "tags": p.tags,
+        "title": p.title,
+        "dependencyGroups": dependency_groups(urls, lower_id, &version, &p.dependencies),
+    })
+}
+
+fn dependency_groups(
+    urls: &UrlBuilder,
+    lower_id: &str,
+    version: &str,
+    groups: &[DependencyGroup],
+) -> Value {
+    let base = format!(
+        "{}#dependencygroup",
+        urls.registration_leaf(lower_id, version)
+    );
+    let items: Vec<Value> = groups
+        .iter()
+        .map(|g| {
+            let tfm = g.target_framework.clone();
+            let group_id = match &tfm {
+                Some(f) => format!("{base}/{}", f.to_lowercase()),
+                None => base.clone(),
+            };
+            let deps: Vec<Value> = g
+                .dependencies
+                .iter()
+                .map(|d| {
+                    json!({
+                        "@id": format!("{group_id}/{}", d.id.to_lowercase()),
+                        "@type": "PackageDependency",
+                        "id": d.id,
+                        "range": d.version_range,
+                        "registration": urls.registration_index(&d.id.to_lowercase()),
+                    })
+                })
+                .collect();
+            json!({
+                "@id": group_id,
+                "@type": "PackageDependencyGroup",
+                "targetFramework": tfm,
+                "dependencies": deps,
+            })
+        })
+        .collect();
+    Value::Array(items)
+}
+
+/// Build the search response (`/v3/search`).
+pub fn search_response(urls: &UrlBuilder, page: &SearchPage) -> Value {
+    let data: Vec<Value> = page
+        .groups
+        .iter()
+        .map(|g| search_result(urls, g))
+        .collect();
+    json!({
+        "@context": {
+            "@vocab": "http://schema.nuget.org/schema#",
+            "@base": urls.registration_base(),
+        },
+        "totalHits": page.total_hits,
+        "data": data,
+    })
+}
+
+fn search_result(urls: &UrlBuilder, group: &SearchGroup) -> Value {
+    let latest = group.latest();
+    let lower_id = latest.lower_id();
+    let versions: Vec<Value> = group
+        .packages
+        .iter()
+        .map(|p| {
+            let v = p.normalized_version();
+            json!({
+                "@id": urls.registration_leaf(&lower_id, &v),
+                "version": v,
+                "downloads": p.downloads,
+            })
+        })
+        .collect();
+    let package_types: Vec<Value> = if latest.package_types.is_empty() {
+        vec![json!({ "name": "Dependency" })]
+    } else {
+        latest
+            .package_types
+            .iter()
+            .map(|t| json!({ "name": t.name }))
+            .collect()
+    };
+
+    json!({
+        "@type": "Package",
+        "registration": urls.registration_index(&lower_id),
+        "id": latest.id,
+        "version": latest.normalized_version(),
+        "description": latest.description,
+        "summary": latest.summary,
+        "title": latest.title,
+        "iconUrl": latest.icon_url,
+        "licenseUrl": latest.license_url,
+        "projectUrl": latest.project_url,
+        "tags": latest.tags,
+        "authors": latest.authors,
+        "totalDownloads": group.total_downloads(),
+        "verified": false,
+        "packageTypes": package_types,
+        "versions": versions,
+    })
+}
+
+/// Build the id-autocomplete response (`/v3/autocomplete`).
+pub fn autocomplete_response(ids: &[String], total_hits: i64) -> Value {
+    json!({
+        "@context": { "@vocab": "http://schema.nuget.org/schema#" },
+        "totalHits": total_hits,
+        "data": ids,
+    })
+}
+
+/// Build the version-enumeration response
+/// (`/v3/autocomplete?id={id}`).
+pub fn enumerate_versions_response(versions: &[String]) -> Value {
+    json!({
+        "@context": { "@vocab": "http://schema.nuget.org/schema#" },
+        "totalHits": versions.len(),
+        "data": versions,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::version::NuGetVersion;
+    use chrono::Utc;
+
+    fn urls() -> UrlBuilder {
+        UrlBuilder::new("https://nuget.example.com")
+    }
+
+    fn pkg(id: &str, version: &str) -> Package {
+        Package {
+            id: id.to_string(),
+            version: NuGetVersion::parse(version).unwrap(),
+            listed: true,
+            authors: vec!["Alice".into(), "Bob".into()],
+            description: "A test package".into(),
+            icon_url: None,
+            license_url: None,
+            license_expression: Some("MIT".into()),
+            project_url: Some("https://example.com".into()),
+            repository_url: None,
+            repository_type: None,
+            min_client_version: None,
+            release_notes: None,
+            language: None,
+            title: Some("Test".into()),
+            summary: None,
+            tags: vec!["a".into(), "b".into()],
+            has_readme: false,
+            has_embedded_icon: false,
+            is_development_dependency: false,
+            is_semver2: false,
+            package_size: 10,
+            package_hash: "aGFzaA==".into(),
+            package_hash_algorithm: "SHA512".into(),
+            published: Utc::now(),
+            downloads: 3,
+            package_types: vec![],
+            dependencies: vec![],
+        }
+    }
+
+    #[test]
+    fn service_index_has_core_resources() {
+        let idx = service_index(&urls());
+        assert_eq!(idx["version"], "3.0.0");
+        let resources = idx["resources"].as_array().unwrap();
+        let types: Vec<&str> = resources
+            .iter()
+            .map(|r| r["@type"].as_str().unwrap())
+            .collect();
+        assert!(types.contains(&"PackageBaseAddress/3.0.0"));
+        assert!(types.contains(&"SearchQueryService"));
+        assert!(types.contains(&"PackagePublish/2.0.0"));
+        assert!(types.contains(&"RegistrationsBaseUrl/3.6.0"));
+        // The package base address points where the client expects.
+        let pba = resources
+            .iter()
+            .find(|r| r["@type"] == "PackageBaseAddress/3.0.0")
+            .unwrap();
+        assert_eq!(pba["@id"], "https://nuget.example.com/v3/package/");
+    }
+
+    #[test]
+    fn registration_index_inlines_leaves() {
+        let pkgs = vec![pkg("Contoso.Utils", "1.0.0"), pkg("Contoso.Utils", "1.1.0")];
+        let reg = registration_index(&urls(), "Contoso.Utils", &pkgs);
+        assert_eq!(reg["count"], 1);
+        let page = &reg["items"][0];
+        assert_eq!(page["count"], 2);
+        assert_eq!(page["lower"], "1.0.0");
+        assert_eq!(page["upper"], "1.1.0");
+        let leaf = &page["items"][0];
+        assert_eq!(
+            leaf["packageContent"],
+            "https://nuget.example.com/v3/package/contoso.utils/1.0.0/contoso.utils.1.0.0.nupkg"
+        );
+        let entry = &leaf["catalogEntry"];
+        assert_eq!(entry["id"], "Contoso.Utils");
+        assert_eq!(entry["version"], "1.0.0");
+        assert_eq!(entry["authors"], "Alice, Bob");
+        assert_eq!(entry["licenseExpression"], "MIT");
+    }
+
+    #[test]
+    fn search_response_groups_versions() {
+        let group = SearchGroup {
+            packages: vec![pkg("Contoso.Utils", "1.0.0"), pkg("Contoso.Utils", "1.1.0")],
+        };
+        let page = SearchPage {
+            total_hits: 1,
+            groups: vec![group],
+        };
+        let resp = search_response(&urls(), &page);
+        assert_eq!(resp["totalHits"], 1);
+        let item = &resp["data"][0];
+        assert_eq!(item["id"], "Contoso.Utils");
+        assert_eq!(item["version"], "1.1.0"); // latest
+        assert_eq!(item["totalDownloads"], 6); // 3 + 3
+        assert_eq!(item["versions"].as_array().unwrap().len(), 2);
+        // Empty package type list defaults to "Dependency".
+        assert_eq!(item["packageTypes"][0]["name"], "Dependency");
+    }
+
+    #[test]
+    fn flat_container_lists_versions() {
+        let v = vec!["1.0.0".to_string(), "1.1.0".to_string()];
+        let doc = flat_container_index(&v);
+        assert_eq!(doc["versions"][0], "1.0.0");
+        assert_eq!(doc["versions"][1], "1.1.0");
+    }
+}

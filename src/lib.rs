@@ -14,6 +14,7 @@
 pub mod database;
 pub mod error;
 pub mod models;
+pub mod nuget;
 pub mod nupkg;
 pub mod nuspec;
 pub mod storage;
