@@ -1,0 +1,20 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# Local runtime data / config
+/data
+/packages
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite-*
+appsettings.local.json
+yanuget.local.toml
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
