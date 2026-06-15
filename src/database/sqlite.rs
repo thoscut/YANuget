@@ -785,4 +785,127 @@ mod tests {
         let ac = db.autocomplete("contoso", 0, 20).await.unwrap();
         assert_eq!(ac, vec!["Contoso.Core".to_string()]);
     }
+
+    #[tokio::test]
+    async fn disabled_versions_are_hidden_but_present() {
+        let db = SqliteDatabase::in_memory().await.unwrap();
+        db.add(&sample("Pkg", "1.0.0")).await.unwrap();
+        db.add(&sample("Pkg", "2.0.0")).await.unwrap();
+        let v1 = NuGetVersion::parse("1.0.0").unwrap();
+
+        // Disable 1.0.0 — hidden from public listings, search and serving.
+        assert!(db.set_enabled("pkg", &v1, false).await.unwrap());
+        assert!(!db.is_servable("pkg", &v1).await.unwrap());
+        assert!(db
+            .is_servable("pkg", &NuGetVersion::parse("2.0.0").unwrap())
+            .await
+            .unwrap());
+        assert!(db.find("pkg", &v1).await.unwrap().is_none());
+
+        let listed = db.find_versions("pkg", true).await.unwrap();
+        assert_eq!(listed.len(), 1); // only 2.0.0
+        let page = db.search(&SearchRequest::default()).await.unwrap();
+        assert_eq!(page.groups[0].packages.len(), 1);
+
+        // But it still exists and admin listing shows it.
+        assert!(db.exists("pkg", &v1).await.unwrap());
+        let all = db.find_all_versions("pkg").await.unwrap();
+        assert_eq!(all.len(), 2);
+        assert!(all.iter().any(|p| !p.enabled));
+
+        // Re-enable restores visibility.
+        assert!(db.set_enabled("pkg", &v1, true).await.unwrap());
+        assert!(db.is_servable("pkg", &v1).await.unwrap());
+        assert_eq!(db.find_versions("pkg", true).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn all_package_ids_and_stats() {
+        let db = SqliteDatabase::in_memory().await.unwrap();
+        db.add(&sample("Alpha", "1.0.0")).await.unwrap();
+        db.add(&sample("Alpha", "1.1.0")).await.unwrap();
+        db.add(&sample("Beta", "2.0.0")).await.unwrap();
+        let v = NuGetVersion::parse("2.0.0").unwrap();
+        db.increment_downloads("beta", &v).await.unwrap();
+
+        let ids = db.all_package_ids().await.unwrap();
+        assert_eq!(ids, vec!["Alpha".to_string(), "Beta".to_string()]);
+
+        let stats = db.stats().await.unwrap();
+        assert_eq!(stats.package_count, 2);
+        assert_eq!(stats.version_count, 3);
+        assert_eq!(stats.listed_count, 3);
+        assert_eq!(stats.total_downloads, 1);
+        assert!(stats.total_size > 0);
+        assert_eq!(stats.symbol_count, 0);
+    }
+
+    #[tokio::test]
+    async fn recent_packages_orders_by_publish_time() {
+        let db = SqliteDatabase::in_memory().await.unwrap();
+        let mut older = sample("Old", "1.0.0");
+        older.published = Utc::now() - chrono::Duration::days(5);
+        let newer = sample("New", "1.0.0");
+        db.add(&older).await.unwrap();
+        db.add(&newer).await.unwrap();
+        let recent = db.recent_packages(10).await.unwrap();
+        assert_eq!(recent[0].id, "New");
+        assert_eq!(recent[1].id, "Old");
+        assert_eq!(db.recent_packages(1).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn symbol_mappings_round_trip_and_clean_up() {
+        let db = SqliteDatabase::in_memory().await.unwrap();
+        db.add(&sample("Sym", "1.0.0")).await.unwrap();
+        let v = NuGetVersion::parse("1.0.0").unwrap();
+
+        db.add_symbol("ABCDEF01FFFFFFFF", "sym.pdb", "Sym", &v)
+            .await
+            .unwrap();
+        // Lookup is case-insensitive on the key.
+        let found = db.find_symbol("abcdef01ffffffff", "sym.pdb").await.unwrap();
+        let found = found.unwrap();
+        assert_eq!(found.lower_id, "sym");
+        assert_eq!(found.normalized_version, "1.0.0");
+        assert!(db.find_symbol("nope", "sym.pdb").await.unwrap().is_none());
+
+        let owned = db.find_symbols("sym", &v).await.unwrap();
+        assert_eq!(owned.len(), 1);
+        assert_eq!(owned[0].filename, "sym.pdb");
+
+        assert_eq!(db.delete_symbols("sym", &v).await.unwrap(), 1);
+        assert!(db
+            .find_symbol("ABCDEF01FFFFFFFF", "sym.pdb")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn ensure_column_is_idempotent() {
+        // Re-opening (which re-runs migrations) must not fail or drop data.
+        let db = SqliteDatabase::in_memory().await.unwrap();
+        db.add(&sample("Keep", "1.0.0")).await.unwrap();
+        ensure_column(
+            &db.pool,
+            "packages",
+            "enabled",
+            "INTEGER NOT NULL DEFAULT 1",
+        )
+        .await
+        .unwrap();
+        // Adding a genuinely new column then re-running is a no-op the 2nd time.
+        ensure_column(&db.pool, "packages", "extra_col", "TEXT")
+            .await
+            .unwrap();
+        ensure_column(&db.pool, "packages", "extra_col", "TEXT")
+            .await
+            .unwrap();
+        assert!(db
+            .find("keep", &NuGetVersion::parse("1.0.0").unwrap())
+            .await
+            .unwrap()
+            .is_some());
+    }
 }

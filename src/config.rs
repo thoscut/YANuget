@@ -316,4 +316,80 @@ mod tests {
         assert!(c.allow_overwrite);
         assert_eq!(c.max_package_size_bytes, Some(26_843_545_600));
     }
+
+    #[test]
+    fn tls_defaults_on_and_scheme_follows() {
+        let c = Config::default();
+        assert!(c.tls_enabled);
+        assert_eq!(c.scheme(), "https");
+        assert!(c.tls_pair().is_none()); // self-signed fallback
+
+        let http = Config {
+            tls_enabled: false,
+            ..Config::default()
+        };
+        assert_eq!(http.scheme(), "http");
+    }
+
+    #[test]
+    fn tls_pair_requires_both_paths() {
+        let only_cert = Config {
+            tls_cert_path: Some(PathBuf::from("/c.pem")),
+            ..Config::default()
+        };
+        assert!(only_cert.tls_pair().is_none());
+
+        let both = Config {
+            tls_cert_path: Some(PathBuf::from("/c.pem")),
+            tls_key_path: Some(PathBuf::from("/k.pem")),
+            ..Config::default()
+        };
+        assert_eq!(
+            both.tls_pair(),
+            Some((PathBuf::from("/c.pem"), PathBuf::from("/k.pem")))
+        );
+    }
+
+    #[test]
+    fn parses_new_toml_options() {
+        let toml = r#"
+            admin_api_key = "adm"
+            gallery_page_size = 7
+            tls_enabled = false
+            tls_cert_path = "/tls/cert.pem"
+            tls_key_path = "/tls/key.pem"
+
+            [retention]
+            enabled = true
+            keep_latest_stable = 5
+            max_age_days = 90
+        "#;
+        let c: Config = toml::from_str(toml).unwrap();
+        assert_eq!(c.admin_api_key.as_deref(), Some("adm"));
+        assert_eq!(c.gallery_page_size, 7);
+        assert!(!c.tls_enabled);
+        assert!(c.tls_pair().is_some());
+        assert!(c.retention.enabled);
+        assert_eq!(c.retention.keep_latest_stable, Some(5));
+        assert_eq!(c.retention.max_age_days, Some(90));
+        assert!(c.retention.has_limits());
+    }
+
+    #[test]
+    fn path_overrides_resolve() {
+        let c = Config {
+            data_dir: PathBuf::from("/data"),
+            ..Config::default()
+        };
+        assert_eq!(c.storage_path(), PathBuf::from("/data/packages"));
+        assert!(c.database_path().ends_with("yanuget.db"));
+
+        let overridden = Config {
+            storage_path: Some(PathBuf::from("/mnt/pkgs")),
+            database_path: Some("/mnt/db.sqlite".into()),
+            ..Config::default()
+        };
+        assert_eq!(overridden.storage_path(), PathBuf::from("/mnt/pkgs"));
+        assert_eq!(overridden.database_path(), "/mnt/db.sqlite");
+    }
 }

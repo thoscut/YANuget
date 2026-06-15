@@ -868,6 +868,107 @@ mod tests {
         assert!(html.contains("&lt;img src=x"));
     }
 
+    #[test]
+    fn detail_page_marks_prerelease_and_unlisted() {
+        let urls = UrlBuilder::new("https://host");
+        let mut p = sample();
+        p.version = crate::version::NuGetVersion::parse("2.0.0-rc.1").unwrap();
+        p.listed = false;
+        let html = detail_page(&urls, std::slice::from_ref(&p), &p, None, "choco", true);
+        assert!(html.contains("badge pre"));
+        assert!(html.contains("badge un"));
+        assert!(html.contains("Debug symbols are available"));
+    }
+
+    fn page_of(ids: &[&str]) -> crate::database::SearchPage {
+        let groups = ids
+            .iter()
+            .map(|id| crate::database::SearchGroup {
+                packages: vec![{
+                    let mut p = sample();
+                    p.id = (*id).into();
+                    p
+                }],
+            })
+            .collect::<Vec<_>>();
+        crate::database::SearchPage {
+            total_hits: ids.len() as i64,
+            groups,
+        }
+    }
+
+    #[test]
+    fn gallery_lists_cards_and_paginates() {
+        let urls = UrlBuilder::new("https://host");
+        // Two of three results shown -> pager with a Next link.
+        let mut page = page_of(&["Pkg.A", "Pkg.B"]);
+        page.total_hits = 3;
+        let html = gallery_page(&urls, &page, "", 0, 2);
+        assert!(html.contains("Pkg.A"));
+        assert!(html.contains("/packages/pkg.b"));
+        assert!(html.contains("class=\"pager\""));
+        assert!(html.contains("skip=2")); // next page
+
+        // Empty result for a query offers a "clear search" link.
+        let empty = gallery_page(&urls, &page_of(&[]), "zzz", 0, 20);
+        assert!(empty.contains("Clear search"));
+    }
+
+    #[test]
+    fn stats_page_renders_totals_and_lists() {
+        let urls = UrlBuilder::new("https://host");
+        let stats = crate::database::DatabaseStats {
+            package_count: 2,
+            version_count: 5,
+            listed_count: 4,
+            total_downloads: 1234,
+            total_size: 2048,
+            symbol_count: 1,
+        };
+        let html = stats_page(&urls, &stats, &page_of(&["Top.Pkg"]), &[sample()]);
+        assert!(html.contains("Statistics"));
+        assert!(html.contains("1,234")); // grouped downloads
+        assert!(html.contains("Top.Pkg"));
+        assert!(html.contains("Recently published"));
+    }
+
+    #[test]
+    fn settings_page_hides_secrets_and_shows_admin_link() {
+        let urls = UrlBuilder::new("https://host");
+        let config = crate::config::Config {
+            api_key: Some("super-secret".into()),
+            admin_api_key: Some("admin-secret".into()),
+            ..Default::default()
+        };
+        let html = settings_page(&urls, &config);
+        assert!(html.contains("Required (API key)"));
+        assert!(!html.contains("super-secret"));
+        assert!(!html.contains("admin-secret"));
+        assert!(html.contains("/admin")); // admin link present when configured
+
+        let no_admin = crate::config::Config {
+            admin_api_key: None,
+            ..Default::default()
+        };
+        assert!(!settings_page(&urls, &no_admin).contains("admin area"));
+    }
+
+    #[test]
+    fn admin_pages_render_actions() {
+        let urls = UrlBuilder::new("https://host");
+        let dash = admin_dashboard_page(&urls, &["Contoso.Utils".into()]);
+        assert!(dash.contains("/admin/packages/contoso.utils"));
+
+        let mut disabled = sample();
+        disabled.enabled = false;
+        let pkg = admin_package_page(&urls, "Contoso.Utils", &[sample(), disabled]);
+        assert!(pkg.contains("/disable"));
+        assert!(pkg.contains("/enable"));
+        assert!(pkg.contains("/delete"));
+        assert!(pkg.contains("badge un")); // the disabled one
+        assert!(pkg.contains("badge ok")); // the active one
+    }
+
     fn sample() -> Package {
         use crate::version::NuGetVersion;
         use chrono::Utc;

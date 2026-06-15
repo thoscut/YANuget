@@ -358,6 +358,117 @@ async fn missing_package_returns_404() {
     assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
 }
 
+#[tokio::test]
+async fn registration_leaf_serves_single_version() {
+    let server = spawn().await;
+    push_multipart(&server, API_KEY, build_nupkg("Leaf.Pkg", "1.2.3", b"x")).await;
+    let leaf: serde_json::Value = server
+        .client
+        .get(server.url("/v3/registration/leaf.pkg/1.2.3.json"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(leaf["catalogEntry"]["id"], "Leaf.Pkg");
+    assert_eq!(leaf["catalogEntry"]["version"], "1.2.3");
+}
+
+#[tokio::test]
+async fn autocomplete_ids_and_versions() {
+    let server = spawn().await;
+    push_multipart(&server, API_KEY, build_nupkg("Auto.Cli", "1.0.0", b"x")).await;
+    push_multipart(&server, API_KEY, build_nupkg("Auto.Cli", "1.1.0", b"x")).await;
+    push_multipart(&server, API_KEY, build_nupkg("Auto.Core", "1.0.0", b"x")).await;
+
+    // Id autocomplete.
+    let ids: serde_json::Value = server
+        .client
+        .get(server.url("/v3/autocomplete?q=auto"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let data = ids["data"].as_array().unwrap();
+    assert_eq!(data.len(), 2);
+
+    // Version enumeration for one id.
+    let versions: serde_json::Value = server
+        .client
+        .get(server.url("/v3/autocomplete?id=auto.cli"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let vs: Vec<&str> = versions["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(vs, vec!["1.0.0", "1.1.0"]);
+}
+
+#[tokio::test]
+async fn overwrite_allows_republish() {
+    let server = spawn_with(|c| c.allow_overwrite = true).await;
+    let nupkg = build_nupkg("Over.Write", "1.0.0", b"x");
+    assert_eq!(
+        push_multipart(&server, API_KEY, nupkg.clone())
+            .await
+            .status(),
+        reqwest::StatusCode::CREATED
+    );
+    // Re-pushing the same version succeeds instead of conflicting.
+    assert_eq!(
+        push_multipart(&server, API_KEY, nupkg).await.status(),
+        reqwest::StatusCode::CREATED
+    );
+}
+
+#[tokio::test]
+async fn hard_delete_removes_payload() {
+    let server = spawn_with(|c| c.hard_delete_enabled = true).await;
+    push_multipart(&server, API_KEY, build_nupkg("Hard.Del", "1.0.0", b"x")).await;
+    let resp = server
+        .client
+        .delete(server.url("/api/v2/package/hard.del/1.0.0"))
+        .header("X-NuGet-ApiKey", API_KEY)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT);
+    // Gone for good — not downloadable.
+    let dl = server
+        .client
+        .get(server.url("/v3/package/hard.del/1.0.0/hard.del.1.0.0.nupkg"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(dl.status(), reqwest::StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn oversized_upload_is_rejected() {
+    let server = spawn_with(|c| c.max_package_size_bytes = Some(64)).await;
+    let big = build_nupkg("Too.Big", "1.0.0", &[0u8; 4096]);
+    let resp = server
+        .client
+        .put(server.url("/api/v2/package"))
+        .header("X-NuGet-ApiKey", API_KEY)
+        .header("Content-Type", "application/octet-stream")
+        .body(big)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::PAYLOAD_TOO_LARGE);
+}
+
 // ---------------------------------------------------------------------------
 // Symbol server
 // ---------------------------------------------------------------------------
@@ -683,9 +794,30 @@ async fn admin_disable_withholds_then_enable_restores() {
 }
 
 #[tokio::test]
-async fn admin_delete_removes_version() {
+async fn admin_delete_removes_version_and_symbols() {
     let server = spawn_admin().await;
     push_multipart(&server, API_KEY, build_nupkg("Del.Pkg", "1.0.0", b"data")).await;
+
+    // Attach symbols, then confirm they are reachable.
+    let pdb = build_portable_pdb(&[9u8; 16]);
+    let key = yanuget::pdb::portable_pdb_signature(&pdb).unwrap();
+    push_symbol(
+        &server,
+        API_KEY,
+        build_snupkg("Del.Pkg", "1.0.0", "del.pkg.pdb", &pdb),
+    )
+    .await;
+    let sym_url = format!("/download/symbols/del.pkg.pdb/{key}/del.pkg.pdb");
+    assert!(server
+        .client
+        .get(server.url(&sym_url))
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .is_success());
+
+    // Admin delete removes the version...
     let resp = no_redirect()
         .post(server.url("/admin/packages/del.pkg/1.0.0/delete"))
         .basic_auth("admin", Some(ADMIN_KEY))
@@ -700,6 +832,14 @@ async fn admin_delete_removes_version() {
         .await
         .unwrap();
     assert_eq!(dl.status(), reqwest::StatusCode::NOT_FOUND);
+    // ...and its symbols are gone too.
+    let sym = server
+        .client
+        .get(server.url(&sym_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(sym.status(), reqwest::StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]

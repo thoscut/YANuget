@@ -105,3 +105,58 @@ impl IntoResponse for Error {
         response
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_codes_map_as_expected() {
+        assert_eq!(Error::PackageNotFound.status(), StatusCode::NOT_FOUND);
+        assert_eq!(Error::PackageAlreadyExists.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            Error::InvalidPackage("x".into()).status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            Error::PayloadTooLarge("x".into()).status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        assert_eq!(Error::Unauthorized.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(Error::AdminUnauthorized.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            Error::InvalidVersion("x".into()).status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            Error::Database(sqlx::Error::RowNotFound).status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            Error::Other(anyhow::anyhow!("boom")).status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[test]
+    fn admin_unauthorized_sends_basic_challenge() {
+        let resp = Error::AdminUnauthorized.into_response();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let header = resp
+            .headers()
+            .get(axum::http::header::WWW_AUTHENTICATE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(header.contains("Basic"));
+    }
+
+    #[test]
+    fn plain_unauthorized_has_no_challenge() {
+        let resp = Error::Unauthorized.into_response();
+        assert!(resp
+            .headers()
+            .get(axum::http::header::WWW_AUTHENTICATE)
+            .is_none());
+    }
+}

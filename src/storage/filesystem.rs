@@ -267,5 +267,56 @@ mod tests {
         let (_d, storage) = temp_storage().await;
         assert!(storage.get_package("..", "1.0.0").await.is_err());
         assert!(storage.package_path("a/b", "1.0.0").is_err());
+        // Symbol keys/filenames are validated too.
+        assert!(storage.symbol_path("../etc", "x.pdb").is_err());
+        assert!(storage.symbol_path("KEY", "a/b.pdb").is_err());
+    }
+
+    #[tokio::test]
+    async fn symbols_round_trip_and_delete() {
+        let (_d, storage) = temp_storage().await;
+        storage
+            .store_symbol("ABCDEF01FFFFFFFF", "App.pdb", b"pdb-bytes")
+            .await
+            .unwrap();
+
+        // Lookup is case-insensitive (the key/filename are lower-cased on disk).
+        let content = storage
+            .get_symbol("abcdef01ffffffff", "app.pdb")
+            .await
+            .unwrap();
+        let PackageContent::LocalPath(path) = content;
+        assert_eq!(tokio::fs::read(path).await.unwrap(), b"pdb-bytes");
+
+        storage
+            .delete_symbol("ABCDEF01FFFFFFFF", "App.pdb")
+            .await
+            .unwrap();
+        assert!(storage
+            .get_symbol("abcdef01ffffffff", "app.pdb")
+            .await
+            .is_err());
+        // Deleting a missing symbol is a no-op.
+        storage.delete_symbol("nope", "x.pdb").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn symbol_package_is_stored_next_to_version() {
+        let (_d, storage) = temp_storage().await;
+        let (_td, temp) = write_temp(b"snupkg-bytes").await;
+        let size = storage
+            .store_symbol_package("Sym.Lib", "1.0.0", temp)
+            .await
+            .unwrap();
+        assert_eq!(size, b"snupkg-bytes".len() as u64);
+        // It lives in the same version directory and is removed with it.
+        storage.delete("sym.lib", "1.0.0").await.unwrap();
+        let (_td2, temp2) = write_temp(b"x").await;
+        storage
+            .store_package("Sym.Lib", "1.0.0", temp2)
+            .await
+            .unwrap();
+        // (sanity) the version dir is usable again after delete.
+        assert!(storage.package_exists("sym.lib", "1.0.0").await);
     }
 }

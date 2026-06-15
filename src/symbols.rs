@@ -119,11 +119,133 @@ fn file_name(entry: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::database::SqliteDatabase;
+    use crate::storage::FilesystemStorage;
+    use crate::version::NuGetVersion;
+    use std::io::Write;
+    use zip::write::SimpleFileOptions;
 
     #[test]
     fn file_name_strips_directories() {
         assert_eq!(file_name("lib/net8.0/app.pdb"), "app.pdb");
         assert_eq!(file_name("App.PDB"), "app.pdb");
         assert_eq!(file_name("a\\b\\c.pdb"), "c.pdb");
+    }
+
+    /// A minimal Portable PDB whose `#Pdb` stream begins with `guid`.
+    fn portable_pdb(guid: &[u8; 16]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&0x424A_5342u32.to_le_bytes());
+        buf.extend_from_slice(&1u16.to_le_bytes());
+        buf.extend_from_slice(&1u16.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        let version = b"PDB v1.0\0\0\0\0";
+        buf.extend_from_slice(&(version.len() as u32).to_le_bytes());
+        buf.extend_from_slice(version);
+        buf.extend_from_slice(&0u16.to_le_bytes());
+        buf.extend_from_slice(&1u16.to_le_bytes());
+        let hp = buf.len();
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(&20u32.to_le_bytes());
+        buf.extend_from_slice(b"#Pdb\0\0\0\0");
+        let off = buf.len() as u32;
+        buf[hp..hp + 4].copy_from_slice(&off.to_le_bytes());
+        buf.extend_from_slice(guid);
+        buf.extend_from_slice(&[0u8; 4]);
+        buf
+    }
+
+    fn make_snupkg(portable: bool, native: bool) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pkg.snupkg");
+        let file = std::fs::File::create(&path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let opts = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        zip.start_file("Sym.Lib.nuspec", opts).unwrap();
+        zip.write_all(
+            br#"<package><metadata><id>Sym.Lib</id><version>1.0.0</version>
+                <authors>A</authors><description>d</description></metadata></package>"#,
+        )
+        .unwrap();
+        if portable {
+            zip.start_file("lib/net8.0/sym.lib.pdb", opts).unwrap();
+            zip.write_all(&portable_pdb(&[7u8; 16])).unwrap();
+        }
+        if native {
+            zip.start_file("lib/net8.0/native.pdb", opts).unwrap();
+            zip.write_all(b"Microsoft C/C++ MSF 7.00\r\n").unwrap();
+        }
+        zip.finish().unwrap();
+        (dir, path)
+    }
+
+    async fn fixtures() -> (tempfile::TempDir, FilesystemStorage, SqliteDatabase) {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FilesystemStorage::new(dir.path()).await.unwrap();
+        let db = SqliteDatabase::in_memory().await.unwrap();
+        (dir, storage, db)
+    }
+
+    fn owning_package() -> crate::models::Package {
+        crate::models::Package {
+            id: "Sym.Lib".into(),
+            version: NuGetVersion::parse("1.0.0").unwrap(),
+            listed: true,
+            enabled: true,
+            authors: vec![],
+            description: String::new(),
+            icon_url: None,
+            license_url: None,
+            license_expression: None,
+            project_url: None,
+            repository_url: None,
+            repository_type: None,
+            min_client_version: None,
+            release_notes: None,
+            language: None,
+            title: None,
+            summary: None,
+            tags: vec![],
+            has_readme: false,
+            has_embedded_icon: false,
+            is_development_dependency: false,
+            is_semver2: false,
+            package_size: 1,
+            package_hash: "h".into(),
+            package_hash_algorithm: "SHA512".into(),
+            published: chrono::Utc::now(),
+            downloads: 0,
+            package_types: vec![],
+            dependencies: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn indexes_portable_skips_native() {
+        let (_d, storage, db) = fixtures().await;
+        db.add(&owning_package()).await.unwrap();
+
+        let (_sd, snupkg) = make_snupkg(true, true);
+        let result = index_symbol_package(&storage, &db, snupkg).await.unwrap();
+        assert_eq!(result.indexed, 1);
+        assert_eq!(result.skipped, 1);
+
+        // The portable PDB is resolvable by its SSQP key.
+        let key = crate::pdb::portable_pdb_signature(&portable_pdb(&[7u8; 16])).unwrap();
+        assert!(db.find_symbol(&key, "sym.lib.pdb").await.unwrap().is_some());
+        assert!(storage.get_symbol(&key, "sym.lib.pdb").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn rejects_symbols_for_unknown_package() {
+        let (_d, storage, db) = fixtures().await;
+        // No package added first.
+        let (_sd, snupkg) = make_snupkg(true, false);
+        let err = index_symbol_package(&storage, &db, snupkg.clone())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::PackageNotFound));
+        // The rejected temp file was cleaned up.
+        assert!(!snupkg.exists());
     }
 }
