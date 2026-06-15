@@ -540,6 +540,54 @@ async fn gallery_lists_and_details_packages() {
 }
 
 #[tokio::test]
+async fn stats_page_aggregates_the_feed() {
+    let server = spawn().await;
+    push_multipart(&server, API_KEY, build_nupkg("Stat.A", "1.0.0", b"xx")).await;
+    push_multipart(&server, API_KEY, build_nupkg("Stat.A", "1.1.0", b"xx")).await;
+    push_multipart(&server, API_KEY, build_nupkg("Stat.B", "2.0.0", b"xx")).await;
+
+    let resp = server
+        .client
+        .get(server.url("/stats"))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("Statistics"));
+    // 2 distinct packages, 3 versions.
+    assert!(body.contains(">2</div><div class=\"l\">Packages"));
+    assert!(body.contains(">3</div><div class=\"l\">Versions"));
+    // Both lists reference the published packages.
+    assert!(body.contains("Most downloaded"));
+    assert!(body.contains("Recently published"));
+    assert!(body.contains("Stat.A"));
+}
+
+#[tokio::test]
+async fn settings_page_shows_policy_without_secrets() {
+    let server = spawn_with(|c| {
+        c.retention.enabled = true;
+        c.retention.keep_latest_stable = Some(7);
+    })
+    .await;
+    let resp = server
+        .client
+        .get(server.url("/settings"))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("Settings"));
+    assert!(body.contains("Required (API key)"));
+    assert!(body.contains("Keep newest stable"));
+    assert!(body.contains("7"));
+    // The actual API key must never appear on the unauthenticated page.
+    assert!(!body.contains(API_KEY));
+}
+
+#[tokio::test]
 async fn web_ui_can_be_disabled() {
     let server = spawn_with(|c| c.enable_web_ui = false).await;
     push_multipart(&server, API_KEY, build_nupkg("Hidden.Pkg", "1.0.0", b"x")).await;

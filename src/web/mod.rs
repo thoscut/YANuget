@@ -123,7 +123,9 @@ pub fn router(state: AppState) -> Router {
             .route("/", get(gallery))
             .route("/packages", get(gallery))
             .route("/packages/{id}", get(package_detail))
-            .route("/packages/{id}/{version}", get(package_detail_version));
+            .route("/packages/{id}/{version}", get(package_detail_version))
+            .route("/stats", get(stats_page))
+            .route("/settings", get(settings_page));
     } else {
         router = router.route("/", get(index_page));
     }
@@ -553,6 +555,26 @@ async fn gallery(
     let page = state.db.search(&request).await?;
     let urls = state.url_builder(&headers);
     Ok(Html(ui::gallery_page(&urls, &page, query.trim())))
+}
+
+async fn settings_page(State(state): State<AppState>, headers: HeaderMap) -> Html<String> {
+    let urls = state.url_builder(&headers);
+    Html(ui::settings_page(&urls, &state.config))
+}
+
+async fn stats_page(State(state): State<AppState>, headers: HeaderMap) -> Result<Html<String>> {
+    let stats = state.db.stats().await?;
+    // Reuse the download-ranked search for the "most downloaded" list.
+    let top = state
+        .db
+        .search(&SearchRequest {
+            take: 10,
+            ..Default::default()
+        })
+        .await?;
+    let recent = state.db.recent_packages(10).await?;
+    let urls = state.url_builder(&headers);
+    Ok(Html(ui::stats_page(&urls, &stats, &top, &recent)))
 }
 
 async fn package_detail(

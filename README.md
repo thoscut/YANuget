@@ -188,9 +188,12 @@ symbols. Native (Windows) PDBs are stored but cannot be indexed.
 A self-contained, dependency-free HTML gallery (no external assets, works
 offline) lives at `/`:
 
-* searchable package list,
+* a searchable package list (search box in the header),
 * a per-package detail page with versions, dependencies, links, readme and the
-  install command for Chocolatey / `dotnet` / `nuget.exe`.
+  install command for Chocolatey / `dotnet` / `nuget.exe`,
+* a statistics page (`/stats`) with feed totals and the most-downloaded /
+  recently-published lists,
+* a read-only settings overview (`/settings`) that never exposes secrets.
 
 Disable it with `enable_web_ui = false`.
 

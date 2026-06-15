@@ -23,7 +23,9 @@ use crate::error::{Error, Result};
 use crate::models::{DependencyGroup, Package, PackageType};
 use crate::version::NuGetVersion;
 
-use super::{PackageDatabase, SearchGroup, SearchPage, SearchRequest, SymbolKey, SymbolRef};
+use super::{
+    DatabaseStats, PackageDatabase, SearchGroup, SearchPage, SearchRequest, SymbolKey, SymbolRef,
+};
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS packages (
@@ -469,6 +471,39 @@ impl PackageDatabase for SqliteDatabase {
                 .execute(&self.pool)
                 .await?;
         Ok(result.rows_affected())
+    }
+
+    async fn stats(&self) -> Result<DatabaseStats> {
+        let row = sqlx::query(
+            r#"SELECT
+                   COUNT(DISTINCT lower_id)       AS package_count,
+                   COUNT(*)                       AS version_count,
+                   COALESCE(SUM(listed), 0)       AS listed_count,
+                   COALESCE(SUM(downloads), 0)    AS total_downloads,
+                   COALESCE(SUM(package_size), 0) AS total_size
+               FROM packages"#,
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        let symbol_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM symbols")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(DatabaseStats {
+            package_count: row.try_get("package_count")?,
+            version_count: row.try_get("version_count")?,
+            listed_count: row.try_get("listed_count")?,
+            total_downloads: row.try_get("total_downloads")?,
+            total_size: row.try_get("total_size")?,
+            symbol_count,
+        })
+    }
+
+    async fn recent_packages(&self, limit: i64) -> Result<Vec<Package>> {
+        let rows = sqlx::query("SELECT * FROM packages ORDER BY published DESC LIMIT ?1")
+            .bind(limit.max(0))
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter().map(row_to_package).collect()
     }
 }
 

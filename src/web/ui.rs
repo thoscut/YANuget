@@ -8,6 +8,7 @@
 //! The gallery is geared towards Chocolatey: the install snippet shown first is
 //! the `choco install` command (configurable via `primary_client`).
 
+use crate::config::Config;
 use crate::models::{Package, PackageType};
 use crate::nuget::UrlBuilder;
 
@@ -57,7 +58,13 @@ table.deps td{padding:3px 8px 3px 0}\
 .readme{white-space:pre-wrap;word-wrap:break-word}\
 .empty{text-align:center;color:var(--muted);padding:60px 0}\
 .kv{font-size:13px}.kv div{padding:3px 0;border-bottom:1px solid var(--border)}\
-.kv b{color:var(--muted);font-weight:500;display:inline-block;min-width:96px}\
+.kv b{color:var(--muted);font-weight:500;display:inline-block;min-width:150px}\
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:14px;margin:0 0 8px}\
+.stat{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:16px 18px}\
+.stat .n{font-size:26px;font-weight:700}\
+.stat .l{color:var(--muted);font-size:13px}\
+.rank{list-style:none;margin:0;padding:0}\
+.rank li{display:flex;justify-content:space-between;gap:10px;padding:6px 0;border-bottom:1px solid var(--border)}\
 footer{border-top:1px solid var(--border);color:var(--muted);font-size:13px;padding:18px 0}\
 ";
 
@@ -91,7 +98,7 @@ fn layout(urls: &UrlBuilder, title: &str, query: &str, body: &str) -> String {
 </div></header>\
 <main><div class=\"wrap\">{body}</div></main>\
 <footer><div class=\"wrap\">Served by YANuget \u{2014} \
-<a href=\"{idx}\">v3 service index</a></div></footer>\
+<a href=\"{idx}\">v3 service index</a> \u{2022} <a href=\"/stats\">Stats</a> \u{2022} <a href=\"/settings\">Settings</a></div></footer>\
 </body></html>",
         title = escape_html(title),
         q = escape_html(query),
@@ -146,6 +153,200 @@ pub fn gallery_page(urls: &UrlBuilder, page: &crate::database::SearchPage, query
         cards
     };
     layout(urls, "YANuget", query, &body)
+}
+
+/// The statistics page: feed-wide totals, the most-downloaded packages, and the
+/// most recently published versions.
+pub fn stats_page(
+    urls: &UrlBuilder,
+    stats: &crate::database::DatabaseStats,
+    top: &crate::database::SearchPage,
+    recent: &[Package],
+) -> String {
+    let cards = [
+        (stats.package_count.to_string(), "Packages"),
+        (stats.version_count.to_string(), "Versions"),
+        (group_digits(stats.total_downloads), "Downloads"),
+        (human_size(stats.total_size.max(0) as u64), "Storage"),
+        (stats.symbol_count.to_string(), "Symbol files"),
+        (stats.listed_count.to_string(), "Listed versions"),
+    ];
+    let mut tiles = String::from("<div class=\"stats\">");
+    for (n, l) in cards {
+        tiles.push_str(&format!(
+            "<div class=\"stat\"><div class=\"n\">{}</div><div class=\"l\">{}</div></div>",
+            escape_html(&n),
+            l
+        ));
+    }
+    tiles.push_str("</div>");
+
+    let top_list = if top.groups.is_empty() {
+        "<p class=\"muted\">No packages yet.</p>".to_string()
+    } else {
+        let mut out = String::from("<ul class=\"rank\">");
+        for g in &top.groups {
+            let p = g.latest();
+            out.push_str(&format!(
+                "<li><a href=\"/packages/{lid}\">{id}</a>\
+                 <span class=\"muted\">{dl} downloads</span></li>",
+                lid = enc_path(&p.lower_id()),
+                id = escape_html(&p.id),
+                dl = group_digits(g.total_downloads() as i64),
+            ));
+        }
+        out.push_str("</ul>");
+        out
+    };
+
+    let recent_list = if recent.is_empty() {
+        "<p class=\"muted\">No packages yet.</p>".to_string()
+    } else {
+        let mut out = String::from("<ul class=\"rank\">");
+        for p in recent {
+            out.push_str(&format!(
+                "<li><a href=\"/packages/{lid}/{ev}\">{id} {dv}</a>\
+                 <span class=\"muted\">{when}</span></li>",
+                lid = enc_path(&p.lower_id()),
+                ev = enc_path(&p.normalized_version()),
+                id = escape_html(&p.id),
+                dv = escape_html(&p.normalized_version()),
+                when = escape_html(&p.published.format("%Y-%m-%d").to_string()),
+            ));
+        }
+        out.push_str("</ul>");
+        out
+    };
+
+    let body = format!(
+        "<h1 class=\"title\">Statistics</h1>{tiles}\
+         <div class=\"grid\">\
+         <div class=\"card\"><h3 class=\"muted\">Most downloaded</h3>{top_list}</div>\
+         <div class=\"card\"><h3 class=\"muted\">Recently published</h3>{recent_list}</div>\
+         </div>"
+    );
+    layout(urls, "Statistics \u{2014} YANuget", "", &body)
+}
+
+/// Group a non-negative integer into thousands with `,` separators.
+fn group_digits(n: i64) -> String {
+    let s = n.max(0).to_string();
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, b) in bytes.iter().enumerate() {
+        if i > 0 && (bytes.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(*b as char);
+    }
+    out
+}
+
+/// A read-only overview of the server's relevant settings.
+///
+/// Deliberately omits secrets and infrastructure details (the API key, data
+/// paths and bind address) because the gallery is unauthenticated — it only
+/// surfaces policy that affects how clients interact with the feed.
+pub fn settings_page(urls: &UrlBuilder, config: &Config) -> String {
+    let yes_no = |b: bool| if b { "Yes" } else { "No" };
+    let on_off = |b: bool| if b { "Enabled" } else { "Disabled" };
+
+    let auth = if config.api_key.is_some() {
+        "Required (API key)"
+    } else {
+        "Open \u{2014} no API key set"
+    };
+    let max_size = match config.max_package_size_bytes {
+        Some(n) => human_size(n),
+        None => "Unlimited".to_string(),
+    };
+    let delete_mode = if config.hard_delete_enabled {
+        "Hard delete (removes files)"
+    } else {
+        "Unlist (restorable)"
+    };
+
+    let mut server = String::from("<div class=\"kv\">");
+    server.push_str(&kv("Push / delete auth", auth));
+    server.push_str(&kv("Max package size", &max_size));
+    server.push_str(&kv(
+        "Overwrite existing version",
+        yes_no(config.allow_overwrite),
+    ));
+    server.push_str(&kv("Delete behaviour", delete_mode));
+    server.push_str(&kv("Symbol server", on_off(config.enable_symbol_server)));
+    server.push_str(&kv("Web gallery", on_off(config.enable_web_ui)));
+    server.push_str(&kv("Preferred client", &config.primary_client));
+    server.push_str("</div>");
+
+    let r = &config.retention;
+    let mut retention = String::from("<div class=\"kv\">");
+    retention.push_str(&kv("Retention", on_off(r.enabled)));
+    if r.enabled {
+        retention.push_str(&kv("Prune after each push", yes_no(r.prune_on_push)));
+        let sweep = if r.interval_hours > 0 {
+            format!("every {} h", r.interval_hours)
+        } else {
+            "off".to_string()
+        };
+        retention.push_str(&kv("Scheduled sweep", &sweep));
+        retention.push_str(&kv("Keep newest stable", &opt_count(r.keep_latest_stable)));
+        retention.push_str(&kv(
+            "Keep newest pre-release",
+            &opt_count(r.keep_latest_prerelease),
+        ));
+        retention.push_str(&kv(
+            "Max version age",
+            &match r.max_age_days {
+                Some(d) => format!("{d} days"),
+                None => "No limit".to_string(),
+            },
+        ));
+    }
+    retention.push_str("</div>");
+
+    let body = format!(
+        "<h1 class=\"title\">Settings</h1>\
+         <p class=\"muted\">Read-only overview of this feed's policy. \
+         Secrets and storage paths are not shown.</p>\
+         <div class=\"card\"><h3 class=\"muted\">Server</h3>{server}</div>\
+         <div class=\"card\"><h3 class=\"muted\">Retention</h3>{retention}</div>\
+         <div class=\"card\"><h3 class=\"muted\">Endpoints</h3><div class=\"kv\">\
+         {svc}{sym}</div></div>",
+        svc = kv_html(
+            "Service index",
+            &format!(
+                "<a href=\"{u}\">{u}</a>",
+                u = escape_html(&urls.service_index())
+            )
+        ),
+        sym = if config.enable_symbol_server {
+            kv_html(
+                "Symbol server",
+                &format!("<code>{}</code>", escape_html(&urls.symbol_server())),
+            )
+        } else {
+            String::new()
+        },
+    );
+    layout(urls, "Settings \u{2014} YANuget", "", &body)
+}
+
+/// A key/value row with an escaped text value.
+fn kv(label: &str, value: &str) -> String {
+    kv_html(label, &escape_html(value))
+}
+
+/// A key/value row whose value is already trusted HTML.
+fn kv_html(label: &str, value_html: &str) -> String {
+    format!("<div><b>{}</b>{}</div>", escape_html(label), value_html)
+}
+
+fn opt_count(n: Option<usize>) -> String {
+    match n {
+        Some(n) => n.to_string(),
+        None => "No limit".to_string(),
+    }
 }
 
 /// The package detail page for one selected version.
@@ -413,6 +614,14 @@ mod tests {
             escape_html("<script>\"&'"),
             "&lt;script&gt;&quot;&amp;&#39;"
         );
+    }
+
+    #[test]
+    fn group_digits_inserts_separators() {
+        assert_eq!(group_digits(0), "0");
+        assert_eq!(group_digits(42), "42");
+        assert_eq!(group_digits(1234), "1,234");
+        assert_eq!(group_digits(1234567), "1,234,567");
     }
 
     #[test]

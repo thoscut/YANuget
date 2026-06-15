@@ -154,11 +154,18 @@ GET /                                  # searchable package list
 GET /packages?q=&skip=&take=           # same, as a search page
 GET /packages/{id}                     # detail for the newest version
 GET /packages/{id}/{version}           # detail for a specific version
+GET /stats                             # feed-wide statistics
+GET /settings                          # read-only policy overview
 ```
 
-Human-facing HTML (not part of the NuGet protocol). The detail page shows
-versions, dependencies, links, readme, symbol availability, and the install
-command for Chocolatey / `dotnet` / `nuget.exe` (ordered by `primary_client`).
+Human-facing HTML (not part of the NuGet protocol). The header has a search box
+(submitting to `/packages?q=`). The detail page shows versions, dependencies,
+links, readme, symbol availability, and the install command for Chocolatey /
+`dotnet` / `nuget.exe` (ordered by `primary_client`). `/stats` shows feed totals
+(packages, versions, downloads, storage, symbol files) plus the most-downloaded
+and most-recently-published lists. `/settings` summarises the feed's policy
+(auth mode, size/overwrite/delete behaviour, symbol server, retention) and never
+exposes the API key or storage paths.
 Requires `enable_web_ui` (on by default); when disabled, `/` serves a minimal
 info page and `/packages/*` return `404`.
 

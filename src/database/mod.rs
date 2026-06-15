@@ -125,6 +125,29 @@ pub trait PackageDatabase: Send + Sync {
     /// Remove all symbol mappings for a package version. Returns how many rows
     /// were removed.
     async fn delete_symbols(&self, id: &str, version: &NuGetVersion) -> Result<u64>;
+
+    /// Aggregate counters across the whole feed, for the statistics page.
+    async fn stats(&self) -> Result<DatabaseStats>;
+
+    /// The most recently published versions, newest first.
+    async fn recent_packages(&self, limit: i64) -> Result<Vec<Package>>;
+}
+
+/// Feed-wide aggregate statistics.
+#[derive(Debug, Clone, Default)]
+pub struct DatabaseStats {
+    /// Distinct package ids.
+    pub package_count: i64,
+    /// Total package versions (rows).
+    pub version_count: i64,
+    /// Versions that are listed (visible in search).
+    pub listed_count: i64,
+    /// Sum of download counters across all versions.
+    pub total_downloads: i64,
+    /// Sum of on-disk `.nupkg` sizes, in bytes.
+    pub total_size: i64,
+    /// Number of indexed symbol files.
+    pub symbol_count: i64,
 }
 
 /// A symbol file's owning package, resolved from an SSQP lookup.
