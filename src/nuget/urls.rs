@@ -11,6 +11,9 @@ use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 pub struct UrlBuilder {
     /// Base URL with any trailing slash removed (e.g. `https://host/nuget`).
     base: String,
+    /// App-relative path prefix for the current feed (`""` or `/{feed}`), used
+    /// to build the gallery/admin links that stay within the feed.
+    prefix: String,
 }
 
 impl UrlBuilder {
@@ -20,12 +23,42 @@ impl UrlBuilder {
         while base.ends_with('/') {
             base.pop();
         }
-        Self { base }
+        Self {
+            base,
+            prefix: String::new(),
+        }
+    }
+
+    /// Create a builder rooted at `root` with an app path `prefix` (e.g.
+    /// `/stable`). Absolute resource URLs include the prefix; [`Self::app`]
+    /// builds prefix-aware links for the HTML UI.
+    pub fn with_prefix(root: impl Into<String>, prefix: &str) -> Self {
+        let root = root.into();
+        let prefix = prefix.trim_end_matches('/').to_string();
+        let mut b = Self::new(format!("{}{}", root.trim_end_matches('/'), prefix));
+        b.prefix = prefix;
+        b
     }
 
     /// The configured base URL (no trailing slash).
     pub fn base(&self) -> &str {
         &self.base
+    }
+
+    /// Build an app-relative link within the current feed. `path` must start
+    /// with `/`; the feed prefix is prepended. The feed root (`/`) maps to the
+    /// bare prefix (e.g. `/stable`) for a prefixed feed — which is where a
+    /// nested feed's index route lives — or to `/` for the root feed.
+    pub fn app(&self, path: &str) -> String {
+        if path == "/" {
+            if self.prefix.is_empty() {
+                "/".to_string()
+            } else {
+                self.prefix.clone()
+            }
+        } else {
+            format!("{}{}", self.prefix, path)
+        }
     }
 
     /// `/v3/index.json`

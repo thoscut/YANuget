@@ -8,7 +8,7 @@ use std::sync::Arc;
 use yanuget::config::Config;
 use yanuget::database::SqliteDatabase;
 use yanuget::storage::FilesystemStorage;
-use yanuget::web::{self, AppState};
+use yanuget::web::{self, AppState, FeedMeta};
 use zip::write::SimpleFileOptions;
 
 const API_KEY: &str = "test-key";
@@ -1244,4 +1244,334 @@ async fn concurrent_pushes_with_prune_on_push_stay_consistent() {
         "newest version was pruned: {list:?}"
     );
     assert!(list.len() <= 8);
+}
+
+// ---------------------------------------------------------------------------
+// Feeds: multi-feed isolation, approval rings, promotion, license policy, read auth
+// ---------------------------------------------------------------------------
+
+/// Spawn a server from fully resolved feeds (the multi-feed `build_app` path).
+async fn spawn_feeds(customize: impl FnOnce(&mut Config)) -> TestServer {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = Config {
+        data_dir: dir.path().to_path_buf(),
+        host: Ipv4Addr::LOCALHOST.into(),
+        port: 0,
+        tls_enabled: false,
+        ..Config::default()
+    };
+    customize(&mut config);
+
+    let storage = Arc::new(FilesystemStorage::new(config.storage_path()).await.unwrap());
+    let db = Arc::new(
+        SqliteDatabase::connect(&config.database_path())
+            .await
+            .unwrap(),
+    );
+    let config = Arc::new(config);
+    let feeds = config.resolved_feeds().unwrap();
+    let feeds_meta = Arc::new(
+        feeds
+            .iter()
+            .map(|f| FeedMeta {
+                name: f.name.clone(),
+                prefix: f.prefix.clone(),
+                requires_approval: f.requires_approval,
+            })
+            .collect::<Vec<_>>(),
+    );
+    let mut states = Vec::new();
+    for f in &feeds {
+        states.push(
+            AppState::for_feed(
+                storage.clone(),
+                db.clone(),
+                config.clone(),
+                f,
+                feeds_meta.clone(),
+            )
+            .await
+            .unwrap(),
+        );
+    }
+    let app = web::build_app(states);
+
+    let listener = tokio::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    TestServer {
+        base: format!("http://{addr}"),
+        client: reqwest::Client::new(),
+        _dir: dir,
+    }
+}
+
+async fn push_to(server: &TestServer, path: &str, key: &str, nupkg: Vec<u8>) -> reqwest::Response {
+    let part = reqwest::multipart::Part::bytes(nupkg)
+        .file_name("package.nupkg")
+        .mime_str("application/octet-stream")
+        .unwrap();
+    let form = reqwest::multipart::Form::new().part("package", part);
+    server
+        .client
+        .put(server.url(path))
+        .header("X-NuGet-ApiKey", key)
+        .multipart(form)
+        .send()
+        .await
+        .unwrap()
+}
+
+fn feed(name: &str) -> yanuget::config::FeedConfig {
+    yanuget::config::FeedConfig {
+        name: name.to_string(),
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn feeds_are_isolated_and_prefixed() {
+    let server = spawn_feeds(|c| {
+        c.api_key = Some(API_KEY.into());
+        c.feeds = vec![feed("stable"), feed("dev")];
+    })
+    .await;
+
+    // Push only into /stable.
+    let resp = push_to(
+        &server,
+        "/stable/api/v2/package",
+        API_KEY,
+        build_nupkg("Iso.Pkg", "1.0.0", b"x"),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+
+    // Visible in stable, absent in dev.
+    let in_stable = server
+        .client
+        .get(server.url("/stable/v3/package/iso.pkg/index.json"))
+        .send()
+        .await
+        .unwrap();
+    assert!(in_stable.status().is_success());
+    let in_dev = server
+        .client
+        .get(server.url("/dev/v3/package/iso.pkg/index.json"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(in_dev.status(), reqwest::StatusCode::NOT_FOUND);
+
+    // The service index advertises feed-prefixed resource URLs.
+    let index: serde_json::Value = server
+        .client
+        .get(server.url("/stable/v3/index.json"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        package_base_address(&index),
+        format!("{}/stable/v3/package/", server.base)
+    );
+
+    // Root lists the feeds; each feed's gallery lives at its prefix `/{name}`.
+    let root = server.client.get(server.url("/")).send().await.unwrap();
+    assert!(root.text().await.unwrap().contains("href=\"/stable\""));
+    let gallery = server
+        .client
+        .get(server.url("/stable"))
+        .send()
+        .await
+        .unwrap();
+    assert!(gallery.status().is_success());
+}
+
+#[tokio::test]
+async fn approval_ring_withholds_until_approved() {
+    let server = spawn_feeds(|c| {
+        c.api_key = Some(API_KEY.into());
+        c.admin_api_key = Some(ADMIN_KEY.into());
+        let mut gated = feed("gated");
+        gated.requires_approval = true;
+        c.feeds = vec![gated];
+    })
+    .await;
+
+    assert_eq!(
+        push_to(
+            &server,
+            "/gated/api/v2/package",
+            API_KEY,
+            build_nupkg("Ring.Pkg", "1.0.0", b"x")
+        )
+        .await
+        .status(),
+        reqwest::StatusCode::CREATED
+    );
+
+    // Pending: not visible to clients yet.
+    let pending = server
+        .client
+        .get(server.url("/gated/v3/package/ring.pkg/index.json"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(pending.status(), reqwest::StatusCode::NOT_FOUND);
+
+    // Admin approves it.
+    let approve = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap()
+        .post(server.url("/gated/admin/packages/ring.pkg/1.0.0/approve"))
+        .basic_auth("admin", Some(ADMIN_KEY))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(approve.status(), reqwest::StatusCode::SEE_OTHER);
+
+    // Now servable.
+    let live = server
+        .client
+        .get(server.url("/gated/v3/package/ring.pkg/index.json"))
+        .send()
+        .await
+        .unwrap();
+    assert!(live.status().is_success());
+}
+
+#[tokio::test]
+async fn promotion_moves_a_version_into_the_next_ring() {
+    let server = spawn_feeds(|c| {
+        c.api_key = Some(API_KEY.into());
+        c.admin_api_key = Some(ADMIN_KEY.into());
+        let mut dev = feed("dev");
+        dev.promotes_to = Some("stable".into());
+        c.feeds = vec![dev, feed("stable")];
+    })
+    .await;
+
+    push_to(
+        &server,
+        "/dev/api/v2/package",
+        API_KEY,
+        build_nupkg("Prom.Pkg", "1.0.0", b"x"),
+    )
+    .await;
+
+    // Not in stable yet.
+    assert_eq!(
+        server
+            .client
+            .get(server.url("/stable/v3/package/prom.pkg/index.json"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::NOT_FOUND
+    );
+
+    // Promote dev -> stable.
+    let promote = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap()
+        .post(server.url("/dev/admin/packages/prom.pkg/1.0.0/promote"))
+        .basic_auth("admin", Some(ADMIN_KEY))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(promote.status(), reqwest::StatusCode::SEE_OTHER);
+
+    // Now present in both rings (shared payload, two memberships).
+    assert!(server
+        .client
+        .get(server.url("/stable/v3/package/prom.pkg/index.json"))
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .is_success());
+    assert!(server
+        .client
+        .get(server.url("/dev/v3/package/prom.pkg/index.json"))
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .is_success());
+}
+
+#[tokio::test]
+async fn blocking_license_policy_rejects_push() {
+    use yanuget::config::PolicyAction;
+    let server = spawn_feeds(|c| {
+        c.api_key = Some(API_KEY.into());
+        let mut strict = feed("strict");
+        strict.license_policy.enabled = true;
+        strict.license_policy.allow_unlicensed = false;
+        strict.license_policy.action = PolicyAction::Block;
+        c.feeds = vec![strict];
+    })
+    .await;
+
+    // build_nupkg declares no license -> blocked.
+    let resp = push_to(
+        &server,
+        "/strict/api/v2/package",
+        API_KEY,
+        build_nupkg("Lic.Pkg", "1.0.0", b"x"),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn read_auth_gates_downloads() {
+    let server = spawn_feeds(|c| {
+        c.api_key = Some(API_KEY.into());
+        let mut private = feed("private");
+        private.read_api_key = Some("read-key".into());
+        c.feeds = vec![private];
+    })
+    .await;
+
+    push_to(
+        &server,
+        "/private/api/v2/package",
+        API_KEY,
+        build_nupkg("Priv.Pkg", "1.0.0", b"x"),
+    )
+    .await;
+
+    let url = "/private/v3/package/priv.pkg/index.json";
+    // No credential -> 401.
+    assert_eq!(
+        server
+            .client
+            .get(server.url(url))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+    // With the read key -> 200.
+    assert!(server
+        .client
+        .get(server.url(url))
+        .header("X-NuGet-ApiKey", "read-key")
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .is_success());
 }

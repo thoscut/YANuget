@@ -54,6 +54,56 @@ package can never be pruned out of existence.
 
 With no limit set, the sweep does nothing even when `enabled`.
 
+## Feeds
+
+By default YANuget serves a single feed at the root (the implicit `default`
+feed, using the global settings above). Add `[[feeds]]` blocks to host several
+feeds; each is mounted under `/{name}` (e.g. `/stable/v3/index.json`) and the
+root serves a feed index. **Feeds are configured in TOML only — there are no
+`YANUGET_*` environment variables for them.**
+
+A package version can belong to **many feeds at once**. The payload and metadata
+are stored **once** (keyed by id/version); each feed holds only a *membership*
+with its own mutable state (listed / enabled / pending / flagged / downloads).
+Removing a version from a feed drops that membership; the shared payload is
+deleted only when the **last** feed referencing it lets go.
+
+| TOML key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `feeds[].name` | string | *(required)* | URL slug + DB key; `[A-Za-z0-9._-]+`, unique. |
+| `feeds[].api_key` | string | *(global `api_key`)* | Push (put) credential. |
+| `feeds[].read_api_key` | string | *(open)* | Download/restore (get) credential. See below. |
+| `feeds[].admin_api_key` | string | *(global `admin_api_key`)* | Moderation/promotion (delete) credential. |
+| `feeds[].allow_overwrite` | bool | *(global)* | Re-push an existing version. |
+| `feeds[].hard_delete_enabled` | bool | *(global)* | DELETE removes vs. unlists. |
+| `feeds[].requires_approval` | bool | `false` | Incoming versions are pending until approved. |
+| `feeds[].promotes_to` | string | *(none)* | Next release ring (must name another feed). |
+| `feeds[].mirror.enabled` | bool | `false` | Read-through cache of an upstream V3 feed. |
+| `feeds[].mirror.upstream` | string | `https://api.nuget.org/v3/index.json` | Upstream service index. |
+| `feeds[].mirror.timeout_secs` | int | `30` | Per-request upstream timeout. |
+| `feeds[].license_policy.enabled` | bool | `false` | Evaluate the offline license policy. |
+| `feeds[].license_policy.allowed` | string[] | `[]` | If non-empty, license must match one. |
+| `feeds[].license_policy.blocked` | string[] | `[]` | Always rejected (even if also allowed). |
+| `feeds[].license_policy.allow_unlicensed` | bool | `true` | Allow packages with no declared license. |
+| `feeds[].license_policy.action` | string | `warn` | `warn` (accept + flag) or `block` (reject). |
+| `feeds[].retention` | table | *(global `[retention]`)* | Per-feed retention overrides. |
+
+### Read authentication
+
+When a feed sets `read_api_key`, downloads/restore **and** the HTML gallery
+require a credential, supplied either as an `X-NuGet-ApiKey` header or as the
+password of HTTP Basic credentials (what `dotnet`/`nuget` send). The
+`/v3/index.json` service index stays open so clients can discover the feed.
+
+### Release rings & approval
+
+`requires_approval = true` makes every version entering a feed (by push,
+promotion or mirror) **pending** — withheld from clients until an operator
+approves it in `/admin`. Combined with `promotes_to`, feeds form an ordered
+promotion chain (e.g. `dev → stable`): an admin promotes a version into the next
+ring, where it waits for approval if that ring gates. Feeds without
+`promotes_to` are simply independent sets a version can be added to.
+
 ## Logging
 
 Logging uses `tracing`. Control verbosity with `RUST_LOG`, e.g.:

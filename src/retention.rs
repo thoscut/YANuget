@@ -93,68 +93,86 @@ pub fn versions_to_prune(
     prune
 }
 
-/// Hard-delete one package version and everything attached to it: its symbol
-/// files and mappings, its stored payload/sidecars, and its database row.
+/// Remove one package version from a single feed.
+///
+/// The feed's membership is dropped. When that was the **last** feed referencing
+/// the version, the now-orphaned global data is hard-deleted too: its symbol
+/// files and mappings, its stored payload/sidecars, and its `packages` row. A
+/// version still referenced by another feed is left fully intact.
 ///
 /// Used by both the retention sweep and the API's hard-delete path so symbol
 /// cleanup is never forgotten.
 pub async fn purge_version(
     storage: &dyn PackageStorage,
     db: &dyn PackageDatabase,
+    feed: &str,
     id: &str,
     version: &NuGetVersion,
 ) -> Result<bool> {
-    for sym in db.find_symbols(id, version).await.unwrap_or_default() {
-        let _ = storage.delete_symbol(&sym.key, &sym.filename).await;
+    // Serialize against a concurrent push of the same version into another feed,
+    // so the feed-count check and global GC see a consistent snapshot.
+    let _guard = crate::locks::lock_version(id, &version.normalized()).await;
+    let removed = db.remove_membership(feed, id, version).await?;
+    if db.feed_count(id, version).await? == 0 {
+        for sym in db.find_symbols(id, version).await.unwrap_or_default() {
+            let _ = storage.delete_symbol(&sym.key, &sym.filename).await;
+        }
+        let _ = db.delete_symbols(id, version).await;
+        let _ = db.delete_package_data(id, version).await;
+        let _ = storage.delete(id, &version.normalized()).await;
     }
-    let _ = db.delete_symbols(id, version).await;
-    let removed = db.delete(id, version).await?;
-    let _ = storage.delete(id, &version.normalized()).await;
     Ok(removed)
 }
 
-/// Apply the policy to a single package id. Returns the number of versions
-/// pruned.
+/// Apply the policy to a single package id within `feed`. Returns the number of
+/// versions pruned from that feed.
 pub async fn prune_package(
     storage: &dyn PackageStorage,
     db: &dyn PackageDatabase,
+    feed: &str,
     id: &str,
     policy: &RetentionPolicy,
 ) -> Result<usize> {
     if !policy.has_limits() {
         return Ok(0);
     }
-    let packages = db.find_all_versions(id).await?;
+    let packages: Vec<Package> = db
+        .find_all_versions(feed, id)
+        .await?
+        .into_iter()
+        .map(|fv| fv.package)
+        .collect();
     let to_prune = versions_to_prune(&packages, policy, Utc::now());
     let mut pruned = 0;
     for version in &to_prune {
-        if purge_version(storage, db, id, version).await? {
+        if purge_version(storage, db, feed, id, version).await? {
             pruned += 1;
-            tracing::info!(%id, version = %version.normalized(), "retention pruned version");
+            tracing::info!(%feed, %id, version = %version.normalized(), "retention pruned version");
         }
     }
     Ok(pruned)
 }
 
-/// Apply the policy to every package id. Returns the total versions pruned.
+/// Apply the policy to every package id in `feed`. Returns the total pruned.
 pub async fn prune_all(
     storage: &dyn PackageStorage,
     db: &dyn PackageDatabase,
+    feed: &str,
     policy: &RetentionPolicy,
 ) -> Result<usize> {
     if !policy.has_limits() {
         return Ok(0);
     }
-    let ids = db.all_package_ids().await?;
+    let ids = db.all_package_ids(feed).await?;
     let mut total = 0;
     for id in ids {
-        match prune_package(storage, db, &id, policy).await {
+        match prune_package(storage, db, feed, &id, policy).await {
             Ok(n) => total += n,
-            Err(e) => tracing::error!(%id, error = %e, "retention sweep failed for package"),
+            Err(e) => tracing::error!(%feed, %id, error = %e, "retention sweep failed for package"),
         }
     }
     if total > 0 {
-        tracing::info!(pruned = total, "retention sweep complete");
+        tracing::info!(%feed, pruned = total, "retention sweep complete");
     }
     Ok(total)
 }
@@ -314,6 +332,8 @@ mod tests {
     use crate::database::SqliteDatabase;
     use crate::storage::FilesystemStorage;
 
+    const FEED: &str = "default";
+
     async fn store_dummy(storage: &FilesystemStorage, id: &str, version: &str) {
         let dir = tempfile::tempdir().unwrap();
         let tmp = dir.path().join("p.nupkg");
@@ -331,7 +351,7 @@ mod tests {
             for v in ["1.0.0", "1.1.0", "1.2.0"] {
                 let mut p = pkg(v, 0);
                 p.id = id.to_string();
-                db.add(&p).await.unwrap();
+                db.add_to_feed(FEED, &p).await.unwrap();
                 store_dummy(&storage, id, v).await;
             }
         }
@@ -340,17 +360,44 @@ mod tests {
             keep_latest_stable: Some(1),
             ..Default::default()
         };
-        let pruned = prune_all(&storage, &db, &policy).await.unwrap();
+        let pruned = prune_all(&storage, &db, FEED, &policy).await.unwrap();
         assert_eq!(pruned, 4); // two older versions per package
 
         for id in ["sweep.a", "sweep.b"] {
-            let remaining = db.find_all_versions(id).await.unwrap();
+            let remaining = db.find_all_versions(FEED, id).await.unwrap();
             assert_eq!(remaining.len(), 1);
-            assert_eq!(remaining[0].normalized_version(), "1.2.0");
+            assert_eq!(remaining[0].package.normalized_version(), "1.2.0");
             // The pruned payloads are gone from storage.
             assert!(!storage.package_exists(id, "1.0.0").await);
             assert!(storage.package_exists(id, "1.2.0").await);
         }
+    }
+
+    #[tokio::test]
+    async fn purge_keeps_version_referenced_by_another_feed() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FilesystemStorage::new(dir.path()).await.unwrap();
+        let db = SqliteDatabase::in_memory().await.unwrap();
+
+        let p = pkg("1.0.0", 0);
+        db.add_to_feed("dev", &p).await.unwrap();
+        db.add_to_feed("stable", &p).await.unwrap();
+        store_dummy(&storage, "Pkg", "1.0.0").await;
+
+        // Purging from one feed leaves the payload and the other feed intact.
+        assert!(purge_version(&storage, &db, "dev", "Pkg", &p.version)
+            .await
+            .unwrap());
+        assert!(storage.package_exists("pkg", "1.0.0").await);
+        assert!(db.package_data_exists("pkg", &p.version).await.unwrap());
+        assert!(db.exists("stable", "pkg", &p.version).await.unwrap());
+
+        // Purging from the last feed removes the global data + payload.
+        assert!(purge_version(&storage, &db, "stable", "Pkg", &p.version)
+            .await
+            .unwrap());
+        assert!(!storage.package_exists("pkg", "1.0.0").await);
+        assert!(!db.package_data_exists("pkg", &p.version).await.unwrap());
     }
 
     #[tokio::test]
@@ -360,7 +407,7 @@ mod tests {
         let db = SqliteDatabase::in_memory().await.unwrap();
 
         let p = pkg("1.0.0", 0);
-        db.add(&p).await.unwrap();
+        db.add_to_feed(FEED, &p).await.unwrap();
         store_dummy(&storage, "Pkg", "1.0.0").await;
         db.add_symbol("KEYFFFFFFFF", "pkg.pdb", "Pkg", &p.version)
             .await
@@ -370,11 +417,11 @@ mod tests {
             .await
             .unwrap();
 
-        let removed = purge_version(&storage, &db, "Pkg", &p.version)
+        let removed = purge_version(&storage, &db, FEED, "Pkg", &p.version)
             .await
             .unwrap();
         assert!(removed);
-        assert!(db.find_all_versions("pkg").await.unwrap().is_empty());
+        assert!(db.find_all_versions(FEED, "pkg").await.unwrap().is_empty());
         assert!(db
             .find_symbol("KEYFFFFFFFF", "pkg.pdb")
             .await
@@ -385,7 +432,7 @@ mod tests {
             Err(crate::error::Error::PackageNotFound)
         ));
         // purge of a non-existent version reports "not removed".
-        assert!(!purge_version(&storage, &db, "Pkg", &p.version)
+        assert!(!purge_version(&storage, &db, FEED, "Pkg", &p.version)
             .await
             .unwrap());
     }

@@ -48,6 +48,51 @@ impl ApiKeyAuth {
     }
 }
 
+/// Authenticator for read (download/restore) access to a feed. When no key is
+/// configured, reads are open. Otherwise the credential may arrive either as an
+/// `X-NuGet-ApiKey` header or as the password of HTTP Basic credentials (what
+/// `dotnet`/`nuget` send to an authenticated feed).
+#[derive(Debug, Clone, Default)]
+pub struct ReadAuth {
+    expected: Option<String>,
+}
+
+impl ReadAuth {
+    /// Build from the configured read key. `None`/empty means reads are open.
+    pub fn new(expected: Option<String>) -> Self {
+        Self {
+            expected: expected.filter(|k| !k.is_empty()),
+        }
+    }
+
+    /// Whether a credential is required for reads.
+    pub fn is_enabled(&self) -> bool {
+        self.expected.is_some()
+    }
+
+    /// Validate the credentials carried in request headers.
+    pub fn check_headers(&self, headers: &HeaderMap) -> bool {
+        let Some(expected) = &self.expected else {
+            return true; // reads are open
+        };
+        if let Some(key) = headers
+            .get(API_KEY_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+        {
+            if constant_time_eq(key.as_bytes(), expected.as_bytes()) {
+                return true;
+            }
+        }
+        headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(basic_password)
+            .map(|p| constant_time_eq(p.as_bytes(), expected.as_bytes()))
+            .unwrap_or(false)
+    }
+}
+
 /// Authenticator for the admin area, validated via HTTP Basic auth so a browser
 /// can prompt for credentials. The username is ignored; the password must match
 /// the configured admin key.

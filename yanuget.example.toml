@@ -80,3 +80,51 @@ interval_hours = 24           # YANUGET_RETENTION_INTERVAL_HOURS — background 
 # keep_latest_stable = 10       # YANUGET_RETENTION_KEEP_LATEST_STABLE
 # keep_latest_prerelease = 5    # YANUGET_RETENTION_KEEP_LATEST_PRERELEASE
 # max_age_days = 180            # YANUGET_RETENTION_MAX_AGE_DAYS
+
+# ---------------------------------------------------------------------------
+# Feeds — host several NuGet feeds from one server.
+#
+# With NO [[feeds]] blocks (the default), a single implicit feed named
+# "default" is served at the server root — the historical single-feed behaviour,
+# using the global api_key / admin_api_key / allow_overwrite / retention above.
+#
+# With one or more [[feeds]], each feed is mounted under /{name}
+# (e.g. /stable/v3/index.json) and the root serves a feed index. A package
+# version can belong to several feeds at once; its payload and metadata are
+# stored ONCE and referenced by each feed (no duplication on disk).
+#
+# Feeds are configured in TOML only — there are no YANUGET_* env vars for them.
+# ---------------------------------------------------------------------------
+
+# [[feeds]]
+# name = "dev"                  # URL slug + database key; [A-Za-z0-9._-]+
+# # api_key falls back to the global api_key when unset (push / "put").
+# # read_api_key gates download/restore ("get"); unset = open. Accepted as an
+# #   X-NuGet-ApiKey header OR the password of HTTP Basic credentials.
+# # read_api_key = "downloaders"
+# # admin_api_key falls back to the global admin_api_key (moderation / "delete").
+# allow_overwrite = false       # falls back to global when unset
+# hard_delete_enabled = false   # falls back to global when unset
+# requires_approval = false     # true = incoming versions are pending until approved
+# promotes_to = "stable"        # the next release ring (must name another feed)
+#
+#   [feeds.dev.mirror]          # read-through cache of an upstream V3 feed
+#   enabled = true
+#   upstream = "https://api.nuget.org/v3/index.json"
+#   timeout_secs = 30
+#
+# [[feeds]]
+# name = "stable"
+# requires_approval = true      # promoted/pushed versions wait for /admin approval
+#
+#   [feeds.stable.license_policy]   # offline SPDX allow/deny (no network)
+#   enabled = true
+#   allowed = ["MIT", "Apache-2.0"] # if non-empty, license must match one
+#   blocked = ["GPL-3.0-only"]      # always rejected, even if also allowed
+#   allow_unlicensed = false        # reject packages that declare no license
+#   action = "warn"                 # "warn" = accept + flag; "block" = reject
+#
+#   # Per-feed retention overrides the global [retention] for this feed.
+#   [feeds.stable.retention]
+#   enabled = true
+#   keep_latest_stable = 20

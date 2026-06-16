@@ -44,6 +44,10 @@ pub enum Error {
     #[error("invalid request: {0}")]
     BadRequest(String),
 
+    /// The package violated a feed policy under a blocking action.
+    #[error("policy violation: {0}")]
+    PolicyViolation(String),
+
     /// A version string could not be parsed.
     #[error("invalid version: {0}")]
     InvalidVersion(String),
@@ -76,6 +80,7 @@ impl Error {
             Error::Unauthorized => StatusCode::UNAUTHORIZED,
             Error::AdminUnauthorized => StatusCode::UNAUTHORIZED,
             Error::BadRequest(_) => StatusCode::BAD_REQUEST,
+            Error::PolicyViolation(_) => StatusCode::FORBIDDEN,
             Error::InvalidVersion(_) => StatusCode::BAD_REQUEST,
             Error::Database(sqlx::Error::RowNotFound) => StatusCode::NOT_FOUND,
             _ => StatusCode::INTERNAL_SERVER_ERROR,

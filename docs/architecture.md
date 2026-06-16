@@ -18,22 +18,39 @@ src/
 ├── nuspec.rs         Event-based .nuspec XML parser
 ├── nupkg.rs          Seek-based ZIP reader (nuspec + targeted entry extraction)
 ├── streaming.rs      Bounded copy-to-disk with incremental SHA-512
-├── config.rs         Layered config (defaults < TOML < env)
-├── auth.rs           Constant-time API-key check
-├── indexing.rs       Upload→validate→store→record pipeline (with rollback)
+├── config.rs         Layered config (defaults < TOML < env); feeds, mirror, policy
+├── auth.rs           Constant-time API-key / read / admin checks
+├── indexing.rs       Upload→validate→policy→store→membership pipeline (with rollback)
+├── policy.rs         Offline license allow/deny evaluation (pure)
+├── mirror.rs         Upstream read-through mirroring (V3 feed → local feed)
+├── retention.rs      Pure prune policy + feed-scoped version pruning / GC
+├── locks.rs          Process-global per-version async lock (store/purge races)
+├── tls.rs            TLS cert loading + cached self-signed generation
 ├── storage/
 │   ├── mod.rs        PackageStorage trait, PackageContent, AuxFile
-│   └── filesystem.rs Streaming filesystem backend
+│   └── filesystem.rs Streaming filesystem backend (global, deduplicated)
 ├── database/
-│   ├── mod.rs        PackageDatabase trait, SearchRequest/Page/Group
-│   └── sqlite.rs     SQLite backend (JSON columns, grouped+ranked search)
+│   ├── mod.rs        PackageDatabase trait, Membership, FeedVersion, Search*
+│   └── sqlite.rs     SQLite backend: global `packages` + `feed_packages` membership
 ├── nuget/
 │   ├── mod.rs        JSON response builders (pure)
-│   └── urls.rs       UrlBuilder (absolute resource URLs)
+│   └── urls.rs       UrlBuilder (absolute resource URLs, feed-prefix aware)
 └── web/
-    ├── mod.rs        AppState, router, handlers
+    ├── mod.rs        AppState, FeedContext, per-feed routers, handlers
+    ├── ui.rs         HTML rendering (gallery, stats, settings, feeds, admin)
     └── files.rs      Range-aware streaming file responses
 ```
+
+## Feeds
+
+Package metadata (`packages`) and payloads are stored **once** and shared by
+every feed. A *feed* is a set of [`feed_packages`] membership rows that link the
+feed to the versions it exposes, each carrying that feed's own mutable state
+(listed / enabled / pending / flagged / downloads). The same version can belong
+to many feeds — release rings or independent sets — without duplicating bytes.
+Each feed is an [`AppState`] (sharing the process-wide storage + database) with
+its own [`FeedContext`] (auth, mirror, policy, retention), mounted under its
+path prefix. `main` builds one state per resolved feed and nests their routers.
 
 ## Request flow: push
 

@@ -8,6 +8,20 @@ Base URLs in responses are derived per-request from the `Host` /
 `X-Forwarded-Proto` / `X-Forwarded-Host` headers, or taken from
 `YANUGET_BASE_URL` when set.
 
+## Feeds and path prefixes
+
+With no `[[feeds]]` configured, a single feed is served at the root and every
+path below is exactly as shown. When multiple feeds are configured, **each path
+is prefixed with the feed name** — e.g. `/stable/v3/index.json`,
+`/stable/api/v2/package`, `/stable/admin` — and the root `/` serves an HTML feed
+index. The service index advertises feed-prefixed resource URLs, so a client
+pointed at `/{feed}/v3/index.json` discovers the right paths automatically.
+
+If a feed sets `read_api_key`, the read endpoints (flat container, registration,
+download, search, autocomplete) and the HTML gallery require a credential —
+sent as an `X-NuGet-ApiKey` header or HTTP Basic password — and return `401`
+without it. The service index itself stays open for discovery.
+
 ## Service index
 
 ```
@@ -35,8 +49,19 @@ indexed. Responses:
 | `201 Created` | Package indexed. |
 | `400 Bad Request` | Malformed package / nuspec / id / version. |
 | `401 Unauthorized` | Missing or wrong API key. |
-| `409 Conflict` | Version already exists (unless `allow_overwrite`). |
+| `403 Forbidden` | Rejected by the feed's `license_policy` (`action = "block"`). |
+| `409 Conflict` | Version already exists in this feed (unless `allow_overwrite`). |
 | `413 Payload Too Large` | Exceeds `max_package_size_bytes`. |
+
+In a feed with `requires_approval = true`, a pushed version is still accepted
+(`201`) but lands **pending** — withheld from clients until an admin approves it.
+Under `license_policy` with `action = "warn"`, a violating package is accepted
+and **flagged** (shown in `/admin`) rather than rejected.
+
+For a mirror-enabled feed, a read miss on the flat container, registration or
+download triggers a best-effort read-through fetch from the upstream feed, which
+is streamed to disk and indexed locally (honouring the feed's approval gate and
+license policy); an upstream failure simply degrades to a normal `404`.
 
 ## Delete / unlist / relist
 
@@ -164,8 +189,9 @@ links, readme, symbol availability, and the install command for Chocolatey /
 `dotnet` / `nuget.exe` (ordered by `primary_client`). `/stats` shows feed totals
 (packages, versions, downloads, storage, symbol files) plus the most-downloaded
 and most-recently-published lists. `/settings` summarises the feed's policy
-(auth mode, size/overwrite/delete behaviour, symbol server, retention) and never
-exposes the API key or storage paths.
+(auth mode incl. download auth, size/overwrite/delete behaviour, approval &
+promotion ring, upstream mirror, license policy, symbol server, retention) and
+never exposes the API key or storage paths.
 Requires `enable_web_ui` (on by default); when disabled, `/` serves a minimal
 info page and `/packages/*` return `404`.
 
@@ -180,16 +206,26 @@ GET  /admin                                       # dashboard: all package ids
 GET  /admin/packages/{id}                          # versions + actions
 POST /admin/packages/{id}/{version}/disable        # withhold a version
 POST /admin/packages/{id}/{version}/enable         # restore a disabled version
-POST /admin/packages/{id}/{version}/delete         # hard-delete a version
+POST /admin/packages/{id}/{version}/delete         # remove from this feed
+POST /admin/packages/{id}/{version}/approve        # clear the pending gate
+POST /admin/packages/{id}/{version}/promote        # add to the next ring
 ```
 
 A **disabled** version is withheld from clients entirely — hidden from search,
 registration and the flat container, **and** not downloadable (`404`) — until an
 admin re-enables it. This is stronger than the NuGet client's *unlist* (which
-keeps a version downloadable for restore). `delete` hard-removes the payload,
-sidecars and any indexed symbols. The POST actions return `303 See Other` back
-to the package page; without credentials they return `401` with a
-`WWW-Authenticate: Basic` challenge.
+keeps a version downloadable for restore). The admin page also surfaces
+**pending** versions (awaiting approval) and **flagged** versions (license-policy
+violations under `warn`).
+
+`delete` removes the version from **this feed**; when no other feed references
+it, the shared payload, sidecars and indexed symbols are hard-deleted too.
+`approve` clears the pending gate on a version in a `requires_approval` feed.
+`promote` adds the version to the feed named by this feed's `promotes_to`
+(landing pending if that ring also gates) — the release-ring step; it requires
+the version to be a member of the current feed. The POST actions return
+`303 See Other` back to the package page; without credentials they return `401`
+with a `WWW-Authenticate: Basic` challenge.
 
 ## Health
 

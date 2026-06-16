@@ -3,6 +3,18 @@
 //! The web layer talks to a [`PackageDatabase`] trait object so the storage
 //! engine can be swapped. A SQLite implementation ships in [`sqlite`]; other
 //! engines (PostgreSQL, MySQL) can be added behind the same trait.
+//!
+//! ## Feeds and deduplication
+//!
+//! Package metadata and payloads are stored **once** (keyed by id/version) and
+//! shared by every feed. A *feed* is a named set of memberships: the
+//! [`Membership`] rows that link a feed to the versions it exposes, each
+//! carrying that feed's own mutable state (listed / enabled / pending /
+//! flagged). The same version can therefore belong to many feeds — a release
+//! ring, a mirror cache, a curated set — without ever duplicating its bytes.
+//!
+//! Methods come in two flavours: a handful operate on the **global** package
+//! data (no feed), the rest are **feed-scoped** and take a `feed` name.
 
 pub mod sqlite;
 
@@ -68,54 +80,182 @@ pub struct SearchPage {
     pub groups: Vec<SearchGroup>,
 }
 
+/// One version's membership of a single feed: the per-feed mutable state that
+/// sits alongside the shared, immutable package metadata.
+#[derive(Debug, Clone)]
+pub struct Membership {
+    pub feed: String,
+    pub lower_id: String,
+    pub normalized_version: String,
+    /// Visible in search/registration (the NuGet "list" flag).
+    pub listed: bool,
+    /// Admin enable flag; a disabled membership is withheld entirely.
+    pub enabled: bool,
+    /// Awaiting approval (release-ring gate / mirror approval). A pending
+    /// membership is withheld from clients until an admin approves it.
+    pub pending: bool,
+    /// Flagged by a policy check (e.g. a disallowed license under "warn").
+    pub flagged: bool,
+    /// Human-readable reason for [`Membership::flagged`].
+    pub flag_reason: Option<String>,
+}
+
+impl Membership {
+    /// An active (listed, enabled, not pending, not flagged) membership for the
+    /// given package in `feed`.
+    pub fn active(feed: &str, package: &Package) -> Self {
+        Self {
+            feed: feed.to_string(),
+            lower_id: package.lower_id(),
+            normalized_version: package.normalized_version(),
+            listed: true,
+            enabled: true,
+            pending: false,
+            flagged: false,
+            flag_reason: None,
+        }
+    }
+}
+
+/// A package version together with its membership state in one feed. Returned by
+/// admin/retention listings that must see pending, disabled and flagged rows.
+#[derive(Debug, Clone)]
+pub struct FeedVersion {
+    pub package: Package,
+    pub pending: bool,
+    pub flagged: bool,
+    pub flag_reason: Option<String>,
+}
+
 /// Metadata store for indexed packages.
 #[async_trait]
 pub trait PackageDatabase: Send + Sync {
-    /// Insert a freshly indexed package. Returns
+    // --- global package data (shared by every feed) ---
+
+    /// Insert global package metadata if absent. Idempotent: returns `true` when
+    /// a new row was written, `false` when the version already existed (e.g. it
+    /// was already pushed to another feed).
+    async fn upsert_package_data(&self, package: &Package) -> Result<bool>;
+
+    /// Whether global metadata exists for this id/version, regardless of feed.
+    async fn package_data_exists(&self, id: &str, version: &NuGetVersion) -> Result<bool>;
+
+    /// Fetch global package metadata, ignoring feed membership and visibility.
+    async fn get_package_data(&self, id: &str, version: &NuGetVersion) -> Result<Option<Package>>;
+
+    /// Hard-delete global metadata (and every feed membership). Returns `true`
+    /// if a row was removed. Caller is responsible for storage/symbol cleanup.
+    async fn delete_package_data(&self, id: &str, version: &NuGetVersion) -> Result<bool>;
+
+    /// How many feeds currently contain this version.
+    async fn feed_count(&self, id: &str, version: &NuGetVersion) -> Result<i64>;
+
+    // --- feed membership ---
+
+    /// Add a membership. Returns
     /// [`Error::PackageAlreadyExists`](crate::error::Error::PackageAlreadyExists)
-    /// if the id/version pair is already present.
-    async fn add(&self, package: &Package) -> Result<()>;
+    /// when the version is already a member of the feed.
+    async fn add_membership(&self, membership: &Membership) -> Result<()>;
 
-    /// Whether a specific id/version exists (listed or not).
-    async fn exists(&self, id: &str, version: &NuGetVersion) -> Result<bool>;
+    /// Remove a membership. Returns `true` if a row was removed.
+    async fn remove_membership(&self, feed: &str, id: &str, version: &NuGetVersion)
+        -> Result<bool>;
 
-    /// Fetch a single package version.
-    async fn find(&self, id: &str, version: &NuGetVersion) -> Result<Option<Package>>;
+    /// Fetch a membership (any state) for admin/promotion logic.
+    async fn get_membership(
+        &self,
+        feed: &str,
+        id: &str,
+        version: &NuGetVersion,
+    ) -> Result<Option<Membership>>;
 
-    /// Fetch all versions of a package id, sorted ascending. When
-    /// `include_unlisted` is false, unlisted versions are omitted.
-    async fn find_versions(&self, id: &str, include_unlisted: bool) -> Result<Vec<Package>>;
+    /// Clear the pending flag on a membership (approve / promote). Returns `true`
+    /// if a row was updated.
+    async fn approve_membership(
+        &self,
+        feed: &str,
+        id: &str,
+        version: &NuGetVersion,
+    ) -> Result<bool>;
 
-    /// Set the listed flag. Returns `true` if a row was updated.
-    async fn set_listed(&self, id: &str, version: &NuGetVersion, listed: bool) -> Result<bool>;
+    /// Convenience: insert the global data (if needed) and an active membership.
+    async fn add_to_feed(&self, feed: &str, package: &Package) -> Result<()> {
+        self.upsert_package_data(package).await?;
+        self.add_membership(&Membership::active(feed, package))
+            .await
+    }
 
-    /// Set the admin `enabled` flag. A disabled version is withheld entirely.
-    /// Returns `true` if a row was updated.
-    async fn set_enabled(&self, id: &str, version: &NuGetVersion, enabled: bool) -> Result<bool>;
+    // --- feed-scoped reads/writes ---
 
-    /// Whether a version may be served to clients: it exists and is enabled.
-    /// (Unlisted-but-enabled versions are still servable by exact version.)
-    async fn is_servable(&self, id: &str, version: &NuGetVersion) -> Result<bool>;
+    /// Whether a specific id/version is a member of `feed` (any state).
+    async fn exists(&self, feed: &str, id: &str, version: &NuGetVersion) -> Result<bool>;
 
-    /// Every version of a package id — including unlisted **and disabled** —
-    /// sorted ascending. For admin views and the retention sweep.
-    async fn find_all_versions(&self, id: &str) -> Result<Vec<Package>>;
+    /// Fetch a single servable (enabled, not pending) package version in `feed`.
+    async fn find(&self, feed: &str, id: &str, version: &NuGetVersion) -> Result<Option<Package>>;
 
-    /// Permanently remove a version. Returns `true` if a row was deleted.
-    async fn delete(&self, id: &str, version: &NuGetVersion) -> Result<bool>;
+    /// Fetch all servable versions of a package id in `feed`, sorted ascending.
+    /// When `include_unlisted` is false, unlisted versions are omitted.
+    async fn find_versions(
+        &self,
+        feed: &str,
+        id: &str,
+        include_unlisted: bool,
+    ) -> Result<Vec<Package>>;
 
-    /// Atomically increment the download counter for a version.
-    async fn increment_downloads(&self, id: &str, version: &NuGetVersion) -> Result<()>;
+    /// Set the listed flag for a membership. Returns `true` if a row was updated.
+    async fn set_listed(
+        &self,
+        feed: &str,
+        id: &str,
+        version: &NuGetVersion,
+        listed: bool,
+    ) -> Result<bool>;
 
-    /// Execute a search query.
-    async fn search(&self, request: &SearchRequest) -> Result<SearchPage>;
+    /// Set the admin `enabled` flag for a membership. A disabled membership is
+    /// withheld entirely. Returns `true` if a row was updated.
+    async fn set_enabled(
+        &self,
+        feed: &str,
+        id: &str,
+        version: &NuGetVersion,
+        enabled: bool,
+    ) -> Result<bool>;
 
-    /// Autocomplete package ids by prefix/substring.
-    async fn autocomplete(&self, query: &str, skip: i64, take: i64) -> Result<Vec<String>>;
+    /// Whether a version may be served from `feed`: present, enabled and not
+    /// pending. (Unlisted-but-enabled versions are still servable by version.)
+    async fn is_servable(&self, feed: &str, id: &str, version: &NuGetVersion) -> Result<bool>;
 
-    /// Every distinct package id (original casing), ascending. Used by the
-    /// retention sweep, which must visit packages search would not rank/return.
-    async fn all_package_ids(&self) -> Result<Vec<String>>;
+    /// Every version of a package id in `feed` — including unlisted, disabled
+    /// **and pending** — sorted ascending. For admin views and retention.
+    async fn find_all_versions(&self, feed: &str, id: &str) -> Result<Vec<FeedVersion>>;
+
+    /// Atomically increment the per-feed download counter for a version.
+    async fn increment_downloads(&self, feed: &str, id: &str, version: &NuGetVersion)
+        -> Result<()>;
+
+    /// Execute a search query within `feed`.
+    async fn search(&self, feed: &str, request: &SearchRequest) -> Result<SearchPage>;
+
+    /// Autocomplete package ids in `feed` by prefix/substring.
+    async fn autocomplete(
+        &self,
+        feed: &str,
+        query: &str,
+        skip: i64,
+        take: i64,
+    ) -> Result<Vec<String>>;
+
+    /// Every distinct package id in `feed` (original casing), ascending. Used by
+    /// the retention sweep, which must visit packages search would not return.
+    async fn all_package_ids(&self, feed: &str) -> Result<Vec<String>>;
+
+    /// Aggregate counters for `feed`, for the statistics page.
+    async fn stats(&self, feed: &str) -> Result<DatabaseStats>;
+
+    /// The most recently published versions in `feed`, newest first.
+    async fn recent_packages(&self, feed: &str, limit: i64) -> Result<Vec<Package>>;
+
+    // --- symbols (global; keyed by SSQP signature) ---
 
     /// Record a symbol-file mapping: its SSQP `key`/`filename` and the owning
     /// package version (for cleanup on delete/retention).
@@ -137,12 +277,6 @@ pub trait PackageDatabase: Send + Sync {
     /// Remove all symbol mappings for a package version. Returns how many rows
     /// were removed.
     async fn delete_symbols(&self, id: &str, version: &NuGetVersion) -> Result<u64>;
-
-    /// Aggregate counters across the whole feed, for the statistics page.
-    async fn stats(&self) -> Result<DatabaseStats>;
-
-    /// The most recently published versions, newest first.
-    async fn recent_packages(&self, limit: i64) -> Result<Vec<Package>>;
 }
 
 /// Feed-wide aggregate statistics.
