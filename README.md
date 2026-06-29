@@ -292,6 +292,34 @@ streams each `.nupkg` to disk and indexes it locally. Mirrored versions honour
 the feed's `requires_approval` gate and `license_policy`. Mirroring is
 best-effort: an upstream outage degrades to a normal cache miss.
 
+### Bulk migration
+
+Moving to YANuget from another NuGet server? Where mirroring caches packages
+*on demand*, the `migrate` sub-command copies **everything** at once. It
+discovers every package on the source (paging its `SearchQueryService`, falling
+back to the `Catalog/3.0.0` resource), then streams each `.nupkg` through the
+same indexing pipeline a push uses — honouring the target feed's
+`requires_approval` gate and `license_policy`. A live display shows progress,
+ETA and transfer rate:
+
+```bash
+# Import every package from a source server into the "default" feed.
+yanuget migrate --source https://old-server/v3/index.json --feed default
+
+# Authenticated source, more parallelism, stable versions only.
+yanuget migrate --source https://old-server/v3/index.json \
+  --source-username ci --source-password "$TOKEN" \
+  --concurrency 8 --skip-prerelease
+
+# See what would be copied without downloading anything.
+yanuget migrate --source https://old-server/v3/index.json --dry-run
+```
+
+Versions already present in the target feed are skipped, so a migration is
+**idempotent and resumable** — re-run it to pick up only what is missing.
+Source credentials accept `--source-username`/`--source-password` (Basic),
+`--source-token` (Bearer) or repeated `--source-header "Name: Value"`.
+
 ### Offline license policy
 
 A feed's `[feeds.<name>.license_policy]` evaluates each pushed/mirrored
@@ -310,8 +338,10 @@ configurable overwrite (incl. **pre-release-only**), Range downloads,
 **symbol/PDB server**, a **web gallery**, **package retention policies**,
 **multiple feeds** (a deduplicated store with per-feed membership), **upstream
 mirroring** (read-through caching of a public feed, with optional
-Basic/Bearer/custom-header **upstream auth**), **release-ring promotion &
-approval gates**, and an **offline license policy**.
+Basic/Bearer/custom-header **upstream auth**), **bulk migration** (`migrate`
+command — copy every package from another server, with progress/ETA/transfer
+rate), **release-ring promotion & approval gates**, and an **offline license
+policy**.
 
 Not yet implemented (contributions welcome): additional storage backends
 (S3/Azure Blob) and database backends (PostgreSQL/MySQL), online vulnerability

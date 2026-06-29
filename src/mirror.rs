@@ -11,7 +11,7 @@
 //! and are withheld from clients until an admin approves them in `/admin` —
 //! turning the mirror into a curated, approval-gated cache.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use futures::StreamExt;
 use tokio::sync::OnceCell;
@@ -37,6 +37,12 @@ pub struct MirrorClient {
 struct MirrorResources {
     /// `PackageBaseAddress/3.0.0`, with a trailing slash.
     package_base: String,
+    /// `SearchQueryService` (any advertised version), when present. Used to
+    /// enumerate the upstream's package ids for a full migration.
+    search: Option<String>,
+    /// `Catalog/3.0.0`, when present. The enumeration fallback for feeds whose
+    /// search service is capped or absent.
+    catalog: Option<String>,
 }
 
 impl MirrorClient {
@@ -85,8 +91,22 @@ impl MirrorClient {
                             self.upstream
                         ))
                     })?;
+                // Search service type names are versioned; accept whichever the
+                // upstream advertises, newest first.
+                let search = find_first_resource(
+                    &index,
+                    &[
+                        "SearchQueryService/3.5.0",
+                        "SearchQueryService/3.0.0-rc",
+                        "SearchQueryService/3.0.0-beta",
+                        "SearchQueryService",
+                    ],
+                );
+                let catalog = find_resource(&index, "Catalog/3.0.0");
                 Ok(MirrorResources {
                     package_base: ensure_trailing_slash(&package_base),
+                    search,
+                    catalog,
                 })
             })
             .await
@@ -94,7 +114,7 @@ impl MirrorClient {
 
     /// Fetch the upstream's list of version strings for `lower_id`. An absent
     /// package (404) yields an empty list rather than an error.
-    async fn upstream_versions(&self, lower_id: &str) -> Result<Vec<String>> {
+    pub async fn upstream_versions(&self, lower_id: &str) -> Result<Vec<String>> {
         let base = &self.resources().await?.package_base;
         let url = format!("{base}{lower_id}/index.json");
         let resp = self.client.get(&url).send().await.map_err(mirror_err)?;
@@ -114,7 +134,16 @@ impl MirrorClient {
             .unwrap_or_default())
     }
 
-    async fn download_nupkg(&self, lower_id: &str, version: &str, dest: &Path) -> Result<()> {
+    /// Stream the upstream's `.nupkg` for `lower_id`/`version` to `dest`,
+    /// returning the [`StreamSummary`](streaming::StreamSummary) (size and
+    /// SHA-512) computed while streaming — so the caller never re-reads the file
+    /// just to hash it.
+    pub async fn download_nupkg(
+        &self,
+        lower_id: &str,
+        version: &str,
+        dest: &Path,
+    ) -> Result<streaming::StreamSummary> {
         let base = &self.resources().await?.package_base;
         let url = format!("{base}{lower_id}/{version}/{lower_id}.{version}.nupkg");
         let resp = self
@@ -129,10 +158,183 @@ impl MirrorClient {
         let stream = resp
             .bytes_stream()
             .map(|r| r.map_err(|e| std::io::Error::other(e.to_string())));
-        streaming::stream_to_writer(Box::pin(stream), &mut file)
+        let summary = streaming::stream_to_writer(Box::pin(stream), &mut file)
             .await
             .map_err(Error::Io)?;
-        Ok(())
+        Ok(summary)
+    }
+
+    /// Discover every package id the upstream exposes.
+    ///
+    /// Prefers the `SearchQueryService`, paging through it with an empty query;
+    /// falls back to walking the `Catalog/3.0.0` resource when the upstream has
+    /// no search service (or search returns nothing while a catalog exists).
+    /// Ids are returned in their original casing, de-duplicated
+    /// case-insensitively.
+    pub async fn enumerate_package_ids(&self) -> Result<Vec<String>> {
+        let res = self.resources().await?;
+        if let Some(search) = &res.search {
+            let ids = self.enumerate_via_search(search).await?;
+            if !ids.is_empty() {
+                return Ok(ids);
+            }
+            // A non-empty search service that returns nothing: either a truly
+            // empty feed, or one whose contents only the catalog can reveal.
+            if res.catalog.is_none() {
+                return Ok(ids);
+            }
+        }
+        if let Some(catalog) = &res.catalog {
+            return self.enumerate_via_catalog(catalog).await;
+        }
+        Err(Error::Other(anyhow::anyhow!(
+            "upstream {} exposes neither SearchQueryService nor Catalog/3.0.0; cannot enumerate packages",
+            self.upstream
+        )))
+    }
+
+    /// Page through the upstream `SearchQueryService` with an empty query,
+    /// collecting every package id.
+    async fn enumerate_via_search(&self, search: &str) -> Result<Vec<String>> {
+        const PAGE: i64 = 100;
+        let mut ids = DedupIds::new();
+        let mut skip: i64 = 0;
+        loop {
+            let sep = if search.contains('?') { '&' } else { '?' };
+            let url = format!(
+                "{search}{sep}q=&skip={skip}&take={PAGE}&prerelease=true&semVerLevel=2.0.0"
+            );
+            let doc: serde_json::Value = self
+                .client
+                .get(&url)
+                .send()
+                .await
+                .map_err(mirror_err)?
+                .error_for_status()
+                .map_err(mirror_err)?
+                .json()
+                .await
+                .map_err(mirror_err)?;
+
+            let page_len = doc
+                .get("data")
+                .and_then(|d| d.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0);
+            for id in page_ids(&doc) {
+                ids.push(&id);
+            }
+
+            skip += PAGE;
+            // A short page means we have reached the end.
+            if page_len < PAGE as usize {
+                break;
+            }
+            // Stop once we've paged past the upstream's reported total.
+            if let Some(total) = doc.get("totalHits").and_then(|t| t.as_i64()) {
+                if skip >= total {
+                    break;
+                }
+            }
+            // Safety valve against an upstream that never returns a short page.
+            if skip > 5_000_000 {
+                break;
+            }
+        }
+        Ok(ids.into_vec())
+    }
+
+    /// Walk the upstream `Catalog/3.0.0` (index → pages → items), collecting
+    /// every package id. Best-effort: a page that fails to load is skipped.
+    async fn enumerate_via_catalog(&self, catalog: &str) -> Result<Vec<String>> {
+        let index: serde_json::Value = self
+            .client
+            .get(catalog)
+            .send()
+            .await
+            .map_err(mirror_err)?
+            .error_for_status()
+            .map_err(mirror_err)?
+            .json()
+            .await
+            .map_err(mirror_err)?;
+
+        let pages: Vec<String> = index
+            .get("items")
+            .and_then(|i| i.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|p| p.get("@id").and_then(|u| u.as_str()).map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let mut ids = DedupIds::new();
+        for page_url in pages {
+            let page: serde_json::Value = match self
+                .client
+                .get(&page_url)
+                .send()
+                .await
+                .and_then(|r| r.error_for_status())
+            {
+                Ok(resp) => match resp.json().await {
+                    Ok(json) => json,
+                    Err(e) => {
+                        tracing::warn!(page = %page_url, error = %e, "catalog page parse failed");
+                        continue;
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!(page = %page_url, error = %e, "catalog page fetch failed");
+                    continue;
+                }
+            };
+            if let Some(items) = page.get("items").and_then(|i| i.as_array()) {
+                for item in items {
+                    if let Some(id) = item.get("nuget:id").and_then(|i| i.as_str()) {
+                        ids.push(id);
+                    }
+                }
+            }
+        }
+        Ok(ids.into_vec())
+    }
+}
+
+/// Extract the package ids from one `SearchQueryService` response page.
+fn page_ids(doc: &serde_json::Value) -> Vec<String> {
+    doc.get("data")
+        .and_then(|d| d.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|i| i.get("id").and_then(|v| v.as_str()).map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Accumulates package ids in first-seen order, dropping case-insensitive
+/// duplicates.
+#[derive(Default)]
+struct DedupIds {
+    seen: std::collections::HashSet<String>,
+    ids: Vec<String>,
+}
+
+impl DedupIds {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn push(&mut self, id: &str) {
+        if self.seen.insert(id.to_lowercase()) {
+            self.ids.push(id.to_string());
+        }
+    }
+
+    fn into_vec(self) -> Vec<String> {
+        self.ids
     }
 }
 
@@ -180,19 +382,13 @@ pub async fn ensure_package(
 
         let normalized = version.normalized().to_lowercase();
         let temp_path = temp_dir.join(format!("mirror-{}.tmp", uuid::Uuid::new_v4()));
-        if let Err(e) = client
+        let summary = match client
             .download_nupkg(&lower_id, &normalized, &temp_path)
             .await
         {
-            tracing::warn!(%feed, id = %lower_id, version = %normalized, error = %e, "mirror download failed");
-            let _ = tokio::fs::remove_file(&temp_path).await;
-            continue;
-        }
-
-        let summary = match summarize(&temp_path).await {
-            Ok(s) => s,
+            Ok(summary) => summary,
             Err(e) => {
-                tracing::warn!(%feed, id = %lower_id, version = %normalized, error = %e, "mirror hash failed");
+                tracing::warn!(%feed, id = %lower_id, version = %normalized, error = %e, "mirror download failed");
                 let _ = tokio::fs::remove_file(&temp_path).await;
                 continue;
             }
@@ -218,18 +414,6 @@ pub async fn ensure_package(
     Ok(mirrored)
 }
 
-/// Re-hash a downloaded file to produce the [`StreamSummary`](streaming::StreamSummary)
-/// the indexing pipeline needs.
-async fn summarize(path: &PathBuf) -> Result<streaming::StreamSummary> {
-    use tokio_util::io::ReaderStream;
-    let file = tokio::fs::File::open(path).await?;
-    let stream = ReaderStream::new(file);
-    let mut sink = tokio::io::sink();
-    streaming::stream_to_writer(stream, &mut sink)
-        .await
-        .map_err(Error::Io)
-}
-
 fn find_resource(index: &serde_json::Value, ty: &str) -> Option<String> {
     index
         .get("resources")?
@@ -239,6 +423,12 @@ fn find_resource(index: &serde_json::Value, ty: &str) -> Option<String> {
         .and_then(|r| r.get("@id"))
         .and_then(|i| i.as_str())
         .map(str::to_string)
+}
+
+/// Return the first resource matching any of `types`, in the given priority
+/// order (used for the versioned `SearchQueryService` type names).
+fn find_first_resource(index: &serde_json::Value, types: &[&str]) -> Option<String> {
+    types.iter().find_map(|ty| find_resource(index, ty))
 }
 
 fn ensure_trailing_slash(s: &str) -> String {
@@ -330,6 +520,56 @@ mod tests {
             "Bearer tok"
         );
         assert_eq!(h.get("X-Feed-Key").unwrap().to_str().unwrap(), "abc");
+    }
+
+    #[test]
+    fn page_ids_extracts_and_dedup_collects() {
+        let page = serde_json::json!({
+            "totalHits": 3,
+            "data": [
+                {"id": "Alpha", "version": "1.0.0"},
+                {"id": "Beta", "version": "2.0.0"},
+                {"version": "9.9.9"} // no id — skipped
+            ]
+        });
+        assert_eq!(
+            page_ids(&page),
+            vec!["Alpha".to_string(), "Beta".to_string()]
+        );
+
+        // DedupIds keeps first-seen casing and drops case-insensitive repeats.
+        let mut ids = DedupIds::new();
+        for id in ["Alpha", "Beta", "alpha", "Gamma", "BETA"] {
+            ids.push(id);
+        }
+        assert_eq!(
+            ids.into_vec(),
+            vec!["Alpha".to_string(), "Beta".to_string(), "Gamma".to_string()]
+        );
+    }
+
+    #[test]
+    fn finds_first_resource_in_priority_order() {
+        let index = serde_json::json!({
+            "resources": [
+                {"@id": "https://up/search-rc", "@type": "SearchQueryService/3.0.0-rc"},
+                {"@id": "https://up/search", "@type": "SearchQueryService"}
+            ]
+        });
+        // 3.5.0 is absent, so the next candidate (3.0.0-rc) wins.
+        assert_eq!(
+            find_first_resource(
+                &index,
+                &[
+                    "SearchQueryService/3.5.0",
+                    "SearchQueryService/3.0.0-rc",
+                    "SearchQueryService"
+                ]
+            )
+            .as_deref(),
+            Some("https://up/search-rc")
+        );
+        assert!(find_first_resource(&index, &["Catalog/3.0.0"]).is_none());
     }
 
     #[test]
