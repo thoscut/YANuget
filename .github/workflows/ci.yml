@@ -68,15 +68,16 @@ jobs:
         run: cargo build --release
 
   msrv:
-    name: Minimum supported Rust (1.82)
+    name: Minimum supported Rust (1.85)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      # rust-toolchain.toml pins `stable`; an explicit `+1.82.0` on the command
+      # rust-toolchain.toml pins `stable`; an explicit `+1.85.0` on the command
       # line overrides it so this job really exercises the declared MSRV.
-      - name: Install Rust 1.82.0
-        uses: dtolnay/rust-toolchain@1.82.0
+      # (1.85 is required by the `edition2024` feature used by transitive deps.)
+      - name: Install Rust 1.85.0
+        uses: dtolnay/rust-toolchain@1.85.0
 
       - name: Cache cargo
         uses: actions/cache@v4
@@ -89,7 +90,7 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-msrv-
 
       - name: Check against MSRV
-        run: cargo +1.82.0 check --all-targets --all-features
+        run: cargo +1.85.0 check --all-targets --all-features
 
   audit:
     name: Dependency audit
@@ -103,5 +104,8 @@ jobs:
       - name: Install cargo-audit
         uses: taiki-e/install-action@cargo-audit
 
+      # RUSTSEC-2023-0071 (rsa, Marvin attack) has no fixed release and reaches
+      # the lockfile only via sqlx-mysql, an optional driver this sqlite-only
+      # build never compiles. Ignored deliberately; revisit if a fix ships.
       - name: Audit dependencies for known vulnerabilities
-        run: cargo audit
+        run: cargo audit --ignore RUSTSEC-2023-0071
