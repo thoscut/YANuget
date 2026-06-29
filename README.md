@@ -37,7 +37,7 @@ See [docs/large-packages.md](docs/large-packages.md) for the full design.
 ### From source
 
 ```bash
-# Build (Rust 1.85+)
+# Build (Rust 1.88+)
 cargo build --release
 
 # Run with an API key and a data directory

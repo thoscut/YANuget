@@ -68,16 +68,16 @@ jobs:
         run: cargo build --release
 
   msrv:
-    name: Minimum supported Rust (1.85)
+    name: Minimum supported Rust (1.88)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      # rust-toolchain.toml pins `stable`; an explicit `+1.85.0` on the command
+      # rust-toolchain.toml pins `stable`; an explicit `+1.88.0` on the command
       # line overrides it so this job really exercises the declared MSRV.
-      # (1.85 is required by the `edition2024` feature used by transitive deps.)
-      - name: Install Rust 1.85.0
-        uses: dtolnay/rust-toolchain@1.85.0
+      # (1.88 is the floor required by transitive deps, e.g. time 0.3.49.)
+      - name: Install Rust 1.88.0
+        uses: dtolnay/rust-toolchain@1.88.0
 
       - name: Cache cargo
         uses: actions/cache@v4
@@ -90,7 +90,7 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-msrv-
 
       - name: Check against MSRV
-        run: cargo +1.85.0 check --all-targets --all-features
+        run: cargo +1.88.0 check --all-targets --all-features
 
   audit:
     name: Dependency audit
