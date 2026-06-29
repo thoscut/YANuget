@@ -11,6 +11,106 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 
+/// Overwrite policy for re-pushing an existing package id/version.
+///
+/// Deserializes from either a bool (`true`/`false`, the historical form) or a
+/// string (`"true"`, `"false"`, `"prerelease-only"`), so existing configs keep
+/// working while the new tri-state is available.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OverwriteMode {
+    /// Never overwrite — versions are immutable (the default).
+    #[default]
+    Disabled,
+    /// Overwrite any existing version.
+    Enabled,
+    /// Overwrite pre-release versions only; stable releases stay immutable.
+    PrereleaseOnly,
+}
+
+impl OverwriteMode {
+    /// Whether a push may overwrite a version with the given pre-release status.
+    pub fn allows(self, is_prerelease: bool) -> bool {
+        match self {
+            OverwriteMode::Disabled => false,
+            OverwriteMode::Enabled => true,
+            OverwriteMode::PrereleaseOnly => is_prerelease,
+        }
+    }
+
+    /// A human-readable label for the settings page.
+    pub fn label(self) -> &'static str {
+        match self {
+            OverwriteMode::Disabled => "No",
+            OverwriteMode::Enabled => "Yes",
+            OverwriteMode::PrereleaseOnly => "Pre-release only",
+        }
+    }
+
+    /// Parse a free-form environment-variable value (lenient; unknown ⇒ off).
+    fn parse_lenient(v: &str) -> OverwriteMode {
+        match v
+            .trim()
+            .to_ascii_lowercase()
+            .replace(['_', ' '], "-")
+            .as_str()
+        {
+            "true" | "all" | "enabled" | "yes" | "on" | "1" => OverwriteMode::Enabled,
+            "prerelease-only" | "prerelease" | "prereleaseonly" | "pre" => {
+                OverwriteMode::PrereleaseOnly
+            }
+            _ => OverwriteMode::Disabled,
+        }
+    }
+}
+
+impl Serialize for OverwriteMode {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        s.serialize_str(match self {
+            OverwriteMode::Disabled => "false",
+            OverwriteMode::Enabled => "true",
+            OverwriteMode::PrereleaseOnly => "prerelease-only",
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for OverwriteMode {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        struct ModeVisitor;
+        impl serde::de::Visitor<'_> for ModeVisitor {
+            type Value = OverwriteMode;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str(r#"a bool or one of "true", "false", "prerelease-only""#)
+            }
+            fn visit_bool<E>(self, v: bool) -> std::result::Result<OverwriteMode, E> {
+                Ok(if v {
+                    OverwriteMode::Enabled
+                } else {
+                    OverwriteMode::Disabled
+                })
+            }
+            fn visit_str<E: serde::de::Error>(
+                self,
+                v: &str,
+            ) -> std::result::Result<OverwriteMode, E> {
+                match v
+                    .trim()
+                    .to_ascii_lowercase()
+                    .replace(['_', ' '], "-")
+                    .as_str()
+                {
+                    "true" | "all" | "enabled" => Ok(OverwriteMode::Enabled),
+                    "false" | "none" | "disabled" | "" => Ok(OverwriteMode::Disabled),
+                    "prerelease-only" | "prerelease" | "prereleaseonly" => {
+                        Ok(OverwriteMode::PrereleaseOnly)
+                    }
+                    other => Err(E::custom(format!("invalid overwrite mode: {other}"))),
+                }
+            }
+        }
+        d.deserialize_any(ModeVisitor)
+    }
+}
+
 /// Top-level server configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -34,6 +134,9 @@ pub struct Config {
     /// API key required for push/delete. When `None`, those endpoints are open
     /// (a loud warning is logged at startup).
     pub api_key: Option<String>,
+    /// Additional accepted push/delete keys (e.g. one per team/developer). Any
+    /// of these — or `api_key` — authenticates a write.
+    pub api_keys: Vec<String>,
     /// Admin key protecting the `/admin` area (disable/enable/delete versions),
     /// presented via HTTP Basic auth. When `None`, the admin area is disabled.
     pub admin_api_key: Option<String>,
@@ -43,9 +146,9 @@ pub struct Config {
     /// Maximum accepted upload size in bytes. `None` means unlimited, which is
     /// the point of YANuget — it streams 25 GiB+ packages straight to disk.
     pub max_package_size_bytes: Option<u64>,
-    /// Whether pushing an existing id/version overwrites it. Off by default to
-    /// preserve NuGet's immutability guarantee.
-    pub allow_overwrite: bool,
+    /// Whether (and which) pushes may overwrite an existing id/version. Off by
+    /// default to preserve NuGet's immutability guarantee.
+    pub allow_overwrite: OverwriteMode,
     /// Whether `DELETE` hard-deletes (true) or merely unlists (false).
     pub hard_delete_enabled: bool,
     /// Serve over HTTPS. On by default; a self-signed certificate is generated
@@ -66,6 +169,8 @@ pub struct Config {
     pub primary_client: String,
     /// Automatic pruning of old package versions.
     pub retention: RetentionConfig,
+    /// Per-IP request rate limiting (brute-force mitigation).
+    pub rate_limit: RateLimitConfig,
     /// Hosted feeds. When empty, a single implicit feed named `default` is
     /// served at the server root (the historical single-feed behaviour). When
     /// non-empty, each feed is mounted under `/{name}` and the root serves a
@@ -116,6 +221,30 @@ impl Default for LicensePolicyConfig {
     }
 }
 
+/// Authentication for an upstream mirror. All fields are optional; set the
+/// `username`/`password` pair for HTTP Basic, `token` for a Bearer token, and/or
+/// `headers` for arbitrary custom headers (e.g. a private-feed API key). When
+/// more than one is set they are all sent.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MirrorAuthConfig {
+    /// HTTP Basic username (sent with `password`).
+    pub username: Option<String>,
+    /// HTTP Basic password.
+    pub password: Option<String>,
+    /// Bearer token, sent as `Authorization: Bearer <token>`.
+    pub token: Option<String>,
+    /// Arbitrary extra request headers.
+    pub headers: std::collections::BTreeMap<String, String>,
+}
+
+impl MirrorAuthConfig {
+    /// Whether any credential is configured.
+    pub fn is_set(&self) -> bool {
+        self.username.is_some() || self.token.is_some() || !self.headers.is_empty()
+    }
+}
+
 /// Per-feed upstream mirroring (read-through caching of a public NuGet feed).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -126,6 +255,8 @@ pub struct MirrorConfig {
     pub upstream: String,
     /// Per-request timeout (seconds) when talking to the upstream.
     pub timeout_secs: u64,
+    /// Credentials for an authenticated upstream feed (default: none).
+    pub auth: MirrorAuthConfig,
 }
 
 impl Default for MirrorConfig {
@@ -134,6 +265,7 @@ impl Default for MirrorConfig {
             enabled: false,
             upstream: "https://api.nuget.org/v3/index.json".to_string(),
             timeout_secs: 30,
+            auth: MirrorAuthConfig::default(),
         }
     }
 }
@@ -146,8 +278,11 @@ pub struct FeedConfig {
     /// URL slug and database key. Must be a non-empty, path-safe token.
     pub name: String,
     /// API key for pushing/promoting into this feed (put). Falls back to the
-    /// global `api_key`.
+    /// global `api_key`/`api_keys`.
     pub api_key: Option<String>,
+    /// Additional accepted push keys for this feed. When this feed sets any push
+    /// key (here or in `api_key`), the global keys do not apply to it.
+    pub api_keys: Vec<String>,
     /// Credential required to download/restore from this feed (get). When unset,
     /// reads are open. Accepted as either an `X-NuGet-ApiKey` header or the
     /// password of HTTP Basic credentials (what `dotnet`/`nuget` send).
@@ -156,7 +291,7 @@ pub struct FeedConfig {
     /// to the global `admin_api_key`.
     pub admin_api_key: Option<String>,
     /// Overwrite policy; falls back to the global `allow_overwrite`.
-    pub allow_overwrite: Option<bool>,
+    pub allow_overwrite: Option<OverwriteMode>,
     /// Hard-delete policy; falls back to the global `hard_delete_enabled`.
     pub hard_delete_enabled: Option<bool>,
     /// When true, versions entering this feed (push, promote or mirror) are
@@ -185,10 +320,11 @@ pub struct ResolvedFeed {
     pub name: String,
     /// URL path prefix: `""` for the implicit default feed, else `/{name}`.
     pub prefix: String,
-    pub api_key: Option<String>,
+    /// Accepted push/delete keys (empty means writes are open).
+    pub api_keys: Vec<String>,
     pub read_api_key: Option<String>,
     pub admin_api_key: Option<String>,
-    pub allow_overwrite: bool,
+    pub allow_overwrite: OverwriteMode,
     pub hard_delete_enabled: bool,
     pub requires_approval: bool,
     pub promotes_to: Option<String>,
@@ -239,6 +375,34 @@ impl RetentionConfig {
     }
 }
 
+/// Per-IP request rate limiting. A fixed window of `window_secs` allows at most
+/// `max_requests` requests per client IP, after which requests are answered with
+/// `429 Too Many Requests` until the window rolls over. The client IP is taken
+/// from `X-Forwarded-For`/`X-Real-IP` (for proxied deployments) and otherwise
+/// the peer address. On by default with a generous limit so ordinary restores
+/// are unaffected while online key brute-forcing is throttled; a reverse proxy
+/// can complement it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RateLimitConfig {
+    /// Master switch.
+    pub enabled: bool,
+    /// Maximum requests per client IP per window. Clamped to at least 1.
+    pub max_requests: u32,
+    /// Window length in seconds.
+    pub window_secs: u64,
+}
+
+impl Default for RateLimitConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_requests: 1000,
+            window_secs: 60,
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -249,10 +413,11 @@ impl Default for Config {
             storage_path: None,
             database_path: None,
             api_key: None,
+            api_keys: Vec::new(),
             admin_api_key: None,
             gallery_page_size: 20,
             max_package_size_bytes: None,
-            allow_overwrite: false,
+            allow_overwrite: OverwriteMode::Disabled,
             hard_delete_enabled: false,
             tls_enabled: true,
             tls_cert_path: None,
@@ -261,6 +426,7 @@ impl Default for Config {
             enable_web_ui: true,
             primary_client: "choco".to_string(),
             retention: RetentionConfig::default(),
+            rate_limit: RateLimitConfig::default(),
             feeds: Vec::new(),
         }
     }
@@ -309,6 +475,14 @@ impl Config {
         if let Ok(v) = std::env::var("YANUGET_API_KEY") {
             self.api_key = (!v.is_empty()).then_some(v);
         }
+        if let Ok(v) = std::env::var("YANUGET_API_KEYS") {
+            self.api_keys = v
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect();
+        }
         if let Ok(v) = std::env::var("YANUGET_ADMIN_API_KEY") {
             self.admin_api_key = (!v.is_empty()).then_some(v);
         }
@@ -323,7 +497,7 @@ impl Config {
             self.max_package_size_bytes = v.parse().ok();
         }
         if let Ok(v) = std::env::var("YANUGET_ALLOW_OVERWRITE") {
-            self.allow_overwrite = truthy(&v);
+            self.allow_overwrite = OverwriteMode::parse_lenient(&v);
         }
         if let Ok(v) = std::env::var("YANUGET_HARD_DELETE_ENABLED") {
             self.hard_delete_enabled = truthy(&v);
@@ -367,6 +541,19 @@ impl Config {
         }
         if let Ok(v) = std::env::var("YANUGET_RETENTION_MAX_AGE_DAYS") {
             self.retention.max_age_days = v.parse().ok();
+        }
+        if let Ok(v) = std::env::var("YANUGET_RATELIMIT_ENABLED") {
+            self.rate_limit.enabled = truthy(&v);
+        }
+        if let Ok(v) = std::env::var("YANUGET_RATELIMIT_MAX_REQUESTS") {
+            if let Ok(n) = v.parse() {
+                self.rate_limit.max_requests = n;
+            }
+        }
+        if let Ok(v) = std::env::var("YANUGET_RATELIMIT_WINDOW_SECS") {
+            if let Ok(n) = v.parse() {
+                self.rate_limit.window_secs = n;
+            }
         }
     }
 
@@ -420,7 +607,7 @@ impl Config {
             return Ok(vec![ResolvedFeed {
                 name: DEFAULT_FEED.to_string(),
                 prefix: String::new(),
-                api_key: self.api_key.clone(),
+                api_keys: combine_keys(&self.api_key, &self.api_keys),
                 read_api_key: None,
                 admin_api_key: self.admin_api_key.clone(),
                 allow_overwrite: self.allow_overwrite,
@@ -443,10 +630,18 @@ impl Config {
                     f.name
                 )));
             }
+            // A feed that sets any push key of its own uses only those; otherwise
+            // it falls back to the global keys.
+            let feed_keys = combine_keys(&f.api_key, &f.api_keys);
+            let api_keys = if feed_keys.is_empty() {
+                combine_keys(&self.api_key, &self.api_keys)
+            } else {
+                feed_keys
+            };
             resolved.push(ResolvedFeed {
                 prefix: format!("/{}", f.name),
                 name: f.name.clone(),
-                api_key: f.api_key.clone().or_else(|| self.api_key.clone()),
+                api_keys,
                 read_api_key: f.read_api_key.clone(),
                 admin_api_key: f
                     .admin_api_key
@@ -502,6 +697,23 @@ fn truthy(v: &str) -> bool {
     )
 }
 
+/// Combine a single optional key with a list of keys into a deduplicated,
+/// non-empty list (order preserved, empties dropped).
+fn combine_keys(single: &Option<String>, list: &[String]) -> Vec<String> {
+    let mut keys: Vec<String> = Vec::new();
+    for k in single
+        .iter()
+        .map(String::as_str)
+        .chain(list.iter().map(String::as_str))
+    {
+        let k = k.trim();
+        if !k.is_empty() && !keys.iter().any(|e| e == k) {
+            keys.push(k.to_string());
+        }
+    }
+    keys
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -511,7 +723,7 @@ mod tests {
         let c = Config::default();
         assert_eq!(c.port, 5000);
         assert!(c.max_package_size_bytes.is_none()); // unlimited by default
-        assert!(!c.allow_overwrite);
+        assert_eq!(c.allow_overwrite, OverwriteMode::Disabled);
         assert_eq!(c.storage_path(), PathBuf::from("./data/packages"));
     }
 
@@ -528,8 +740,39 @@ mod tests {
         assert_eq!(c.port, 8080);
         assert_eq!(c.base_url.as_deref(), Some("https://nuget.example.com"));
         assert_eq!(c.api_key.as_deref(), Some("secret"));
-        assert!(c.allow_overwrite);
+        assert_eq!(c.allow_overwrite, OverwriteMode::Enabled);
         assert_eq!(c.max_package_size_bytes, Some(26_843_545_600));
+    }
+
+    #[test]
+    fn overwrite_mode_parses_bool_and_strings() {
+        #[derive(Deserialize)]
+        struct W {
+            allow_overwrite: OverwriteMode,
+        }
+        let mode = |s: &str| toml::from_str::<W>(s).unwrap().allow_overwrite;
+        assert_eq!(mode("allow_overwrite = true"), OverwriteMode::Enabled);
+        assert_eq!(mode("allow_overwrite = false"), OverwriteMode::Disabled);
+        assert_eq!(
+            mode(r#"allow_overwrite = "prerelease-only""#),
+            OverwriteMode::PrereleaseOnly
+        );
+
+        // The decision helper.
+        assert!(!OverwriteMode::Disabled.allows(true));
+        assert!(OverwriteMode::Enabled.allows(false));
+        assert!(OverwriteMode::PrereleaseOnly.allows(true));
+        assert!(!OverwriteMode::PrereleaseOnly.allows(false));
+
+        // Lenient env parsing.
+        assert_eq!(
+            OverwriteMode::parse_lenient("prerelease"),
+            OverwriteMode::PrereleaseOnly
+        );
+        assert_eq!(
+            OverwriteMode::parse_lenient("garbage"),
+            OverwriteMode::Disabled
+        );
     }
 
     #[test]

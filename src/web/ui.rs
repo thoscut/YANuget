@@ -118,6 +118,30 @@ pub fn escape_html(s: &str) -> String {
     out
 }
 
+/// Return `url` only if it carries a safe, expected scheme (`http`, `https` or
+/// `mailto`). Package metadata (project/repository/license/icon URLs) is
+/// attacker-controlled, so an unfiltered value like `javascript:alert(1)` or a
+/// `data:` URI placed into an `href`/`src` attribute would be a stored-XSS hole
+/// that HTML-escaping alone does not close (the scheme contains no escapable
+/// characters). The scheme is compared case-insensitively with ASCII whitespace
+/// and control characters stripped, because browsers ignore those when
+/// resolving it. The caller must still HTML-escape the returned value.
+pub fn safe_href(url: &str) -> Option<&str> {
+    let trimmed = url.trim();
+    let scheme: String = trimmed
+        .split(':')
+        .next()
+        .unwrap_or("")
+        .chars()
+        .filter(|c| !c.is_ascii_whitespace() && !c.is_ascii_control())
+        .flat_map(char::to_lowercase)
+        .collect();
+    match scheme.as_str() {
+        "http" | "https" | "mailto" => Some(trimmed),
+        _ => None,
+    }
+}
+
 /// Tiny inline script giving the install-command "Copy" buttons their
 /// behaviour. It degrades gracefully: without JS the `<pre>` stays selectable
 /// and the button simply does nothing.
@@ -399,7 +423,7 @@ pub fn settings_page(urls: &UrlBuilder, config: &Config, feed: &super::FeedConte
     server.push_str(&kv("Max package size", &max_size));
     server.push_str(&kv(
         "Overwrite existing version",
-        yes_no(feed.allow_overwrite),
+        feed.allow_overwrite.label(),
     ));
     server.push_str(&kv("Delete behaviour", delete_mode));
     server.push_str(&kv("Approval required", yes_no(feed.requires_approval)));
@@ -822,10 +846,12 @@ fn render_info(p: &Package) -> String {
 fn render_links(p: &Package) -> String {
     let mut links = Vec::new();
     let mut add = |url: &str, label: &str| {
-        links.push(format!(
-            "<a href=\"{}\" rel=\"nofollow noopener\">{label}</a>",
-            escape_html(url)
-        ));
+        if let Some(safe) = safe_href(url) {
+            links.push(format!(
+                "<a href=\"{}\" rel=\"nofollow noopener\">{label}</a>",
+                escape_html(safe)
+            ));
+        }
     };
     if let Some(u) = &p.project_url {
         add(u, "Project");
@@ -993,6 +1019,44 @@ mod tests {
     }
 
     #[test]
+    fn safe_href_allows_only_expected_schemes() {
+        assert_eq!(
+            safe_href("https://example.com/x"),
+            Some("https://example.com/x")
+        );
+        assert_eq!(
+            safe_href("  http://example.com  "),
+            Some("http://example.com")
+        );
+        assert_eq!(
+            safe_href("HTTPS://Example.com"),
+            Some("HTTPS://Example.com")
+        );
+        assert_eq!(
+            safe_href("mailto:dev@example.com"),
+            Some("mailto:dev@example.com")
+        );
+        assert_eq!(safe_href("javascript:alert(1)"), None);
+        // Browsers strip control characters before resolving the scheme; so do we.
+        assert_eq!(safe_href("java\tscript:alert(1)"), None);
+        assert_eq!(safe_href("data:text/html,<script>alert(1)</script>"), None);
+        assert_eq!(safe_href("//evil.example.com"), None);
+        assert_eq!(safe_href("not a url"), None);
+    }
+
+    #[test]
+    fn render_links_drops_dangerous_url_schemes() {
+        let mut p = sample();
+        p.project_url = Some("javascript:alert(1)".into());
+        p.repository_url = Some("https://example.com/repo".into());
+        p.license_url = Some("data:text/html,<script>alert(1)</script>".into());
+        let html = render_links(&p);
+        assert!(!html.contains("javascript:"));
+        assert!(!html.contains("data:"));
+        assert!(html.contains("https://example.com/repo"));
+    }
+
+    #[test]
     fn detail_page_marks_prerelease_and_unlisted() {
         let urls = UrlBuilder::new("https://host");
         let mut p = sample();
@@ -1063,7 +1127,7 @@ mod tests {
             auth: crate::auth::ApiKeyAuth::new(api.map(str::to_string)),
             read_auth: crate::auth::ReadAuth::new(None),
             admin: crate::auth::AdminAuth::new(admin.map(str::to_string)),
-            allow_overwrite: false,
+            allow_overwrite: crate::config::OverwriteMode::Disabled,
             hard_delete_enabled: false,
             requires_approval: false,
             promotes_to: None,

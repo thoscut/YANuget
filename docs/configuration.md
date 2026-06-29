@@ -20,10 +20,11 @@ A fully commented template lives in
 | `storage_path` | `YANUGET_STORAGE_PATH` | path | `{data_dir}/packages` | Package store. |
 | `database_path` | `YANUGET_DATABASE_PATH` | path | `{data_dir}/yanuget.db` | SQLite file. |
 | `api_key` | `YANUGET_API_KEY` | string | *(none)* | Required to push/delete. |
+| `api_keys` | `YANUGET_API_KEYS` | string[] | `[]` | Additional accepted push/delete keys (env: comma-separated). Any of these or `api_key` authenticates. |
 | `admin_api_key` | `YANUGET_ADMIN_API_KEY` | string | *(none)* | Protects `/admin` (Basic auth). Unset ⇒ admin area off. |
 | `gallery_page_size` | `YANUGET_GALLERY_PAGE_SIZE` | int | `20` | Packages per gallery page (`?take=` overrides). |
 | `max_package_size_bytes` | `YANUGET_MAX_PACKAGE_SIZE_BYTES` | int | *(unlimited)* | Upload cap; streamed either way. |
-| `allow_overwrite` | `YANUGET_ALLOW_OVERWRITE` | bool | `false` | Re-push an existing version. |
+| `allow_overwrite` | `YANUGET_ALLOW_OVERWRITE` | bool \| string | `false` | Re-push an existing version: `false`, `true`, or `"prerelease-only"` (overwrite pre-releases only). |
 | `hard_delete_enabled` | `YANUGET_HARD_DELETE_ENABLED` | bool | `false` | DELETE removes vs. unlists. |
 | `tls_enabled` | `YANUGET_TLS_ENABLED` | bool | `true` | Serve HTTPS (self-signed fallback). |
 | `tls_cert_path` | `YANUGET_TLS_CERT_PATH` | path | *(self-signed)* | PEM certificate (chain). |
@@ -33,6 +34,23 @@ A fully commented template lives in
 | `primary_client` | `YANUGET_PRIMARY_CLIENT` | string | `choco` | Install command shown first (`choco`/`dotnet`/`nuget`). |
 
 Booleans accept `1/true/yes/on` (case-insensitive) via environment variables.
+
+## Rate limiting
+
+Per-client-IP request throttling under the `[rate_limit]` table. A fixed window
+of `window_secs` allows at most `max_requests` requests per client IP; exceeding
+it returns `429 Too Many Requests` with a `Retry-After` header. It is **on by
+default** with a generous limit so ordinary restores are unaffected while online
+API-key guessing is throttled. The client IP is taken from `X-Forwarded-For` /
+`X-Real-IP` (behind a proxy) and otherwise the peer address; requests with no
+determinable IP are not throttled. For very high read volume, raise the limit or
+disable it and rely on a reverse proxy.
+
+| TOML key | Env var | Type | Default | Description |
+| --- | --- | --- | --- | --- |
+| `rate_limit.enabled` | `YANUGET_RATELIMIT_ENABLED` | bool | `true` | Master switch. |
+| `rate_limit.max_requests` | `YANUGET_RATELIMIT_MAX_REQUESTS` | int | `1000` | Max requests per IP per window (min 1). |
+| `rate_limit.window_secs` | `YANUGET_RATELIMIT_WINDOW_SECS` | int | `60` | Window length in seconds. |
 
 ## Retention
 
@@ -72,15 +90,19 @@ deleted only when the **last** feed referencing it lets go.
 | --- | --- | --- | --- |
 | `feeds[].name` | string | *(required)* | URL slug + DB key; `[A-Za-z0-9._-]+`, unique. |
 | `feeds[].api_key` | string | *(global `api_key`)* | Push (put) credential. |
+| `feeds[].api_keys` | string[] | *(global)* | Additional push keys. A feed that sets any push key uses only its own. |
 | `feeds[].read_api_key` | string | *(open)* | Download/restore (get) credential. See below. |
 | `feeds[].admin_api_key` | string | *(global `admin_api_key`)* | Moderation/promotion (delete) credential. |
-| `feeds[].allow_overwrite` | bool | *(global)* | Re-push an existing version. |
+| `feeds[].allow_overwrite` | bool \| string | *(global)* | Re-push policy (`false`/`true`/`"prerelease-only"`). |
 | `feeds[].hard_delete_enabled` | bool | *(global)* | DELETE removes vs. unlists. |
 | `feeds[].requires_approval` | bool | `false` | Incoming versions are pending until approved. |
 | `feeds[].promotes_to` | string | *(none)* | Next release ring (must name another feed). |
 | `feeds[].mirror.enabled` | bool | `false` | Read-through cache of an upstream V3 feed. |
 | `feeds[].mirror.upstream` | string | `https://api.nuget.org/v3/index.json` | Upstream service index. |
 | `feeds[].mirror.timeout_secs` | int | `30` | Per-request upstream timeout. |
+| `feeds[].mirror.auth.username` / `.password` | string | *(none)* | HTTP Basic credentials for the upstream. |
+| `feeds[].mirror.auth.token` | string | *(none)* | Bearer token for the upstream (`Authorization: Bearer …`). |
+| `feeds[].mirror.auth.headers` | table | `{}` | Arbitrary extra request headers (e.g. a private-feed API key). |
 | `feeds[].license_policy.enabled` | bool | `false` | Evaluate the offline license policy. |
 | `feeds[].license_policy.allowed` | string[] | `[]` | If non-empty, license must match one. |
 | `feeds[].license_policy.blocked` | string[] | `[]` | Always rejected (even if also allowed). |
@@ -130,7 +152,8 @@ YANuget serves **HTTPS by default**. Behaviour:
   right scheme/host.
 
 When TLS is on and no base URL is configured, generated URLs default to the
-`https` scheme (still overridable by `X-Forwarded-Proto`).
+`https` scheme (still overridable by `X-Forwarded-Proto`). With TLS enabled,
+responses also carry a `Strict-Transport-Security` header (one year).
 
 ## Security notes
 

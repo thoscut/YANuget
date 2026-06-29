@@ -33,7 +33,7 @@ async fn main() -> anyhow::Result<()> {
 
     let feeds = config.resolved_feeds()?;
     for feed in &feeds {
-        if feed.api_key.is_none() {
+        if feed.api_keys.is_empty() {
             tracing::warn!(
                 feed = %feed.name,
                 "no API key configured — package push and delete are UNAUTHENTICATED for this feed"
@@ -64,6 +64,14 @@ async fn main() -> anyhow::Result<()> {
             .collect::<Vec<_>>(),
     );
 
+    // A single shutdown signal fanned out to every background task and both
+    // serve paths, so retention sweeps stop cleanly instead of being abandoned.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        let _ = shutdown_tx.send(true);
+    });
+
     let mut states = Vec::with_capacity(feeds.len());
     for feed in &feeds {
         let state = AppState::for_feed(
@@ -86,16 +94,25 @@ async fn main() -> anyhow::Result<()> {
             let policy = RetentionPolicy::from(&feed.retention);
             let interval = feed.retention.interval_hours;
             let feed_name = feed.name.clone();
+            let mut shutdown = shutdown_rx.clone();
             tracing::info!(feed = %feed_name, interval_hours = interval, "retention sweep enabled");
             tokio::spawn(async move {
                 let mut tick = tokio::time::interval(Duration::from_secs(interval * 3600));
                 loop {
-                    tick.tick().await;
-                    if let Err(e) =
-                        retention::prune_all(storage.as_ref(), db.as_ref(), &feed_name, &policy)
+                    tokio::select! {
+                        _ = tick.tick() => {
+                            if let Err(e) = retention::prune_all(
+                                storage.as_ref(),
+                                db.as_ref(),
+                                &feed_name,
+                                &policy,
+                            )
                             .await
-                    {
-                        tracing::error!(feed = %feed_name, error = %e, "retention sweep failed");
+                            {
+                                tracing::error!(feed = %feed_name, error = %e, "retention sweep failed");
+                            }
+                        }
+                        _ = shutdown.changed() => break,
                     }
                 }
             });
@@ -106,14 +123,19 @@ async fn main() -> anyhow::Result<()> {
     let addr = config.socket_addr();
 
     if config.tls_enabled {
-        serve_tls(app, addr, &config).await?;
+        serve_tls(app, addr, &config, shutdown_rx).await?;
     } else {
         let listener = tokio::net::TcpListener::bind(addr).await?;
         tracing::info!("YANuget listening on http://{addr} (TLS disabled)");
         tracing::info!("service index: http://{addr}/v3/index.json");
-        axum::serve(listener, app)
-            .with_graceful_shutdown(shutdown_signal())
-            .await?;
+        // `with_connect_info` exposes the peer address so the rate limiter can
+        // key on it when no `X-Forwarded-*` header is present.
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .with_graceful_shutdown(wait_for_shutdown(shutdown_rx))
+        .await?;
     }
     Ok(())
 }
@@ -124,6 +146,7 @@ async fn serve_tls(
     app: axum::Router,
     addr: std::net::SocketAddr,
     config: &Config,
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     // Install the ring crypto provider as the process default before any
     // rustls configuration is built.
@@ -145,13 +168,13 @@ async fn serve_tls(
     let handle = axum_server::Handle::new();
     let shutdown = handle.clone();
     tokio::spawn(async move {
-        shutdown_signal().await;
+        wait_for_shutdown(shutdown_rx).await;
         shutdown.graceful_shutdown(Some(std::time::Duration::from_secs(10)));
     });
 
     axum_server::bind_rustls(addr, tls)
         .handle(handle)
-        .serve(app.into_make_service())
+        .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
         .await?;
     Ok(())
 }
@@ -163,6 +186,14 @@ fn init_tracing() {
         .with(fmt::layer())
         .with(filter)
         .init();
+}
+
+/// Resolve once the shutdown signal has been broadcast on `rx`.
+async fn wait_for_shutdown(mut rx: tokio::sync::watch::Receiver<bool>) {
+    if *rx.borrow_and_update() {
+        return;
+    }
+    let _ = rx.changed().await;
 }
 
 /// Wait for Ctrl-C (or SIGTERM on Unix) for graceful shutdown.

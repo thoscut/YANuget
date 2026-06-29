@@ -21,6 +21,10 @@ data_dir = "./data"        # YANUGET_DATA_DIR
 # If unset, those endpoints are unauthenticated.
 # api_key = "change-me"    # YANUGET_API_KEY
 
+# Additional accepted push/delete keys (e.g. one per team or developer). Any of
+# these — or api_key — authenticates a write. The env var is comma-separated.
+# api_keys = ["alice-key", "bob-key"]   # YANUGET_API_KEYS="alice-key,bob-key"
+
 # Admin key protecting the /admin area, where you can disable, re-enable or
 # delete individual package versions via the browser (HTTP Basic auth — any
 # username, this key as the password). When unset, the admin area is disabled.
@@ -34,9 +38,12 @@ gallery_page_size = 20     # YANUGET_GALLERY_PAGE_SIZE
 # 26843545600 = 25 GiB.
 # max_package_size_bytes = 26843545600    # YANUGET_MAX_PACKAGE_SIZE_BYTES
 
-# Allow re-pushing an existing id/version (off by default to preserve NuGet's
-# immutability guarantee).
-allow_overwrite = false    # YANUGET_ALLOW_OVERWRITE
+# Whether re-pushing an existing id/version overwrites it. Off by default to
+# preserve NuGet's immutability guarantee. Accepts a bool or a string:
+#   false  — never overwrite (default)
+#   true   — overwrite any version
+#   "prerelease-only" — overwrite pre-releases only; stable releases stay immutable
+allow_overwrite = false    # YANUGET_ALLOW_OVERWRITE (false|true|prerelease-only)
 
 # When true, DELETE hard-deletes a package. When false (default), DELETE only
 # unlists it (the NuGet client's "delete" semantics), keeping it restorable.
@@ -61,6 +68,20 @@ enable_web_ui = true          # YANUGET_ENABLE_WEB_UI
 # One of "choco", "dotnet", "nuget". Defaults to "choco" since YANuget is
 # primarily deployed as a Chocolatey feed.
 primary_client = "choco"      # YANUGET_PRIMARY_CLIENT
+
+# ---------------------------------------------------------------------------
+# Rate limiting — per-client-IP request throttling (brute-force mitigation).
+#
+# On by default with a generous limit so ordinary restores are unaffected while
+# online API-key guessing is throttled. The client IP is taken from
+# X-Forwarded-For / X-Real-IP (behind a proxy) and otherwise the peer address.
+# Tune up for very high-volume read traffic, or disable and rely on a reverse
+# proxy. Exceeding the limit returns 429 with a Retry-After header.
+# ---------------------------------------------------------------------------
+[rate_limit]
+enabled = true                # YANUGET_RATELIMIT_ENABLED
+max_requests = 1000           # YANUGET_RATELIMIT_MAX_REQUESTS — per IP per window
+window_secs = 60              # YANUGET_RATELIMIT_WINDOW_SECS
 
 # ---------------------------------------------------------------------------
 # Package retention — automatic pruning of old versions.
@@ -112,6 +133,15 @@ interval_hours = 24           # YANUGET_RETENTION_INTERVAL_HOURS — background 
 #   enabled = true
 #   upstream = "https://api.nuget.org/v3/index.json"
 #   timeout_secs = 30
+#
+#     # Credentials for an authenticated upstream (all optional). Set the
+#     # username/password pair for HTTP Basic, token for a Bearer token, and/or
+#     # headers for a custom header (e.g. a private-feed API key).
+#     [feeds.dev.mirror.auth]
+#     # username = "ci"
+#     # password = "secret"
+#     # token = "ghp_xxx"
+#     # headers = { "X-NuGet-ApiKey" = "upstream-key" }
 #
 # [[feeds]]
 # name = "stable"

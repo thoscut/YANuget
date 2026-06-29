@@ -87,7 +87,11 @@ CREATE TABLE IF NOT EXISTS feed_packages (
     downloads          INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (feed, lower_id, normalized_version)
 );
-CREATE INDEX IF NOT EXISTS idx_feed_packages_feed ON feed_packages (feed, lower_id);
+-- Covers the search ranking: the (feed, lower_id) prefix scopes a feed and
+-- supports GROUP BY lower_id, while including `downloads` lets SUM(downloads)
+-- be read straight from the index instead of looking up each table row.
+CREATE INDEX IF NOT EXISTS idx_feed_packages_rank
+    ON feed_packages (feed, lower_id, downloads);
 CREATE INDEX IF NOT EXISTS idx_feed_packages_pkg
     ON feed_packages (lower_id, normalized_version);
 
@@ -153,6 +157,11 @@ impl SqliteDatabase {
         sqlx::raw_sql(SCHEMA).execute(&pool).await?;
         // Migrate databases created before the admin `enabled` column existed.
         ensure_column(&pool, "packages", "enabled", "INTEGER NOT NULL DEFAULT 1").await?;
+        // Drop the legacy (feed, lower_id) index, now subsumed by the wider
+        // covering index `idx_feed_packages_rank` created above.
+        sqlx::query("DROP INDEX IF EXISTS idx_feed_packages_feed")
+            .execute(&pool)
+            .await?;
 
         // One-shot migration of single-feed databases created before feeds
         // existed: seed each existing package into the implicit `default` feed,
@@ -561,6 +570,13 @@ impl PackageDatabase for SqliteDatabase {
         let query = request.query.trim().to_lowercase();
         let pattern = like_pattern(&query);
 
+        // An optional package-type filter, applied in SQL so the page and the
+        // total count stay consistent. `''` (no filter) makes the predicate a
+        // no-op; otherwise a package id matches when any of its versions
+        // declares the type. `json_each`/`json_extract` parse the stored JSON
+        // so there is no quoting/escaping ambiguity.
+        let package_type = request.package_type.as_deref().unwrap_or("").to_lowercase();
+
         // Phase 1: pick the page of matching package ids, ranked by downloads.
         let filter = "fp.feed = ?1 AND fp.listed = 1 AND fp.enabled = 1 AND fp.pending = 0 \
              AND (?2 = 1 OR p.is_prerelease = 0) \
@@ -569,14 +585,17 @@ impl PackageDatabase for SqliteDatabase {
                   OR p.lower_id LIKE ?5 ESCAPE '\\' \
                   OR lower(p.description) LIKE ?5 ESCAPE '\\' \
                   OR lower(p.tags) LIKE ?5 ESCAPE '\\' \
-                  OR lower(IFNULL(p.title, '')) LIKE ?5 ESCAPE '\\')";
+                  OR lower(IFNULL(p.title, '')) LIKE ?5 ESCAPE '\\') \
+             AND (?6 = '' OR EXISTS ( \
+                  SELECT 1 FROM json_each(p.package_types) je \
+                  WHERE lower(json_extract(je.value, '$.name')) = ?6))";
 
         let id_sql = format!(
             "SELECT p.lower_id AS lower_id, SUM(fp.downloads) AS total \
              FROM packages p JOIN feed_packages fp \
                ON fp.lower_id = p.lower_id AND fp.normalized_version = p.normalized_version \
              WHERE {filter} \
-             GROUP BY p.lower_id ORDER BY total DESC, p.lower_id ASC LIMIT ?6 OFFSET ?7"
+             GROUP BY p.lower_id ORDER BY total DESC, p.lower_id ASC LIMIT ?7 OFFSET ?8"
         );
         let id_rows = sqlx::query(&id_sql)
             .bind(feed)
@@ -584,6 +603,7 @@ impl PackageDatabase for SqliteDatabase {
             .bind(i64::from(request.include_semver2))
             .bind(&query)
             .bind(&pattern)
+            .bind(&package_type)
             .bind(request.take.max(0))
             .bind(request.skip.max(0))
             .fetch_all(&self.pool)
@@ -606,11 +626,12 @@ impl PackageDatabase for SqliteDatabase {
             .bind(i64::from(request.include_semver2))
             .bind(&query)
             .bind(&pattern)
+            .bind(&package_type)
             .fetch_one(&self.pool)
             .await?;
 
         // Phase 2: load every visible version for the chosen ids.
-        let mut groups = self
+        let groups = self
             .load_groups(
                 feed,
                 &ids,
@@ -619,16 +640,6 @@ impl PackageDatabase for SqliteDatabase {
                 true,
             )
             .await?;
-
-        // Optional package-type filter (applied to the page).
-        if let Some(pt) = &request.package_type {
-            groups.retain(|g| {
-                g.latest()
-                    .package_types
-                    .iter()
-                    .any(|t| t.name.eq_ignore_ascii_case(pt))
-            });
-        }
 
         Ok(SearchPage { total_hits, groups })
     }
@@ -1139,6 +1150,49 @@ mod tests {
             .unwrap();
         assert_eq!(page.total_hits, 1);
         assert_eq!(page.groups[0].latest().id, "Alpha.Tools");
+    }
+
+    #[tokio::test]
+    async fn package_type_filter_keeps_count_and_page_consistent() {
+        let db = SqliteDatabase::in_memory().await.unwrap();
+        let mut tool = sample("Contoso.Tool", "1.0.0");
+        tool.package_types = vec![PackageType {
+            name: "DotnetTool".into(),
+            version: None,
+        }];
+        db.add_to_feed(FEED, &tool).await.unwrap();
+        db.add_to_feed(FEED, &sample("Contoso.Lib", "1.0.0"))
+            .await
+            .unwrap();
+
+        // The filter is applied in SQL, so total_hits matches the page.
+        let page = db
+            .search(
+                FEED,
+                &SearchRequest {
+                    package_type: Some("dotnettool".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.total_hits, 1);
+        assert_eq!(page.groups.len(), 1);
+        assert_eq!(page.groups[0].latest().id, "Contoso.Tool");
+
+        // A type nothing declares yields zero, consistently (case-insensitive).
+        let none = db
+            .search(
+                FEED,
+                &SearchRequest {
+                    package_type: Some("Template".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(none.total_hits, 0);
+        assert_eq!(none.groups.len(), 0);
     }
 
     #[tokio::test]

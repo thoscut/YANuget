@@ -149,6 +149,20 @@ async fn push_requires_api_key() {
 }
 
 #[tokio::test]
+async fn any_configured_api_key_authenticates_push() {
+    let server = spawn_with(|c| c.api_keys = vec!["team-key".into()]).await;
+    // The primary key still works...
+    let resp = push_multipart(&server, API_KEY, build_nupkg("Multi.Key", "1.0.0", b"a")).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+    // ...and so does an additional configured key.
+    let resp = push_multipart(&server, "team-key", build_nupkg("Multi.Key", "2.0.0", b"b")).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+    // An unconfigured key is still rejected.
+    let resp = push_multipart(&server, "nope", build_nupkg("Multi.Key", "3.0.0", b"c")).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
 async fn full_publish_and_consume_flow() {
     let server = spawn().await;
     let payload = vec![0xABu8; 64 * 1024];
@@ -452,7 +466,7 @@ async fn autocomplete_ids_and_versions() {
 
 #[tokio::test]
 async fn overwrite_allows_republish() {
-    let server = spawn_with(|c| c.allow_overwrite = true).await;
+    let server = spawn_with(|c| c.allow_overwrite = yanuget::config::OverwriteMode::Enabled).await;
     let nupkg = build_nupkg("Over.Write", "1.0.0", b"x");
     assert_eq!(
         push_multipart(&server, API_KEY, nupkg.clone())
@@ -463,6 +477,36 @@ async fn overwrite_allows_republish() {
     // Re-pushing the same version succeeds instead of conflicting.
     assert_eq!(
         push_multipart(&server, API_KEY, nupkg).await.status(),
+        reqwest::StatusCode::CREATED
+    );
+}
+
+#[tokio::test]
+async fn prerelease_only_overwrite_protects_stable_versions() {
+    let server =
+        spawn_with(|c| c.allow_overwrite = yanuget::config::OverwriteMode::PrereleaseOnly).await;
+
+    // A stable version is immutable: the re-push conflicts.
+    let stable = build_nupkg("Pre.Only", "1.0.0", b"a");
+    assert_eq!(
+        push_multipart(&server, API_KEY, stable.clone())
+            .await
+            .status(),
+        reqwest::StatusCode::CREATED
+    );
+    assert_eq!(
+        push_multipart(&server, API_KEY, stable).await.status(),
+        reqwest::StatusCode::CONFLICT
+    );
+
+    // A pre-release version may be overwritten.
+    let pre = build_nupkg("Pre.Only", "2.0.0-rc.1", b"a");
+    assert_eq!(
+        push_multipart(&server, API_KEY, pre.clone()).await.status(),
+        reqwest::StatusCode::CREATED
+    );
+    assert_eq!(
+        push_multipart(&server, API_KEY, pre).await.status(),
         reqwest::StatusCode::CREATED
     );
 }
@@ -503,6 +547,48 @@ async fn oversized_upload_is_rejected() {
         .await
         .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
+async fn rate_limit_returns_429_after_threshold() {
+    let server = spawn_with(|c| {
+        c.rate_limit.enabled = true;
+        c.rate_limit.max_requests = 3;
+        c.rate_limit.window_secs = 60;
+    })
+    .await;
+    let url = server.url("/health");
+
+    // Three requests from one client IP (carried in X-Forwarded-For) pass; the
+    // fourth is throttled.
+    for _ in 0..3 {
+        let resp = server
+            .client
+            .get(&url)
+            .header("X-Forwarded-For", "9.9.9.9")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    }
+    let resp = server
+        .client
+        .get(&url)
+        .header("X-Forwarded-For", "9.9.9.9")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+
+    // A different client IP has its own budget.
+    let resp = server
+        .client
+        .get(&url)
+        .header("X-Forwarded-For", "8.8.8.8")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
 }
 
 // ---------------------------------------------------------------------------

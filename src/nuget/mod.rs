@@ -15,8 +15,10 @@ use serde_json::{json, Value};
 use crate::database::{SearchGroup, SearchPage};
 use crate::models::{DependencyGroup, Package};
 
-/// Build the `/v3/index.json` service index document.
-pub fn service_index(urls: &UrlBuilder) -> Value {
+/// Build the `/v3/index.json` service index document. When `web_ui_enabled`, a
+/// `PackageDetailsUriTemplate` pointing at the HTML gallery is advertised so
+/// clients (and Visual Studio) can link to a package's details page.
+pub fn service_index(urls: &UrlBuilder, web_ui_enabled: bool) -> Value {
     // Each logical resource is advertised under every `@type` alias clients
     // look up, so old and new clients alike resolve them.
     let mut resources = Vec::new();
@@ -82,6 +84,13 @@ pub fn service_index(urls: &UrlBuilder) -> Value {
         &["SymbolServer/4.9.0"],
         "Base URL for downloading symbols (SSQP).",
     );
+    if web_ui_enabled {
+        push(
+            urls.package_details_template(),
+            &["PackageDetailsUriTemplate/5.1.0"],
+            "URI template for a package's details page.",
+        );
+    }
 
     json!({
         "version": "3.0.0",
@@ -97,18 +106,63 @@ pub fn flat_container_index(versions: &[String]) -> Value {
     json!({ "versions": versions })
 }
 
-/// Build the registration index (`/v3/registration/{id}/index.json`) with all
-/// leaves inlined into a single page. `packages` must be sorted ascending by
-/// version and contain at least one element.
+/// Packages with fewer than this many versions inline all leaves into a single
+/// registration page; larger sets are split into external pages the client
+/// fetches on demand (matching nuget.org's behaviour).
+const REGISTRATION_INLINE_MAX: usize = 128;
+/// Versions per external registration page.
+const REGISTRATION_PAGE_SIZE: usize = 64;
+
+/// Build the registration index (`/v3/registration/{id}/index.json`).
+///
+/// For small packages all leaves are inlined into one page. Once a package has
+/// [`REGISTRATION_INLINE_MAX`] or more versions, the index instead lists
+/// external pages of [`REGISTRATION_PAGE_SIZE`] versions each (served by
+/// [`registration_page`]), so the index document stays small. `packages` must be
+/// sorted ascending by version and contain at least one element.
 pub fn registration_index(urls: &UrlBuilder, id: &str, packages: &[Package]) -> Value {
     let lower_id = id.to_lowercase();
     let index_url = urls.registration_index(&lower_id);
 
+    let items: Vec<Value> = if packages.len() < REGISTRATION_INLINE_MAX {
+        vec![inline_page(urls, &lower_id, &index_url, packages)]
+    } else {
+        packages
+            .chunks(REGISTRATION_PAGE_SIZE)
+            .map(|chunk| {
+                let lower = chunk
+                    .first()
+                    .map(|p| p.normalized_version())
+                    .unwrap_or_default();
+                let upper = chunk
+                    .last()
+                    .map(|p| p.normalized_version())
+                    .unwrap_or_default();
+                json!({
+                    "@id": urls.registration_page(&lower_id, &lower, &upper),
+                    "count": chunk.len(),
+                    "lower": lower,
+                    "upper": upper,
+                })
+            })
+            .collect()
+    };
+
+    json!({
+        "@id": index_url,
+        "@type": ["catalog:CatalogRoot", "PackageRegistration", "catalog:Permalink"],
+        "count": items.len(),
+        "items": items,
+    })
+}
+
+/// Build a single inline registration page object (used inside the index for
+/// small packages).
+fn inline_page(urls: &UrlBuilder, lower_id: &str, index_url: &str, packages: &[Package]) -> Value {
     let leaves: Vec<Value> = packages
         .iter()
-        .map(|p| registration_leaf_item(urls, &lower_id, p))
+        .map(|p| registration_leaf_item(urls, lower_id, p))
         .collect();
-
     let lower = packages
         .first()
         .map(|p| p.normalized_version())
@@ -117,20 +171,40 @@ pub fn registration_index(urls: &UrlBuilder, id: &str, packages: &[Package]) -> 
         .last()
         .map(|p| p.normalized_version())
         .unwrap_or_default();
-
     json!({
-        "@id": index_url,
-        "@type": ["catalog:CatalogRoot", "PackageRegistration", "catalog:Permalink"],
-        "count": 1,
-        "items": [
-            {
-                "@id": format!("{index_url}#page/{lower}/{upper}"),
-                "count": packages.len(),
-                "lower": lower,
-                "upper": upper,
-                "items": leaves,
-            }
-        ],
+        "@id": format!("{index_url}#page/{lower}/{upper}"),
+        "count": packages.len(),
+        "lower": lower,
+        "upper": upper,
+        "items": leaves,
+    })
+}
+
+/// Build a standalone registration page document
+/// (`/v3/registration/{id}/page/{lower}/{upper}.json`) with its leaves inlined.
+/// `packages` is the slice of versions covered by this page, sorted ascending.
+pub fn registration_page(urls: &UrlBuilder, id: &str, packages: &[Package]) -> Value {
+    let lower_id = id.to_lowercase();
+    let leaves: Vec<Value> = packages
+        .iter()
+        .map(|p| registration_leaf_item(urls, &lower_id, p))
+        .collect();
+    let lower = packages
+        .first()
+        .map(|p| p.normalized_version())
+        .unwrap_or_default();
+    let upper = packages
+        .last()
+        .map(|p| p.normalized_version())
+        .unwrap_or_default();
+    json!({
+        "@id": urls.registration_page(&lower_id, &lower, &upper),
+        "@type": "catalog:CatalogPage",
+        "count": packages.len(),
+        "lower": lower,
+        "upper": upper,
+        "parent": urls.registration_index(&lower_id),
+        "items": leaves,
     })
 }
 
@@ -358,7 +432,7 @@ mod tests {
 
     #[test]
     fn service_index_has_core_resources() {
-        let idx = service_index(&urls());
+        let idx = service_index(&urls(), true);
         assert_eq!(idx["version"], "3.0.0");
         let resources = idx["resources"].as_array().unwrap();
         let types: Vec<&str> = resources
@@ -375,6 +449,24 @@ mod tests {
             .find(|r| r["@type"] == "PackageBaseAddress/3.0.0")
             .unwrap();
         assert_eq!(pba["@id"], "https://nuget.example.com/v3/package/");
+        // The package-details template is advertised with its placeholders.
+        let details = resources
+            .iter()
+            .find(|r| r["@type"] == "PackageDetailsUriTemplate/5.1.0")
+            .unwrap();
+        assert_eq!(
+            details["@id"],
+            "https://nuget.example.com/packages/{id}/{version}"
+        );
+    }
+
+    #[test]
+    fn service_index_omits_details_template_without_web_ui() {
+        let idx = service_index(&urls(), false);
+        let resources = idx["resources"].as_array().unwrap();
+        assert!(resources
+            .iter()
+            .all(|r| r["@type"] != "PackageDetailsUriTemplate/5.1.0"));
     }
 
     #[test]
@@ -396,6 +488,38 @@ mod tests {
         assert_eq!(entry["version"], "1.0.0");
         assert_eq!(entry["authors"], "Alice, Bob");
         assert_eq!(entry["licenseExpression"], "MIT");
+    }
+
+    #[test]
+    fn registration_index_paginates_large_packages() {
+        let pkgs: Vec<Package> = (0..130)
+            .map(|i| pkg("Big.Pkg", &format!("1.0.{i}")))
+            .collect();
+        let reg = registration_index(&urls(), "Big.Pkg", &pkgs);
+        // 130 versions / 64 per page = 3 external pages.
+        assert_eq!(reg["count"], 3);
+        let pages = reg["items"].as_array().unwrap();
+        assert_eq!(pages.len(), 3);
+        // External pages reference a page URL and do NOT inline their leaves.
+        assert!(pages[0]["items"].is_null());
+        assert_eq!(pages[0]["count"], 64);
+        assert_eq!(pages[0]["lower"], "1.0.0");
+        assert!(pages[0]["@id"].as_str().unwrap().contains("/page/"));
+    }
+
+    #[test]
+    fn registration_page_inlines_its_leaves() {
+        let pkgs = vec![pkg("Big.Pkg", "1.0.0"), pkg("Big.Pkg", "1.0.1")];
+        let page = registration_page(&urls(), "Big.Pkg", &pkgs);
+        assert_eq!(page["count"], 2);
+        assert_eq!(page["lower"], "1.0.0");
+        assert_eq!(page["upper"], "1.0.1");
+        assert_eq!(page["items"][0]["catalogEntry"]["version"], "1.0.0");
+        assert!(page["@id"].as_str().unwrap().contains("/page/"));
+        assert_eq!(
+            page["parent"],
+            "https://nuget.example.com/v3/registration/big.pkg/index.json"
+        );
     }
 
     #[test]

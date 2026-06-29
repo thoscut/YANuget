@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 use chrono::Utc;
 
-use crate::config::LicensePolicyConfig;
+use crate::config::{LicensePolicyConfig, OverwriteMode};
 use crate::database::{Membership, PackageDatabase};
 use crate::error::{Error, Result};
 use crate::models::Package;
@@ -27,8 +27,9 @@ const MAX_ICON_BYTES: u64 = 4 * 1024 * 1024;
 /// Options influencing how a package is indexed into a feed.
 #[derive(Debug, Clone, Default)]
 pub struct IndexOptions {
-    /// Replace an existing id/version instead of rejecting the push.
-    pub allow_overwrite: bool,
+    /// Whether (and for which versions) an existing id/version is replaced
+    /// instead of rejected.
+    pub overwrite: OverwriteMode,
     /// The new membership starts pending (withheld until an admin approves it).
     pub pending: bool,
     /// The feed's offline license policy, evaluated against the package.
@@ -127,7 +128,7 @@ async fn index_inner(
 
     // 4. Honour immutability / overwrite policy *within this feed*.
     if db.exists(feed, &id, &version).await? {
-        if options.allow_overwrite {
+        if options.overwrite.allows(version.is_prerelease()) {
             db.remove_membership(feed, &id, &version).await?;
             // If no other feed references the version, drop the orphaned global
             // data and payload so the re-push stores fresh content.
@@ -363,7 +364,7 @@ mod tests {
         let storage = FilesystemStorage::new(store_dir.path()).await.unwrap();
         let db = SqliteDatabase::in_memory().await.unwrap();
         let opts = IndexOptions {
-            allow_overwrite: true,
+            overwrite: OverwriteMode::Enabled,
             ..Default::default()
         };
 
