@@ -5,6 +5,7 @@
 //! single unconfigured feed is served at the root, preserving the original
 //! single-feed URLs.
 
+mod docs;
 mod files;
 mod ui;
 
@@ -348,7 +349,12 @@ fn feed_routes(state: AppState) -> Router {
             .route("/packages/{id}", get(package_detail))
             .route("/packages/{id}/{version}", get(package_detail_version))
             .route("/stats", get(stats_page))
-            .route("/settings", get(settings_page));
+            .route("/settings", get(settings_page))
+            // Embedded, offline documentation site. `/docs` redirects to
+            // `/docs/` so the site's relative links resolve.
+            .route("/docs", get(docs::docs_root))
+            .route("/docs/", get(docs::docs_index))
+            .route("/docs/{*path}", get(docs::serve_docs));
 
         // Admin area (disable/enable/delete/approve/promote versions), behind
         // HTTP Basic auth. Only mounted when an admin key is configured.

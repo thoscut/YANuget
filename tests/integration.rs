@@ -1040,6 +1040,49 @@ async fn web_ui_can_be_disabled() {
     // Root still serves the minimal fallback page.
     let root = server.client.get(server.url("/")).send().await.unwrap();
     assert!(root.status().is_success());
+    // The docs site is part of the web UI, so it is gone too.
+    let docs = server
+        .client
+        .get(server.url("/docs/"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(docs.status(), reqwest::StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn embedded_docs_site_is_served() {
+    let server = spawn().await;
+    // The embedded site is served at /docs/ (the placeholder in test builds, the
+    // real mkdocs site in CI/release builds) as self-contained HTML.
+    let resp = server
+        .client
+        .get(server.url("/docs/"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    assert!(content_type.starts_with("text/html"), "got {content_type}");
+    assert!(!resp.text().await.unwrap().is_empty());
+
+    // /docs (no trailing slash) redirects to /docs/ (reqwest follows it to 200).
+    let red = server.client.get(server.url("/docs")).send().await.unwrap();
+    assert!(red.status().is_success());
+
+    // An unknown doc path is a 404, not a panic or a wildcard match.
+    let missing = server
+        .client
+        .get(server.url("/docs/nope/not-here.html"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), reqwest::StatusCode::NOT_FOUND);
 }
 
 // ---------------------------------------------------------------------------

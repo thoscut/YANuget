@@ -113,6 +113,7 @@ YANuget implements the NuGet v3 protocol. Full reference in
 | Push symbols | `PUT /api/v2/symbol` |
 | Download symbol (SSQP) | `GET /download/symbols/{file}/{key}/{file}` |
 | Web gallery | `GET /` and `GET /packages/{id}[/{version}]` |
+| Documentation | `GET /docs` (embedded, offline) |
 | Admin (Basic auth) | `GET /admin`, `POST /admin/packages/{id}/{version}/{disable\|enable\|delete}` |
 | Health | `GET /health` |
 
@@ -204,7 +205,26 @@ offline) lives at `/`:
 * a read-only settings overview (`/settings`) that never exposes secrets,
 * a configurable page size (`gallery_page_size`, default 20) with pagination.
 
-Disable it with `enable_web_ui = false`.
+The gallery loads **no external resources** — all CSS and JavaScript are inlined
+and the favicon is an inline data URI, so it works on an air-gapped network.
+
+Disable the gallery (and the docs below) with `enable_web_ui = false`.
+
+## Documentation
+
+The full documentation is built with [MkDocs](https://www.mkdocs.org/) (Material
+theme) and **embedded into the binary**, served at `/docs` — completely offline,
+with no fonts, scripts or styles fetched from outside the network. Build it
+locally with:
+
+```bash
+pip install -r requirements-docs.txt
+mkdocs build      # outputs site/, embedded at compile time
+```
+
+Release binaries ship the rendered docs; a plain `cargo build` without MkDocs
+still compiles (a small placeholder page is embedded instead). The Markdown
+sources live in [`docs/`](docs/).
 
 ## Admin moderation
 

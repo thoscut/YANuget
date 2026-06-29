@@ -32,6 +32,29 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
 
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      # Build the documentation site so it is embedded into the binary, and
+      # enforce the offline guarantee: the built site must reference no external
+      # asset hosts (fonts/CDNs). Done before any cargo step that compiles.
+      - name: Build documentation site
+        run: |
+          pip install -r requirements-docs.txt
+          mkdocs build
+          # Enforce offline: HTML/CSS (the files that *declare* loaded resources)
+          # must reference no external asset hosts. JS bundles are served locally,
+          # so substrings inside them (e.g. UMD comments) are not flagged.
+          if grep -rEiq --include="*.html" --include="*.css" \
+              "https?://[a-z0-9.-]*(fonts\.|gstatic|googleapis|cdn\.|unpkg|jsdelivr|cdnjs)" site/; then
+            echo "::error::Built docs site references external asset hosts (not offline-safe)"
+            grep -rEi --include="*.html" --include="*.css" \
+              "https?://[a-z0-9.-]*(fonts\.|gstatic|googleapis|cdn\.|unpkg|jsdelivr|cdnjs)" site/ || true
+            exit 1
+          fi
+
       - name: Format check
         run: cargo fmt --all -- --check
 

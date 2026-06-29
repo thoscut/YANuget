@@ -165,6 +165,7 @@ fn layout(urls: &UrlBuilder, title: &str, query: &str, active: &str, body: &str)
     format!(
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
 <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
+<link rel=\"icon\" href=\"data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2032%2032'%3E%3Crect%20width='32'%20height='32'%20rx='6'%20fill='%23512bd4'/%3E%3Ctext%20x='16'%20y='22'%20font-size='15'%20font-family='sans-serif'%20font-weight='700'%20fill='white'%20text-anchor='middle'%3EYN%3C/text%3E%3C/svg%3E\">\
 <title>{title}</title><style>{STYLE}</style></head><body>\
 <a class=\"skip\" href=\"#main\">Skip to content</a>\
 <header><div class=\"wrap\">\
@@ -176,7 +177,8 @@ fn layout(urls: &UrlBuilder, title: &str, query: &str, active: &str, body: &str)
 </div></header>\
 <main id=\"main\" tabindex=\"-1\"><div class=\"wrap\">{body}</div></main>\
 <footer><div class=\"wrap\"><nav aria-label=\"Site\">Served by YANuget \u{2014} \
-<a href=\"{idx}\">v3 service index</a> \u{2022} <a href=\"{stats}\"{cs}>Stats</a> \u{2022} \
+<a href=\"{idx}\">v3 service index</a> \u{2022} <a href=\"{docs}\">Docs</a> \u{2022} \
+<a href=\"{stats}\"{cs}>Stats</a> \u{2022} \
 <a href=\"{settings}\"{cg}>Settings</a></nav></div></footer>\
 {COPY_SCRIPT}</body></html>",
         title = escape_html(title),
@@ -184,6 +186,7 @@ fn layout(urls: &UrlBuilder, title: &str, query: &str, active: &str, body: &str)
         home = escape_html(&urls.app("/")),
         packages = escape_html(&urls.app("/packages")),
         idx = escape_html(&urls.service_index()),
+        docs = escape_html(&urls.app("/docs/")),
         stats = escape_html(&urls.app("/stats")),
         settings = escape_html(&urls.app("/settings")),
         cs = cur("stats"),
@@ -1100,6 +1103,29 @@ mod tests {
         // Empty result for a query offers a "clear search" link.
         let empty = gallery_page(&urls, &page_of(&[]), "zzz", 0, 20);
         assert!(empty.contains("Clear search"));
+    }
+
+    #[test]
+    fn gallery_chrome_loads_no_external_assets() {
+        // An empty gallery page (no package-provided links) must reference no
+        // external assets: all CSS/JS is inline and the favicon is a data URI.
+        let urls = UrlBuilder::new("https://host");
+        let html = gallery_page(&urls, &page_of(&[]), "", 0, 20);
+        for needle in [
+            "googleapis",
+            "gstatic",
+            "cdn.",
+            "unpkg",
+            "jsdelivr",
+            "cdnjs",
+            "<script src",
+            "stylesheet",
+        ] {
+            assert!(!html.contains(needle), "external asset reference: {needle}");
+        }
+        // The offline building blocks are present.
+        assert!(html.contains("<style>"));
+        assert!(html.contains("rel=\"icon\" href=\"data:image/svg+xml,"));
     }
 
     #[test]
