@@ -8,34 +8,43 @@ use axum::http::HeaderMap;
 /// The header NuGet clients use to carry the push API key.
 pub const API_KEY_HEADER: &str = "X-NuGet-ApiKey";
 
-/// Authenticator holding the (optional) configured API key.
+/// Authenticator holding the configured API keys. Several keys may be accepted
+/// at once (e.g. one per team/developer); a presented key matching any of them
+/// is valid.
 #[derive(Debug, Clone, Default)]
 pub struct ApiKeyAuth {
-    expected: Option<String>,
+    expected: Vec<String>,
 }
 
 impl ApiKeyAuth {
-    /// Build from the configured key. `None`/empty means authentication is
-    /// disabled and all writes are permitted.
-    pub fn new(expected: Option<String>) -> Self {
+    /// Build from the configured keys. Empty entries are ignored; an empty list
+    /// means authentication is disabled and all writes are permitted.
+    pub fn new(expected: impl IntoIterator<Item = String>) -> Self {
         Self {
-            expected: expected.filter(|k| !k.is_empty()),
+            expected: expected.into_iter().filter(|k| !k.is_empty()).collect(),
         }
     }
 
     /// Whether a key is required at all.
     pub fn is_enabled(&self) -> bool {
-        self.expected.is_some()
+        !self.expected.is_empty()
     }
 
-    /// Check a presented key against the configured one.
+    /// Check a presented key against the configured ones. Every configured key
+    /// is compared (constant-time) so the work — and timing — does not depend on
+    /// which key matches.
     pub fn check(&self, presented: Option<&str>) -> bool {
-        match &self.expected {
-            None => true, // auth disabled
-            Some(expected) => presented
-                .map(|p| constant_time_eq(p.as_bytes(), expected.as_bytes()))
-                .unwrap_or(false),
+        if self.expected.is_empty() {
+            return true; // auth disabled
         }
+        let Some(p) = presented else {
+            return false;
+        };
+        let mut ok = false;
+        for expected in &self.expected {
+            ok |= constant_time_eq(p.as_bytes(), expected.as_bytes());
+        }
+        ok
     }
 
     /// Convenience: validate the key carried in request headers.
@@ -163,7 +172,7 @@ mod tests {
 
     #[test]
     fn disabled_auth_allows_everything() {
-        let auth = ApiKeyAuth::new(None);
+        let auth = ApiKeyAuth::new(Vec::new());
         assert!(!auth.is_enabled());
         assert!(auth.check(None));
         assert!(auth.check(Some("anything")));
@@ -171,7 +180,7 @@ mod tests {
 
     #[test]
     fn enabled_auth_requires_exact_key() {
-        let auth = ApiKeyAuth::new(Some("s3cret".into()));
+        let auth = ApiKeyAuth::new(["s3cret".to_string()]);
         assert!(auth.is_enabled());
         assert!(auth.check(Some("s3cret")));
         assert!(!auth.check(Some("wrong")));
@@ -180,8 +189,21 @@ mod tests {
     }
 
     #[test]
+    fn accepts_any_of_several_keys() {
+        let auth = ApiKeyAuth::new(["alice".to_string(), "bob".to_string()]);
+        assert!(auth.check(Some("alice")));
+        assert!(auth.check(Some("bob")));
+        assert!(!auth.check(Some("carol")));
+        // Empty entries are ignored, never enabling a blank key.
+        let mixed = ApiKeyAuth::new(["".to_string(), "real".to_string()]);
+        assert!(mixed.is_enabled());
+        assert!(!mixed.check(Some("")));
+        assert!(mixed.check(Some("real")));
+    }
+
+    #[test]
     fn reads_header() {
-        let auth = ApiKeyAuth::new(Some("key".into()));
+        let auth = ApiKeyAuth::new(["key".to_string()]);
         let mut headers = HeaderMap::new();
         headers.insert(API_KEY_HEADER, HeaderValue::from_static("key"));
         assert!(auth.check_headers(&headers));

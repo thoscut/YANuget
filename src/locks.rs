@@ -12,15 +12,43 @@
 //! operations on *different* versions fully concurrent.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
-type Registry = Mutex<HashMap<String, Arc<AsyncMutex<()>>>>;
+/// The keyed registry of per-version locks. Entries hold a [`Weak`] so a lock is
+/// reclaimable once no caller holds or waits on it; dead entries are swept
+/// opportunistically so the map stays bounded over a long uptime instead of
+/// retaining one entry for every version the process ever touched.
+#[derive(Default)]
+struct Registry {
+    map: HashMap<String, Weak<AsyncMutex<()>>>,
+    /// Sweep dead entries once the map grows to at least this size.
+    sweep_at: usize,
+}
 
-fn registry() -> &'static Registry {
-    static LOCKS: OnceLock<Registry> = OnceLock::new();
-    LOCKS.get_or_init(|| Mutex::new(HashMap::new()))
+fn registry() -> &'static Mutex<Registry> {
+    static LOCKS: OnceLock<Mutex<Registry>> = OnceLock::new();
+    LOCKS.get_or_init(|| Mutex::new(Registry::default()))
+}
+
+/// Return the lock for `key`, creating it if no live one exists. Before
+/// inserting, dead `Weak`s are swept once the map crosses a growing threshold,
+/// which amortises the cleanup to O(1) per call while bounding the map at
+/// roughly twice the set of in-flight versions.
+fn acquire(reg: &mut Registry, key: String) -> Arc<AsyncMutex<()>> {
+    if reg.map.len() >= reg.sweep_at {
+        reg.map.retain(|_, weak| weak.strong_count() > 0);
+        reg.sweep_at = reg.map.len() * 2 + 16;
+    }
+    match reg.map.get(&key).and_then(Weak::upgrade) {
+        Some(existing) => existing,
+        None => {
+            let created = Arc::new(AsyncMutex::new(()));
+            reg.map.insert(key, Arc::downgrade(&created));
+            created
+        }
+    }
 }
 
 /// Acquire the lock for one package version. The returned guard releases on
@@ -32,10 +60,8 @@ pub async fn lock_version(id: &str, normalized_version: &str) -> OwnedMutexGuard
         normalized_version.to_ascii_lowercase()
     );
     let mutex = {
-        let mut map = registry().lock().expect("version-lock registry poisoned");
-        map.entry(key)
-            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
-            .clone()
+        let mut reg = registry().lock().expect("version-lock registry poisoned");
+        acquire(&mut reg, key)
     };
     mutex.lock_owned().await
 }
@@ -73,5 +99,28 @@ mod tests {
         let _a = lock_version("A", "1.0.0").await;
         // A different key must be acquirable while `_a` is held.
         let _b = lock_version("B", "1.0.0").await;
+    }
+
+    #[test]
+    fn registry_returns_same_lock_for_a_live_key() {
+        let mut reg = Registry::default();
+        let a = acquire(&mut reg, "pkg/1.0.0".into());
+        let b = acquire(&mut reg, "pkg/1.0.0".into());
+        // While at least one strong ref is alive, the same lock is returned.
+        assert!(Arc::ptr_eq(&a, &b));
+    }
+
+    #[test]
+    fn registry_reclaims_dropped_entries() {
+        let mut reg = Registry::default();
+        // Touch many distinct versions, each released immediately.
+        for i in 0..1000 {
+            let _m = acquire(&mut reg, format!("pkg/1.0.{i}"));
+        }
+        // Despite 1000 distinct versions, the map stays bounded and holds no
+        // live locks, because dead Weaks are swept as the threshold is crossed.
+        assert!(reg.map.len() <= reg.sweep_at);
+        let live = reg.map.values().filter(|w| w.strong_count() > 0).count();
+        assert_eq!(live, 0);
     }
 }

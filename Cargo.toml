@@ -2,7 +2,7 @@
 name = "yanuget"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.82"
+rust-version = "1.88"
 description = "YANuget — Yet Another NuGet server. A fast, streaming NuGet V3 server written in Rust, reimplementing BaGetter."
 license = "MIT"
 repository = "https://github.com/thoscut/yanuget"
@@ -52,6 +52,7 @@ mime = "0.3"
 percent-encoding = "2"
 toml = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+rust-embed = { version = "8", features = ["debug-embed"] }
 
 [dev-dependencies]
 tempfile = "3"

@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use futures::StreamExt;
 use tokio::sync::OnceCell;
 
-use crate::config::{LicensePolicyConfig, MirrorConfig};
+use crate::config::{LicensePolicyConfig, MirrorAuthConfig, MirrorConfig};
 use crate::database::PackageDatabase;
 use crate::error::{Error, Result};
 use crate::indexing::{self, IndexOptions};
@@ -49,6 +49,7 @@ impl MirrorClient {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(config.timeout_secs.max(1)))
             .user_agent(concat!("yanuget/", env!("CARGO_PKG_VERSION")))
+            .default_headers(auth_headers(&config.auth))
             .build()
             .ok()?;
         Some(Self {
@@ -198,7 +199,7 @@ pub async fn ensure_package(
         };
 
         let opts = IndexOptions {
-            allow_overwrite: false,
+            overwrite: crate::config::OverwriteMode::Disabled,
             pending: options.requires_approval,
             license_policy: options.license_policy.clone(),
         };
@@ -252,9 +253,84 @@ fn mirror_err(e: reqwest::Error) -> Error {
     Error::Other(anyhow::anyhow!("upstream request failed: {e}"))
 }
 
+/// Build the default header map a mirror client sends on every upstream request
+/// from its configured credentials. Basic and Bearer both populate
+/// `Authorization` (Basic wins if both are set); custom headers are added as-is.
+/// Malformed header names/values are skipped with a warning rather than failing
+/// the whole client.
+fn auth_headers(auth: &MirrorAuthConfig) -> reqwest::header::HeaderMap {
+    use base64::Engine;
+    use reqwest::header::{HeaderMap, HeaderName, HeaderValue, AUTHORIZATION};
+
+    let mut headers = HeaderMap::new();
+    if let Some(user) = &auth.username {
+        let pass = auth.password.as_deref().unwrap_or("");
+        let raw = base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pass}"));
+        if let Ok(mut value) = HeaderValue::from_str(&format!("Basic {raw}")) {
+            value.set_sensitive(true);
+            headers.insert(AUTHORIZATION, value);
+        }
+    } else if let Some(token) = &auth.token {
+        if let Ok(mut value) = HeaderValue::from_str(&format!("Bearer {token}")) {
+            value.set_sensitive(true);
+            headers.insert(AUTHORIZATION, value);
+        }
+    }
+    for (name, value) in &auth.headers {
+        match (
+            HeaderName::from_bytes(name.as_bytes()),
+            HeaderValue::from_str(value),
+        ) {
+            (Ok(n), Ok(mut v)) => {
+                v.set_sensitive(true);
+                headers.insert(n, v);
+            }
+            _ => tracing::warn!(header = %name, "ignoring invalid mirror auth header"),
+        }
+    }
+    headers
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auth_headers_basic_bearer_and_custom() {
+        use reqwest::header::AUTHORIZATION;
+
+        // No credentials → no headers.
+        assert!(auth_headers(&MirrorAuthConfig::default()).is_empty());
+
+        // Basic auth populates Authorization.
+        let basic = MirrorAuthConfig {
+            username: Some("user".into()),
+            password: Some("pass".into()),
+            ..Default::default()
+        };
+        let h = auth_headers(&basic);
+        assert!(h
+            .get(AUTHORIZATION)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("Basic "));
+
+        // Bearer token plus a custom header.
+        let mut headers = std::collections::BTreeMap::new();
+        headers.insert("X-Feed-Key".to_string(), "abc".to_string());
+        let bearer = MirrorAuthConfig {
+            token: Some("tok".into()),
+            headers,
+            ..Default::default()
+        };
+        let h = auth_headers(&bearer);
+        assert_eq!(
+            h.get(AUTHORIZATION).unwrap().to_str().unwrap(),
+            "Bearer tok"
+        );
+        assert_eq!(h.get("X-Feed-Key").unwrap().to_str().unwrap(), "abc");
+    }
 
     #[test]
     fn finds_resource_by_type() {

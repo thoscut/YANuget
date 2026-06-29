@@ -109,6 +109,18 @@ impl UrlBuilder {
         )
     }
 
+    /// `/v3/registration/{id}/page/{lower}/{upper}.json` — a registration page
+    /// covering the version range `[lower, upper]`.
+    pub fn registration_page(&self, lower_id: &str, lower: &str, upper: &str) -> String {
+        format!(
+            "{}/v3/registration/{}/page/{}/{}.json",
+            self.base,
+            enc(lower_id),
+            enc(&lower.to_lowercase()),
+            enc(&upper.to_lowercase()),
+        )
+    }
+
     /// `/v3/search`
     pub fn search(&self) -> String {
         format!("{}/v3/search", self.base)
@@ -133,6 +145,13 @@ impl UrlBuilder {
     /// `{file}/{key}/{file}` to fetch a PDB.
     pub fn symbol_server(&self) -> String {
         format!("{}/download/symbols/", self.base)
+    }
+
+    /// URI *template* for a package's gallery detail page, with literal `{id}`
+    /// and `{version}` placeholders the client substitutes
+    /// (`PackageDetailsUriTemplate`).
+    pub fn package_details_template(&self) -> String {
+        format!("{}/packages/{{id}}/{{version}}", self.base)
     }
 }
 

@@ -5,14 +5,16 @@
 //! single unconfigured feed is served at the root, preserving the original
 //! single-feed URLs.
 
+mod docs;
 mod files;
 mod ui;
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::{DefaultBodyLimit, FromRequest, Multipart, Path, Query, Request, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{Html, IntoResponse, Json, Redirect, Response};
 use axum::routing::{delete, get, post, put};
 use axum::Router;
@@ -22,12 +24,15 @@ use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
 use crate::auth::{AdminAuth, ApiKeyAuth, ReadAuth};
-use crate::config::{Config, LicensePolicyConfig, ResolvedFeed, RetentionConfig};
+use crate::config::{
+    Config, LicensePolicyConfig, OverwriteMode, RateLimitConfig, ResolvedFeed, RetentionConfig,
+};
 use crate::database::{Membership, PackageDatabase, SearchRequest};
 use crate::error::{Error, Result};
 use crate::indexing::{self, IndexOptions};
 use crate::mirror::{self, MirrorClient, MirrorOptions};
 use crate::nuget::{self, UrlBuilder};
+use crate::ratelimit::{self, RateLimiter};
 use crate::retention::{self, RetentionPolicy};
 use crate::storage::{AuxFile, PackageContent, PackageStorage};
 use crate::streaming::{self, StreamSummary};
@@ -50,7 +55,7 @@ pub struct FeedContext {
     pub read_auth: ReadAuth,
     /// Moderation/promotion (delete) authenticator.
     pub admin: AdminAuth,
-    pub allow_overwrite: bool,
+    pub allow_overwrite: OverwriteMode,
     pub hard_delete_enabled: bool,
     /// Incoming versions are pending (withheld) until an admin approves them.
     pub requires_approval: bool,
@@ -67,7 +72,7 @@ impl FeedContext {
         Self {
             name: feed.name.clone(),
             prefix: feed.prefix.clone(),
-            auth: ApiKeyAuth::new(feed.api_key.clone()),
+            auth: ApiKeyAuth::new(feed.api_keys.clone()),
             read_auth: ReadAuth::new(feed.read_api_key.clone()),
             admin: AdminAuth::new(feed.admin_api_key.clone()),
             allow_overwrite: feed.allow_overwrite,
@@ -215,6 +220,8 @@ impl AppState {
 /// A single root feed is served directly; multiple feeds are each mounted under
 /// their `/{name}` prefix with a feed index at the root.
 pub fn build_app(states: Vec<AppState>) -> Router {
+    let rate_limit = states.first().map(|s| s.config.rate_limit.clone());
+    let hsts = states.first().is_some_and(|s| s.config.tls_enabled);
     let mut top = Router::new().route("/health", get(health));
 
     if states.len() == 1 && states[0].feed.prefix.is_empty() {
@@ -241,23 +248,55 @@ pub fn build_app(states: Vec<AppState>) -> Router {
         }
     }
 
-    top.layer(DefaultBodyLimit::disable())
-        .layer(CorsLayer::permissive())
-        .layer(TraceLayer::new_for_http())
+    apply_global_layers(top, rate_limit, hsts)
 }
 
 /// Build a single feed's complete application (with global middleware). Used by
 /// tests and single-feed deployments.
 pub fn router(state: AppState) -> Router {
-    Router::new()
+    let rate_limit = Some(state.config.rate_limit.clone());
+    let hsts = state.config.tls_enabled;
+    let app = Router::new()
         .route("/health", get(health))
-        .merge(feed_routes(state))
-        // Uploads stream straight to disk; remove axum's small default cap so
-        // multi-gigabyte packages are accepted (the configured size limit is
-        // still enforced while streaming).
+        .merge(feed_routes(state));
+    apply_global_layers(app, rate_limit, hsts)
+}
+
+/// Apply the process-wide middleware shared by every served app: an unbounded
+/// body limit (uploads stream straight to disk, so axum's small default cap is
+/// removed; the configured size limit is still enforced while streaming),
+/// permissive CORS, request tracing, per-IP rate limiting (when enabled) and —
+/// when TLS is on — an HSTS header.
+fn apply_global_layers(router: Router, rate_limit: Option<RateLimitConfig>, hsts: bool) -> Router {
+    let mut router = router
         .layer(DefaultBodyLimit::disable())
         .layer(CorsLayer::permissive())
-        .layer(TraceLayer::new_for_http())
+        .layer(TraceLayer::new_for_http());
+    // Added before HSTS so it stays inner: short-circuits abusive callers, and
+    // its 429 response still flows out through the HSTS layer below.
+    if let Some(cfg) = rate_limit.filter(|c| c.enabled) {
+        let limiter = RateLimiter::new(cfg.max_requests, Duration::from_secs(cfg.window_secs));
+        router = router.layer(axum::middleware::from_fn_with_state(
+            limiter,
+            ratelimit::enforce,
+        ));
+    }
+    // Outermost: stamp HSTS on every response when serving over TLS.
+    if hsts {
+        router = router.layer(axum::middleware::from_fn(add_hsts));
+    }
+    router
+}
+
+/// Add a one-year `Strict-Transport-Security` header to every response. Only
+/// wired in when the server itself terminates TLS.
+async fn add_hsts(req: Request, next: axum::middleware::Next) -> Response {
+    let mut resp = next.run(req).await;
+    resp.headers_mut().insert(
+        header::STRICT_TRANSPORT_SECURITY,
+        HeaderValue::from_static("max-age=31536000"),
+    );
+    resp
 }
 
 /// Build one feed's routes (relative paths, no global middleware), ready to be
@@ -282,6 +321,10 @@ fn feed_routes(state: AppState) -> Router {
             get(download_package),
         )
         .route("/v3/registration/{id}/index.json", get(registration_index))
+        .route(
+            "/v3/registration/{id}/page/{lower}/{upper}",
+            get(registration_page),
+        )
         .route("/v3/registration/{id}/{version}", get(registration_leaf))
         .route("/v3/search", get(search))
         .route("/v3/autocomplete", get(autocomplete));
@@ -306,7 +349,12 @@ fn feed_routes(state: AppState) -> Router {
             .route("/packages/{id}", get(package_detail))
             .route("/packages/{id}/{version}", get(package_detail_version))
             .route("/stats", get(stats_page))
-            .route("/settings", get(settings_page));
+            .route("/settings", get(settings_page))
+            // Embedded, offline documentation site. `/docs` redirects to
+            // `/docs/` so the site's relative links resolve.
+            .route("/docs", get(docs::docs_root))
+            .route("/docs/", get(docs::docs_index))
+            .route("/docs/{*path}", get(docs::serve_docs));
 
         // Admin area (disable/enable/delete/approve/promote versions), behind
         // HTTP Basic auth. Only mounted when an admin key is configured.
@@ -364,7 +412,7 @@ async fn service_index(
     headers: HeaderMap,
 ) -> Json<serde_json::Value> {
     let urls = state.url_builder(&headers);
-    Json(nuget::service_index(&urls))
+    Json(nuget::service_index(&urls, state.config.enable_web_ui))
 }
 
 // ---------------------------------------------------------------------------
@@ -397,7 +445,7 @@ async fn push_package(State(state): State<AppState>, request: Request) -> Result
     drop(file);
 
     let options = IndexOptions {
-        allow_overwrite: state.feed.allow_overwrite,
+        overwrite: state.feed.allow_overwrite,
         pending: state.feed.requires_approval,
         license_policy: state.feed.license_policy.clone(),
     };
@@ -616,6 +664,25 @@ async fn registration_index(
     }
     let urls = state.url_builder(&headers);
     Ok(Json(nuget::registration_index(&urls, &id, &packages)))
+}
+
+async fn registration_page(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((id, lower, upper)): Path<(String, String, String)>,
+) -> Result<Json<serde_json::Value>> {
+    state.require_read(&headers)?;
+    let upper = upper.strip_suffix(".json").unwrap_or(&upper);
+    let lower = parse_version(&lower)?;
+    let upper = parse_version(upper)?;
+    // Registration includes unlisted versions; restrict to the page's range.
+    let mut packages = state.db.find_versions(state.feed(), &id, true).await?;
+    packages.retain(|p| p.version >= lower && p.version <= upper);
+    if packages.is_empty() {
+        return Err(Error::PackageNotFound);
+    }
+    let urls = state.url_builder(&headers);
+    Ok(Json(nuget::registration_page(&urls, &id, &packages)))
 }
 
 async fn registration_leaf(

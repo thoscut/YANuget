@@ -2,6 +2,9 @@
 **/*.rs.bk
 *.pdb
 
+# Generated documentation site (built with `mkdocs build`, embedded at compile time)
+/site
+
 # Local runtime data / config
 /data
 /packages

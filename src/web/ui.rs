@@ -118,6 +118,30 @@ pub fn escape_html(s: &str) -> String {
     out
 }
 
+/// Return `url` only if it carries a safe, expected scheme (`http`, `https` or
+/// `mailto`). Package metadata (project/repository/license/icon URLs) is
+/// attacker-controlled, so an unfiltered value like `javascript:alert(1)` or a
+/// `data:` URI placed into an `href`/`src` attribute would be a stored-XSS hole
+/// that HTML-escaping alone does not close (the scheme contains no escapable
+/// characters). The scheme is compared case-insensitively with ASCII whitespace
+/// and control characters stripped, because browsers ignore those when
+/// resolving it. The caller must still HTML-escape the returned value.
+pub fn safe_href(url: &str) -> Option<&str> {
+    let trimmed = url.trim();
+    let scheme: String = trimmed
+        .split(':')
+        .next()
+        .unwrap_or("")
+        .chars()
+        .filter(|c| !c.is_ascii_whitespace() && !c.is_ascii_control())
+        .flat_map(char::to_lowercase)
+        .collect();
+    match scheme.as_str() {
+        "http" | "https" | "mailto" => Some(trimmed),
+        _ => None,
+    }
+}
+
 /// Tiny inline script giving the install-command "Copy" buttons their
 /// behaviour. It degrades gracefully: without JS the `<pre>` stays selectable
 /// and the button simply does nothing.
@@ -141,6 +165,7 @@ fn layout(urls: &UrlBuilder, title: &str, query: &str, active: &str, body: &str)
     format!(
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
 <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
+<link rel=\"icon\" href=\"data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2032%2032'%3E%3Crect%20width='32'%20height='32'%20rx='6'%20fill='%23512bd4'/%3E%3Ctext%20x='16'%20y='22'%20font-size='15'%20font-family='sans-serif'%20font-weight='700'%20fill='white'%20text-anchor='middle'%3EYN%3C/text%3E%3C/svg%3E\">\
 <title>{title}</title><style>{STYLE}</style></head><body>\
 <a class=\"skip\" href=\"#main\">Skip to content</a>\
 <header><div class=\"wrap\">\
@@ -152,7 +177,8 @@ fn layout(urls: &UrlBuilder, title: &str, query: &str, active: &str, body: &str)
 </div></header>\
 <main id=\"main\" tabindex=\"-1\"><div class=\"wrap\">{body}</div></main>\
 <footer><div class=\"wrap\"><nav aria-label=\"Site\">Served by YANuget \u{2014} \
-<a href=\"{idx}\">v3 service index</a> \u{2022} <a href=\"{stats}\"{cs}>Stats</a> \u{2022} \
+<a href=\"{idx}\">v3 service index</a> \u{2022} <a href=\"{docs}\">Docs</a> \u{2022} \
+<a href=\"{stats}\"{cs}>Stats</a> \u{2022} \
 <a href=\"{settings}\"{cg}>Settings</a></nav></div></footer>\
 {COPY_SCRIPT}</body></html>",
         title = escape_html(title),
@@ -160,6 +186,7 @@ fn layout(urls: &UrlBuilder, title: &str, query: &str, active: &str, body: &str)
         home = escape_html(&urls.app("/")),
         packages = escape_html(&urls.app("/packages")),
         idx = escape_html(&urls.service_index()),
+        docs = escape_html(&urls.app("/docs/")),
         stats = escape_html(&urls.app("/stats")),
         settings = escape_html(&urls.app("/settings")),
         cs = cur("stats"),
@@ -355,7 +382,7 @@ fn group_digits(n: i64) -> String {
     let bytes = s.as_bytes();
     let mut out = String::with_capacity(s.len() + s.len() / 3);
     for (i, b) in bytes.iter().enumerate() {
-        if i > 0 && (bytes.len() - i) % 3 == 0 {
+        if i > 0 && (bytes.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(*b as char);
@@ -399,7 +426,7 @@ pub fn settings_page(urls: &UrlBuilder, config: &Config, feed: &super::FeedConte
     server.push_str(&kv("Max package size", &max_size));
     server.push_str(&kv(
         "Overwrite existing version",
-        yes_no(feed.allow_overwrite),
+        feed.allow_overwrite.label(),
     ));
     server.push_str(&kv("Delete behaviour", delete_mode));
     server.push_str(&kv("Approval required", yes_no(feed.requires_approval)));
@@ -822,10 +849,12 @@ fn render_info(p: &Package) -> String {
 fn render_links(p: &Package) -> String {
     let mut links = Vec::new();
     let mut add = |url: &str, label: &str| {
-        links.push(format!(
-            "<a href=\"{}\" rel=\"nofollow noopener\">{label}</a>",
-            escape_html(url)
-        ));
+        if let Some(safe) = safe_href(url) {
+            links.push(format!(
+                "<a href=\"{}\" rel=\"nofollow noopener\">{label}</a>",
+                escape_html(safe)
+            ));
+        }
     };
     if let Some(u) = &p.project_url {
         add(u, "Project");
@@ -993,6 +1022,44 @@ mod tests {
     }
 
     #[test]
+    fn safe_href_allows_only_expected_schemes() {
+        assert_eq!(
+            safe_href("https://example.com/x"),
+            Some("https://example.com/x")
+        );
+        assert_eq!(
+            safe_href("  http://example.com  "),
+            Some("http://example.com")
+        );
+        assert_eq!(
+            safe_href("HTTPS://Example.com"),
+            Some("HTTPS://Example.com")
+        );
+        assert_eq!(
+            safe_href("mailto:dev@example.com"),
+            Some("mailto:dev@example.com")
+        );
+        assert_eq!(safe_href("javascript:alert(1)"), None);
+        // Browsers strip control characters before resolving the scheme; so do we.
+        assert_eq!(safe_href("java\tscript:alert(1)"), None);
+        assert_eq!(safe_href("data:text/html,<script>alert(1)</script>"), None);
+        assert_eq!(safe_href("//evil.example.com"), None);
+        assert_eq!(safe_href("not a url"), None);
+    }
+
+    #[test]
+    fn render_links_drops_dangerous_url_schemes() {
+        let mut p = sample();
+        p.project_url = Some("javascript:alert(1)".into());
+        p.repository_url = Some("https://example.com/repo".into());
+        p.license_url = Some("data:text/html,<script>alert(1)</script>".into());
+        let html = render_links(&p);
+        assert!(!html.contains("javascript:"));
+        assert!(!html.contains("data:"));
+        assert!(html.contains("https://example.com/repo"));
+    }
+
+    #[test]
     fn detail_page_marks_prerelease_and_unlisted() {
         let urls = UrlBuilder::new("https://host");
         let mut p = sample();
@@ -1039,6 +1106,29 @@ mod tests {
     }
 
     #[test]
+    fn gallery_chrome_loads_no_external_assets() {
+        // An empty gallery page (no package-provided links) must reference no
+        // external assets: all CSS/JS is inline and the favicon is a data URI.
+        let urls = UrlBuilder::new("https://host");
+        let html = gallery_page(&urls, &page_of(&[]), "", 0, 20);
+        for needle in [
+            "googleapis",
+            "gstatic",
+            "cdn.",
+            "unpkg",
+            "jsdelivr",
+            "cdnjs",
+            "<script src",
+            "stylesheet",
+        ] {
+            assert!(!html.contains(needle), "external asset reference: {needle}");
+        }
+        // The offline building blocks are present.
+        assert!(html.contains("<style>"));
+        assert!(html.contains("rel=\"icon\" href=\"data:image/svg+xml,"));
+    }
+
+    #[test]
     fn stats_page_renders_totals_and_lists() {
         let urls = UrlBuilder::new("https://host");
         let stats = crate::database::DatabaseStats {
@@ -1063,7 +1153,7 @@ mod tests {
             auth: crate::auth::ApiKeyAuth::new(api.map(str::to_string)),
             read_auth: crate::auth::ReadAuth::new(None),
             admin: crate::auth::AdminAuth::new(admin.map(str::to_string)),
-            allow_overwrite: false,
+            allow_overwrite: crate::config::OverwriteMode::Disabled,
             hard_delete_enabled: false,
             requires_approval: false,
             promotes_to: None,

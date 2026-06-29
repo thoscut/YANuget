@@ -61,6 +61,25 @@ jobs:
           key: ${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ matrix.target }}-cargo-
 
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      # Render and embed the offline documentation site before compiling, so the
+      # release binary ships the full docs at /docs on every target.
+      - name: Build documentation site
+        shell: bash
+        run: |
+          pip install -r requirements-docs.txt
+          mkdocs build
+          # HTML/CSS must reference no external asset hosts (offline guarantee).
+          if grep -rEiq --include="*.html" --include="*.css" \
+              "https?://[a-z0-9.-]*(fonts\.|gstatic|googleapis|cdn\.|unpkg|jsdelivr|cdnjs)" site/; then
+            echo "::error::Built docs site references external asset hosts (not offline-safe)"
+            exit 1
+          fi
+
       - name: Build release
         run: cargo build --release --target ${{ matrix.target }}
 

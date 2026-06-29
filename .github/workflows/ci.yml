@@ -32,6 +32,29 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
 
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      # Build the documentation site so it is embedded into the binary, and
+      # enforce the offline guarantee: the built site must reference no external
+      # asset hosts (fonts/CDNs). Done before any cargo step that compiles.
+      - name: Build documentation site
+        run: |
+          pip install -r requirements-docs.txt
+          mkdocs build
+          # Enforce offline: HTML/CSS (the files that *declare* loaded resources)
+          # must reference no external asset hosts. JS bundles are served locally,
+          # so substrings inside them (e.g. UMD comments) are not flagged.
+          if grep -rEiq --include="*.html" --include="*.css" \
+              "https?://[a-z0-9.-]*(fonts\.|gstatic|googleapis|cdn\.|unpkg|jsdelivr|cdnjs)" site/; then
+            echo "::error::Built docs site references external asset hosts (not offline-safe)"
+            grep -rEi --include="*.html" --include="*.css" \
+              "https?://[a-z0-9.-]*(fonts\.|gstatic|googleapis|cdn\.|unpkg|jsdelivr|cdnjs)" site/ || true
+            exit 1
+          fi
+
       - name: Format check
         run: cargo fmt --all -- --check
 
@@ -43,3 +66,46 @@ jobs:
 
       - name: Build release
         run: cargo build --release
+
+  msrv:
+    name: Minimum supported Rust (1.88)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # rust-toolchain.toml pins `stable`; an explicit `+1.88.0` on the command
+      # line overrides it so this job really exercises the declared MSRV.
+      # (1.88 is the floor required by transitive deps, e.g. time 0.3.49.)
+      - name: Install Rust 1.88.0
+        uses: dtolnay/rust-toolchain@1.88.0
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-msrv-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-msrv-
+
+      - name: Check against MSRV
+        run: cargo +1.88.0 check --all-targets --all-features
+
+  audit:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@cargo-audit
+
+      # RUSTSEC-2023-0071 (rsa, Marvin attack) has no fixed release and reaches
+      # the lockfile only via sqlx-mysql, an optional driver this sqlite-only
+      # build never compiles. Ignored deliberately; revisit if a fix ships.
+      - name: Audit dependencies for known vulnerabilities
+        run: cargo audit --ignore RUSTSEC-2023-0071

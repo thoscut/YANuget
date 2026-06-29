@@ -1,0 +1,7 @@
+# Documentation toolchain for the embedded `/docs` site.
+#
+# The site is built with `mkdocs build` (output: site/) and embedded into the
+# YANuget binary. It must remain fully offline — keep `font: false` in
+# mkdocs.yml and do not add plugins that fetch remote assets. Bump this version
+# deliberately when updating the bundled theme.
+mkdocs-material>=9.5,<10

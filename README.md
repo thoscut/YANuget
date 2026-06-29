@@ -37,7 +37,7 @@ See [docs/large-packages.md](docs/large-packages.md) for the full design.
 ### From source
 
 ```bash
-# Build (Rust 1.82+)
+# Build (Rust 1.88+)
 cargo build --release
 
 # Run with an API key and a data directory
@@ -86,8 +86,9 @@ The essentials:
 | Data directory | `YANUGET_DATA_DIR` | `./data` | Holds the package store and SQLite DB. |
 | Base URL | `YANUGET_BASE_URL` | *(per-request)* | Derived from `Host`/`X-Forwarded-*` if unset. |
 | Max upload size | `YANUGET_MAX_PACKAGE_SIZE_BYTES` | *(unlimited)* | Streams to disk regardless. |
-| Overwrite | `YANUGET_ALLOW_OVERWRITE` | `false` | Re-push an existing version. |
+| Overwrite | `YANUGET_ALLOW_OVERWRITE` | `false` | `false`/`true`/`prerelease-only`. |
 | Hard delete | `YANUGET_HARD_DELETE_ENABLED` | `false` | Otherwise DELETE unlists. |
+| Rate limit | `YANUGET_RATELIMIT_*` | on, 1000/60s | Per-IP throttle; returns `429`. |
 
 ---
 
@@ -105,12 +106,14 @@ YANuget implements the NuGet v3 protocol. Full reference in
 | Versions (flat container) | `GET /v3/package/{id}/index.json` |
 | Download | `GET /v3/package/{id}/{version}/{id}.{version}.nupkg` |
 | Registration index | `GET /v3/registration/{id}/index.json` |
+| Registration page | `GET /v3/registration/{id}/page/{lower}/{upper}` |
 | Registration leaf | `GET /v3/registration/{id}/{version}.json` |
 | Search | `GET /v3/search?q=&skip=&take=&prerelease=&semVerLevel=&packageType=` |
 | Autocomplete / versions | `GET /v3/autocomplete?q=` / `?id=` |
 | Push symbols | `PUT /api/v2/symbol` |
 | Download symbol (SSQP) | `GET /download/symbols/{file}/{key}/{file}` |
 | Web gallery | `GET /` and `GET /packages/{id}[/{version}]` |
+| Documentation | `GET /docs` (embedded, offline) |
 | Admin (Basic auth) | `GET /admin`, `POST /admin/packages/{id}/{version}/{disable\|enable\|delete}` |
 | Health | `GET /health` |
 
@@ -202,7 +205,26 @@ offline) lives at `/`:
 * a read-only settings overview (`/settings`) that never exposes secrets,
 * a configurable page size (`gallery_page_size`, default 20) with pagination.
 
-Disable it with `enable_web_ui = false`.
+The gallery loads **no external resources** — all CSS and JavaScript are inlined
+and the favicon is an inline data URI, so it works on an air-gapped network.
+
+Disable the gallery (and the docs below) with `enable_web_ui = false`.
+
+## Documentation
+
+The full documentation is built with [MkDocs](https://www.mkdocs.org/) (Material
+theme) and **embedded into the binary**, served at `/docs` — completely offline,
+with no fonts, scripts or styles fetched from outside the network. Build it
+locally with:
+
+```bash
+pip install -r requirements-docs.txt
+mkdocs build      # outputs site/, embedded at compile time
+```
+
+Release binaries ship the rendered docs; a plain `cargo build` without MkDocs
+still compiles (a small placeholder page is embedded instead). The Markdown
+sources live in [`docs/`](docs/).
 
 ## Admin moderation
 
@@ -280,13 +302,16 @@ violation is accepted but **flagged** (visible in `/admin`); with
 
 ## Roadmap
 
-Implemented: NuGet v3 push/restore/search/registration/autocomplete, streaming
-large-package support, API-key auth, filesystem storage, SQLite index, unlist /
-relist / hard-delete, Range downloads, **symbol/PDB server**, a **web gallery**,
-**package retention policies**, **multiple feeds** (a deduplicated store with
-per-feed membership), **upstream mirroring** (read-through caching of a public
-feed), **release-ring promotion & approval gates**, and an **offline license
-policy**.
+Implemented: NuGet v3 push/restore/search/registration (with paginated
+registration for packages with many versions) / autocomplete, streaming
+large-package support, API-key auth (**multiple keys**), per-IP **rate
+limiting**, filesystem storage, SQLite index, unlist / relist / hard-delete,
+configurable overwrite (incl. **pre-release-only**), Range downloads,
+**symbol/PDB server**, a **web gallery**, **package retention policies**,
+**multiple feeds** (a deduplicated store with per-feed membership), **upstream
+mirroring** (read-through caching of a public feed, with optional
+Basic/Bearer/custom-header **upstream auth**), **release-ring promotion &
+approval gates**, and an **offline license policy**.
 
 Not yet implemented (contributions welcome): additional storage backends
 (S3/Azure Blob) and database backends (PostgreSQL/MySQL), online vulnerability

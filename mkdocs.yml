@@ -1,0 +1,45 @@
+site_name: YANuget
+site_description: A fast, streaming NuGet v3 server — offline documentation.
+# No site_url: keep generated links relative so the site works when embedded and
+# served under /docs (and under any reverse-proxy path base or feed prefix).
+docs_dir: docs
+site_dir: site
+use_directory_urls: true
+
+# IMPORTANT: this site is embedded into the YANuget binary and must work fully
+# offline. `font: false` disables Google Fonts; do NOT enable the social or
+# analytics features (they fetch remote assets). A CI check greps the built
+# site/ for external asset URLs.
+theme:
+  name: material
+  font: false
+  features:
+    - navigation.sections
+    - navigation.top
+    - navigation.tracking
+    - content.code.copy
+    - search.suggest
+    - search.highlight
+  palette:
+    - scheme: default
+      primary: indigo
+      accent: indigo
+
+plugins:
+  - search
+
+markdown_extensions:
+  - admonition
+  - toc:
+      permalink: true
+  - tables
+  - pymdownx.highlight
+  - pymdownx.superfences
+  - pymdownx.details
+
+nav:
+  - Home: index.md
+  - HTTP API: api.md
+  - Configuration: configuration.md
+  - Architecture: architecture.md
+  - Large packages: large-packages.md
