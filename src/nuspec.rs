@@ -4,8 +4,9 @@
 //! We match on *local* element names so the parser is agnostic to the (several)
 //! XML namespaces NuGet has used over the years.
 
+use quick_xml::escape::unescape;
 use quick_xml::events::Event;
-use quick_xml::Reader;
+use quick_xml::{Reader, XmlVersion};
 
 use crate::error::Error;
 use crate::models::{Dependency, DependencyGroup, PackageType};
@@ -109,7 +110,15 @@ pub fn parse_nuspec(xml: &str) -> Result<Nuspec, Error> {
                 path.push(name);
             }
             Ok(Event::Text(e)) => {
-                let text = e.unescape().map(|c| c.into_owned()).unwrap_or_default();
+                // quick-xml 0.41 split text handling: `xml10_content` decodes and
+                // normalizes EOLs, then `unescape` resolves XML entities — together
+                // they replace the old one-shot `BytesText::unescape`.
+                let Ok(decoded) = e.xml10_content() else {
+                    continue;
+                };
+                let text = unescape(&decoded)
+                    .map(|u| u.into_owned())
+                    .unwrap_or_else(|_| decoded.into_owned());
                 if text.trim().is_empty() {
                     continue;
                 }
@@ -256,7 +265,11 @@ fn attr(e: &quick_xml::events::BytesStart, name: &str) -> Option<String> {
     e.attributes().flatten().find_map(|a| {
         let key = local_name(a.key.as_ref());
         if key == name {
-            a.unescape_value().ok().map(|v| v.into_owned())
+            // `normalized_value` replaces the deprecated `unescape_value` and
+            // applies XML 1.0 attribute-value normalization plus entity resolution.
+            a.normalized_value(XmlVersion::Implicit1_0)
+                .ok()
+                .map(|v| v.into_owned())
         } else {
             None
         }
