@@ -271,7 +271,7 @@ pub async fn run(
         license_policy: feed.license_policy.clone(),
     };
 
-    let outcomes: Vec<Outcome> = stream::iter(work.into_iter())
+    let outcomes: Vec<Outcome> = stream::iter(work)
         .map(|item| {
             let client = &client;
             let index_opts = &index_opts;
