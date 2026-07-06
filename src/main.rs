@@ -3,11 +3,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use clap::Parser;
+use clap::{Args, Parser, Subcommand};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
-use yanuget::config::Config;
+use yanuget::config::{Config, MirrorAuthConfig, MirrorConfig, OverwriteMode};
 use yanuget::database::SqliteDatabase;
+use yanuget::migrate::MigrateOptions;
 use yanuget::retention::{self, RetentionPolicy};
 use yanuget::storage::FilesystemStorage;
 use yanuget::web::{self, AppState, FeedMeta};
@@ -20,14 +21,72 @@ struct Cli {
     /// override its values.
     #[arg(short, long, env = "YANUGET_CONFIG")]
     config: Option<String>,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+/// Sub-commands. With none given, `yanuget` runs the server.
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Migrate every package from a source NuGet server into a local feed,
+    /// with live progress, ETA and transfer rate.
+    Migrate(MigrateArgs),
+}
+
+/// Arguments for `yanuget migrate`.
+#[derive(Debug, Args)]
+struct MigrateArgs {
+    /// Source NuGet V3 service-index URL (e.g. https://host/v3/index.json).
+    #[arg(long)]
+    source: String,
+    /// Target local feed to import into.
+    #[arg(long, default_value = "default")]
+    feed: String,
+    /// HTTP Basic username for the source feed.
+    #[arg(long)]
+    source_username: Option<String>,
+    /// HTTP Basic password for the source feed.
+    #[arg(long)]
+    source_password: Option<String>,
+    /// Bearer token for the source feed.
+    #[arg(long)]
+    source_token: Option<String>,
+    /// Extra source request header as "Name: Value"; may be repeated.
+    #[arg(long)]
+    source_header: Vec<String>,
+    /// Per-request timeout to the source, in seconds.
+    #[arg(long, default_value_t = 60)]
+    timeout_secs: u64,
+    /// Number of packages downloaded and indexed concurrently.
+    #[arg(long, default_value_t = 4)]
+    concurrency: usize,
+    /// Skip pre-release versions (otherwise all versions are migrated).
+    #[arg(long)]
+    skip_prerelease: bool,
+    /// Overwrite versions that already exist in the target feed.
+    #[arg(long)]
+    overwrite: bool,
+    /// Only discover and report what would be migrated; download nothing.
+    #[arg(long)]
+    dry_run: bool,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    init_tracing();
     let cli = Cli::parse();
+    match cli.command {
+        Some(Command::Migrate(args)) => run_migrate(cli.config.as_deref(), args).await,
+        None => {
+            init_tracing();
+            run_server(cli.config.as_deref()).await
+        }
+    }
+}
 
-    let config = Config::load(cli.config.as_deref())?;
+/// Run the HTTP(S) server — the default behaviour when no sub-command is given.
+async fn run_server(config_path: Option<&str>) -> anyhow::Result<()> {
+    let config = Config::load(config_path)?;
     tokio::fs::create_dir_all(&config.data_dir).await?;
     tokio::fs::create_dir_all(config.storage_path()).await?;
 
@@ -186,6 +245,105 @@ fn init_tracing() {
         .with(fmt::layer())
         .with(filter)
         .init();
+}
+
+/// Quieter logging for the migrate command so warnings don't fight the progress
+/// bars. `RUST_LOG` still overrides this when set.
+fn init_tracing_quiet() {
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn,yanuget=warn"));
+    let _ = tracing_subscriber::registry()
+        .with(fmt::layer().with_writer(std::io::stderr))
+        .with(filter)
+        .try_init();
+}
+
+/// Drive a bulk package migration from a source NuGet server into a local feed.
+async fn run_migrate(config_path: Option<&str>, args: MigrateArgs) -> anyhow::Result<()> {
+    init_tracing_quiet();
+
+    let config = Config::load(config_path)?;
+    tokio::fs::create_dir_all(&config.data_dir).await?;
+    tokio::fs::create_dir_all(config.storage_path()).await?;
+
+    let feeds = config.resolved_feeds()?;
+    let feed = feeds.iter().find(|f| f.name == args.feed).ok_or_else(|| {
+        anyhow::anyhow!(
+            "feed '{}' is not configured (known feeds: {})",
+            args.feed,
+            feeds
+                .iter()
+                .map(|f| f.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    })?;
+
+    let storage = FilesystemStorage::new(config.storage_path()).await?;
+    let db = SqliteDatabase::connect(&config.database_path()).await?;
+
+    // Temp files must share the package store's filesystem so indexing can move
+    // each download into place with an atomic rename.
+    let temp_dir = config.storage_path().join(".migrate");
+    tokio::fs::create_dir_all(&temp_dir).await?;
+
+    let source = build_source_config(&args);
+    let opts = MigrateOptions {
+        concurrency: args.concurrency,
+        include_prerelease: !args.skip_prerelease,
+        overwrite: if args.overwrite {
+            OverwriteMode::Enabled
+        } else {
+            feed.allow_overwrite
+        },
+        dry_run: args.dry_run,
+        quiet: false,
+    };
+
+    let summary = yanuget::migrate::run(
+        &storage,
+        &db,
+        feed,
+        &temp_dir,
+        source,
+        opts,
+        indicatif::ProgressDrawTarget::stderr(),
+    )
+    .await?;
+
+    // Best-effort cleanup of the scratch directory.
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+
+    // Surface a non-zero exit only when nothing at all got through.
+    if summary.failed > 0 && summary.imported == 0 && summary.skipped == 0 {
+        anyhow::bail!(
+            "migration failed: {} error(s), nothing imported",
+            summary.failed
+        );
+    }
+    Ok(())
+}
+
+/// Translate the CLI's source flags into a [`MirrorConfig`] the existing mirror
+/// client knows how to authenticate against.
+fn build_source_config(args: &MigrateArgs) -> MirrorConfig {
+    let mut headers = std::collections::BTreeMap::new();
+    for raw in &args.source_header {
+        if let Some((name, value)) = raw.split_once(':') {
+            headers.insert(name.trim().to_string(), value.trim().to_string());
+        }
+    }
+    MirrorConfig {
+        enabled: true,
+        upstream: args.source.clone(),
+        timeout_secs: args.timeout_secs,
+        auth: MirrorAuthConfig {
+            username: args.source_username.clone(),
+            password: args.source_password.clone(),
+            token: args.source_token.clone(),
+            headers,
+        },
+    }
 }
 
 /// Resolve once the shutdown signal has been broadcast on `rx`.

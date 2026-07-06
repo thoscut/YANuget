@@ -17,6 +17,7 @@ pub mod database;
 pub mod error;
 pub mod indexing;
 pub mod locks;
+pub mod migrate;
 pub mod mirror;
 pub mod models;
 pub mod nuget;

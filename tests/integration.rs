@@ -5,9 +5,11 @@ use std::io::{Cursor, Write};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
-use yanuget::config::Config;
-use yanuget::database::SqliteDatabase;
+use yanuget::config::{Config, MirrorConfig};
+use yanuget::database::{PackageDatabase, SqliteDatabase};
+use yanuget::migrate::MigrateOptions;
 use yanuget::storage::FilesystemStorage;
+use yanuget::version::NuGetVersion;
 use yanuget::web::{self, AppState, FeedMeta};
 use zip::write::SimpleFileOptions;
 
@@ -1703,4 +1705,150 @@ async fn read_auth_gates_downloads() {
         .unwrap()
         .status()
         .is_success());
+}
+
+/// A standalone target (storage + database + a resolved default feed) that a
+/// migration imports into, mirroring how the `migrate` command bootstraps.
+struct MigrateTarget {
+    storage: FilesystemStorage,
+    db: SqliteDatabase,
+    config: Arc<Config>,
+    temp_dir: std::path::PathBuf,
+    _dir: tempfile::TempDir,
+}
+
+async fn migrate_target() -> MigrateTarget {
+    let dir = tempfile::tempdir().unwrap();
+    let config = Config {
+        data_dir: dir.path().to_path_buf(),
+        tls_enabled: false,
+        ..Config::default()
+    };
+    let storage = FilesystemStorage::new(config.storage_path()).await.unwrap();
+    let db = SqliteDatabase::connect(&config.database_path())
+        .await
+        .unwrap();
+    let temp_dir = config.storage_path().join(".migrate");
+    tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+    MigrateTarget {
+        storage,
+        db,
+        config: Arc::new(config),
+        temp_dir,
+        _dir: dir,
+    }
+}
+
+#[tokio::test]
+async fn migrate_imports_all_packages_and_is_idempotent() {
+    // The source is a real YANuget server holding several packages/versions.
+    let source = spawn().await;
+    for (id, version) in [
+        ("Migrate.One", "1.0.0"),
+        ("Migrate.One", "2.0.0"),
+        ("Migrate.Two", "1.0.0"),
+    ] {
+        let resp = push_multipart(&source, API_KEY, build_nupkg(id, version, b"payload")).await;
+        assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+    }
+
+    let target = migrate_target().await;
+    let feeds = target.config.resolved_feeds().unwrap();
+    let feed = &feeds[0];
+    let source_cfg = MirrorConfig {
+        enabled: true,
+        upstream: source.url("/v3/index.json"),
+        ..Default::default()
+    };
+    let opts = MigrateOptions {
+        quiet: true,
+        ..Default::default()
+    };
+
+    // First run migrates everything.
+    let summary = yanuget::migrate::run(
+        &target.storage,
+        &target.db,
+        feed,
+        &target.temp_dir,
+        source_cfg.clone(),
+        opts.clone(),
+        indicatif::ProgressDrawTarget::hidden(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(summary.discovered_ids, 2);
+    assert_eq!(summary.total_versions, 3);
+    assert_eq!(summary.imported, 3);
+    assert_eq!(summary.skipped, 0);
+    assert_eq!(summary.failed, 0);
+    assert!(summary.total_bytes > 0);
+
+    // The target feed now actually exposes every migrated version.
+    for (id, version) in [
+        ("migrate.one", "1.0.0"),
+        ("migrate.one", "2.0.0"),
+        ("migrate.two", "1.0.0"),
+    ] {
+        let v = NuGetVersion::parse(version).unwrap();
+        assert!(
+            target.db.exists(&feed.name, id, &v).await.unwrap(),
+            "expected {id} {version} in the target feed"
+        );
+    }
+
+    // Second run is a no-op: everything is already present (idempotent/resumable).
+    let again = yanuget::migrate::run(
+        &target.storage,
+        &target.db,
+        feed,
+        &target.temp_dir,
+        source_cfg,
+        opts,
+        indicatif::ProgressDrawTarget::hidden(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(again.imported, 0);
+    assert_eq!(again.skipped, 3);
+    assert_eq!(again.failed, 0);
+}
+
+#[tokio::test]
+async fn migrate_dry_run_reports_without_importing() {
+    let source = spawn().await;
+    let resp = push_multipart(&source, API_KEY, build_nupkg("Dry.Run", "1.0.0", b"x")).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+
+    let target = migrate_target().await;
+    let feeds = target.config.resolved_feeds().unwrap();
+    let feed = &feeds[0];
+    let source_cfg = MirrorConfig {
+        enabled: true,
+        upstream: source.url("/v3/index.json"),
+        ..Default::default()
+    };
+
+    let summary = yanuget::migrate::run(
+        &target.storage,
+        &target.db,
+        feed,
+        &target.temp_dir,
+        source_cfg,
+        MigrateOptions {
+            quiet: true,
+            dry_run: true,
+            ..Default::default()
+        },
+        indicatif::ProgressDrawTarget::hidden(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(summary.total_versions, 1);
+    assert_eq!(summary.imported, 0);
+    // Nothing was actually written to the target.
+    let v = NuGetVersion::parse("1.0.0").unwrap();
+    assert!(!target.db.exists(&feed.name, "dry.run", &v).await.unwrap());
 }
