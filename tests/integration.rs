@@ -84,6 +84,24 @@ fn connect_info(
 
 /// Build a minimal but valid `.nupkg` in memory.
 fn build_nupkg(id: &str, version: &str, payload_filler: &[u8]) -> Vec<u8> {
+    build_nupkg_with_icon(id, version, payload_filler, None)
+}
+
+/// A minimal 1x1 PNG, for exercising the embedded-icon path.
+const TINY_PNG: &[u8] = &[
+    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4,
+    0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x00, 0x01, 0x00, 0x00,
+    0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE,
+    0x42, 0x60, 0x82,
+];
+
+fn build_nupkg_with_icon(
+    id: &str,
+    version: &str,
+    payload_filler: &[u8],
+    icon: Option<&[u8]>,
+) -> Vec<u8> {
     let nuspec = format!(
         r#"<?xml version="1.0"?>
 <package xmlns="http://schemas.microsoft.com/packaging/2013/05/nuspec.xsd">
@@ -94,13 +112,19 @@ fn build_nupkg(id: &str, version: &str, payload_filler: &[u8]) -> Vec<u8> {
     <description>An integration test package for {id}.</description>
     <tags>integration test</tags>
     <requireLicenseAcceptance>true</requireLicenseAcceptance>
+    {icon_element}
     <dependencies>
       <group targetFramework="net8.0">
         <dependency id="Newtonsoft.Json" version="[13.0.1, )" />
       </group>
     </dependencies>
   </metadata>
-</package>"#
+</package>"#,
+        icon_element = if icon.is_some() {
+            "<icon>images/icon.png</icon>"
+        } else {
+            ""
+        }
     );
 
     let mut cursor = Cursor::new(Vec::new());
@@ -112,6 +136,10 @@ fn build_nupkg(id: &str, version: &str, payload_filler: &[u8]) -> Vec<u8> {
         zip.write_all(nuspec.as_bytes()).unwrap();
         zip.start_file("lib/net8.0/Lib.dll", opts).unwrap();
         zip.write_all(payload_filler).unwrap();
+        if let Some(bytes) = icon {
+            zip.start_file("images/icon.png", opts).unwrap();
+            zip.write_all(bytes).unwrap();
+        }
         zip.finish().unwrap();
     }
     cursor.into_inner()
@@ -2313,4 +2341,87 @@ async fn require_license_acceptance_is_reported_as_the_author_declared_it() {
         reg["items"][0]["items"][0]["catalogEntry"]["requireLicenseAcceptance"],
         serde_json::Value::Bool(true)
     );
+}
+
+#[tokio::test]
+async fn embedded_icons_are_served_only_when_they_really_are_images() {
+    let server = spawn().await;
+
+    // A package with a genuine PNG icon.
+    push_multipart(
+        &server,
+        API_KEY,
+        build_nupkg_with_icon("Icon.Pkg", "1.0.0", b"x", Some(TINY_PNG)),
+    )
+    .await;
+
+    let icon = server
+        .client
+        .get(server.url("/packages/icon.pkg/1.0.0/icon"))
+        .send()
+        .await
+        .unwrap();
+    assert!(icon.status().is_success());
+    assert_eq!(icon.headers().get("content-type").unwrap(), "image/png");
+    // Icon bytes come from an uploaded package, so they are attacker-controlled
+    // content served same-origin. They must not be sniffable into a document,
+    // framable, or able to load anything of their own.
+    assert_eq!(
+        icon.headers().get("x-content-type-options").unwrap(),
+        "nosniff"
+    );
+    assert_eq!(
+        icon.headers().get("content-security-policy").unwrap(),
+        "default-src 'none'"
+    );
+    assert_eq!(icon.bytes().await.unwrap().as_ref(), TINY_PNG);
+
+    // An "icon" that is really an SVG — a script-bearing document — must not be
+    // handed to a browser, whatever the manifest calls it.
+    let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" onload="alert(1)"/>"#;
+    push_multipart(
+        &server,
+        API_KEY,
+        build_nupkg_with_icon("Evil.Icon", "1.0.0", b"x", Some(svg)),
+    )
+    .await;
+    let refused = server
+        .client
+        .get(server.url("/packages/evil.icon/1.0.0/icon"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), reqwest::StatusCode::NOT_FOUND);
+
+    // A package with no icon simply has none.
+    push_multipart(&server, API_KEY, build_nupkg("Plain.Pkg", "1.0.0", b"x")).await;
+    let none = server
+        .client
+        .get(server.url("/packages/plain.pkg/1.0.0/icon"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(none.status(), reqwest::StatusCode::NOT_FOUND);
+
+    // The detail page links the icon only for the package that has one.
+    let with_icon = server
+        .client
+        .get(server.url("/packages/icon.pkg"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(with_icon.contains("/packages/icon.pkg/1.0.0/icon"));
+    let without = server
+        .client
+        .get(server.url("/packages/plain.pkg"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(!without.contains("/icon\""));
 }

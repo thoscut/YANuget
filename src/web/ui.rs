@@ -73,6 +73,7 @@ background:#21262d;border:1px solid var(--border);color:var(--fg)}\
 table.deps{width:100%;border-collapse:collapse;font-size:13px}\
 table.deps td{padding:3px 8px 3px 0}\
 .readme{white-space:pre-wrap;word-wrap:break-word;overflow-wrap:anywhere}\
+img.picon{width:32px;height:32px;object-fit:contain;vertical-align:-6px;margin-right:10px;border-radius:6px;background:#21262d}\
 .links a[rel~=nofollow]::after{content:\" \u{2197}\";color:var(--muted);font-size:11px}\
 .empty{text-align:center;color:var(--muted);padding:60px 0}\
 .kv{font-size:13px}.kv div{display:flex;gap:10px;padding:3px 0;border-bottom:1px solid var(--border)}\
@@ -784,10 +785,11 @@ pub fn detail_page(
     let main = format!(
         "<nav class=\"crumbs\" aria-label=\"Breadcrumb\">\
          <a href=\"{packages}\">Packages</a> <span aria-hidden=\"true\">/</span> <span>{id}</span></nav>\
-         <h1 class=\"title\">{id}</h1>\
+         <h1 class=\"title\">{icon}{id}</h1>\
          <div class=\"meta\">{version}{badges} \u{2022} {dl} downloads \u{2022} published {pub}</div>\
          <p>{desc}</p>{tags}{links}{deps}{symbols}{readme}",
         packages = escape_html(&urls.app("/packages")),
+        icon = render_icon(urls, selected),
         version = escape_html(&version),
         badges = status_badges(selected),
         dl = selected.downloads,
@@ -950,6 +952,27 @@ fn render_dependencies(urls: &UrlBuilder, p: &Package) -> String {
         out.push_str("</table>");
     }
     out
+}
+
+/// The package's embedded icon, when it has one.
+///
+/// The image is served from this origin by [`crate::web`], which sniffs the
+/// bytes and refuses anything that is not a raster format — so the gallery's
+/// `img-src 'self'` policy is enough here. `loading="lazy"` keeps a long list
+/// of packages from fetching every icon up front.
+fn render_icon(urls: &UrlBuilder, p: &Package) -> String {
+    if !p.has_embedded_icon {
+        return String::new();
+    }
+    let src = urls.app(&format!(
+        "/packages/{}/{}/icon",
+        enc_path(&p.lower_id()),
+        enc_path(&p.normalized_version().to_lowercase()),
+    ));
+    format!(
+        "<img class=\"picon\" src=\"{}\" alt=\"\" loading=\"lazy\" decoding=\"async\">",
+        escape_html(&src)
+    )
 }
 
 fn render_readme(readme: Option<&str>) -> String {

@@ -92,6 +92,13 @@ Streams the `.nupkg`. Supports `Range: bytes=...` (responds `206 Partial
 Content` with `Content-Range`); always sends `Accept-Ranges: bytes`. Each
 successful fetch increments the download counter.
 
+A published id/version is immutable, so the response carries a strong `ETag`
+(the package's SHA-512 — a content hash of exactly the bytes served) and
+`Cache-Control: public, max-age=31536000, immutable`. Repeating the request with
+`If-None-Match` returns `304 Not Modified` with an empty body, so a client that
+already holds a multi-gigabyte package pays for a header exchange rather than
+the payload.
+
 ```
 GET /v3/package/{id}/{version}/{id}.nuspec
 ```
@@ -179,6 +186,7 @@ GET /                                  # searchable package list
 GET /packages?q=&skip=&take=           # same, as a search page
 GET /packages/{id}                     # detail for the newest version
 GET /packages/{id}/{version}           # detail for a specific version
+GET /packages/{id}/{version}/icon      # the package's embedded icon
 GET /stats                             # feed-wide statistics
 GET /settings                          # read-only policy overview
 ```
@@ -191,7 +199,16 @@ links, readme, symbol availability, and the install command for Chocolatey /
 and most-recently-published lists. `/settings` summarises the feed's policy
 (auth mode incl. download auth, size/overwrite/delete behaviour, approval &
 promotion ring, upstream mirror, license policy, symbol server, retention) and
-never exposes the API key or storage paths.
+never exposes the API key or storage paths. All of these honour the feed's
+`read_api_key` when one is set.
+
+`/packages/{id}/{version}/icon` serves the icon embedded in the package. Those
+bytes come from an uploaded `.nupkg`, so the content type is decided by
+**sniffing the bytes** rather than by trusting any declared name, and only
+raster formats (PNG, JPEG, GIF, WebP, BMP, ICO) are recognised — an "icon" that
+is really an SVG, which is a script-bearing document, returns `404` instead. The
+response also carries its own `Content-Security-Policy: default-src 'none'`.
+
 Requires `enable_web_ui` (on by default); when disabled, `/` serves a minimal
 info page and `/packages/*` return `404`.
 
@@ -227,12 +244,59 @@ the version to be a member of the current feed. The POST actions return
 `303 See Other` back to the package page; without credentials they return `401`
 with a `WWW-Authenticate: Basic` challenge.
 
+### CSRF
+
+The POST actions additionally require a CSRF token. Browsers replay HTTP Basic
+credentials automatically on any request to this origin, so authentication alone
+does not distinguish a click in `/admin` from a form auto-submitted by a page on
+someone else's site — without this, a signed-in operator merely visiting a
+hostile page would be enough to delete packages.
+
+The token is derived from the admin key, so producing it requires already
+knowing that key. The admin page embeds it in every form as a hidden `_csrf`
+field; a scripted caller may instead send it as an `X-CSRF-Token` header:
+
+```
+curl -u admin:$ADMIN_KEY -X POST \
+     -H "X-CSRF-Token: $TOKEN" \
+     https://host/admin/packages/foo/1.0.0/disable
+```
+
+A request without the token, or one a browser labels `Sec-Fetch-Site:
+cross-site`, returns `400`. Admin POST bodies are capped at 64 KiB.
+
 ## Health
 
 ```
-GET /health      → 200 "OK"
+GET /health         → 200 "OK"   (readiness: also probes the database)
+GET /health/ready   → same as /health
+GET /health/live    → 200 "OK"   (liveness: this process only)
 ```
+
+`/health` returns `503` with `database unavailable` when the store cannot be
+reached — the case an orchestrator has to act on, and one a static `OK` would
+hide. `/health/live` touches nothing else, so a slow dependency cannot trigger
+a restart loop through it.
+
+## Response headers
+
+Every response carries `X-Content-Type-Options: nosniff`,
+`X-Frame-Options: DENY`, `Referrer-Policy: no-referrer` and
+`Vary: Host, X-Forwarded-Host, X-Forwarded-Proto` — protocol documents embed
+absolute URLs derived from those inputs, so a shared cache must key on them.
+With TLS terminated by YANuget itself, responses also carry
+`Strict-Transport-Security`.
+
+Gallery pages carry a `Content-Security-Policy` of `default-src 'none'` whose
+only permitted inline style and script are the two the server itself emits,
+pinned by SHA-256. The embedded documentation site sets its own, looser policy
+(mkdocs emits inline bootstrap code this crate does not control).
 
 ## Error bodies
 
 Errors return the appropriate status with a JSON body `{ "error": "<message>" }`.
+
+`4xx` messages describe what the caller did wrong and are safe to act on. `5xx`
+responses return a generic `internal server error`: the underlying I/O,
+SQL or upstream detail would otherwise disclose filesystem paths, queries and
+upstream URLs, so it goes to the server log only.

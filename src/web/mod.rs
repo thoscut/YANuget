@@ -482,6 +482,7 @@ fn feed_routes(state: AppState) -> Router {
             .route("/packages", get(gallery))
             .route("/packages/{id}", get(package_detail))
             .route("/packages/{id}/{version}", get(package_detail_version))
+            .route("/packages/{id}/{version}/icon", get(package_icon))
             .route("/stats", get(stats_page))
             .route("/settings", get(settings_page))
             // Embedded, offline documentation site. `/docs` redirects to
@@ -1165,6 +1166,77 @@ async fn package_detail_version(
     Path((id, version)): Path<(String, String)>,
 ) -> Result<Html<String>> {
     render_detail(&state, &headers, &id, Some(&version)).await
+}
+
+/// Serve a package's embedded icon.
+///
+/// The bytes come from an uploaded `.nupkg`, so this is attacker-controlled
+/// content served same-origin to a browser — the one place in the gallery where
+/// that is true. Three things keep it inert: the content type is decided by
+/// *sniffing the bytes* rather than by trusting any declared name, only raster
+/// formats are recognised (notably **not** SVG, which is a script-bearing
+/// document), and the response carries its own `default-src 'none'` policy.
+async fn package_icon(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((id, version)): Path<(String, String)>,
+) -> Result<Response> {
+    state.require_read(&headers)?;
+    let version = parse_version(&version)?;
+    if !state.db.is_servable(state.feed(), &id, &version).await? {
+        return Err(Error::PackageNotFound);
+    }
+    let bytes = state
+        .storage
+        .get_aux(&id, &version.normalized(), AuxFile::Icon)
+        .await?;
+    let Some(content_type) = sniff_image(&bytes) else {
+        // Stored, but not something we are willing to hand a browser.
+        return Err(Error::PackageNotFound);
+    };
+    Ok((
+        [
+            (header::CONTENT_TYPE, content_type),
+            (header::CACHE_CONTROL, IMMUTABLE_CACHE),
+            (header::CONTENT_SECURITY_POLICY, "default-src 'none'"),
+            (header::CONTENT_DISPOSITION, "inline"),
+        ],
+        bytes,
+    )
+        .into_response())
+}
+
+/// Identify a raster image from its magic bytes, or `None` for anything else.
+///
+/// An allow-list, deliberately: a format that is not recognised is refused
+/// rather than guessed at or passed through as `application/octet-stream`.
+fn sniff_image(bytes: &[u8]) -> Option<&'static str> {
+    const PNG: &[u8] = b"\x89PNG\r\n\x1a\n";
+    const GIF87: &[u8] = b"GIF87a";
+    const GIF89: &[u8] = b"GIF89a";
+    const BMP: &[u8] = b"BM";
+    const ICO: &[u8] = b"\x00\x00\x01\x00";
+
+    if bytes.starts_with(PNG) {
+        return Some("image/png");
+    }
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return Some("image/jpeg");
+    }
+    if bytes.starts_with(GIF87) || bytes.starts_with(GIF89) {
+        return Some("image/gif");
+    }
+    // RIFF....WEBP
+    if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        return Some("image/webp");
+    }
+    if bytes.starts_with(BMP) {
+        return Some("image/bmp");
+    }
+    if bytes.starts_with(ICO) {
+        return Some("image/x-icon");
+    }
+    None
 }
 
 async fn render_detail(

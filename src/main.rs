@@ -159,7 +159,12 @@ async fn run_server(config_path: Option<&str>) -> anyhow::Result<()> {
             let mut shutdown = shutdown_rx.clone();
             tracing::info!(feed = %feed_name, interval_hours = interval, "retention sweep enabled");
             tokio::spawn(async move {
-                let mut tick = tokio::time::interval(Duration::from_secs(interval * 3600));
+                // `interval_hours` comes from configuration as a `u64`; the
+                // multiplication into seconds would overflow (a panic in debug,
+                // a wrap to a tiny period in release — a sweep every few
+                // seconds). Saturating keeps an absurd value meaning "never".
+                let period = Duration::from_secs(interval.saturating_mul(3600));
+                let mut tick = tokio::time::interval(period);
                 loop {
                     tokio::select! {
                         _ = tick.tick() => {

@@ -114,9 +114,10 @@ YANuget implements the NuGet v3 protocol. Full reference in
 | Push symbols | `PUT /api/v2/symbol` |
 | Download symbol (SSQP) | `GET /download/symbols/{file}/{key}/{file}` |
 | Web gallery | `GET /` and `GET /packages/{id}[/{version}]` |
+| Package icon | `GET /packages/{id}/{version}/icon` |
 | Documentation | `GET /docs` (embedded, offline) |
 | Admin (Basic auth) | `GET /admin`, `POST /admin/packages/{id}/{version}/{disable\|enable\|delete}` |
-| Health | `GET /health` |
+| Health | `GET /health` (readiness), `GET /health/live` (liveness) |
 
 ---
 
@@ -201,6 +202,9 @@ offline) lives at `/`:
 * a searchable package list (search box in the header),
 * a per-package detail page with versions, dependencies, links, readme and the
   install command for Chocolatey / `dotnet` / `nuget.exe`,
+* a package's embedded icon, served from the feed itself — the bytes are
+  sniffed and only raster formats are accepted, so an "icon" that is really an
+  SVG (a script-bearing document) is refused rather than handed to a browser,
 * a statistics page (`/stats`) with feed totals and the most-downloaded /
   recently-published lists,
 * a read-only settings overview (`/settings`) that never exposes secrets,
