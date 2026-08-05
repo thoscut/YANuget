@@ -186,6 +186,15 @@ pub fn is_private_host(host: &str) -> bool {
     }
 }
 
+/// Whether an already-resolved address is one the mirror must not fetch from.
+///
+/// [`is_private_host`] can only classify a host it can read as an address; a
+/// DNS name has to be resolved first, and this is what the resolved addresses
+/// are then checked against.
+pub fn is_private_ip_addr(ip: IpAddr) -> bool {
+    is_private_ip(unmap(ip))
+}
+
 fn is_private_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {

@@ -145,6 +145,35 @@ fn build_nupkg_with_icon(
     cursor.into_inner()
 }
 
+/// A package declaring an SPDX `licenseExpression`, for exercising the license
+/// policy.
+fn build_nupkg_with_license(id: &str, version: &str, expression: &str) -> Vec<u8> {
+    let nuspec = format!(
+        r#"<?xml version="1.0"?>
+<package xmlns="http://schemas.microsoft.com/packaging/2013/05/nuspec.xsd">
+  <metadata>
+    <id>{id}</id>
+    <version>{version}</version>
+    <authors>Test Author</authors>
+    <description>A package licensed under {expression}.</description>
+    <license type="expression">{expression}</license>
+  </metadata>
+</package>"#
+    );
+    let mut cursor = Cursor::new(Vec::new());
+    {
+        let mut zip = zip::ZipWriter::new(&mut cursor);
+        let opts =
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        zip.start_file(format!("{id}.nuspec"), opts).unwrap();
+        zip.write_all(nuspec.as_bytes()).unwrap();
+        zip.start_file("lib/net8.0/Lib.dll", opts).unwrap();
+        zip.write_all(b"dll").unwrap();
+        zip.finish().unwrap();
+    }
+    cursor.into_inner()
+}
+
 async fn push_multipart(server: &TestServer, key: &str, nupkg: Vec<u8>) -> reqwest::Response {
     let part = reqwest::multipart::Part::bytes(nupkg)
         .file_name("package.nupkg")
@@ -1503,6 +1532,7 @@ async fn spawn_feeds(customize: impl FnOnce(&mut Config)) -> TestServer {
                 name: f.name.clone(),
                 prefix: f.prefix.clone(),
                 requires_approval: f.requires_approval,
+                license_policy: f.license_policy.clone(),
             })
             .collect::<Vec<_>>(),
     );
@@ -2954,4 +2984,60 @@ async fn gallery_errors_are_pages_but_api_errors_stay_json() {
         !body.contains("<html"),
         "v3 errors must not be HTML: {body}"
     );
+}
+
+/// Promotion is how a version enters the target feed, so it has to clear that
+/// feed's license policy — not the source feed's.
+///
+/// Without this, a permissive `dev` ring is a way around `stable`'s
+/// `action = "block"`, and whoever holds `dev`'s admin key effectively has
+/// write access to `stable`.
+#[tokio::test]
+async fn promotion_is_held_to_the_target_feeds_license_policy() {
+    use yanuget::config::LicensePolicyConfig;
+
+    let server = spawn_feeds(|c| {
+        c.api_key = Some(API_KEY.into());
+        c.admin_api_key = Some(ADMIN_KEY.into());
+        let mut dev = feed("dev");
+        dev.promotes_to = Some("stable".into());
+        let mut stable = feed("stable");
+        // `stable` accepts MIT only; `dev` accepts anything.
+        stable.license_policy = LicensePolicyConfig {
+            enabled: true,
+            allowed: vec!["MIT".into()],
+            action: yanuget::config::PolicyAction::Block,
+            ..LicensePolicyConfig::default()
+        };
+        c.feeds = vec![dev, stable];
+    })
+    .await;
+
+    // A GPL package is fine in dev.
+    let nupkg = build_nupkg_with_license("Gpl.Pkg", "1.0.0", "GPL-3.0-only");
+    let response = push_to(&server, "/dev/api/v2/package", API_KEY, nupkg).await;
+    assert_eq!(response.status(), 201);
+
+    let promote = no_redirect()
+        .post(server.url("/dev/admin/packages/gpl.pkg/1.0.0/promote"))
+        .basic_auth("admin", Some(ADMIN_KEY))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(admin_body(ADMIN_KEY))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        promote.status(),
+        403,
+        "stable blocks GPL, so promoting into it must be refused"
+    );
+
+    // And it really did not land there.
+    let listed = server
+        .client
+        .get(server.url("/stable/v3/package/gpl.pkg/index.json"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(listed.status(), 404);
 }

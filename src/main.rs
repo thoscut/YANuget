@@ -122,6 +122,7 @@ async fn run_server(config_path: Option<&str>) -> anyhow::Result<()> {
                 name: f.name.clone(),
                 prefix: f.prefix.clone(),
                 requires_approval: f.requires_approval,
+                license_policy: f.license_policy.clone(),
             })
             .collect::<Vec<_>>(),
     );

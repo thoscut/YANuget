@@ -106,6 +106,9 @@ pub struct FeedMeta {
     pub name: String,
     pub prefix: String,
     pub requires_approval: bool,
+    /// The target feed's own license policy, so a promotion into it is held to
+    /// the same rule a direct push would be.
+    pub license_policy: LicensePolicyConfig,
 }
 
 /// Shared application state for one feed, cheaply cloneable (everything behind
@@ -946,10 +949,30 @@ async fn download_package(
             .storage
             .get_aux(&id, &normalized, AuxFile::Nuspec)
             .await?;
+        // These bytes are whatever the pusher put in the manifest, stored
+        // verbatim — including anything before or around `<metadata>`, which the
+        // parser ignores. Served as bare `application/xml` from this origin, a
+        // manifest beginning with an `<?xml-stylesheet?>` PI can make a browser
+        // run script here: the same-origin script execution the gallery's
+        // hash-pinned CSP exists to prevent, and from which a logged-in
+        // operator's admin session is reachable. The icon endpoint already
+        // sniffs and restricts its bytes for exactly this reason; the manifest
+        // got none of it.
+        //
+        // So: deny everything via CSP, refuse content sniffing, and mark it a
+        // download. Clients fetch this with an HTTP library, which ignores all
+        // three; only a browser is affected, and a browser has no business
+        // rendering it.
         return Ok((
             [
                 (header::CONTENT_TYPE, "application/xml"),
                 (header::CACHE_CONTROL, IMMUTABLE_CACHE),
+                (header::CONTENT_SECURITY_POLICY, "default-src 'none'"),
+                (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+                (
+                    header::CONTENT_DISPOSITION,
+                    "attachment; filename=\"manifest.nuspec\"",
+                ),
             ],
             nuspec,
         )
@@ -1711,16 +1734,41 @@ async fn admin_promote(
         .await?
         .ok_or(Error::PackageNotFound)?;
     // The target must be a known feed; gate the promoted membership if it does.
-    let target_gates = state
+    let target_meta = state
         .feeds
         .iter()
         .find(|m| &m.name == target)
-        .ok_or_else(|| Error::BadRequest(format!("unknown promotion target {target:?}")))?
-        .requires_approval;
+        .ok_or_else(|| Error::BadRequest(format!("unknown promotion target {target:?}")))?;
+
+    // The target feed's own license policy, not this one's. A promotion is how
+    // a version enters that feed, so it has to clear the same rule a direct
+    // push would: otherwise `dev` with no policy is a way around `stable`'s
+    // `action = "block"`, and whoever holds `dev`'s admin key effectively has
+    // write access to `stable`.
+    let outcome = crate::policy::evaluate_license(&target_meta.license_policy, &package);
+    if !outcome.allowed {
+        return Err(Error::PolicyViolation(format!(
+            "{target} rejects this package: {}",
+            outcome.violation.unwrap_or_else(|| "license policy".into())
+        )));
+    }
+
     let membership = Membership {
-        pending: target_gates,
+        pending: target_meta.requires_approval,
+        flagged: outcome.violation.is_some(),
+        flag_reason: outcome.violation,
         ..Membership::active(target, &package)
     };
+    // Under the same lock as a push or a purge of this version, so the
+    // existence check above and the membership below see one consistent state.
+    // Without it a retention sweep that drops the last membership in between
+    // deletes the shared data, and this insert then leaves a membership
+    // pointing at a package row that no longer exists — invisible to every
+    // query (they all inner-join) yet enough to make a later push conflict.
+    let _guard = crate::locks::lock_version(&id, &v.normalized()).await;
+    if !state.db.package_data_exists(&id, &v).await? {
+        return Err(Error::PackageNotFound);
+    }
     match state.db.add_membership(&membership).await {
         Ok(()) | Err(Error::PackageAlreadyExists) => {}
         Err(e) => return Err(e),

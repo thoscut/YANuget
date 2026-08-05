@@ -68,21 +68,38 @@ impl MirrorClient {
         // — so when any credential is configured, redirects may not leave the
         // host they started on. An upstream cannot then bounce the mirror at a
         // collector and harvest the feed token.
-        builder = if config.auth.is_set() {
-            builder.redirect(reqwest::redirect::Policy::custom(|attempt| {
+        //
+        // Every hop is re-checked, not just the URL we started with. `check_url`
+        // vets a resource URL before the request, but a redirect chooses a new
+        // one *after* it — so a `302` to `http://169.254.169.254/…` or an
+        // address on the server's own network walked straight past the guard,
+        // and the read path that triggers a mirror fetch is reachable without
+        // authentication.
+        let credentialed = config.auth.is_set();
+        let allow_private = config.allow_private_upstream;
+        builder = builder.redirect(reqwest::redirect::Policy::custom(move |attempt| {
+            if attempt.previous().len() > 5 {
+                return attempt.error("too many redirects");
+            }
+            if !matches!(attempt.url().scheme(), "http" | "https") {
+                return attempt.error("redirect to a non-HTTP scheme");
+            }
+            if !allow_private {
+                if let Some(host) = attempt.url().host_str() {
+                    if crate::proxy::is_private_host(host) {
+                        return attempt.error("redirect to a private address");
+                    }
+                }
+            }
+            if credentialed {
                 let same_host = attempt.previous().last().and_then(|p| p.host_str())
                     == attempt.url().host_str();
                 if !same_host {
-                    attempt.stop()
-                } else if attempt.previous().len() > 5 {
-                    attempt.error("too many redirects")
-                } else {
-                    attempt.follow()
+                    return attempt.stop();
                 }
-            }))
-        } else {
-            builder.redirect(reqwest::redirect::Policy::limited(5))
-        };
+            }
+            attempt.follow()
+        }));
         Some(Self {
             client: builder.build().ok()?,
             upstream: config.upstream.clone(),
@@ -124,6 +141,50 @@ impl MirrorClient {
         Ok(())
     }
 
+    /// [`Self::check_url`], plus a DNS resolution of the host.
+    ///
+    /// `check_url` can only classify an address it can see, so a *name* —
+    /// `metadata.evil.example` with an `A` record of `169.254.169.254` — passed
+    /// it untouched. Resolving closes that, at the cost of one lookup.
+    ///
+    /// This is a check, not a pin: the address the connection finally uses is
+    /// resolved again by the HTTP client, so a DNS entry that changes between
+    /// the two answers (rebinding) is still possible. Narrowing that further
+    /// means pinning the connection to the address checked here, which reqwest
+    /// does not expose per-request — so an upstream is a trust decision, and
+    /// `allow_private_upstream` is how an operator states it deliberately.
+    async fn check_url_resolved(&self, url: &str, what: &str) -> Result<()> {
+        self.check_url(url, what)?;
+        if self.allow_private_upstream {
+            return Ok(());
+        }
+        let parsed = reqwest::Url::parse(url)
+            .map_err(|e| Error::Other(anyhow::anyhow!("upstream {what} url is invalid: {e}")))?;
+        let Some(host) = parsed.host_str() else {
+            return Ok(());
+        };
+        // A literal was already classified by `check_url`.
+        if host.parse::<std::net::IpAddr>().is_ok() {
+            return Ok(());
+        }
+        let port = parsed.port_or_known_default().unwrap_or(443);
+        let Ok(addrs) = tokio::net::lookup_host((host, port)).await else {
+            // Unresolvable: the request will fail on its own, and refusing here
+            // would turn a transient DNS blip into a policy error.
+            return Ok(());
+        };
+        for addr in addrs {
+            if crate::proxy::is_private_ip_addr(addr.ip()) {
+                return Err(Error::Other(anyhow::anyhow!(
+                    "upstream {what} host {host} resolves to the private address {}; \
+                     set allow_private_upstream = true to permit it",
+                    addr.ip()
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// [`Self::check_url`] as a predicate, logging why a resource was dropped.
     fn log_check(&self, url: &str, what: &str) -> bool {
         match self.check_url(url, what) {
@@ -156,7 +217,8 @@ impl MirrorClient {
     async fn resources(&self) -> Result<&MirrorResources> {
         self.resources
             .get_or_try_init(|| async {
-                self.check_url(&self.upstream, "service index")?;
+                self.check_url_resolved(&self.upstream, "service index")
+                    .await?;
                 let index: serde_json::Value = self
                     .client
                     .get(&self.upstream)
@@ -190,7 +252,8 @@ impl MirrorClient {
                 // Every one of these is a URL the *upstream* chose; vet each
                 // before it is ever fetched. A bad optional resource is dropped
                 // rather than fatal, so one odd entry cannot disable mirroring.
-                self.check_url(&package_base, "PackageBaseAddress")?;
+                self.check_url_resolved(&package_base, "PackageBaseAddress")
+                    .await?;
                 Ok(MirrorResources {
                     package_base: ensure_trailing_slash(&package_base),
                     search: search.filter(|u| self.log_check(u, "SearchQueryService")),

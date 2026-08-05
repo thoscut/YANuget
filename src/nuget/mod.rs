@@ -303,7 +303,14 @@ fn dependency_groups(
                         "@id": format!("{group_id}/{}", d.id.to_lowercase()),
                         "@type": "PackageDependency",
                         "id": d.id,
-                        "range": d.version_range,
+                        // `<dependency id="X" />` with no `version` attribute is
+                        // legal and means "any version". Emitting it as JSON
+                        // `null` is not: nuget.org writes the unbounded range as
+                        // `(, )`, and NuGet.Protocol hands the value straight to
+                        // `VersionRange.Parse`, which throws on null rather than
+                        // degrading to `VersionRange.All` — so reading the
+                        // metadata fails instead of the dependency being open.
+                        "range": d.version_range.clone().unwrap_or_else(|| "(, )".into()),
                         "registration": urls.registration_index(&d.id.to_lowercase()),
                     })
                 })
