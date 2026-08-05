@@ -2666,3 +2666,62 @@ async fn autocomplete_does_not_suggest_packages_the_filters_exclude() {
     );
     assert!(stable.contains(&"Stable.One".to_string()));
 }
+
+/// A pre-release label differing only in case is the *same* version, and the
+/// server has to treat it as one everywhere or it hands clients bytes that do
+/// not match the hash it published for them.
+///
+/// Before this was fixed the two pushes below produced two database rows that
+/// shared a single file on disk: the second push was accepted even with
+/// `allow_overwrite` off, it replaced the first package's bytes, and the flat
+/// container listed the version twice.
+#[tokio::test]
+async fn a_case_variant_of_a_published_prerelease_is_the_same_version() {
+    let server = spawn().await;
+
+    let first = build_nupkg("Case.Probe", "1.0.0-Beta", b"AAAA");
+    let response = push_multipart(&server, API_KEY, first.clone()).await;
+    assert_eq!(response.status(), 201);
+
+    // Same version, different case, different bytes: a conflict, not a push.
+    let second = build_nupkg("Case.Probe", "1.0.0-beta", b"BBBB");
+    let response = push_multipart(&server, API_KEY, second).await;
+    assert_eq!(
+        response.status(),
+        409,
+        "a case-variant re-push must conflict, not silently overwrite"
+    );
+
+    // The flat container lists the version once, in its canonical form.
+    let versions: serde_json::Value = server
+        .client
+        .get(server.url("/v3/package/case.probe/index.json"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(versions["versions"], serde_json::json!(["1.0.0-beta"]));
+
+    // Both spellings resolve to the originally published bytes.
+    for spelling in ["1.0.0-Beta", "1.0.0-beta"] {
+        let response = server
+            .client
+            .get(server.url(&format!(
+                "/v3/package/case.probe/{}/case.probe.{}.nupkg",
+                spelling.to_ascii_lowercase(),
+                spelling.to_ascii_lowercase()
+            )))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200, "{spelling}");
+        let body = response.bytes().await.unwrap();
+        assert_eq!(
+            body.as_ref(),
+            first.as_slice(),
+            "{spelling} served other bytes"
+        );
+    }
+}
