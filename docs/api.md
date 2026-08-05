@@ -81,8 +81,17 @@ still restorable by exact version) — the same semantics as the NuGet client's
 GET /v3/package/{id}/index.json
 ```
 
-`{ "versions": ["1.0.0", "1.1.0", ...] }` — lower-cased, normalized, listed
-versions, ascending. `404` if the id is unknown.
+`{ "versions": ["1.0.0", "1.1.0", ...] }` — lower-cased, normalized versions,
+ascending. `404` if the id is unknown.
+
+**Unlisted versions are included.** This endpoint is how a client resolves a
+version it is about to restore, so omitting them would make a project pinned to
+an unlisted version fail with `NU1101` — which is precisely the difference
+between unlisting and deleting. Unlisted versions are still hidden from
+`/v3/search`, and registration reports them with `"listed": false`.
+
+Admin-**disabled** and still-**pending** versions are excluded here, as they are
+everywhere else: those are withheld from clients outright.
 
 ```
 GET /v3/package/{id}/{version}/{id}.{version}.nupkg

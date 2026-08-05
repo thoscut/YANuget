@@ -388,7 +388,27 @@ async fn delete_unlists_package() {
         .unwrap();
     assert_eq!(search["totalHits"], 0);
 
-    // ...but still downloadable by exact version (NuGet restore semantics).
+    // ...but the flat container must still list it. That endpoint is how a
+    // client resolves a version it is about to restore, so omitting unlisted
+    // versions makes a project pinned to one fail with NU1101 — which defeats
+    // the entire point of unlisting rather than deleting. (Verified against the
+    // real `dotnet restore`, which reported exactly that before this was fixed.)
+    let versions: serde_json::Value = server
+        .client
+        .get(server.url("/v3/package/unlist.me/index.json"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        versions["versions"],
+        serde_json::json!(["1.0.0"]),
+        "an unlisted version must stay resolvable through the flat container"
+    );
+
+    // ...and still downloadable by exact version (NuGet restore semantics).
     let download = server
         .client
         .get(server.url("/v3/package/unlist.me/1.0.0/unlist.me.1.0.0.nupkg"))
@@ -396,6 +416,18 @@ async fn delete_unlists_package() {
         .await
         .unwrap();
     assert!(download.status().is_success());
+
+    // Search still hides it — discovery and resolution are different questions.
+    let search: serde_json::Value = server
+        .client
+        .get(server.url("/v3/search?q=unlist"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(search["totalHits"], 0);
 
     // Relist restores it.
     let resp = server

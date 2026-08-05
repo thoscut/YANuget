@@ -810,10 +810,25 @@ async fn package_versions(
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>> {
     state.require_read(&headers)?;
-    let mut packages = state.db.find_versions(state.feed(), &id, false).await?;
+    // The flat container is how a client resolves a version it is *about to
+    // restore*, so it must include unlisted versions. Unlisting means "hide
+    // from discovery, stay restorable" — that is the whole distinction from
+    // deleting — and omitting them here makes a project pinned to an unlisted
+    // version fail with NU1101, even though the payload is still served.
+    //
+    // Admin-disabled and still-pending versions are a different matter and
+    // remain excluded: those are withheld from clients outright.
+    const INCLUDE_UNLISTED: bool = true;
+    let mut packages = state
+        .db
+        .find_versions(state.feed(), &id, INCLUDE_UNLISTED)
+        .await?;
     if packages.is_empty() {
         state.mirror_if_needed(&id).await;
-        packages = state.db.find_versions(state.feed(), &id, false).await?;
+        packages = state
+            .db
+            .find_versions(state.feed(), &id, INCLUDE_UNLISTED)
+            .await?;
     }
     if packages.is_empty() {
         return Err(Error::PackageNotFound);
