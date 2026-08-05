@@ -77,8 +77,15 @@ jobs:
             git diff --stat -- .github/media
           fi
 
+      # `continue-on-error`, because opening the pull request needs the
+      # repository's "Allow GitHub Actions to create and approve pull requests"
+      # setting, which this workflow cannot turn on and should not depend on.
+      # The branch is pushed either way, so the captures are never lost — the
+      # step below says where they are.
       - name: Open a pull request
+        id: pr
         if: steps.diff.outputs.changed == 'true'
+        continue-on-error: true
         uses: peter-evans/create-pull-request@v7
         with:
           add-paths: .github/media
@@ -92,13 +99,20 @@ jobs:
             renders — review the diff as you would a UI change, because that is
             what it is.
 
-      - name: Note that a refresh is pending
+      - name: Say where the refreshed captures are
         if: steps.diff.outputs.changed == 'true'
         run: |
-          echo "::notice::The captures differ from what is committed; a pull \
-          request with the new ones has been opened. Some of the difference may \
-          be this runner rendering differently, so review it rather than merging \
-          it blind."
+          repo="${{ github.server_url }}/${{ github.repository }}"
+          if [ "${{ steps.pr.outcome }}" = success ]; then
+            echo "::notice::A pull request with the refreshed captures is open."
+          else
+            echo "::notice::Captures pushed to the 'chore/refresh-media' branch. \
+            Opening the pull request needs the repository setting 'Allow GitHub \
+            Actions to create and approve pull requests'; until that is on, open \
+            it by hand: $repo/compare/chore/refresh-media?expand=1"
+          fi
+          echo "Some of the difference is this runner rendering differently from \
+          the machine that last committed them — review rather than merge blind."
 
       # Either way, the freshly captured media is downloadable from the run.
       - name: Upload the captures

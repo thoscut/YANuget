@@ -245,9 +245,17 @@ jobs:
 
   # Publish to crates.io, if the repository has a token configured. Without one
   # the step is skipped, so the rest of the release still completes.
+  # Publishing to crates.io is opt-in, and off.
+  #
+  # A version published there can be yanked but never replaced or re-uploaded,
+  # so it is the one step of a release that cannot be redone. Having the token
+  # present should not be what decides it: set the repository variable
+  # `PUBLISH_TO_CRATES_IO` to `true` when the crate name and contents have
+  # settled and you mean it.
   crates-io:
     name: Publish to crates.io
     needs: [guard, release]
+    if: vars.PUBLISH_TO_CRATES_IO == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

@@ -67,10 +67,14 @@ realistic feed, one empty for the first-run panel), drives a real browser
 against them and assembles the GIFs.
 
 Forgetting is handled too: the `Refresh product media` workflow re-runs the
-same script whenever the UI or docs change on `main`, and opens a pull request
-when the result differs from what is committed. Review that pull request rather
-than merging it blind — a CI runner does not render byte-identically to your
-machine, so part of any diff is the runner rather than your change.
+same script whenever the UI or docs change on `main` and pushes the result to
+`chore/refresh-media` when it differs from what is committed. It opens a pull
+request as well if the repository allows Actions to do that; if not, the run's
+log links the compare page.
+
+Review that branch rather than merging it blind — a CI runner does not render
+byte-identically to your machine, so part of any diff is the runner rather than
+your change.
 
 ## What good changes look like
 
