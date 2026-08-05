@@ -3,7 +3,7 @@
 # The toolchain must satisfy the crate's `rust-version` (see Cargo.toml). Pinning
 # an older image compiles nothing — the build fails on the first dependency that
 # needs a newer compiler.
-FROM rust:1.88-slim AS builder
+FROM rust:1.96-slim AS builder
 WORKDIR /app
 
 # Cache dependencies first. `build.rs` has to be present even for this dummy
