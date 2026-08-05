@@ -72,7 +72,16 @@ pub fn versions_to_prune(
         .or_else(|| prerelease.first())
         .map(|p| &p.version);
 
-    let cutoff = policy.max_age_days.map(|d| now - Duration::days(d as i64));
+    // `Duration::days` panics outside its representable range, and a `u64` day
+    // count from configuration can easily exceed it — so build the cutoff with
+    // checked arithmetic. An unrepresentably distant cutoff means "never too
+    // old", which is the safe reading: it prunes nothing rather than, via a
+    // wrapped negative duration, treating every version as expired.
+    let cutoff = policy
+        .max_age_days
+        .and_then(|d| i64::try_from(d).ok())
+        .and_then(Duration::try_days)
+        .and_then(|d| now.checked_sub_signed(d));
 
     let mut prune = Vec::new();
     for (channel, keep) in [
@@ -206,6 +215,7 @@ mod tests {
             has_readme: false,
             has_embedded_icon: false,
             is_development_dependency: false,
+            require_license_acceptance: false,
             is_semver2: false,
             package_size: 1,
             package_hash: "h".into(),
@@ -215,6 +225,36 @@ mod tests {
             package_types: vec![],
             dependencies: vec![],
         }
+    }
+
+    #[test]
+    fn an_absurd_max_age_prunes_nothing_instead_of_panicking() {
+        // A day count this large is out of `Duration`'s range. Building the
+        // cutoff must not panic, and — critically — must not wrap into a future
+        // date, which would mark every version as expired and delete the feed.
+        // 1.0.0 is ancient; 2.0.0 is current and is the protected newest stable.
+        let packages = vec![pkg("1.0.0", 5_000), pkg("2.0.0", 0)];
+        for days in [u64::MAX, i64::MAX as u64, 1 << 60] {
+            let policy = RetentionPolicy {
+                max_age_days: Some(days),
+                ..Default::default()
+            };
+            assert!(
+                versions_to_prune(&packages, &policy, Utc::now()).is_empty(),
+                "max_age_days = {days} pruned versions"
+            );
+        }
+
+        // A sane large-but-representable value still works normally.
+        let policy = RetentionPolicy {
+            max_age_days: Some(1_000),
+            ..Default::default()
+        };
+        assert_eq!(
+            names(versions_to_prune(&packages, &policy, Utc::now())),
+            vec!["1.0.0".to_string()],
+            "the 5000-day-old 1.0.0 should be pruned; 2.0.0 is the protected newest"
+        );
     }
 
     fn names(mut v: Vec<NuGetVersion>) -> Vec<String> {

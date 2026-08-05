@@ -483,8 +483,16 @@ pub async fn ensure_package(
     // One read-through miss per id at a time. Without this, N concurrent
     // restores of the same missing package each start their own full download
     // of every upstream version — N times the bandwidth and disk for one
-    // result. The loser waits and then finds the work already done.
-    let _guard = crate::locks::lock_version(&lower_id, "<mirror>").await;
+    // result.
+    //
+    // Declining rather than queueing matters: a fetch can run for minutes, and
+    // a waiter would hold its request open for all of it to obtain a result the
+    // winner is already producing. Losing the race is treated as a plain cache
+    // miss, which is what it is.
+    let Some(_guard) = crate::locks::try_lock_version(&lower_id, "<mirror>") else {
+        tracing::debug!(%feed, id = %lower_id, "mirror fetch already in progress; skipping");
+        return Ok(0);
+    };
 
     let versions = client.upstream_versions(&lower_id).await?;
     let mut versions: Vec<NuGetVersion> = versions

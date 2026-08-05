@@ -67,8 +67,18 @@ impl Nuspec {
     }
 }
 
+/// Bounds on a single manifest. A real nuspec is a few KiB with a handful of
+/// dependency groups; these are far above anything legitimate and exist only so
+/// a hostile manifest cannot turn its (already capped) 16 MiB of XML into an
+/// unbounded pile of allocations, database rows and rendered HTML.
+const MAX_ELEMENT_DEPTH: usize = 64;
+const MAX_DEPENDENCY_GROUPS: usize = 512;
+const MAX_DEPENDENCIES: usize = 10_000;
+const MAX_PACKAGE_TYPES: usize = 64;
+
 /// Parse a `.nuspec` document. Returns [`Error::InvalidPackage`] when the XML is
-/// malformed or is missing the mandatory `id`/`version` fields.
+/// malformed, exceeds the structural limits above, or is missing the mandatory
+/// `id`/`version` fields.
 pub fn parse_nuspec(xml: &str) -> Result<Nuspec, Error> {
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(true);
@@ -87,6 +97,7 @@ pub fn parse_nuspec(xml: &str) -> Result<Nuspec, Error> {
             Ok(Event::Empty(e)) => {
                 let name = local_name(e.name().as_ref());
                 handle_attr_element(&name, &e, &mut nuspec, current_group);
+                check_limits(&nuspec)?;
             }
             Ok(Event::Start(e)) => {
                 let name = local_name(e.name().as_ref());
@@ -105,9 +116,17 @@ pub fn parse_nuspec(xml: &str) -> Result<Nuspec, Error> {
 
                 handle_attr_element(&name, &e, &mut nuspec, current_group);
                 if name == "group" {
-                    current_group = Some(nuspec.dependency_groups.len() - 1);
+                    // `handle_attr_element` always pushes a group for this name,
+                    // so the list is non-empty here.
+                    current_group = nuspec.dependency_groups.len().checked_sub(1);
+                }
+                if path.len() >= MAX_ELEMENT_DEPTH {
+                    return Err(Error::InvalidPackage(format!(
+                        "nuspec nests deeper than {MAX_ELEMENT_DEPTH} elements"
+                    )));
                 }
                 path.push(name);
+                check_limits(&nuspec)?;
             }
             Ok(Event::Text(e)) => {
                 // quick-xml 0.41 split text handling: `xml10_content` decodes and
@@ -146,6 +165,31 @@ pub fn parse_nuspec(xml: &str) -> Result<Nuspec, Error> {
         return Err(Error::InvalidPackage("nuspec is missing <version>".into()));
     }
     Ok(nuspec)
+}
+
+/// Reject a manifest that has grown past the structural limits.
+fn check_limits(n: &Nuspec) -> Result<(), Error> {
+    if n.dependency_groups.len() > MAX_DEPENDENCY_GROUPS {
+        return Err(Error::InvalidPackage(format!(
+            "nuspec declares more than {MAX_DEPENDENCY_GROUPS} dependency groups"
+        )));
+    }
+    if n.package_types.len() > MAX_PACKAGE_TYPES {
+        return Err(Error::InvalidPackage(format!(
+            "nuspec declares more than {MAX_PACKAGE_TYPES} package types"
+        )));
+    }
+    let deps: usize = n
+        .dependency_groups
+        .iter()
+        .map(|g| g.dependencies.len())
+        .sum();
+    if deps > MAX_DEPENDENCIES {
+        return Err(Error::InvalidPackage(format!(
+            "nuspec declares more than {MAX_DEPENDENCIES} dependencies"
+        )));
+    }
+    Ok(())
 }
 
 /// Process an element whose data lives entirely in its attributes. Shared by

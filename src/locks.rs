@@ -54,16 +54,27 @@ fn acquire(reg: &mut Registry, key: String) -> Arc<AsyncMutex<()>> {
 /// Acquire the lock for one package version. The returned guard releases on
 /// drop. Keys are normalized so callers using different casing agree.
 pub async fn lock_version(id: &str, normalized_version: &str) -> OwnedMutexGuard<()> {
+    mutex_for(id, normalized_version).lock_owned().await
+}
+
+/// Take the lock only if it is free right now, otherwise return `None`.
+///
+/// For work that another task is already doing and that nobody needs done
+/// twice — a read-through mirror fetch, say — waiting is worse than declining:
+/// the waiter would hold a request open for as long as the winner takes, while
+/// its result will be there for the next request anyway.
+pub fn try_lock_version(id: &str, normalized_version: &str) -> Option<OwnedMutexGuard<()>> {
+    mutex_for(id, normalized_version).try_lock_owned().ok()
+}
+
+fn mutex_for(id: &str, normalized_version: &str) -> Arc<AsyncMutex<()>> {
     let key = format!(
         "{}/{}",
         id.to_ascii_lowercase(),
         normalized_version.to_ascii_lowercase()
     );
-    let mutex = {
-        let mut reg = registry().lock().expect("version-lock registry poisoned");
-        acquire(&mut reg, key)
-    };
-    mutex.lock_owned().await
+    let mut reg = registry().lock().expect("version-lock registry poisoned");
+    acquire(&mut reg, key)
 }
 
 #[cfg(test)]
@@ -92,6 +103,17 @@ mod tests {
         }
         // Never more than one holder of the same key at a time.
         assert_eq!(max.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn try_lock_declines_instead_of_waiting() {
+        let held = lock_version("Busy", "1.0.0").await;
+        // A second caller must not block behind the holder.
+        assert!(try_lock_version("busy", "1.0.0").is_none());
+        // A different version is unaffected.
+        assert!(try_lock_version("busy", "2.0.0").is_some());
+        drop(held);
+        assert!(try_lock_version("Busy", "1.0.0").is_some());
     }
 
     #[tokio::test]

@@ -498,17 +498,23 @@ fn feed_routes(state: AppState) -> Router {
                 .route("/admin/packages/{id}", get(admin_package))
                 .route(
                     "/admin/packages/{id}/{version}/disable",
-                    post(admin_disable),
+                    admin_post(admin_disable),
                 )
-                .route("/admin/packages/{id}/{version}/enable", post(admin_enable))
-                .route("/admin/packages/{id}/{version}/delete", post(admin_delete))
+                .route(
+                    "/admin/packages/{id}/{version}/enable",
+                    admin_post(admin_enable),
+                )
+                .route(
+                    "/admin/packages/{id}/{version}/delete",
+                    admin_post(admin_delete),
+                )
                 .route(
                     "/admin/packages/{id}/{version}/approve",
-                    post(admin_approve),
+                    admin_post(admin_approve),
                 )
                 .route(
                     "/admin/packages/{id}/{version}/promote",
-                    post(admin_promote),
+                    admin_post(admin_promote),
                 );
         }
     } else {
@@ -516,6 +522,21 @@ fn feed_routes(state: AppState) -> Router {
     }
 
     router.with_state(state)
+}
+
+/// An admin form POST, capped at a size a form can plausibly be.
+///
+/// The global body limit is disabled so package uploads can stream to disk, but
+/// these handlers read the body into memory to check the CSRF field. Without a
+/// cap of their own, an authenticated admin POST with a multi-gigabyte body
+/// would be buffered in full.
+fn admin_post<H, T>(handler: H) -> axum::routing::MethodRouter<AppState>
+where
+    H: axum::handler::Handler<T, AppState>,
+    T: 'static,
+{
+    const MAX_ADMIN_FORM_BYTES: usize = 64 * 1024;
+    post(handler).layer(DefaultBodyLimit::max(MAX_ADMIN_FORM_BYTES))
 }
 
 // ---------------------------------------------------------------------------
@@ -1038,6 +1059,26 @@ async fn download_symbol(
     if !file.eq_ignore_ascii_case(&file2) {
         return Err(Error::PackageNotFound);
     }
+
+    // The symbol *store* is global — a PDB is addressed by its own signature,
+    // not by feed — so serving straight from it would hand a caller symbols for
+    // a package that only some other feed contains. Resolve the owning package
+    // first and require that this feed can actually serve it, which also makes
+    // an admin-disabled or still-pending version withhold its symbols.
+    let owner = state
+        .db
+        .find_symbol(&key, &file)
+        .await?
+        .ok_or(Error::PackageNotFound)?;
+    let owner_version = parse_version(&owner.normalized_version)?;
+    if !state
+        .db
+        .is_servable(state.feed(), &owner.lower_id, &owner_version)
+        .await?
+    {
+        return Err(Error::PackageNotFound);
+    }
+
     let content = state.storage.get_symbol(&key, &file).await?;
     match content {
         // A symbol is addressed by its own content signature, so the key itself

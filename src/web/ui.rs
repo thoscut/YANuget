@@ -1327,6 +1327,7 @@ mod tests {
             has_readme: false,
             has_embedded_icon: false,
             is_development_dependency: false,
+            require_license_acceptance: false,
             is_semver2: false,
             package_size: 2048,
             package_hash: "h".into(),

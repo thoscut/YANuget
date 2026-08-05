@@ -6,13 +6,10 @@
 
 #[test]
 fn shipped_example_config_parses() {
-    let text = std::fs::read_to_string(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/yanuget.example.toml"
-    ))
-    .expect("example config is present");
-    let config: yanuget::config::Config =
-        toml::from_str(&text).expect("example config parses");
+    let text =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/yanuget.example.toml"))
+            .expect("example config is present");
+    let config: yanuget::config::Config = toml::from_str(&text).expect("example config parses");
 
     // Spot-check that it really deserialized rather than falling back to
     // defaults for everything.

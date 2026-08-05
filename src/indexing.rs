@@ -275,6 +275,7 @@ fn build_package(
         has_readme: readme_bytes.is_some(),
         has_embedded_icon: icon_bytes.is_some(),
         is_development_dependency: n.development_dependency,
+        require_license_acceptance: n.require_license_acceptance,
         package_size: summary.size,
         package_hash: summary.sha512_base64.clone(),
         package_hash_algorithm: "SHA512".to_string(),

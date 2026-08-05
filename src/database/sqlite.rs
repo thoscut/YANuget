@@ -63,6 +63,7 @@ CREATE TABLE IF NOT EXISTS packages (
     has_readme                INTEGER NOT NULL,
     has_embedded_icon         INTEGER NOT NULL,
     is_development_dependency INTEGER NOT NULL,
+    require_license_acceptance INTEGER NOT NULL DEFAULT 0,
     package_size              INTEGER NOT NULL,
     package_hash              TEXT    NOT NULL,
     package_hash_algorithm    TEXT    NOT NULL,
@@ -157,6 +158,15 @@ impl SqliteDatabase {
         sqlx::raw_sql(SCHEMA).execute(&pool).await?;
         // Migrate databases created before the admin `enabled` column existed.
         ensure_column(&pool, "packages", "enabled", "INTEGER NOT NULL DEFAULT 1").await?;
+        // Databases predating the requireLicenseAcceptance passthrough. The
+        // default is `false`, which is exactly what those rows were reported as.
+        ensure_column(
+            &pool,
+            "packages",
+            "require_license_acceptance",
+            "INTEGER NOT NULL DEFAULT 0",
+        )
+        .await?;
         // Drop the legacy (feed, lower_id) index, now subsumed by the wider
         // covering index `idx_feed_packages_rank` created above.
         sqlx::query("DROP INDEX IF EXISTS idx_feed_packages_feed")
@@ -267,13 +277,14 @@ impl PackageDatabase for SqliteDatabase {
                 project_url, repository_url, repository_type, min_client_version,
                 release_notes, language, title, summary, tags,
                 has_readme, has_embedded_icon, is_development_dependency,
+                require_license_acceptance,
                 package_size, package_hash, package_hash_algorithm,
                 published, downloads, package_types, dependencies
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
                 ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21,
                 ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29,
-                ?30, ?31, ?32, ?33, ?34, ?35, ?36
+                ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37
             )
             ON CONFLICT(lower_id, normalized_version) DO NOTHING"#,
         )
@@ -306,6 +317,7 @@ impl PackageDatabase for SqliteDatabase {
         .bind(i64::from(p.has_readme))
         .bind(i64::from(p.has_embedded_icon))
         .bind(i64::from(p.is_development_dependency))
+        .bind(i64::from(p.require_license_acceptance))
         .bind(p.package_size as i64)
         .bind(&p.package_hash)
         .bind(&p.package_hash_algorithm)
@@ -895,6 +907,7 @@ fn build_package(row: &SqliteRow, listed: bool, enabled: bool, downloads: u64) -
         has_readme: row.try_get::<i64, _>("has_readme")? != 0,
         has_embedded_icon: row.try_get::<i64, _>("has_embedded_icon")? != 0,
         is_development_dependency: row.try_get::<i64, _>("is_development_dependency")? != 0,
+        require_license_acceptance: row.try_get::<i64, _>("require_license_acceptance")? != 0,
         is_semver2: row.try_get::<i64, _>("is_semver2")? != 0,
         package_size: row.try_get::<i64, _>("package_size")? as u64,
         package_hash: row.try_get("package_hash")?,
@@ -958,6 +971,7 @@ mod tests {
             has_readme: false,
             has_embedded_icon: false,
             is_development_dependency: false,
+            require_license_acceptance: false,
             is_semver2: NuGetVersion::parse(version).unwrap().is_semver2(),
             package_size: 25_000_000_000, // 25 GB — exercises i64 sizing
             package_hash: "aGFzaA==".into(),

@@ -93,6 +93,7 @@ fn build_nupkg(id: &str, version: &str, payload_filler: &[u8]) -> Vec<u8> {
     <authors>Test Author</authors>
     <description>An integration test package for {id}.</description>
     <tags>integration test</tags>
+    <requireLicenseAcceptance>true</requireLicenseAcceptance>
     <dependencies>
       <group targetFramework="net8.0">
         <dependency id="Newtonsoft.Json" version="[13.0.1, )" />
@@ -2207,4 +2208,109 @@ async fn health_reports_readiness_and_liveness() {
         let resp = server.client.get(server.url(path)).send().await.unwrap();
         assert!(resp.status().is_success(), "{path} was {}", resp.status());
     }
+}
+
+#[tokio::test]
+async fn symbols_are_scoped_to_the_feed_that_owns_the_package() {
+    let server = spawn_feeds(|c| {
+        c.api_key = Some(API_KEY.into());
+        c.feeds = vec![feed("one"), feed("two")];
+    })
+    .await;
+
+    // Publish a package and its symbols into /one only.
+    let resp = push_to(
+        &server,
+        "/one/api/v2/package",
+        API_KEY,
+        build_nupkg("Sym.Scoped", "1.0.0", b"x"),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+
+    let pdb = build_portable_pdb(&[42u8; 16]);
+    let snupkg = build_snupkg("Sym.Scoped", "1.0.0", "sym.scoped.pdb", &pdb);
+    let part = reqwest::multipart::Part::bytes(snupkg)
+        .file_name("symbols.snupkg")
+        .mime_str("application/octet-stream")
+        .unwrap();
+    let resp = server
+        .client
+        .put(server.url("/one/api/v2/symbol"))
+        .header("X-NuGet-ApiKey", API_KEY)
+        .multipart(reqwest::multipart::Form::new().part("package", part))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+
+    // The SSQP key is a property of the PDB itself, so anyone holding the .pdb
+    // can compute it and ask any feed for it. The store is global — a symbol is
+    // addressed by its signature, not by feed — so the feed that owns the
+    // package is what has to decide who may fetch it.
+    let ssqp = symbol_key_for(&pdb);
+    let path = format!("/download/symbols/sym.scoped.pdb/{ssqp}/sym.scoped.pdb");
+
+    let from_owner = server
+        .client
+        .get(server.url(&format!("/one{path}")))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        from_owner.status().is_success(),
+        "the owning feed should serve its own symbols: {}",
+        from_owner.status()
+    );
+
+    // /two never received this package, so it must not serve its symbols.
+    let from_other = server
+        .client
+        .get(server.url(&format!("/two{path}")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        from_other.status(),
+        reqwest::StatusCode::NOT_FOUND,
+        "a feed without the package leaked its symbols"
+    );
+}
+
+/// The SSQP key a debugger computes for a Portable PDB: the GUID in canonical
+/// order, upper-case hex, followed by the literal age `FFFFFFFF`.
+fn symbol_key_for(pdb: &[u8]) -> String {
+    // The fixture writes the GUID immediately after the 8-byte `#Pdb` name.
+    let guid_at = pdb.len() - 20;
+    let g = &pdb[guid_at..guid_at + 16];
+    let order = [3, 2, 1, 0, 5, 4, 7, 6, 8, 9, 10, 11, 12, 13, 14, 15];
+    let mut s = String::new();
+    for i in order {
+        s.push_str(&format!("{:02X}", g[i]));
+    }
+    s.push_str("FFFFFFFF");
+    s
+}
+
+#[tokio::test]
+async fn require_license_acceptance_is_reported_as_the_author_declared_it() {
+    let server = spawn().await;
+    push_multipart(&server, API_KEY, build_nupkg("Lic.Accept", "1.0.0", b"x")).await;
+
+    // The fixture's nuspec sets <requireLicenseAcceptance>true</...>. Reporting
+    // it as false would tell clients the author asked for no acceptance step
+    // when they did.
+    let reg: serde_json::Value = server
+        .client
+        .get(server.url("/v3/registration/lic.accept/index.json"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        reg["items"][0]["items"][0]["catalogEntry"]["requireLicenseAcceptance"],
+        serde_json::Value::Bool(true)
+    );
 }

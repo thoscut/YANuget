@@ -44,6 +44,10 @@ pub struct Package {
     pub has_embedded_icon: bool,
     /// Whether this version requires development dependency semantics.
     pub is_development_dependency: bool,
+    /// The nuspec's `<requireLicenseAcceptance>`. Reported verbatim to clients:
+    /// a package whose author asked for explicit licence acceptance must not be
+    /// advertised as though it did not.
+    pub require_license_acceptance: bool,
     /// `true` when the version requires `SemVerLevel=2.0.0` to be visible.
     pub is_semver2: bool,
     /// Total uncompressed-irrelevant on-disk size of the `.nupkg`, in bytes.
