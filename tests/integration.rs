@@ -2592,3 +2592,45 @@ async fn http2_clients_are_given_this_servers_urls_not_localhost() {
         .unwrap();
     assert!(versions.status().is_success());
 }
+
+#[tokio::test]
+async fn autocomplete_does_not_suggest_packages_the_filters_exclude() {
+    let server = spawn().await;
+    // One package with only a pre-release version, one with a stable release.
+    push_multipart(
+        &server,
+        API_KEY,
+        build_nupkg("Pre.Only", "1.0.0-alpha", b"x"),
+    )
+    .await;
+    push_multipart(&server, API_KEY, build_nupkg("Stable.One", "1.0.0", b"x")).await;
+
+    let ids = |q: &str| {
+        let url = server.url(q);
+        let client = server.client.clone();
+        async move {
+            let doc: serde_json::Value =
+                client.get(url).send().await.unwrap().json().await.unwrap();
+            doc["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        }
+    };
+
+    // With pre-releases included, both are suggested.
+    let all = ids("/v3/autocomplete?q=&prerelease=true").await;
+    assert!(all.contains(&"Pre.Only".to_string()));
+    assert!(all.contains(&"Stable.One".to_string()));
+
+    // Without them, suggesting `Pre.Only` sends the caller to a package it will
+    // then find nothing in.
+    let stable = ids("/v3/autocomplete?q=&prerelease=false").await;
+    assert!(
+        !stable.contains(&"Pre.Only".to_string()),
+        "suggested a package with no matching version: {stable:?}"
+    );
+    assert!(stable.contains(&"Stable.One".to_string()));
+}

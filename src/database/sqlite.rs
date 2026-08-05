@@ -669,23 +669,31 @@ impl PackageDatabase for SqliteDatabase {
         &self,
         feed: &str,
         query: &str,
+        include_prerelease: bool,
+        include_semver2: bool,
         skip: i64,
         take: i64,
     ) -> Result<Vec<String>> {
         let q = query.trim().to_lowercase();
         let pattern = like_pattern(&q);
+        // The version predicates sit inside the grouped scan, so an id survives
+        // only if it still has at least one version the caller would accept.
         let rows = sqlx::query(
             r#"SELECT MAX(p.id) AS id FROM packages p JOIN feed_packages fp
                    ON fp.lower_id = p.lower_id AND fp.normalized_version = p.normalized_version
                WHERE fp.feed = ?1 AND fp.listed = 1 AND fp.enabled = 1 AND fp.pending = 0
                  AND (?2 = '' OR p.lower_id LIKE ?3 ESCAPE '\')
+                 AND (?4 = 1 OR p.is_prerelease = 0)
+                 AND (?5 = 1 OR p.is_semver2 = 0)
                GROUP BY p.lower_id
                ORDER BY p.lower_id ASC
-               LIMIT ?4 OFFSET ?5"#,
+               LIMIT ?6 OFFSET ?7"#,
         )
         .bind(feed)
         .bind(&q)
         .bind(&pattern)
+        .bind(i64::from(include_prerelease))
+        .bind(i64::from(include_semver2))
         .bind(take.max(0))
         .bind(skip.max(0))
         .fetch_all(&self.pool)
@@ -1247,14 +1255,20 @@ mod tests {
             .await
             .unwrap();
 
-        let ac = db.autocomplete(FEED, "contoso", 0, 20).await.unwrap();
+        let ac = db
+            .autocomplete(FEED, "contoso", true, true, 0, 20)
+            .await
+            .unwrap();
         assert_eq!(ac.len(), 2);
         assert!(ac.contains(&"Contoso.Cli".to_string()));
 
         let v = NuGetVersion::parse("1.0.0").unwrap();
         assert!(db.delete_package_data("contoso.cli", &v).await.unwrap());
         assert!(!db.exists(FEED, "contoso.cli", &v).await.unwrap());
-        let ac = db.autocomplete(FEED, "contoso", 0, 20).await.unwrap();
+        let ac = db
+            .autocomplete(FEED, "contoso", true, true, 0, 20)
+            .await
+            .unwrap();
         assert_eq!(ac, vec!["Contoso.Core".to_string()]);
     }
 

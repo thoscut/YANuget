@@ -244,10 +244,17 @@ pub trait PackageDatabase: Send + Sync {
     async fn search(&self, feed: &str, request: &SearchRequest) -> Result<SearchPage>;
 
     /// Autocomplete package ids in `feed` by prefix/substring.
+    /// Package ids matching `query`, for the autocomplete service.
+    ///
+    /// `include_prerelease`/`include_semver2` mirror the search filters: an id
+    /// whose only versions are excluded by them must not be suggested, or the
+    /// caller is pointed at a package it will then find nothing in.
     async fn autocomplete(
         &self,
         feed: &str,
         query: &str,
+        include_prerelease: bool,
+        include_semver2: bool,
         skip: i64,
         take: i64,
     ) -> Result<Vec<String>>;
