@@ -21,6 +21,15 @@ updates:
     groups:
       actions:
         patterns: ["*"]
+    ignore:
+      # `dtolnay/rust-toolchain@1.88.0` does not name a version of the action —
+      # that ref *is* the toolchain the action installs, and it is pinned to the
+      # crate's MSRV on purpose. Dependabot cannot tell the two apart and
+      # "upgraded" it to 1.100.0, which would have left a job still called
+      # "Minimum supported Rust (1.88)" installing Rust 1.100 and checking
+      # nothing. It failed loudly that time; a version that existed would have
+      # passed and been worse.
+      - dependency-name: dtolnay/rust-toolchain
 
   - package-ecosystem: docker
     directory: /
