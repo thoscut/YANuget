@@ -117,6 +117,12 @@ footer{border-top:1px solid var(--border);color:var(--muted);font-size:13px;padd
 footer a[aria-current=page]{color:var(--fg);font-weight:600}\
 ";
 
+/// The inline SVG favicon, as a data URI so the page loads no external asset.
+const FAVICON: &str = "data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'\
+%20viewBox='0%200%2032%2032'%3E%3Crect%20width='32'%20height='32'%20rx='6'%20fill='%23512bd4'/%3E\
+%3Ctext%20x='16'%20y='22'%20font-size='15'%20font-family='sans-serif'%20font-weight='700'\
+%20fill='white'%20text-anchor='middle'%3EYN%3C/text%3E%3C/svg%3E";
+
 /// The form field (and header) carrying the admin CSRF token.
 pub const CSRF_FIELD: &str = "_csrf";
 
@@ -211,6 +217,32 @@ fn csp_hash(content: &str) -> String {
 ///
 /// `active` marks the current footer nav item (`"stats"`, `"settings"`, or `""`).
 fn layout(urls: &UrlBuilder, title: &str, query: &str, active: &str, body: &str) -> String {
+    layout_with_chrome(urls, title, query, active, body, Chrome::Feed)
+}
+
+/// Which navigation a page can offer.
+///
+/// Search, the service index, the docs and the stats/settings pages are all
+/// *feed-scoped* routes: in multi-feed mode they exist only under `/{feed}`.
+/// The feed-index page at the root has none of them, so offering them there
+/// gives a first-time visitor a search box that returns a bare 404 and three
+/// dead links — on the very first page they see.
+#[derive(Clone, Copy, PartialEq)]
+enum Chrome {
+    /// Inside a feed: everything is reachable.
+    Feed,
+    /// The multi-feed root: only the feed list itself.
+    Root,
+}
+
+fn layout_with_chrome(
+    urls: &UrlBuilder,
+    title: &str,
+    query: &str,
+    active: &str,
+    body: &str,
+    chrome: Chrome,
+) -> String {
     let cur = |name: &str| {
         if name == active {
             " aria-current=\"page\""
@@ -218,10 +250,25 @@ fn layout(urls: &UrlBuilder, title: &str, query: &str, active: &str, body: &str)
             ""
         }
     };
+    if chrome == Chrome::Root {
+        return format!(
+            "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
+<link rel=\"icon\" href=\"{FAVICON}\">\
+<title>{title}</title><style>{STYLE}</style></head><body>\
+<a class=\"skip\" href=\"#main\">Skip to content</a>\
+<header><div class=\"wrap\">\
+<a class=\"logo\" href=\"/\">YA<span>NuGet</span></a></div></header>\
+<main id=\"main\" tabindex=\"-1\"><div class=\"wrap\">{body}</div></main>\
+<footer><div class=\"wrap\">Served by YANuget</div></footer>\
+<script>{COPY_SCRIPT_BODY}</script></body></html>",
+            title = escape_html(title),
+        );
+    }
     format!(
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
 <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
-<link rel=\"icon\" href=\"data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2032%2032'%3E%3Crect%20width='32'%20height='32'%20rx='6'%20fill='%23512bd4'/%3E%3Ctext%20x='16'%20y='22'%20font-size='15'%20font-family='sans-serif'%20font-weight='700'%20fill='white'%20text-anchor='middle'%3EYN%3C/text%3E%3C/svg%3E\">\
+<link rel=\"icon\" href=\"{FAVICON}\">\
 <title>{title}</title><style>{STYLE}</style></head><body>\
 <a class=\"skip\" href=\"#main\">Skip to content</a>\
 <header><div class=\"wrap\">\
@@ -259,15 +306,25 @@ pub fn gallery_page(
     take: i64,
 ) -> String {
     let body = if page.groups.is_empty() {
-        if query.trim().is_empty() {
-            first_run_panel(urls)
-        } else {
+        let browse_all = escape_html(&urls.app("/packages"));
+        if !query.trim().is_empty() {
             format!(
                 "<div class=\"empty\"><p>No packages match \u{201c}{}\u{201d}.</p>\
-                 <p><a href=\"{}\">Clear search and browse all packages</a></p></div>",
+                 <p><a href=\"{browse_all}\">Clear search and browse all packages</a></p></div>",
                 escape_html(query),
-                escape_html(&urls.app("/packages"))
             )
+        } else if page.total_hits > 0 {
+            // Empty page, non-empty feed: `skip` is past the end. That happens
+            // from a bookmarked link, a hand-edited URL, or a `skip` that was
+            // valid until a delete or a retention sweep shortened the list.
+            // Answering it with the onboarding panel told an operator with
+            // thousands of packages that their feed was empty.
+            format!(
+                "<div class=\"empty\"><p>There is nothing on this page.</p>\
+                 <p><a href=\"{browse_all}\">Back to the first page</a></p></div>"
+            )
+        } else {
+            first_run_panel(urls)
         }
     } else {
         let mut cards = String::new();
@@ -385,7 +442,14 @@ fn pager(urls: &UrlBuilder, query: &str, skip: i64, take: i64, shown: i64, total
     let to = skip + shown;
     let link = |target: i64, enabled: bool, label: &str| {
         if enabled {
-            format!("<a class=\"btn\" href=\"{base}?q={q}&skip={target}\">{label}</a>")
+            // `take` has to be carried, or paging silently changes the page size
+            // back to the default: `?take=5` showed "1–5 of N", and Next then
+            // returned twenty items while the counter still claimed five. And
+            // `&` is `&amp;` inside an HTML attribute — a bare one is only
+            // tolerated because no entity name follows it here.
+            format!(
+                "<a class=\"btn\" href=\"{base}?q={q}&amp;skip={target}&amp;take={take}\">{label}</a>"
+            )
         } else {
             format!("<span class=\"btn\" aria-disabled=\"true\">{label}</span>")
         }
@@ -786,7 +850,7 @@ pub fn feeds_index_page(feeds: &[(String, String)]) -> String {
          <p class=\"muted\">This server hosts several NuGet feeds. Pick one:</p>\
          <div class=\"card\">{list}</div>"
     );
-    layout(&urls, "Feeds \u{2014} YANuget", "", "", &body)
+    layout_with_chrome(&urls, "Feeds \u{2014} YANuget", "", "", &body, Chrome::Root)
 }
 
 /// Replace any `user:password@` in a URL with `***@`.
@@ -1392,6 +1456,63 @@ mod tests {
         // Empty result for a query offers a "clear search" link.
         let empty = gallery_page(&urls, &page_of(&[]), "zzz", 0, 20);
         assert!(empty.contains("Clear search"));
+    }
+
+    #[test]
+    fn the_feed_index_offers_only_links_that_exist_at_the_root() {
+        // In multi-feed mode the root router mounts `/`, `/health` and nothing
+        // else — every feed route lives under `/{name}`. The shared chrome
+        // pointed the search form and three footer links at feed routes, so the
+        // first page a visitor saw had a search box returning a bare 404.
+        let html = feeds_index_page(&[
+            ("stable".into(), "/stable".into()),
+            ("dev".into(), "/dev".into()),
+        ]);
+        assert!(
+            !html.contains("<form"),
+            "no search form at the root: {html}"
+        );
+        for dead in [
+            "/packages",
+            "/stats",
+            "/settings",
+            "/docs/",
+            "/v3/index.json\"",
+        ] {
+            assert!(
+                !html.contains(&format!("\"{dead}")),
+                "root page links {dead}, which is not mounted there: {html}"
+            );
+        }
+        // The feed links themselves are the point of the page.
+        assert!(html.contains("href=\"/stable\""), "{html}");
+        assert!(html.contains("href=\"/dev/v3/index.json\""), "{html}");
+    }
+
+    #[test]
+    fn an_empty_page_of_a_non_empty_feed_is_not_the_onboarding_panel() {
+        // A bookmarked `skip`, or one that outlived a delete, lands here. The
+        // onboarding panel told an operator with a full feed it was empty.
+        let urls = UrlBuilder::new("https://host");
+        let mut page = page_of(&[]);
+        page.total_hits = 5000;
+        let html = gallery_page(&urls, &page, "", 99_999, 20);
+        assert!(!html.contains("Your feed is live"), "{html}");
+        assert!(html.contains("nothing on this page"), "{html}");
+        assert!(html.contains("Back to the first page"), "{html}");
+    }
+
+    #[test]
+    fn paging_keeps_the_page_size_and_escapes_the_separator() {
+        let urls = UrlBuilder::new("https://host");
+        let mut page = page_of(&["A", "B"]);
+        page.total_hits = 40;
+        let html = gallery_page(&urls, &page, "", 0, 5);
+        // Carrying `take` is what keeps the "1-5 of 40" counter honest on the
+        // next page.
+        assert!(html.contains("skip=5&amp;take=5"), "{html}");
+        // A bare `&` in an attribute is invalid HTML.
+        assert!(!html.contains("?q=&skip="), "{html}");
     }
 
     #[test]

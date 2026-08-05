@@ -71,16 +71,25 @@ generated rather than shipped in the crate.
 
 The server prints its listen address and service index URL on startup.
 **TLS is on by default**, so it listens on `https://0.0.0.0:5000` with an
-auto-generated self-signed certificate (cached under `{data_dir}/tls/`). For
-local testing, trust that certificate or pass `--insecure`/`-k` to your client;
-for production, provide a real cert via `tls_cert_path`/`tls_key_path`, or set
-`tls_enabled = false` to run plain HTTP behind a TLS-terminating reverse proxy.
-See [docs/configuration.md](docs/configuration.md#tls).
+auto-generated self-signed certificate (cached under `{data_dir}/tls/`) — note
+the `https` in the commands below.
+
+Nothing will trust that certificate yet, and `dotnet nuget` and `choco` have no
+"ignore the certificate" switch, so pick one of:
+
+- **trust it** — import `{data_dir}/tls/cert.pem` into your OS trust store;
+- **turn TLS off for local work** — `YANUGET_TLS_ENABLED=false`, then use
+  `http://localhost:5000` in the commands below;
+- **use a real certificate** in production via `tls_cert_path`/`tls_key_path`,
+  or terminate TLS at a reverse proxy and set `tls_enabled = false`.
+
+`curl` is the exception — it takes `-k`/`--insecure`, which is why the examples
+further down use it. See [docs/configuration.md](docs/configuration.md#tls).
 
 ### Add the feed and push a package
 
 ```bash
-dotnet nuget add source http://localhost:5000/v3/index.json -n yanuget
+dotnet nuget add source https://localhost:5000/v3/index.json -n yanuget
 
 dotnet nuget push MyPackage.1.0.0.nupkg \
   --source yanuget \
@@ -90,7 +99,7 @@ dotnet nuget push MyPackage.1.0.0.nupkg \
 ### Restore from it
 
 ```bash
-dotnet restore --source http://localhost:5000/v3/index.json
+dotnet restore --source https://localhost:5000/v3/index.json
 ```
 
 ---
@@ -223,13 +232,13 @@ feed. Chocolatey CLI v2+ speaks the NuGet v3 protocol, so point it at the
 service index:
 
 ```powershell
-choco source add -n=yanuget -s="http://localhost:5000/v3/index.json"
+choco source add -n=yanuget -s="https://localhost:5000/v3/index.json"
 
 # Push (the API key is your YANUGET_API_KEY)
-choco push my-package.1.0.0.nupkg -s="http://localhost:5000/v3/index.json" -k="change-me"
+choco push my-package.1.0.0.nupkg -s="https://localhost:5000/v3/index.json" -k="change-me"
 
 # Install
-choco install my-package --version 1.0.0 --source="http://localhost:5000/v3/index.json"
+choco install my-package --version 1.0.0 --source="https://localhost:5000/v3/index.json"
 ```
 
 The web gallery's package page shows the exact `choco install` command for each
@@ -352,7 +361,7 @@ requires_approval = true        # versions are pending until approved
 
 ### Upstream mirroring
 
-A feed with `[feeds.<name>.mirror] enabled = true` becomes a read-through cache:
+A feed with `[feeds.mirror] enabled = true` becomes a read-through cache:
 on a request for a package it does not have, YANuget fetches that package's
 versions from the upstream V3 feed (default `https://api.nuget.org/v3/index.json`),
 streams each `.nupkg` to disk and indexes it locally. Mirrored versions honour
@@ -389,7 +398,7 @@ Source credentials accept `--source-username`/`--source-password` (Basic),
 
 ### Offline license policy
 
-A feed's `[feeds.<name>.license_policy]` evaluates each pushed/mirrored
+A feed's `[feeds.license_policy]` evaluates each pushed/mirrored
 package's SPDX `licenseExpression` (or legacy `licenseUrl`) against `allowed` /
 `blocked` lists — no network access. With `action = "warn"` (default) a
 violation is accepted but **flagged** (visible in `/admin`); with

@@ -84,5 +84,5 @@ Configuration choices that matter most:
 - **Set `max_package_size_bytes`** on any feed open to more than a few people.
 - **Keep `admin_api_key` distinct** from the push key, and do not expose `/admin`
   to the internet.
-- **Review `[feeds.<name>.mirror]` upstreams.** A mirror makes your server fetch
+- **Review `[feeds.mirror]` upstreams.** A mirror makes your server fetch
   from, and republish under your name, whatever that upstream serves.

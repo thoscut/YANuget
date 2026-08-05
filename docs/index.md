@@ -30,7 +30,7 @@ YANUGET_API_KEY=change-me ./target/release/yanuget
 
 ```bash
 # Add the feed and push a package
-dotnet nuget add source http://localhost:5000/v3/index.json -n yanuget
+dotnet nuget add source https://localhost:5000/v3/index.json -n yanuget
 dotnet nuget push MyPackage.1.0.0.nupkg --source yanuget --api-key change-me
 ```
 

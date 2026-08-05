@@ -217,7 +217,7 @@ responses also carry a `Strict-Transport-Security` header (one year).
   detail goes to the log only.
 - Unknown keys in the TOML file are a **hard error**, so a mistyped security
   setting fails loudly instead of silently reverting to its default.
-- A feed with `[feeds.<name>.mirror]` follows resource URLs chosen by the
+- A feed with `[feeds.mirror]` follows resource URLs chosen by the
   *upstream*. Non-HTTP schemes and private/loopback targets are refused unless
   `allow_private_upstream = true`, mirrored downloads are bounded by
   `max_package_size_bytes` and `max_versions_per_package`, and a mirrored
