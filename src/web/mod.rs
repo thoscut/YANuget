@@ -1307,10 +1307,17 @@ async fn push_symbol_package(State(state): State<AppState>, request: Request) ->
     let (temp_path, mut file) = state.create_temp().await?;
     let limit = state.config.max_package_size_bytes;
 
-    if let Err(e) = write_upload(request, &mut file, is_multipart, limit, &state).await {
-        let _ = tokio::fs::remove_file(&temp_path).await;
-        return Err(e);
-    }
+    // The size and hash are computed while the bytes stream past, so recording
+    // them costs nothing. Dropping them left the one number in the log that says
+    // how much a symbol push actually cost, and any later question about which
+    // bytes were stored, unanswerable.
+    let summary = match write_upload(request, &mut file, is_multipart, limit, &state).await {
+        Ok(summary) => summary,
+        Err(e) => {
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            return Err(e);
+        }
+    };
     // Flush the OS page cache to stable storage before the payload is renamed
     // into the store. The database row that follows says the package exists; if
     // a crash lands between the rename and the kernel's own writeback, that row
@@ -1333,6 +1340,8 @@ async fn push_symbol_package(State(state): State<AppState>, request: Request) ->
         version = %result.version.normalized(),
         indexed = result.indexed,
         skipped = result.skipped,
+        bytes = summary.size,
+        sha512 = %summary.sha512_base64,
         "indexed symbol package",
     );
     Ok(StatusCode::CREATED.into_response())
