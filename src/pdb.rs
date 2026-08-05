@@ -43,15 +43,17 @@ fn portable_pdb_guid(bytes: &[u8]) -> Option<[u8; 16]> {
     let version_padded = version_len.div_ceil(4) * 4;
     let mut pos = 16usize.checked_add(version_padded)?;
 
-    // Flags(2), then Streams(2) — the number of stream headers.
+    // Flags(2), then Streams(2) — the number of stream headers. Every offset
+    // below comes from the file itself, so all of this arithmetic is checked:
+    // a crafted PDB must not be able to overflow an index and panic the server.
     let _flags = read_u16(bytes, pos)?;
-    let stream_count = read_u16(bytes, pos + 2)? as usize;
+    let stream_count = read_u16(bytes, pos.checked_add(2)?)? as usize;
     pos = pos.checked_add(4)?;
 
     // --- Stream headers (II.24.2.2) ---
     for _ in 0..stream_count {
         let offset = read_u32(bytes, pos)? as usize;
-        let _size = read_u32(bytes, pos + 4)?;
+        let _size = read_u32(bytes, pos.checked_add(4)?)?;
         pos = pos.checked_add(8)?;
 
         // Name: ASCII, NUL-terminated, padded to the next 4-byte boundary, at
@@ -62,7 +64,7 @@ fn portable_pdb_guid(bytes: &[u8]) -> Option<[u8; 16]> {
         if name == "#Pdb" {
             // The PDB id is the first 20 bytes of the stream; the GUID is the
             // leading 16.
-            let guid = bytes.get(offset..offset + 16)?;
+            let guid = bytes.get(offset..offset.checked_add(16)?)?;
             return guid.try_into().ok();
         }
     }
@@ -98,12 +100,12 @@ fn guid_to_hex(g: &[u8; 16]) -> String {
 }
 
 fn read_u16(bytes: &[u8], at: usize) -> Option<u16> {
-    let b = bytes.get(at..at + 2)?;
+    let b = bytes.get(at..at.checked_add(2)?)?;
     Some(u16::from_le_bytes([b[0], b[1]]))
 }
 
 fn read_u32(bytes: &[u8], at: usize) -> Option<u32> {
-    let b = bytes.get(at..at + 4)?;
+    let b = bytes.get(at..at.checked_add(4)?)?;
     Some(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
 }
 
@@ -157,5 +159,55 @@ mod tests {
         assert!(portable_pdb_signature(b"Microsoft C/C++ MSF 7.00\r\n").is_none());
         assert!(portable_pdb_signature(b"").is_none());
         assert!(portable_pdb_signature(b"not a pdb").is_none());
+    }
+
+    /// Every offset here comes from the file, so a crafted PDB must fail to
+    /// parse rather than panic — a panic in a push handler is a free DoS.
+    #[test]
+    fn hostile_pdbs_return_none_instead_of_panicking() {
+        let good = make_portable_pdb(&[1u8; 16]);
+
+        // Truncation at every length must be handled. Some prefixes still hold
+        // a complete GUID and legitimately parse; the requirement is that none
+        // of them panics.
+        for len in 0..good.len() {
+            let _ = portable_pdb_signature(&good[..len]);
+        }
+        // A file cut before the GUID cannot yield a key.
+        assert!(portable_pdb_signature(&good[..good.len() - 8]).is_none());
+
+        // A version length that runs past the end of the file.
+        let mut huge_version = good.clone();
+        huge_version[12..16].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(portable_pdb_signature(&huge_version).is_none());
+
+        // A stream count far larger than the headers actually present. Here the
+        // first header still is `#Pdb`, so the key is found before the bogus
+        // count matters — what must not happen is walking off the end.
+        let mut many_streams = good.clone();
+        let count_at = 16 + 12 + 2; // header + version + flags
+        many_streams[count_at..count_at + 2].copy_from_slice(&u16::MAX.to_le_bytes());
+        assert!(portable_pdb_signature(&many_streams).is_some());
+
+        // ...and with the name changed so the walk actually runs to the end of
+        // that inflated count, it must terminate with None rather than panic.
+        let mut many_streams_no_pdb = many_streams.clone();
+        let name_at = 16 + 12 + 4 + 8;
+        many_streams_no_pdb[name_at..name_at + 4].copy_from_slice(b"#Str");
+        assert!(portable_pdb_signature(&many_streams_no_pdb).is_none());
+
+        // A `#Pdb` stream whose offset points past the end of the file.
+        let mut bad_offset = good.clone();
+        let header_at = 16 + 12 + 4; // header + version + flags + streams
+        bad_offset[header_at..header_at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(portable_pdb_signature(&bad_offset).is_none());
+
+        // An unterminated stream name.
+        let mut no_terminator = good.clone();
+        let name_at = header_at + 8;
+        for b in &mut no_terminator[name_at..name_at + 8] {
+            *b = b'A';
+        }
+        assert!(portable_pdb_signature(&no_terminator).is_none());
     }
 }

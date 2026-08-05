@@ -70,6 +70,9 @@ struct MigrateArgs {
     /// Only discover and report what would be migrated; download nothing.
     #[arg(long)]
     dry_run: bool,
+    /// Skip any source package larger than this many bytes (default: no limit).
+    #[arg(long)]
+    max_package_size_bytes: Option<u64>,
 }
 
 #[tokio::main]
@@ -119,6 +122,7 @@ async fn run_server(config_path: Option<&str>) -> anyhow::Result<()> {
                 name: f.name.clone(),
                 prefix: f.prefix.clone(),
                 requires_approval: f.requires_approval,
+                license_policy: f.license_policy.clone(),
             })
             .collect::<Vec<_>>(),
     );
@@ -156,7 +160,12 @@ async fn run_server(config_path: Option<&str>) -> anyhow::Result<()> {
             let mut shutdown = shutdown_rx.clone();
             tracing::info!(feed = %feed_name, interval_hours = interval, "retention sweep enabled");
             tokio::spawn(async move {
-                let mut tick = tokio::time::interval(Duration::from_secs(interval * 3600));
+                // `interval_hours` comes from configuration as a `u64`; the
+                // multiplication into seconds would overflow (a panic in debug,
+                // a wrap to a tiny period in release — a sweep every few
+                // seconds). Saturating keeps an absurd value meaning "never".
+                let period = Duration::from_secs(interval.saturating_mul(3600));
+                let mut tick = tokio::time::interval(period);
                 loop {
                     tokio::select! {
                         _ = tick.tick() => {
@@ -174,6 +183,11 @@ async fn run_server(config_path: Option<&str>) -> anyhow::Result<()> {
                         _ = shutdown.changed() => break,
                     }
                 }
+                // Only reached on shutdown. If this task ever ends any other
+                // way it panicked, and a dropped `JoinHandle` would swallow
+                // that silently — retention would stop for the life of the
+                // process while `/settings` kept advertising "every N h".
+                tracing::debug!(feed = %feed_name, "retention sweep stopped");
             });
         }
     }
@@ -181,12 +195,23 @@ async fn run_server(config_path: Option<&str>) -> anyhow::Result<()> {
     let app = web::build_app(states);
     let addr = config.socket_addr();
 
+    // Rendered here, printed last — after any certificate or configuration
+    // warning — so the summary is what is left on screen, not scrolled off it.
+    let feed_names: Vec<&str> = feeds.iter().map(|f| f.name.as_str()).collect();
+    let banner = banner(
+        if config.tls_enabled { "https" } else { "http" },
+        addr,
+        &feed_names,
+        &config.data_dir,
+        feeds.iter().any(|f| f.api_keys.is_empty()),
+    );
+
     if config.tls_enabled {
-        serve_tls(app, addr, &config, shutdown_rx).await?;
+        serve_tls(app, addr, &config, &banner, shutdown_rx).await?;
     } else {
         let listener = tokio::net::TcpListener::bind(addr).await?;
         tracing::info!("YANuget listening on http://{addr} (TLS disabled)");
-        tracing::info!("service index: http://{addr}/v3/index.json");
+        print!("{banner}");
         // `with_connect_info` exposes the peer address so the rate limiter can
         // key on it when no `X-Forwarded-*` header is present.
         axum::serve(
@@ -199,12 +224,68 @@ async fn run_server(config_path: Option<&str>) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The block printed on startup: where the server is, what it is serving, and
+/// the one thing that is most likely to be wrong.
+///
+/// The URLs are the point. The first thing anyone does with a fresh package
+/// server is paste its service index into a client, and hunting for the path is
+/// a poor first minute. A wildcard bind is shown as `localhost`, because
+/// `https://0.0.0.0:5000` is not a URL anything will accept.
+fn banner(
+    scheme: &str,
+    addr: std::net::SocketAddr,
+    feeds: &[&str],
+    data_dir: &std::path::Path,
+    unauthenticated: bool,
+) -> String {
+    use std::fmt::Write as _;
+    use std::io::IsTerminal;
+
+    let colour = std::io::stdout().is_terminal();
+    let (bold, dim, warn, off) = if colour {
+        ("\x1b[1m", "\x1b[2m", "\x1b[33m", "\x1b[0m")
+    } else {
+        ("", "", "", "")
+    };
+
+    let host = match addr.ip() {
+        ip if ip.is_unspecified() => "localhost".to_string(),
+        std::net::IpAddr::V6(ip) => format!("[{ip}]"),
+        ip => ip.to_string(),
+    };
+    let base = format!("{scheme}://{host}:{}", addr.port());
+
+    let mut out = format!(
+        "\n  {bold}YANuget{off} {dim}{version}{off}\n\n",
+        version = env!("CARGO_PKG_VERSION"),
+    );
+    let mut row = |label: &str, value: &str| {
+        let _ = writeln!(out, "    {dim}{label:<15}{off}{value}");
+    };
+    row("Gallery", &format!("{base}/"));
+    row("Service index", &format!("{base}/v3/index.json"));
+    row("Documentation", &format!("{base}/docs/"));
+    row("Feeds", &feeds.join(", "));
+    row("Data", &data_dir.display().to_string());
+
+    if unauthenticated {
+        let _ = write!(
+            out,
+            "\n  {warn}!{off}  No API key configured \u{2014} push and delete are open to anyone \
+             who can reach this port.\n     Set {bold}YANUGET_API_KEY{off} to require one.\n"
+        );
+    }
+    out.push('\n');
+    out
+}
+
 /// Serve over HTTPS, resolving (and if necessary generating a self-signed)
 /// certificate, with the same graceful-shutdown behaviour as the HTTP path.
 async fn serve_tls(
     app: axum::Router,
     addr: std::net::SocketAddr,
     config: &Config,
+    banner: &str,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     // Install the ring crypto provider as the process default before any
@@ -222,7 +303,7 @@ async fn serve_tls(
         .map_err(|e| anyhow::anyhow!("failed to load TLS certificate: {e}"))?;
 
     tracing::info!("YANuget listening on https://{addr}");
-    tracing::info!("service index: https://{addr}/v3/index.json");
+    print!("{banner}");
 
     let handle = axum_server::Handle::new();
     let shutdown = handle.clone();
@@ -343,6 +424,13 @@ fn build_source_config(args: &MigrateArgs) -> MirrorConfig {
             token: args.source_token.clone(),
             headers,
         },
+        // A migration is an operator running a command against a source they
+        // chose, so a source on the private network is expected and allowed —
+        // unlike the read-through mirror, which anonymous requests can trigger.
+        allow_private_upstream: true,
+        max_package_size_bytes: args.max_package_size_bytes,
+        // A migration is meant to copy everything.
+        max_versions_per_package: None,
     }
 }
 
@@ -355,19 +443,34 @@ async fn wait_for_shutdown(mut rx: tokio::sync::watch::Receiver<bool>) {
 }
 
 /// Wait for Ctrl-C (or SIGTERM on Unix) for graceful shutdown.
+///
+/// A handler that cannot be installed is logged and then simply never fires,
+/// rather than panicking this task. Panicking here loses the whole shutdown
+/// path: `shutdown_tx` is never sent, the server ignores SIGTERM for the rest
+/// of its life, and the orchestrator falls through to SIGKILL — which is
+/// exactly the case that leaves a half-written upload behind.
 async fn shutdown_signal() {
     let ctrl_c = async {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("failed to install Ctrl-C handler");
+        match tokio::signal::ctrl_c().await {
+            Ok(()) => {}
+            Err(e) => {
+                tracing::error!(error = %e, "cannot listen for Ctrl-C; shutdown must come from SIGTERM");
+                std::future::pending::<()>().await
+            }
+        }
     };
 
     #[cfg(unix)]
     let terminate = async {
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("failed to install SIGTERM handler")
-            .recv()
-            .await;
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "cannot listen for SIGTERM; shutdown must come from Ctrl-C");
+                std::future::pending::<()>().await
+            }
+        }
     };
     #[cfg(not(unix))]
     let terminate = std::future::pending::<()>();
@@ -377,4 +480,89 @@ async fn shutdown_signal() {
         _ = terminate => {},
     }
     tracing::info!("shutting down");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+    use std::path::Path;
+
+    fn render(addr: SocketAddr, feeds: &[&str], unauthenticated: bool) -> String {
+        banner(
+            "https",
+            addr,
+            feeds,
+            Path::new("/var/lib/yanuget"),
+            unauthenticated,
+        )
+    }
+
+    #[test]
+    fn banner_shows_the_urls_a_client_needs() {
+        let out = render(
+            SocketAddr::from(([127, 0, 0, 1], 5000)),
+            &["default"],
+            false,
+        );
+        assert!(
+            out.contains("https://127.0.0.1:5000/v3/index.json"),
+            "{out}"
+        );
+        assert!(out.contains("https://127.0.0.1:5000/docs/"), "{out}");
+        assert!(out.contains(env!("CARGO_PKG_VERSION")), "{out}");
+        assert!(out.contains("/var/lib/yanuget"), "{out}");
+    }
+
+    #[test]
+    fn a_wildcard_bind_is_shown_as_a_url_that_works() {
+        // `https://0.0.0.0:5000` is not something a client will accept, and
+        // pasting it is the obvious thing to do with a printed URL.
+        let v4 = render(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 5000),
+            &["default"],
+            false,
+        );
+        assert!(v4.contains("https://localhost:5000/"), "{v4}");
+        assert!(!v4.contains("0.0.0.0"), "{v4}");
+
+        let v6 = render(
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 5000),
+            &["default"],
+            false,
+        );
+        assert!(v6.contains("https://localhost:5000/"), "{v6}");
+    }
+
+    #[test]
+    fn a_literal_ipv6_address_is_bracketed() {
+        let addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 5000);
+        let out = render(addr, &["default"], false);
+        assert!(out.contains("https://[::1]:5000/v3/index.json"), "{out}");
+    }
+
+    #[test]
+    fn every_feed_is_listed() {
+        let out = render(
+            SocketAddr::from(([127, 0, 0, 1], 5000)),
+            &["dev", "stable"],
+            false,
+        );
+        assert!(out.contains("dev, stable"), "{out}");
+    }
+
+    #[test]
+    fn an_unauthenticated_feed_is_called_out() {
+        let addr = SocketAddr::from(([127, 0, 0, 1], 5000));
+        assert!(render(addr, &["default"], true).contains("No API key configured"));
+        assert!(!render(addr, &["default"], false).contains("No API key configured"));
+    }
+
+    #[test]
+    fn the_banner_carries_no_escape_codes_when_not_a_terminal() {
+        // Tests capture stdout, so this exercises the non-terminal path — which
+        // is also the one that ends up in `docker logs` and journald.
+        let out = render(SocketAddr::from(([127, 0, 0, 1], 5000)), &["default"], true);
+        assert!(!out.contains('\x1b'), "{out}");
+    }
 }

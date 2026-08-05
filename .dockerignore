@@ -1,0 +1,24 @@
+# Keep the build context small. Without this, `docker build .` uploads the whole
+# `target/` tree — gigabytes — before the first instruction runs.
+
+/target
+/site
+/data
+/packages
+/.git
+/.github
+/tests
+/scripts
+
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite-*
+yanuget.local.toml
+appsettings.local.json
+
+.DS_Store
+.idea/
+.vscode/
+*.swp

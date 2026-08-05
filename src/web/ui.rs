@@ -15,15 +15,23 @@ use crate::nuget::UrlBuilder;
 /// Minimal, dependency-free styling, inlined so the UI needs no static assets
 /// and works fully offline.
 const STYLE: &str = "\
-:root{--bg:#0d1117;--card:#161b22;--border:#30363d;--fg:#e6edf3;--muted:#9aa4af;\
---accent:#58a6ff;--accent2:#1f6feb;--code:#010409;--warn:#d29922}\
+:root{color-scheme:dark light;\
+--bg:#0d1117;--card:#161b22;--border:#30363d;--fg:#e6edf3;--muted:#9aa4af;\
+--accent:#58a6ff;--accent2:#1f6feb;--accent2h:#2d76f0;--onaccent:#fff;\
+--code:#010409;--warn:#d29922;--subtle:#21262d;--subtleh:#30363d;\
+--ok:#3fb950;--danger:#b62324;--dangerfg:#ff7b72}\
+@media(prefers-color-scheme:light){:root{\
+--bg:#f6f8fa;--card:#fff;--border:#d0d7de;--fg:#1f2328;--muted:#59636e;\
+--accent:#0969da;--accent2:#0969da;--accent2h:#0a5fc2;--onaccent:#fff;\
+--code:#f6f8fa;--warn:#9a6700;--subtle:#eaeef2;--subtleh:#dde3ea;\
+--ok:#1a7f37;--danger:#cf222e;--dangerfg:#cf222e}}\
 *{box-sizing:border-box}\
 body{margin:0;background:var(--bg);color:var(--fg);\
 font:15px/1.55 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif}\
 a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}\
 a:focus-visible,button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline-offset:2px}\
 .vh{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);border:0}\
-.skip{position:absolute;left:-999px;top:0;background:var(--accent2);color:#fff;padding:8px 12px;border-radius:0 0 6px 0;z-index:10}\
+.skip{position:absolute;left:-999px;top:0;background:var(--accent2);color:var(--onaccent);padding:8px 12px;border-radius:0 0 6px 0;z-index:10}\
 .skip:focus{left:0}\
 header{background:var(--card);border-bottom:1px solid var(--border);padding:14px 0}\
 .wrap{max-width:980px;margin:0 auto;padding:0 20px}\
@@ -35,8 +43,8 @@ input[type=search]{flex:1;padding:9px 12px;border-radius:6px;border:1px solid va
 background:var(--bg);color:var(--fg);font-size:15px;min-height:44px}\
 input[type=search]:focus{border-color:var(--accent)}\
 button{padding:9px 16px;border-radius:6px;border:1px solid var(--accent2);\
-background:var(--accent2);color:#fff;font-size:15px;cursor:pointer;min-height:44px}\
-button:hover{background:#2d76f0}\
+background:var(--accent2);color:var(--onaccent);font-size:15px;cursor:pointer;min-height:44px}\
+button:hover{background:var(--accent2h)}\
 @media(max-width:560px){header .wrap{flex-wrap:wrap}form.search{flex:1 0 100%}}\
 main{padding:26px 0 60px}\
 .card{background:var(--card);border:1px solid var(--border);border-radius:10px;\
@@ -45,13 +53,13 @@ padding:18px 20px;margin:0 0 14px}\
 .meta{color:var(--muted);font-size:13px;margin:2px 0}\
 .crumbs{font-size:13px;color:var(--muted);margin:0 0 6px}\
 .tags{margin-top:8px;list-style:none;padding:0;display:flex;flex-wrap:wrap}\
-.tag{display:inline-block;background:#21262d;border:1px solid var(--border);border-radius:20px;\
+.tag{display:inline-block;background:var(--subtle);border:1px solid var(--border);border-radius:20px;\
 padding:1px 10px;font-size:12px;color:var(--muted);margin:0 4px 4px 0}\
 .badge{display:inline-block;font-size:11px;padding:0 7px;border-radius:20px;border:1px solid var(--border);vertical-align:middle}\
 .badge.pre{color:var(--warn);border-color:var(--warn)}\
 .badge.un{color:var(--muted)}\
 .muted{color:var(--muted)}\
-.grid{display:grid;grid-template-columns:1fr 280px;gap:22px}\
+.grid{display:grid;grid-template-columns:1fr 340px;gap:22px}\
 @media(max-width:760px){.grid{grid-template-columns:1fr}}\
 @media(min-width:761px){.side .install{position:sticky;top:20px}}\
 h1.title{font-size:26px;margin:0 0 2px;overflow-wrap:anywhere}\
@@ -60,21 +68,28 @@ overflow:auto;font-size:13px;margin:6px 0}\
 code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}\
 .install h3{margin:14px 0 4px;font-size:13px;text-transform:uppercase;letter-spacing:.4px;color:var(--muted)}\
 .install .primary h3{color:var(--accent)}\
-.install pre{white-space:pre-wrap;overflow-wrap:anywhere}\
-.snip{position:relative}\
-.snip .copy{position:absolute;top:6px;right:6px;padding:3px 10px;font-size:12px;min-height:0;\
-background:#21262d;border:1px solid var(--border);color:var(--fg)}\
-.snip .copy:hover{background:#30363d}\
-.snip pre{padding-right:64px}\
+.install pre{white-space:pre-wrap;overflow-wrap:break-word}\
+.snip{display:flex;flex-direction:column;align-items:flex-end}\
+.snip .copy{padding:6px 12px;font-size:12px;min-height:32px;margin-bottom:-4px;\
+background:var(--subtle);border:1px solid var(--border);color:var(--fg)}\
+.snip .copy:hover{background:var(--subtleh)}\
+.snip pre{width:100%}\
 .versions{list-style:none;margin:0;padding:0;max-height:340px;overflow:auto}\
 .versions li{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:5px 0;border-bottom:1px solid var(--border)}\
-.versions a{min-height:32px;display:inline-flex;align-items:center}\
+.versions a{min-height:40px;display:inline-flex;align-items:center}\
 .versions a.sel{font-weight:700}\
 table.deps{width:100%;border-collapse:collapse;font-size:13px}\
 table.deps td{padding:3px 8px 3px 0}\
 .readme{white-space:pre-wrap;word-wrap:break-word;overflow-wrap:anywhere}\
+img.picon{width:32px;height:32px;object-fit:contain;vertical-align:-6px;margin-right:10px;border-radius:6px;background:var(--subtle)}\
 .links a[rel~=nofollow]::after{content:\" \u{2197}\";color:var(--muted);font-size:11px}\
 .empty{text-align:center;color:var(--muted);padding:60px 0}\
+.hero{text-align:center;padding:30px 0 4px}\
+.hero h1{font-size:30px;margin:0 0 8px;letter-spacing:-.4px}\
+.hero p{margin:0 auto;max-width:46ch;color:var(--muted)}\
+.steps h3{margin:16px 0 4px;font-size:13px;text-transform:uppercase;letter-spacing:.4px;color:var(--muted)}\
+.steps h3:first-child{margin-top:0}\
+.steps pre{white-space:pre-wrap;overflow-wrap:break-word}\
 .kv{font-size:13px}.kv div{display:flex;gap:10px;padding:3px 0;border-bottom:1px solid var(--border)}\
 .kv b{color:var(--muted);font-weight:500;min-width:120px;flex:0 0 auto}\
 @media(max-width:480px){.kv div{flex-direction:column;gap:0}.kv b{min-width:0}}\
@@ -88,19 +103,28 @@ table.deps td{padding:3px 8px 3px 0}\
 .pager{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:18px 0;flex-wrap:wrap}\
 .btn{border:1px solid var(--border);border-radius:6px;padding:8px 14px;color:var(--fg)}\
 .btn[aria-disabled=true]{opacity:.4;pointer-events:none}\
-.badge.ok{color:#3fb950;border-color:#3fb950}\
+.badge.ok{color:var(--ok);border-color:var(--ok)}\
 .atbl{width:100%;border-collapse:collapse}\
 .atbl th,.atbl td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--border);font-size:14px;vertical-align:middle}\
 .atbl th{color:var(--muted);font-weight:500;font-size:12px;text-transform:uppercase;letter-spacing:.4px}\
 .actions{display:flex;gap:8px;flex-wrap:wrap}\
 .actions form{margin:0}\
-.actions button{padding:5px 12px;font-size:13px;min-height:0;background:#21262d;border:1px solid var(--border);color:var(--fg)}\
-.actions button:hover{background:#30363d}\
-.actions button.danger{border-color:#b62324;color:#ff7b72}\
-.actions button.danger:hover{background:#b62324;color:#fff}\
+.actions button{padding:8px 14px;font-size:13px;min-height:40px;background:var(--subtle);border:1px solid var(--border);color:var(--fg)}\
+.actions button:hover{background:var(--subtleh)}\
+.actions button.danger{border-color:var(--danger);color:var(--dangerfg)}\
+.actions button.danger:hover{background:var(--danger);color:var(--onaccent)}\
 footer{border-top:1px solid var(--border);color:var(--muted);font-size:13px;padding:18px 0}\
 footer a[aria-current=page]{color:var(--fg);font-weight:600}\
 ";
+
+/// The inline SVG favicon, as a data URI so the page loads no external asset.
+const FAVICON: &str = "data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'\
+%20viewBox='0%200%2032%2032'%3E%3Crect%20width='32'%20height='32'%20rx='6'%20fill='%23512bd4'/%3E\
+%3Ctext%20x='16'%20y='22'%20font-size='15'%20font-family='sans-serif'%20font-weight='700'\
+%20fill='white'%20text-anchor='middle'%3EYN%3C/text%3E%3C/svg%3E";
+
+/// The form field (and header) carrying the admin CSRF token.
+pub const CSRF_FIELD: &str = "_csrf";
 
 /// Escape the five HTML-significant characters.
 pub fn escape_html(s: &str) -> String {
@@ -145,16 +169,80 @@ pub fn safe_href(url: &str) -> Option<&str> {
 /// Tiny inline script giving the install-command "Copy" buttons their
 /// behaviour. It degrades gracefully: without JS the `<pre>` stays selectable
 /// and the button simply does nothing.
-const COPY_SCRIPT: &str = "<script>document.addEventListener('click',function(e){\
+///
+/// Kept separate from its `<script>` wrapper because the CSP hash below must be
+/// taken over exactly this text — the element's content, not the tags.
+/// It also carries the admin area's destructive-action confirmation. That used
+/// to be an inline `onsubmit=` attribute, which the CSP below cannot whitelist
+/// by hash — so the prompt is delegated from here off a `data-confirm`
+/// attribute instead, keeping the guard rail and the policy both intact.
+const COPY_SCRIPT_BODY: &str = "document.addEventListener('click',function(e){\
 var b=e.target.closest('.copy');if(!b)return;\
 var c=b.parentNode.querySelector('code');if(!c||!navigator.clipboard)return;\
 navigator.clipboard.writeText(c.innerText).then(function(){\
-var o=b.textContent;b.textContent='Copied';setTimeout(function(){b.textContent=o},1200)})});</script>";
+var o=b.textContent;b.textContent='Copied';setTimeout(function(){b.textContent=o},1200)})});\
+document.addEventListener('submit',function(e){\
+var m=e.target.getAttribute&&e.target.getAttribute('data-confirm');\
+if(m&&!confirm(m))e.preventDefault()});";
+
+/// The `Content-Security-Policy` served with every gallery/admin page.
+///
+/// The gallery renders package-supplied metadata (descriptions, readmes, links,
+/// dependency ids). [`escape_html`] and [`safe_href`] are the primary defence;
+/// this policy is the backstop that keeps an escaping bug from becoming script
+/// execution. `default-src 'none'` denies everything not listed, and the only
+/// inline style/script permitted are the two the server itself emits, pinned by
+/// SHA-256 — an injected `<script>` has a different hash and will not run.
+pub static CSP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!(
+        "default-src 'none'; img-src 'self' data:; style-src '{style}'; script-src '{script}'; \
+         base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
+        style = csp_hash(STYLE),
+        script = csp_hash(COPY_SCRIPT_BODY),
+    )
+});
+
+/// The `sha256-<base64>` source expression for an inline element's content.
+fn csp_hash(content: &str) -> String {
+    use base64::Engine;
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(content.as_bytes());
+    format!(
+        "sha256-{}",
+        base64::engine::general_purpose::STANDARD.encode(digest)
+    )
+}
 
 /// Wrap a page body in the shared layout (head, header bar, footer).
 ///
 /// `active` marks the current footer nav item (`"stats"`, `"settings"`, or `""`).
 fn layout(urls: &UrlBuilder, title: &str, query: &str, active: &str, body: &str) -> String {
+    layout_with_chrome(urls, title, query, active, body, Chrome::Feed)
+}
+
+/// Which navigation a page can offer.
+///
+/// Search, the service index, the docs and the stats/settings pages are all
+/// *feed-scoped* routes: in multi-feed mode they exist only under `/{feed}`.
+/// The feed-index page at the root has none of them, so offering them there
+/// gives a first-time visitor a search box that returns a bare 404 and three
+/// dead links — on the very first page they see.
+#[derive(Clone, Copy, PartialEq)]
+enum Chrome {
+    /// Inside a feed: everything is reachable.
+    Feed,
+    /// The multi-feed root: only the feed list itself.
+    Root,
+}
+
+fn layout_with_chrome(
+    urls: &UrlBuilder,
+    title: &str,
+    query: &str,
+    active: &str,
+    body: &str,
+    chrome: Chrome,
+) -> String {
     let cur = |name: &str| {
         if name == active {
             " aria-current=\"page\""
@@ -162,10 +250,25 @@ fn layout(urls: &UrlBuilder, title: &str, query: &str, active: &str, body: &str)
             ""
         }
     };
+    if chrome == Chrome::Root {
+        return format!(
+            "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
+<link rel=\"icon\" href=\"{FAVICON}\">\
+<title>{title}</title><style>{STYLE}</style></head><body>\
+<a class=\"skip\" href=\"#main\">Skip to content</a>\
+<header><div class=\"wrap\">\
+<a class=\"logo\" href=\"/\">YA<span>NuGet</span></a></div></header>\
+<main id=\"main\" tabindex=\"-1\"><div class=\"wrap\">{body}</div></main>\
+<footer><div class=\"wrap\">Served by YANuget</div></footer>\
+<script>{COPY_SCRIPT_BODY}</script></body></html>",
+            title = escape_html(title),
+        );
+    }
     format!(
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
 <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
-<link rel=\"icon\" href=\"data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2032%2032'%3E%3Crect%20width='32'%20height='32'%20rx='6'%20fill='%23512bd4'/%3E%3Ctext%20x='16'%20y='22'%20font-size='15'%20font-family='sans-serif'%20font-weight='700'%20fill='white'%20text-anchor='middle'%3EYN%3C/text%3E%3C/svg%3E\">\
+<link rel=\"icon\" href=\"{FAVICON}\">\
 <title>{title}</title><style>{STYLE}</style></head><body>\
 <a class=\"skip\" href=\"#main\">Skip to content</a>\
 <header><div class=\"wrap\">\
@@ -180,7 +283,7 @@ fn layout(urls: &UrlBuilder, title: &str, query: &str, active: &str, body: &str)
 <a href=\"{idx}\">v3 service index</a> \u{2022} <a href=\"{docs}\">Docs</a> \u{2022} \
 <a href=\"{stats}\"{cs}>Stats</a> \u{2022} \
 <a href=\"{settings}\"{cg}>Settings</a></nav></div></footer>\
-{COPY_SCRIPT}</body></html>",
+<script>{COPY_SCRIPT_BODY}</script></body></html>",
         title = escape_html(title),
         q = escape_html(query),
         home = escape_html(&urls.app("/")),
@@ -194,6 +297,56 @@ fn layout(urls: &UrlBuilder, title: &str, query: &str, active: &str, body: &str)
     )
 }
 
+/// A styled error page for the gallery, so a browser never sees a bare JSON
+/// error body.
+///
+/// The text is derived from the status alone. The JSON body it replaces is
+/// deliberately not parsed through: a 5xx message is generic on purpose (the
+/// underlying I/O, SQL or upstream detail goes to the log), and re-rendering an
+/// error string into HTML is a needless place to get escaping wrong.
+pub fn error_page(urls: &UrlBuilder, status: axum::http::StatusCode) -> String {
+    use axum::http::StatusCode;
+    let (heading, detail) = match status {
+        StatusCode::NOT_FOUND => (
+            "Not found",
+            "This feed does not have that package, version or page. It may never              have been published here, or it may have been deleted.",
+        ),
+        StatusCode::UNAUTHORIZED => (
+            "Sign-in required",
+            "This feed requires credentials to browse. Use the API key configured              for reading it.",
+        ),
+        StatusCode::BAD_REQUEST => (
+            "That request did not make sense",
+            "Check the package id and version in the address bar.",
+        ),
+        StatusCode::TOO_MANY_REQUESTS => (
+            "Too many requests",
+            "This client has been throttled. Wait a moment and try again.",
+        ),
+        StatusCode::SERVICE_UNAVAILABLE => (
+            "Temporarily unavailable",
+            "The server cannot reach its database right now. It should recover on              its own.",
+        ),
+        s if s.is_server_error() => (
+            "Something went wrong",
+            "The server hit an unexpected error. The details are in its log.",
+        ),
+        _ => (
+            "That did not work",
+            "The request could not be completed.",
+        ),
+    };
+    let body = format!(
+        "<div class=\"empty\"><h1 class=\"title\">{heading}</h1>\
+         <p>{detail}</p>\
+         <p><a href=\"{home}\">Back to the package list</a></p>\
+         <p class=\"muted\">HTTP {code}</p></div>",
+        home = escape_html(&urls.app("/")),
+        code = status.as_u16(),
+    );
+    layout(urls, &format!("{heading} \u{2014} YANuget"), "", "", &body)
+}
+
 /// The gallery / search-results page. `skip`/`take` drive pagination.
 pub fn gallery_page(
     urls: &UrlBuilder,
@@ -203,36 +356,47 @@ pub fn gallery_page(
     take: i64,
 ) -> String {
     let body = if page.groups.is_empty() {
-        let what = if query.trim().is_empty() {
-            "No packages have been published yet.".to_string()
-        } else {
-            format!("No packages match \u{201c}{}\u{201d}.", escape_html(query))
-        };
-        let clear = if query.trim().is_empty() {
-            "<p class=\"muted\">Push one with <code>dotnet nuget push</code> or \
-             <code>choco push</code>.</p>"
-                .to_string()
-        } else {
+        let browse_all = escape_html(&urls.app("/packages"));
+        if !query.trim().is_empty() {
             format!(
-                "<p><a href=\"{}\">Clear search and browse all packages</a></p>",
-                escape_html(&urls.app("/packages"))
+                "<div class=\"empty\"><p>No packages match \u{201c}{}\u{201d}.</p>\
+                 <p><a href=\"{browse_all}\">Clear search and browse all packages</a></p></div>",
+                escape_html(query),
             )
-        };
-        format!("<div class=\"empty\"><p>{what}</p>{clear}</div>")
+        } else if page.total_hits > 0 {
+            // Empty page, non-empty feed: `skip` is past the end. That happens
+            // from a bookmarked link, a hand-edited URL, or a `skip` that was
+            // valid until a delete or a retention sweep shortened the list.
+            // Answering it with the onboarding panel told an operator with
+            // thousands of packages that their feed was empty.
+            format!(
+                "<div class=\"empty\"><p>There is nothing on this page.</p>\
+                 <p><a href=\"{browse_all}\">Back to the first page</a></p></div>"
+            )
+        } else {
+            first_run_panel(urls)
+        }
     } else {
         let mut cards = String::new();
+        // A real `<h1>`, not a muted paragraph: this is the landing page, and
+        // without one a screen reader announces no page heading at all — while
+        // the *empty* state did have one, so the structure changed with the
+        // content.
         let heading = if query.trim().is_empty() {
-            format!("{} package(s)", page.total_hits)
+            format!("{} package{}", page.total_hits, plural(page.total_hits))
         } else {
             format!(
-                "{} result(s) for \u{201c}{}\u{201d}",
+                "{} result{} for \u{201c}{}\u{201d}",
                 page.total_hits,
+                plural(page.total_hits),
                 escape_html(query)
             )
         };
-        cards.push_str(&format!("<p class=\"muted\">{heading}</p>"));
+        cards.push_str(&format!("<h1 class=\"title\">{heading}</h1>"));
         for group in &page.groups {
-            let p = group.latest();
+            // The newest *stable* version, matching what a NuGet client
+            // searching this feed is offered.
+            let p = group.headline();
             let id = escape_html(&p.id);
             let url = escape_html(&urls.app(&format!("/packages/{}", enc_path(&p.lower_id()))));
             let pre = if p.is_prerelease() {
@@ -248,10 +412,10 @@ pub fn gallery_page(
             cards.push_str(&format!(
                 "<div class=\"card\"><h2><a href=\"{url}\">{id}</a> \
                  <span class=\"muted\">{ver}</span>{pre}</h2>\
-                 <div class=\"meta\">{dl} downloads{authors}</div>\
+                 <div class=\"meta\">{dl} downloads, all versions{authors}</div>\
                  <p>{desc}</p>{tags}</div>",
                 ver = escape_html(&p.normalized_version()),
-                dl = group.total_downloads(),
+                dl = group_digits(group.total_downloads() as i64),
                 desc = escape_html(&truncate(&p.description, 240)),
                 tags = render_tags(&p.tags),
             ));
@@ -266,7 +430,62 @@ pub fn gallery_page(
         ));
         cards
     };
-    layout(urls, "YANuget", query, "", &body)
+    let title = if query.trim().is_empty() {
+        "YANuget".to_string()
+    } else {
+        // Otherwise every search result page shares one <title>, so tabs,
+        // bookmarks and history entries for different queries look identical.
+        format!("Search: \u{201c}{query}\u{201d} \u{2014} YANuget")
+    };
+    layout(urls, &title, query, "", &body)
+}
+
+/// What an empty feed shows instead of "no packages": the three commands that
+/// take someone from a running server to a restored package, already carrying
+/// this server's own service-index URL.
+///
+/// This is the first page most people ever see, and the thing they need at that
+/// moment is not an apology for being empty — it is the URL to point a client
+/// at, which they would otherwise have to go and find.
+fn first_run_panel(urls: &UrlBuilder) -> String {
+    // Assembled raw and escaped once at output, like `render_install`: escaping
+    // twice would put a literal `&amp;` on the clipboard.
+    let idx = urls.service_index();
+    let steps = [
+        (
+            "1 \u{2014} Add this feed",
+            format!("dotnet nuget add source {idx} -n yanuget"),
+        ),
+        (
+            "2 \u{2014} Push a package",
+            "dotnet nuget push MyPackage.1.0.0.nupkg --source yanuget --api-key <your-api-key>"
+                .to_string(),
+        ),
+        (
+            "3 \u{2014} Restore from it",
+            format!("dotnet restore --source {idx}"),
+        ),
+    ];
+
+    let mut snippets = String::new();
+    for (label, cmd) in steps {
+        snippets.push_str(&format!(
+            "<h3>{label}</h3><div class=\"snip\">\
+             <button type=\"button\" class=\"copy\" aria-label=\"Copy command\">Copy</button>\
+             <pre><code>{cmd}</code></pre></div>",
+            cmd = escape_html(&cmd),
+        ));
+    }
+
+    format!(
+        "<div class=\"hero\"><h1>Your feed is live</h1>\
+         <p>Nothing published to it yet. Three commands change that.</p></div>\
+         <div class=\"card steps\">{snippets}</div>\
+         <p class=\"muted\">Using Chocolatey, <code>nuget.exe</code> or Visual Studio? \
+         The same service-index URL works for all of them \u{2014} see \
+         <a href=\"{docs}\">the documentation</a>.</p>",
+        docs = escape_html(&urls.app("/docs/")),
+    )
 }
 
 /// Previous/next pagination control for the gallery.
@@ -287,7 +506,14 @@ fn pager(urls: &UrlBuilder, query: &str, skip: i64, take: i64, shown: i64, total
     let to = skip + shown;
     let link = |target: i64, enabled: bool, label: &str| {
         if enabled {
-            format!("<a class=\"btn\" href=\"{base}?q={q}&skip={target}\">{label}</a>")
+            // `take` has to be carried, or paging silently changes the page size
+            // back to the default: `?take=5` showed "1–5 of N", and Next then
+            // returned twenty items while the counter still claimed five. And
+            // `&` is `&amp;` inside an HTML attribute — a bare one is only
+            // tolerated because no entity name follows it here.
+            format!(
+                "<a class=\"btn\" href=\"{base}?q={q}&amp;skip={target}&amp;take={take}\">{label}</a>"
+            )
         } else {
             format!("<span class=\"btn\" aria-disabled=\"true\">{label}</span>")
         }
@@ -377,6 +603,15 @@ pub fn stats_page(
 }
 
 /// Group a non-negative integer into thousands with `,` separators.
+/// `""` or `"s"`, so counts read as "1 package" rather than "1 package(s)".
+fn plural(n: i64) -> &'static str {
+    if n == 1 {
+        ""
+    } else {
+        "s"
+    }
+}
+
 fn group_digits(n: i64) -> String {
     let s = n.max(0).to_string();
     let bytes = s.as_bytes();
@@ -443,7 +678,7 @@ pub fn settings_page(urls: &UrlBuilder, config: &Config, feed: &super::FeedConte
     match &feed.mirror {
         Some(m) => {
             policy.push_str(&kv("Upstream mirror", "Enabled"));
-            policy.push_str(&kv("Upstream", m.upstream()));
+            policy.push_str(&kv("Upstream", &redact_userinfo(m.upstream())));
         }
         None => policy.push_str(&kv("Upstream mirror", "Disabled")),
     }
@@ -564,6 +799,7 @@ pub fn admin_package_page(
     id: &str,
     versions: &[crate::database::FeedVersion],
     promote_target: Option<&str>,
+    csrf_token: &str,
 ) -> String {
     let mut ordered: Vec<&crate::database::FeedVersion> = versions.iter().collect();
     ordered.sort_by(|a, b| b.package.version.cmp(&a.package.version));
@@ -576,6 +812,13 @@ pub fn admin_package_page(
             op
         )))
     };
+    // Every admin form carries the CSRF token; the handlers reject a POST
+    // without it, so a cross-site form submission cannot ride the browser's
+    // auto-replayed Basic credentials.
+    let csrf = format!(
+        "<input type=\"hidden\" name=\"{CSRF_FIELD}\" value=\"{}\">",
+        escape_html(csrf_token)
+    );
 
     let mut rows = String::new();
     for fv in ordered {
@@ -597,13 +840,13 @@ pub fn admin_package_page(
         let mut actions = String::new();
         if fv.pending {
             actions.push_str(&format!(
-                "<form method=\"post\" action=\"{}\"><button type=\"submit\">Approve</button></form>",
+                "<form method=\"post\" action=\"{}\">{csrf}<button type=\"submit\">Approve</button></form>",
                 action(&v, "approve")
             ));
         }
         if let Some(target) = promote_target {
             actions.push_str(&format!(
-                "<form method=\"post\" action=\"{}\"><button type=\"submit\">Promote \u{2192} {}</button></form>",
+                "<form method=\"post\" action=\"{}\">{csrf}<button type=\"submit\">Promote \u{2192} {}</button></form>",
                 action(&v, "promote"),
                 escape_html(target),
             ));
@@ -611,22 +854,22 @@ pub fn admin_package_page(
         // Enable/disable toggle depending on current state.
         if p.enabled {
             actions.push_str(&format!(
-                "<form method=\"post\" action=\"{}\"><button type=\"submit\">Disable</button></form>",
+                "<form method=\"post\" action=\"{}\">{csrf}<button type=\"submit\">Disable</button></form>",
                 action(&v, "disable")
             ));
         } else {
             actions.push_str(&format!(
-                "<form method=\"post\" action=\"{}\"><button type=\"submit\">Enable</button></form>",
+                "<form method=\"post\" action=\"{}\">{csrf}<button type=\"submit\">Enable</button></form>",
                 action(&v, "enable")
             ));
         }
         actions.push_str(&format!(
-            "<form method=\"post\" action=\"{a}\" \
-             onsubmit=\"return confirm('Remove {dv} {dvv} from this feed? If no other feed uses it, the files are deleted.')\">\
+            "<form method=\"post\" action=\"{a}\" data-confirm=\"{confirm}\">{csrf}\
              <button type=\"submit\" class=\"danger\">Delete</button></form>",
             a = action(&v, "delete"),
-            dv = escape_html(&id.replace('\'', "")),
-            dvv = escape_html(&v.replace('\'', "")),
+            confirm = escape_html(&format!(
+                "Remove {id} {v} from this feed? If no other feed uses it, the files are deleted."
+            )),
         ));
 
         let reason = match (fv.flagged, fv.flag_reason.as_deref()) {
@@ -642,7 +885,7 @@ pub fn admin_package_page(
                 ""
             },
             dv = escape_html(&v),
-            dl = p.downloads,
+            dl = group_digits(p.downloads as i64),
         ));
     }
 
@@ -680,7 +923,29 @@ pub fn feeds_index_page(feeds: &[(String, String)]) -> String {
          <p class=\"muted\">This server hosts several NuGet feeds. Pick one:</p>\
          <div class=\"card\">{list}</div>"
     );
-    layout(&urls, "Feeds \u{2014} YANuget", "", "", &body)
+    layout_with_chrome(&urls, "Feeds \u{2014} YANuget", "", "", &body, Chrome::Root)
+}
+
+/// Replace any `user:password@` in a URL with `***@`.
+///
+/// The upstream is operator-configured and normally carries its credentials in
+/// the separate `[mirror.auth]` settings — but nothing stops someone putting
+/// them in the URL, and this page is the one place that URL is displayed. The
+/// page is read-auth gated, so this is defence in depth rather than the only
+/// guard.
+fn redact_userinfo(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_string();
+    };
+    // Userinfo, if present, is everything before the first `@` of the authority.
+    let (authority, tail) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, ""),
+    };
+    match authority.rsplit_once('@') {
+        Some((_, host)) => format!("{scheme}://***@{host}{tail}"),
+        None => url.to_string(),
+    }
 }
 
 /// A key/value row with an escaped text value.
@@ -722,12 +987,12 @@ pub fn detail_page(
         let sel = if v == version { " class=\"sel\"" } else { "" };
         versions.push_str(&format!(
             "<li><span><a{sel} href=\"{href}\">{dv}</a>{badges}</span>\
-             <span class=\"muted\">{dls} dl</span></li>",
+             <span class=\"muted\">{dls} downloads</span></li>",
             href =
                 escape_html(&urls.app(&format!("/packages/{}/{}", enc_path(&lower), enc_path(&v)))),
             dv = escape_html(&v),
             badges = status_badges(p),
-            dls = p.downloads,
+            dls = group_digits(p.downloads as i64),
         ));
     }
     versions.push_str("</ul>");
@@ -735,13 +1000,14 @@ pub fn detail_page(
     let main = format!(
         "<nav class=\"crumbs\" aria-label=\"Breadcrumb\">\
          <a href=\"{packages}\">Packages</a> <span aria-hidden=\"true\">/</span> <span>{id}</span></nav>\
-         <h1 class=\"title\">{id}</h1>\
-         <div class=\"meta\">{version}{badges} \u{2022} {dl} downloads \u{2022} published {pub}</div>\
+         <h1 class=\"title\">{icon}{id}</h1>\
+         <div class=\"meta\">{version}{badges} \u{2022} {dl} downloads of this version \u{2022} published {pub}</div>\
          <p>{desc}</p>{tags}{links}{deps}{symbols}{readme}",
         packages = escape_html(&urls.app("/packages")),
+        icon = render_icon(urls, selected),
         version = escape_html(&version),
         badges = status_badges(selected),
-        dl = selected.downloads,
+        dl = group_digits(selected.downloads as i64),
         pub = escape_html(&selected.published.format("%Y-%m-%d").to_string()),
         desc = escape_html(&selected.description),
         tags = render_tags(&selected.tags),
@@ -766,7 +1032,13 @@ pub fn detail_page(
     let body = format!(
         "<div class=\"grid\"><div class=\"content\">{main}</div><div class=\"side\">{side}</div></div>"
     );
-    layout(urls, &format!("{} {}", selected.id, version), "", "", &body)
+    layout(
+        urls,
+        &format!("{} {} \u{2014} YANuget", selected.id, version),
+        "",
+        "",
+        &body,
+    )
 }
 
 /// Prerelease / unlisted status badges for a version (empty when stable+listed).
@@ -782,9 +1054,13 @@ fn status_badges(p: &Package) -> String {
 }
 
 fn render_install(urls: &UrlBuilder, p: &Package, primary_client: &str) -> String {
-    let idx = escape_html(&urls.service_index());
-    let id = escape_html(&p.id);
-    let ver = escape_html(&p.normalized_version());
+    // Assembled from raw values and escaped once, at output. Escaping here as
+    // well would double-encode: the page would show `&amp;amp;` and the copy
+    // button — which reads `innerText`, undoing exactly one level — would put a
+    // command carrying a literal `&amp;` on the clipboard.
+    let idx = urls.service_index();
+    let id = &p.id;
+    let ver = p.normalized_version();
 
     let choco = (
         "Chocolatey",
@@ -903,16 +1179,67 @@ fn render_dependencies(urls: &UrlBuilder, p: &Package) -> String {
     out
 }
 
+/// The package's embedded icon, when it has one.
+///
+/// The image is served from this origin by [`crate::web`], which sniffs the
+/// bytes and refuses anything that is not a raster format — so the gallery's
+/// `img-src 'self'` policy is enough here. `loading="lazy"` keeps a long list
+/// of packages from fetching every icon up front.
+fn render_icon(urls: &UrlBuilder, p: &Package) -> String {
+    if !p.has_embedded_icon {
+        return String::new();
+    }
+    let src = urls.app(&format!(
+        "/packages/{}/{}/icon",
+        enc_path(&p.lower_id()),
+        enc_path(&p.normalized_version().to_lowercase()),
+    ));
+    format!(
+        "<img class=\"picon\" src=\"{}\" alt=\"\" loading=\"lazy\" decoding=\"async\">",
+        escape_html(&src)
+    )
+}
+
+/// How much of a readme the detail page renders inline.
+///
+/// A readme is package-supplied and highly compressible, so a small upload can
+/// carry a very large one — and the detail page is served on every view, to
+/// anyone who can read the feed. Rendering it whole turns one cheap push into a
+/// permanently expensive response, so the page shows a generous prefix and
+/// points at the package itself for the rest.
+const MAX_RENDERED_README_BYTES: usize = 64 * 1024;
+
 fn render_readme(readme: Option<&str>) -> String {
     match readme {
         Some(text) if !text.trim().is_empty() => {
+            let (shown, truncated) = truncate_bytes(text, MAX_RENDERED_README_BYTES);
+            let notice = if truncated {
+                "<p class=\"muted\">Readme truncated; the full text is inside the package.</p>"
+            } else {
+                ""
+            };
             format!(
-                "<h3 class=\"muted\">Readme</h3><div class=\"card readme\">{}</div>",
-                escape_html(text)
+                "<h3 class=\"muted\">Readme</h3><div class=\"card readme\">{}</div>{notice}",
+                escape_html(shown)
             )
         }
         _ => String::new(),
     }
+}
+
+/// Cut `s` to at most `max` bytes without splitting a character, reporting
+/// whether anything was dropped.
+fn truncate_bytes(s: &str, max: usize) -> (&str, bool) {
+    if s.len() <= max {
+        return (s, false);
+    }
+    // Walk back to the nearest character boundary; `is_char_boundary` is true at
+    // 0, so this always terminates.
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    (&s[..end], true)
 }
 
 fn render_tags(tags: &[String]) -> String {
@@ -973,6 +1300,111 @@ fn human_size(bytes: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// The CSP pins the inline `<style>` and `<script>` by SHA-256, so a page
+    /// whose inline content drifts from the policy silently loses its styling
+    /// and its copy buttons. Extract both from a real rendered page and check
+    /// the policy actually covers them.
+    #[test]
+    fn install_snippets_are_escaped_exactly_once() {
+        // A base URL may legitimately contain `&`. Escaping the parts and then
+        // the assembled command again shows `&amp;amp;` on the page, and the
+        // copy button (which reads `innerText`, undoing one level) would put a
+        // literal `&amp;` on the clipboard — a command that does not work.
+        let urls = super::UrlBuilder::new("https://host.test/a&b");
+        let mut p = sample();
+        p.id = "Contoso.Utils".into();
+        let html = super::render_install(&urls, &p, "choco");
+
+        assert!(
+            html.contains("https://host.test/a&amp;b/v3/index.json"),
+            "expected a singly-escaped URL, got: {html}"
+        );
+        assert!(
+            !html.contains("&amp;amp;"),
+            "command was escaped twice: {html}"
+        );
+    }
+
+    #[test]
+    fn a_huge_readme_does_not_become_a_huge_page() {
+        // A readme is package-supplied and compresses well, so a small upload
+        // can carry a very large one. The detail page is served on every view,
+        // so rendering it whole turns one push into a permanent cost.
+        let huge = "A".repeat(super::MAX_RENDERED_README_BYTES * 4);
+        let rendered = super::render_readme(Some(&huge));
+        assert!(
+            rendered.len() < super::MAX_RENDERED_README_BYTES * 2,
+            "rendered {} bytes from a {} byte readme",
+            rendered.len(),
+            huge.len()
+        );
+        assert!(rendered.contains("Readme truncated"));
+
+        // An ordinary readme is untouched and unannotated.
+        let small = super::render_readme(Some("# Hello\n\nSome docs."));
+        assert!(small.contains("Some docs."));
+        assert!(!small.contains("truncated"));
+    }
+
+    #[test]
+    fn truncation_never_splits_a_character() {
+        // Cutting at a byte offset inside a multi-byte character would panic on
+        // slicing; the boundary walk has to handle it.
+        let s = "\u{00e9}".repeat(100); // two bytes each
+        for max in 0..s.len() {
+            let (cut, truncated) = super::truncate_bytes(&s, max);
+            assert!(cut.len() <= max);
+            assert_eq!(truncated, s.len() > max);
+            assert!(s.starts_with(cut));
+        }
+    }
+
+    #[test]
+    fn credentials_in_an_upstream_url_are_not_displayed() {
+        assert_eq!(
+            super::redact_userinfo("https://ci:s3cret@feed.example.com/v3/index.json"),
+            "https://***@feed.example.com/v3/index.json"
+        );
+        // A password containing an `@` still redacts fully (the *last* `@` in
+        // the authority separates userinfo from host).
+        assert_eq!(
+            super::redact_userinfo("https://ci:p@ss@feed.example.com/v3/index.json"),
+            "https://***@feed.example.com/v3/index.json"
+        );
+        // No credentials, no change.
+        assert_eq!(
+            super::redact_userinfo("https://api.nuget.org/v3/index.json"),
+            "https://api.nuget.org/v3/index.json"
+        );
+        // A path containing `@` is not mistaken for userinfo.
+        assert_eq!(
+            super::redact_userinfo("https://host/feeds/@scope/index.json"),
+            "https://host/feeds/@scope/index.json"
+        );
+        assert_eq!(super::redact_userinfo("not a url"), "not a url");
+    }
+
+    #[test]
+    fn csp_hashes_cover_the_inline_assets_the_page_emits() {
+        let urls = super::UrlBuilder::new("https://host");
+        let html = super::settings_page(
+            &urls,
+            &crate::config::Config::default(),
+            &feed_ctx(None, None),
+        );
+
+        for (open, close) in [("<style>", "</style>"), ("<script>", "</script>")] {
+            let start = html.find(open).expect("inline block present") + open.len();
+            let end = html[start..].find(close).expect("closing tag") + start;
+            let hash = super::csp_hash(&html[start..end]);
+            assert!(
+                super::CSP.contains(&hash),
+                "CSP does not cover the emitted {open} block (expected {hash})\nCSP: {}",
+                *super::CSP
+            );
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -1106,6 +1538,159 @@ mod tests {
     }
 
     #[test]
+    fn the_feed_index_offers_only_links_that_exist_at_the_root() {
+        // In multi-feed mode the root router mounts `/`, `/health` and nothing
+        // else — every feed route lives under `/{name}`. The shared chrome
+        // pointed the search form and three footer links at feed routes, so the
+        // first page a visitor saw had a search box returning a bare 404.
+        let html = feeds_index_page(&[
+            ("stable".into(), "/stable".into()),
+            ("dev".into(), "/dev".into()),
+        ]);
+        assert!(
+            !html.contains("<form"),
+            "no search form at the root: {html}"
+        );
+        for dead in [
+            "/packages",
+            "/stats",
+            "/settings",
+            "/docs/",
+            "/v3/index.json\"",
+        ] {
+            assert!(
+                !html.contains(&format!("\"{dead}")),
+                "root page links {dead}, which is not mounted there: {html}"
+            );
+        }
+        // The feed links themselves are the point of the page.
+        assert!(html.contains("href=\"/stable\""), "{html}");
+        assert!(html.contains("href=\"/dev/v3/index.json\""), "{html}");
+    }
+
+    #[test]
+    fn the_gallery_headlines_the_version_a_client_would_offer() {
+        // `/v3/search` excludes pre-releases unless asked, so headlining the
+        // newest version outright made the card — and the install command under
+        // its copy button — offer `2.0.0-beta` while Visual Studio showed
+        // `1.9.0`.
+        let urls = UrlBuilder::new("https://host");
+        let versioned = |v: &str| {
+            let mut p = sample();
+            p.id = "Mixed".into();
+            p.version = crate::version::NuGetVersion::parse(v).unwrap();
+            p
+        };
+        let mut group = crate::database::SearchGroup {
+            packages: vec![versioned("1.9.0"), versioned("2.0.0-beta")],
+        };
+        assert_eq!(group.latest().normalized_version(), "2.0.0-beta");
+        assert_eq!(group.headline().normalized_version(), "1.9.0");
+
+        // A package that has only ever shipped pre-releases still shows one.
+        group.packages = vec![versioned("0.1.0-alpha")];
+        assert_eq!(group.headline().normalized_version(), "0.1.0-alpha");
+
+        let page = crate::database::SearchPage {
+            groups: vec![crate::database::SearchGroup {
+                packages: vec![versioned("1.9.0"), versioned("2.0.0-beta")],
+            }],
+            total_hits: 1,
+        };
+        let html = gallery_page(&urls, &page, "", 0, 20);
+        assert!(html.contains("1.9.0"), "{html}");
+    }
+
+    #[test]
+    fn the_landing_page_has_a_heading_and_searches_have_distinct_titles() {
+        let urls = UrlBuilder::new("https://host");
+        let mut page = page_of(&["A"]);
+        page.total_hits = 1;
+        let html = gallery_page(&urls, &page, "", 0, 20);
+        assert!(html.contains("<h1"), "no h1 on the landing page: {html}");
+        // "1 package", not "1 package(s)".
+        assert!(html.contains("1 package<"), "{html}");
+        assert!(html.contains("<title>YANuget</title>"), "{html}");
+
+        let searched = gallery_page(&urls, &page, "logging", 0, 20);
+        assert!(searched.contains("<title>Search:"), "{searched}");
+        assert!(searched.contains("logging"), "{searched}");
+    }
+
+    #[test]
+    fn an_empty_page_of_a_non_empty_feed_is_not_the_onboarding_panel() {
+        // A bookmarked `skip`, or one that outlived a delete, lands here. The
+        // onboarding panel told an operator with a full feed it was empty.
+        let urls = UrlBuilder::new("https://host");
+        let mut page = page_of(&[]);
+        page.total_hits = 5000;
+        let html = gallery_page(&urls, &page, "", 99_999, 20);
+        assert!(!html.contains("Your feed is live"), "{html}");
+        assert!(html.contains("nothing on this page"), "{html}");
+        assert!(html.contains("Back to the first page"), "{html}");
+    }
+
+    #[test]
+    fn paging_keeps_the_page_size_and_escapes_the_separator() {
+        let urls = UrlBuilder::new("https://host");
+        let mut page = page_of(&["A", "B"]);
+        page.total_hits = 40;
+        let html = gallery_page(&urls, &page, "", 0, 5);
+        // Carrying `take` is what keeps the "1-5 of 40" counter honest on the
+        // next page.
+        assert!(html.contains("skip=5&amp;take=5"), "{html}");
+        // A bare `&` in an attribute is invalid HTML.
+        assert!(!html.contains("?q=&skip="), "{html}");
+    }
+
+    #[test]
+    fn an_empty_feed_shows_the_commands_that_fill_it() {
+        // The first page anyone sees. It has to carry *this* server's service
+        // index, not a placeholder host, or it is just decoration.
+        let urls = UrlBuilder::new("https://nuget.example.com");
+        let html = gallery_page(&urls, &page_of(&[]), "", 0, 20);
+        assert!(html.contains("Your feed is live"), "{html}");
+        assert!(
+            html.contains("dotnet nuget add source https://nuget.example.com/v3/index.json"),
+            "{html}"
+        );
+        assert!(html.contains("dotnet nuget push"), "{html}");
+        assert!(
+            html.contains("dotnet restore --source https://nuget.example.com/v3/index.json"),
+            "{html}"
+        );
+        // Each command gets a copy button, which reads `innerText` — so the
+        // command must be escaped exactly once or the clipboard gets entities.
+        assert_eq!(html.matches("class=\"copy\"").count(), 3, "{html}");
+        assert!(!html.contains("&amp;amp;"), "{html}");
+
+        // A search that finds nothing is a different situation and must not be
+        // answered with onboarding instructions.
+        let no_match = gallery_page(&urls, &page_of(&[]), "zzz", 0, 20);
+        assert!(!no_match.contains("Your feed is live"), "{no_match}");
+    }
+
+    #[test]
+    fn the_palette_adapts_to_a_light_browser_theme() {
+        // Every colour has to come from a custom property, or a light-themed
+        // browser gets dark text on dark chrome in whatever was left hardcoded.
+        let style = STYLE;
+        let vars = style
+            .split_once("*{box-sizing:border-box}")
+            .expect("variable block precedes the rules")
+            .0;
+        assert!(vars.contains("prefers-color-scheme:light"), "{vars}");
+        let rules = style
+            .split_once("*{box-sizing:border-box}")
+            .expect("rules follow the variable block")
+            .1;
+        assert!(
+            !rules.contains('#'),
+            "hardcoded colour outside the variable block: {rules}"
+        );
+    }
+
+    #[test]
     fn gallery_chrome_loads_no_external_assets() {
         // An empty gallery page (no package-provided links) must reference no
         // external assets: all CSS/JS is inline and the favicon is a data URI.
@@ -1199,7 +1784,7 @@ mod tests {
             feed_version(sample(), false, false),
             feed_version(disabled, false, false),
         ];
-        let pkg = admin_package_page(&urls, "Contoso.Utils", &versions, None);
+        let pkg = admin_package_page(&urls, "Contoso.Utils", &versions, None, "tok");
         assert!(pkg.contains("/disable"));
         assert!(pkg.contains("/enable"));
         assert!(pkg.contains("/delete"));
@@ -1211,7 +1796,7 @@ mod tests {
     fn admin_page_shows_pending_and_promote() {
         let urls = UrlBuilder::new("https://host");
         let versions = vec![feed_version(sample(), true, true)];
-        let pkg = admin_package_page(&urls, "Contoso.Utils", &versions, Some("stable"));
+        let pkg = admin_package_page(&urls, "Contoso.Utils", &versions, Some("stable"), "tok");
         assert!(pkg.contains("/approve"));
         assert!(pkg.contains("/promote"));
         assert!(pkg.contains("pending"));
@@ -1253,6 +1838,7 @@ mod tests {
             has_readme: false,
             has_embedded_icon: false,
             is_development_dependency: false,
+            require_license_acceptance: false,
             is_semver2: false,
             package_size: 2048,
             package_hash: "h".into(),

@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/thoscut/yanuget/security/advisories/new
+    about: Please report security problems privately, not as a public issue. See SECURITY.md.
+  - name: Documentation
+    url: https://github.com/thoscut/yanuget/tree/main/docs
+    about: Configuration, HTTP API, architecture and the large-package design.

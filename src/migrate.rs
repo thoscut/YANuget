@@ -159,7 +159,27 @@ pub async fn run(
     discover.enable_steady_tick(Duration::from_millis(120));
     discover.set_message("resolving source service index & listing package ids…");
 
-    let ids = client.enumerate_package_ids().await?;
+    // Ids come from the source's own search/catalog response and are then
+    // interpolated into the URLs we fetch. Anything that is not a well-formed
+    // NuGet id (slashes, `..`, control characters) could steer those requests
+    // off the flat-container path entirely, so it is dropped here rather than
+    // sent.
+    let discovered = client.enumerate_package_ids().await?;
+    let total_discovered = discovered.len();
+    let ids: Vec<String> = discovered
+        .into_iter()
+        .filter(|id| crate::validation::validate_package_id(id).is_ok())
+        .collect();
+    if ids.len() < total_discovered {
+        let dropped = total_discovered - ids.len();
+        tracing::warn!(
+            dropped,
+            "source listed package ids that are not valid NuGet ids"
+        );
+        if !opts.quiet {
+            println!("Skipping {dropped} source entries that are not valid package ids");
+        }
+    }
     discover.finish_with_message(format!("discovered {} package id(s)", ids.len()));
 
     let version_bar = mp.add(ProgressBar::new(ids.len() as u64));
@@ -269,6 +289,9 @@ pub async fn run(
         overwrite: opts.overwrite,
         pending: feed.requires_approval,
         license_policy: feed.license_policy.clone(),
+        // Pinned per item in `migrate_one` — the source is asked for a specific
+        // id/version and must not be able to answer with a different package.
+        expect: None,
     };
 
     let outcomes: Vec<Outcome> = stream::iter(work)
@@ -347,9 +370,23 @@ async fn migrate_one(
     };
     let bytes = summary.size;
 
+    // Require the downloaded manifest to declare the id/version this item asked
+    // the source for, so a rogue source cannot slip a different package into the
+    // target feed under a name that is already trusted there.
+    let index_opts = match crate::version::NuGetVersion::parse(&item.display_version) {
+        Ok(version) => IndexOptions {
+            expect: Some(indexing::ExpectedIdentity {
+                id: item.lower_id.clone(),
+                version,
+            }),
+            ..index_opts.clone()
+        },
+        Err(_) => index_opts.clone(),
+    };
+
     // index_package moves the temp file into storage on success and removes it
     // on failure, so we never leave the download behind.
-    match indexing::index_package(storage, db, feed, temp_path, summary, index_opts).await {
+    match indexing::index_package(storage, db, feed, temp_path, summary, &index_opts).await {
         Ok(_) => Outcome {
             kind: OutcomeKind::Imported,
             bytes,

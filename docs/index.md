@@ -15,6 +15,10 @@ on an air-gapped network.
 - **[Configuration](configuration.md)** — all settings and `YANUGET_*`
   environment variables, including TLS, rate limiting, multiple API keys,
   retention, and multi-feed / mirroring / license-policy options.
+- **[Deployment](deployment.md)** — running it as a service: systemd, Docker
+  Compose, Kubernetes probes, backup/restore and upgrades.
+- **[Bulk migration](migrate.md)** — `yanuget migrate`: importing every
+  package from another server in one pass.
 - **[Architecture](architecture.md)** — the module map and trait boundaries.
 - **[Large packages](large-packages.md)** — the bounded-memory streaming design.
 
@@ -28,7 +32,7 @@ YANUGET_API_KEY=change-me ./target/release/yanuget
 
 ```bash
 # Add the feed and push a package
-dotnet nuget add source http://localhost:5000/v3/index.json -n yanuget
+dotnet nuget add source https://localhost:5000/v3/index.json -n yanuget
 dotnet nuget push MyPackage.1.0.0.nupkg --source yanuget --api-key change-me
 ```
 

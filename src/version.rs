@@ -120,8 +120,19 @@ impl NuGetVersion {
     }
 
     /// The normalized string used as the canonical identifier in URLs, storage
-    /// paths and the database. Build metadata is dropped; a trailing zero
-    /// revision is omitted; pre-release case is preserved.
+    /// paths and the database. Build metadata is dropped, a trailing zero
+    /// revision is omitted, and the pre-release label is lower-cased.
+    ///
+    /// The lower-casing is what makes this string an *identity*. Two versions
+    /// whose pre-release labels differ only in case are the same version — that
+    /// is what [`compare_identifier`] implements and what NuGet clients assume —
+    /// and every other place that identifies a version already agrees: storage
+    /// paths are lower-cased, and so are the URLs clients request. Leaving the
+    /// case here made the database the one component that disagreed, so
+    /// `1.0.0-Beta` and `1.0.0-beta` became two rows sharing a single file: the
+    /// second push was accepted despite `allow_overwrite = false`, it replaced
+    /// the first one's bytes, and the first row went on advertising a hash that
+    /// no longer matched what was served. Use [`Self::original`] for display.
     pub fn normalized(&self) -> String {
         let mut out = if self.revision > 0 {
             format!(
@@ -133,7 +144,7 @@ impl NuGetVersion {
         };
         if !self.pre.is_empty() {
             out.push('-');
-            out.push_str(&self.pre.join("."));
+            out.push_str(&self.pre.join(".").to_ascii_lowercase());
         }
         out
     }
@@ -263,6 +274,39 @@ pub struct VersionParseError(pub String);
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_pre_release_label_normalizes_to_one_canonical_case() {
+        // `normalized()` is the database key, the storage path and the URL
+        // segment. Two versions that compare equal must produce the same one,
+        // or they become two rows sharing a single file — with the first row
+        // still advertising a hash the served bytes no longer match.
+        let upper = NuGetVersion::parse("1.0.0-Beta").unwrap();
+        let lower = NuGetVersion::parse("1.0.0-beta").unwrap();
+        assert_eq!(
+            upper, lower,
+            "NuGet compares pre-release labels case-insensitively"
+        );
+        assert_eq!(upper.normalized(), lower.normalized());
+        assert_eq!(upper.normalized(), "1.0.0-beta");
+
+        // Multi-identifier labels and build metadata take the same path.
+        let mixed = NuGetVersion::parse("2.1.0-RC.2+SHA.abcDEF").unwrap();
+        assert_eq!(mixed.normalized(), "2.1.0-rc.2");
+
+        // The string the publisher wrote is still available for display.
+        assert_eq!(upper.original(), "1.0.0-Beta");
+
+        // Nothing about the numeric core changes.
+        assert_eq!(
+            NuGetVersion::parse("1.2.3.0").unwrap().normalized(),
+            "1.2.3"
+        );
+        assert_eq!(
+            NuGetVersion::parse("1.2.3.4").unwrap().normalized(),
+            "1.2.3.4"
+        );
+    }
+
     use super::*;
 
     fn v(s: &str) -> NuGetVersion {

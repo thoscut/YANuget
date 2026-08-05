@@ -30,6 +30,12 @@ use crate::version::NuGetVersion;
 pub struct MirrorClient {
     client: reqwest::Client,
     upstream: String,
+    /// Permit upstream resource URLs that resolve to private/loopback hosts.
+    allow_private_upstream: bool,
+    /// Cap on a single mirrored `.nupkg`, in bytes.
+    max_package_size_bytes: Option<u64>,
+    /// Cap on versions fetched for one read-through miss.
+    max_versions_per_package: Option<usize>,
     resources: OnceCell<MirrorResources>,
 }
 
@@ -45,6 +51,21 @@ struct MirrorResources {
     catalog: Option<String>,
 }
 
+/// How long one read-through miss may spend fetching before it gives up and
+/// answers with what it has.
+///
+/// `ensure_package` downloads up to `max_versions_per_package` (50 by default)
+/// `.nupkg`s one after another, each bounded only by the per-request timeout —
+/// so a single `GET /v3/package/{id}/index.json`, which needs no
+/// authentication, could hold a connection open for twenty-five minutes. The
+/// mirror is a cache: stopping early is not a failure, because the versions
+/// already fetched are kept and the next request continues from there.
+const MIRROR_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Default cap on a single mirrored `.nupkg` when neither the feed nor the
+/// server configured one.
+const DEFAULT_MIRROR_MAX_PACKAGE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
 impl MirrorClient {
     /// Build a client from a feed's [`MirrorConfig`]. Returns `None` when
     /// mirroring is disabled for the feed.
@@ -52,17 +73,142 @@ impl MirrorClient {
         if !config.enabled {
             return None;
         }
-        let client = reqwest::Client::builder()
+        let mut builder = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(config.timeout_secs.max(1)))
             .user_agent(concat!("yanuget/", env!("CARGO_PKG_VERSION")))
-            .default_headers(auth_headers(&config.auth))
-            .build()
-            .ok()?;
+            .default_headers(auth_headers(&config.auth));
+        // Upstream credentials ride on every request as default headers. reqwest
+        // drops `Authorization` on a cross-host redirect, but it cannot know that
+        // an operator's custom `headers` entry (`X-Feed-Key: …`) is a secret too
+        // — so when any credential is configured, redirects may not leave the
+        // host they started on. An upstream cannot then bounce the mirror at a
+        // collector and harvest the feed token.
+        //
+        // Every hop is re-checked, not just the URL we started with. `check_url`
+        // vets a resource URL before the request, but a redirect chooses a new
+        // one *after* it — so a `302` to `http://169.254.169.254/…` or an
+        // address on the server's own network walked straight past the guard,
+        // and the read path that triggers a mirror fetch is reachable without
+        // authentication.
+        let credentialed = config.auth.is_set();
+        let allow_private = config.allow_private_upstream;
+        builder = builder.redirect(reqwest::redirect::Policy::custom(move |attempt| {
+            if attempt.previous().len() > 5 {
+                return attempt.error("too many redirects");
+            }
+            if !matches!(attempt.url().scheme(), "http" | "https") {
+                return attempt.error("redirect to a non-HTTP scheme");
+            }
+            if !allow_private {
+                if let Some(host) = attempt.url().host_str() {
+                    if crate::proxy::is_private_host(host) {
+                        return attempt.error("redirect to a private address");
+                    }
+                }
+            }
+            if credentialed {
+                let same_host = attempt.previous().last().and_then(|p| p.host_str())
+                    == attempt.url().host_str();
+                if !same_host {
+                    return attempt.stop();
+                }
+            }
+            attempt.follow()
+        }));
         Some(Self {
-            client,
+            client: builder.build().ok()?,
             upstream: config.upstream.clone(),
+            allow_private_upstream: config.allow_private_upstream,
+            max_package_size_bytes: config.max_package_size_bytes,
+            max_versions_per_package: config.max_versions_per_package,
             resources: OnceCell::new(),
         })
+    }
+
+    /// Reject an upstream-supplied resource URL that we should not fetch.
+    ///
+    /// The service index is operator-configured, but every resource URL inside
+    /// it — and therefore every URL the mirror actually fetches — is chosen by
+    /// the upstream. A hostile or compromised upstream that answers with
+    /// `http://169.254.169.254/…` or an address on the server's own network
+    /// turns the mirror into an SSRF probe, so non-HTTP schemes and
+    /// private/loopback/link-local hosts are refused unless the operator opted
+    /// in (which a self-hosted upstream on a private network legitimately does).
+    fn check_url(&self, url: &str, what: &str) -> Result<()> {
+        let parsed = reqwest::Url::parse(url)
+            .map_err(|e| Error::Other(anyhow::anyhow!("upstream {what} url is invalid: {e}")))?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            return Err(Error::Other(anyhow::anyhow!(
+                "upstream {what} url uses unsupported scheme {:?}",
+                parsed.scheme()
+            )));
+        }
+        if !self.allow_private_upstream {
+            if let Some(host) = parsed.host_str() {
+                if crate::proxy::is_private_host(host) {
+                    return Err(Error::Other(anyhow::anyhow!(
+                        "upstream {what} url points at the private address {host}; \
+                         set allow_private_upstream = true to permit it"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// [`Self::check_url`], plus a DNS resolution of the host.
+    ///
+    /// `check_url` can only classify an address it can see, so a *name* —
+    /// `metadata.evil.example` with an `A` record of `169.254.169.254` — passed
+    /// it untouched. Resolving closes that, at the cost of one lookup.
+    ///
+    /// This is a check, not a pin: the address the connection finally uses is
+    /// resolved again by the HTTP client, so a DNS entry that changes between
+    /// the two answers (rebinding) is still possible. Narrowing that further
+    /// means pinning the connection to the address checked here, which reqwest
+    /// does not expose per-request — so an upstream is a trust decision, and
+    /// `allow_private_upstream` is how an operator states it deliberately.
+    async fn check_url_resolved(&self, url: &str, what: &str) -> Result<()> {
+        self.check_url(url, what)?;
+        if self.allow_private_upstream {
+            return Ok(());
+        }
+        let parsed = reqwest::Url::parse(url)
+            .map_err(|e| Error::Other(anyhow::anyhow!("upstream {what} url is invalid: {e}")))?;
+        let Some(host) = parsed.host_str() else {
+            return Ok(());
+        };
+        // A literal was already classified by `check_url`.
+        if host.parse::<std::net::IpAddr>().is_ok() {
+            return Ok(());
+        }
+        let port = parsed.port_or_known_default().unwrap_or(443);
+        let Ok(addrs) = tokio::net::lookup_host((host, port)).await else {
+            // Unresolvable: the request will fail on its own, and refusing here
+            // would turn a transient DNS blip into a policy error.
+            return Ok(());
+        };
+        for addr in addrs {
+            if crate::proxy::is_private_ip_addr(addr.ip()) {
+                return Err(Error::Other(anyhow::anyhow!(
+                    "upstream {what} host {host} resolves to the private address {}; \
+                     set allow_private_upstream = true to permit it",
+                    addr.ip()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// [`Self::check_url`] as a predicate, logging why a resource was dropped.
+    fn log_check(&self, url: &str, what: &str) -> bool {
+        match self.check_url(url, what) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(%url, error = %e, "ignoring upstream resource");
+                false
+            }
+        }
     }
 
     /// The upstream service-index URL this client mirrors from.
@@ -70,9 +216,31 @@ impl MirrorClient {
         &self.upstream
     }
 
+    /// How many versions of one package a single read-through miss may fetch.
+    pub fn max_versions_per_package(&self) -> Option<usize> {
+        self.max_versions_per_package
+    }
+
+    /// Apply the server-wide upload cap to mirrored downloads unless the feed
+    /// set a tighter one of its own.
+    pub fn set_default_size_limit(&mut self, limit: Option<u64>) {
+        if self.max_package_size_bytes.is_none() {
+            self.max_package_size_bytes = limit;
+        }
+        // A mirror fetch is started by an *anonymous read*, and it writes what
+        // it fetches to the operator's disk. "No limit" is a defensible default
+        // for a push, which needs a credential; it is not one here. A feed that
+        // genuinely mirrors enormous packages says so.
+        if self.max_package_size_bytes.is_none() {
+            self.max_package_size_bytes = Some(DEFAULT_MIRROR_MAX_PACKAGE_BYTES);
+        }
+    }
+
     async fn resources(&self) -> Result<&MirrorResources> {
         self.resources
             .get_or_try_init(|| async {
+                self.check_url_resolved(&self.upstream, "service index")
+                    .await?;
                 let index: serde_json::Value = self
                     .client
                     .get(&self.upstream)
@@ -103,10 +271,15 @@ impl MirrorClient {
                     ],
                 );
                 let catalog = find_resource(&index, "Catalog/3.0.0");
+                // Every one of these is a URL the *upstream* chose; vet each
+                // before it is ever fetched. A bad optional resource is dropped
+                // rather than fatal, so one odd entry cannot disable mirroring.
+                self.check_url_resolved(&package_base, "PackageBaseAddress")
+                    .await?;
                 Ok(MirrorResources {
                     package_base: ensure_trailing_slash(&package_base),
-                    search,
-                    catalog,
+                    search: search.filter(|u| self.log_check(u, "SearchQueryService")),
+                    catalog: catalog.filter(|u| self.log_check(u, "Catalog")),
                 })
             })
             .await
@@ -154,13 +327,36 @@ impl MirrorClient {
             .map_err(mirror_err)?
             .error_for_status()
             .map_err(mirror_err)?;
+        // Reject an over-sized package before a single byte hits the disk when
+        // the upstream is honest about its length; the streaming cap below is
+        // the real enforcement for when it is not.
+        if let (Some(limit), Some(len)) = (self.max_package_size_bytes, resp.content_length()) {
+            if len > limit {
+                return Err(Error::PayloadTooLarge(format!(
+                    "upstream package is {len} bytes, over the {limit} byte mirror limit"
+                )));
+            }
+        }
         let mut file = tokio::fs::File::create(dest).await?;
         let stream = resp
             .bytes_stream()
             .map(|r| r.map_err(|e| std::io::Error::other(e.to_string())));
-        let summary = streaming::stream_to_writer(Box::pin(stream), &mut file)
-            .await
-            .map_err(Error::Io)?;
+        // A mirror fetch is triggered by an ordinary (possibly anonymous) read,
+        // so an unbounded copy here would let anyone fill the disk by naming
+        // packages upstream happens to host. The push path is capped; so is this.
+        let summary = streaming::stream_to_writer_limited(
+            Box::pin(stream),
+            &mut file,
+            self.max_package_size_bytes,
+        )
+        .await
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::InvalidData {
+                Error::PayloadTooLarge(e.to_string())
+            } else {
+                Error::Io(e)
+            }
+        })?;
         Ok(summary)
     }
 
@@ -368,16 +564,55 @@ pub async fn ensure_package(
         return Ok(0);
     }
     let lower_id = id.to_lowercase();
-    let versions = client.upstream_versions(&lower_id).await?;
-    let mut mirrored = 0;
 
-    for raw in versions {
-        let Ok(version) = NuGetVersion::parse(&raw) else {
-            continue;
-        };
+    // One read-through miss per id at a time. Without this, N concurrent
+    // restores of the same missing package each start their own full download
+    // of every upstream version — N times the bandwidth and disk for one
+    // result.
+    //
+    // Declining rather than queueing matters: a fetch can run for minutes, and
+    // a waiter would hold its request open for all of it to obtain a result the
+    // winner is already producing. Losing the race is treated as a plain cache
+    // miss, which is what it is.
+    let Some(_guard) = crate::locks::try_lock_version(&lower_id, "<mirror>") else {
+        tracing::debug!(%feed, id = %lower_id, "mirror fetch already in progress; skipping");
+        return Ok(0);
+    };
+
+    let versions = client.upstream_versions(&lower_id).await?;
+    let mut versions: Vec<NuGetVersion> = versions
+        .iter()
+        .filter_map(|raw| NuGetVersion::parse(raw).ok())
+        .collect();
+    // Newest first, so a bounded fetch keeps the versions clients actually want.
+    versions.sort_by(|a, b| b.cmp(a));
+    let considered = versions.len();
+    if let Some(max) = client.max_versions_per_package() {
+        versions.truncate(max);
+    }
+    if versions.len() < considered {
+        tracing::info!(
+            %feed, id = %lower_id, considered, fetching = versions.len(),
+            "limiting mirrored versions (mirror.max_versions_per_package)"
+        );
+    }
+    let mut mirrored = 0;
+    let deadline = tokio::time::Instant::now() + MIRROR_BUDGET;
+
+    for version in versions {
         // Skip versions the feed already exposes.
         if db.exists(feed, &lower_id, &version).await.unwrap_or(false) {
             continue;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            tracing::info!(
+                %feed,
+                id = %lower_id,
+                mirrored,
+                "mirror budget spent; the rest of this package's versions will \
+                 be fetched on a later request"
+            );
+            break;
         }
 
         let normalized = version.normalized().to_lowercase();
@@ -398,6 +633,14 @@ pub async fn ensure_package(
             overwrite: crate::config::OverwriteMode::Disabled,
             pending: options.requires_approval,
             license_policy: options.license_policy.clone(),
+            // Pin the identity: whatever the upstream returned must be the
+            // package we asked for. Otherwise a hostile upstream answers a
+            // request for an obscure id with a manifest claiming a popular one,
+            // and it lands in the local feed under that trusted name.
+            expect: Some(crate::indexing::ExpectedIdentity {
+                id: lower_id.clone(),
+                version: version.clone(),
+            }),
         };
         match indexing::index_package(storage, db, feed, temp_path, summary, &opts).await {
             Ok(_) => {
@@ -591,6 +834,81 @@ mod tests {
     fn trailing_slash_is_normalized() {
         assert_eq!(ensure_trailing_slash("https://x/flat"), "https://x/flat/");
         assert_eq!(ensure_trailing_slash("https://x/flat/"), "https://x/flat/");
+    }
+
+    #[test]
+    fn upstream_urls_are_vetted_before_they_are_fetched() {
+        let client = MirrorClient::from_config(&MirrorConfig {
+            enabled: true,
+            ..Default::default()
+        })
+        .unwrap();
+
+        // The ordinary case: a public HTTPS feed.
+        assert!(client
+            .check_url("https://api.nuget.org/v3/index.json", "index")
+            .is_ok());
+
+        // Every one of these is a URL the *upstream* would choose, so each is a
+        // way to turn the mirror into a probe of the server's own network.
+        for hostile in [
+            "http://169.254.169.254/latest/meta-data/",
+            "http://127.0.0.1:8080/v3/index.json",
+            "https://localhost/v3/index.json",
+            "http://10.1.2.3/flat/",
+            "http://[::1]/flat/",
+        ] {
+            assert!(
+                client.check_url(hostile, "resource").is_err(),
+                "{hostile} should be refused"
+            );
+        }
+
+        // Non-HTTP schemes never make sense for a feed resource.
+        for scheme in ["file:///etc/passwd", "ftp://host/x", "gopher://host/1"] {
+            assert!(
+                client.check_url(scheme, "resource").is_err(),
+                "{scheme} should be refused"
+            );
+        }
+
+        // An operator running an upstream on their own network opts in.
+        let private_ok = MirrorClient::from_config(&MirrorConfig {
+            enabled: true,
+            allow_private_upstream: true,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(private_ok
+            .check_url("http://10.1.2.3/v3/index.json", "index")
+            .is_ok());
+        // ...but that opt-in still does not enable other schemes.
+        assert!(private_ok.check_url("file:///etc/passwd", "index").is_err());
+    }
+
+    #[test]
+    fn read_through_mirroring_is_bounded_by_default() {
+        // An anonymous read can trigger a mirror fetch, so an unbounded default
+        // would let anyone name a popular upstream id and pull tens of
+        // gigabytes onto the disk.
+        let cfg = MirrorConfig::default();
+        assert!(cfg.max_versions_per_package.is_some());
+        assert!(!cfg.allow_private_upstream);
+    }
+
+    #[test]
+    fn size_limit_is_inherited_from_the_server_unless_set() {
+        let mut client = MirrorClient::from_config(&MirrorConfig {
+            enabled: true,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(client.max_package_size_bytes.is_none());
+        client.set_default_size_limit(Some(1024));
+        assert_eq!(client.max_package_size_bytes, Some(1024));
+        // A feed that set its own tighter cap keeps it.
+        client.set_default_size_limit(Some(9999));
+        assert_eq!(client.max_package_size_bytes, Some(1024));
     }
 
     #[test]

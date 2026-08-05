@@ -23,6 +23,11 @@ src/
 ├── indexing.rs       Upload→validate→policy→store→membership pipeline (with rollback)
 ├── policy.rs         Offline license allow/deny evaluation (pure)
 ├── mirror.rs         Upstream read-through mirroring (V3 feed → local feed)
+├── migrate.rs        `yanuget migrate`: bulk import of a whole source server
+├── pdb.rs            Portable PDB parsing → SSQP symbol key
+├── symbols.rs        `.snupkg` ingest: extract PDBs, index by symbol key
+├── ratelimit.rs      Per-client-IP fixed-window throttle
+├── proxy.rs          Trusted-proxy gate for `X-Forwarded-*` / `Forwarded`
 ├── retention.rs      Pure prune policy + feed-scoped version pruning / GC
 ├── locks.rs          Process-global per-version async lock (store/purge races)
 ├── tls.rs            TLS cert loading + cached self-signed generation
@@ -38,7 +43,8 @@ src/
 └── web/
     ├── mod.rs        AppState, FeedContext, per-feed routers, handlers
     ├── ui.rs         HTML rendering (gallery, stats, settings, feeds, admin)
-    └── files.rs      Range-aware streaming file responses
+    ├── files.rs      Range-aware streaming file responses
+    └── docs.rs       The embedded documentation site (this page), served at /docs
 ```
 
 ## Feeds

@@ -21,8 +21,14 @@ use crate::version::NuGetVersion;
 use crate::{nupkg, validation};
 
 /// Caps for embedded sidecar files extracted into auxiliary storage.
-const MAX_README_BYTES: u64 = 8 * 1024 * 1024;
-const MAX_ICON_BYTES: u64 = 4 * 1024 * 1024;
+///
+/// These bound decompression work per push *and* the size of what the gallery
+/// later renders on every page view — a highly compressible readme is otherwise
+/// a cheap way to turn a small upload into a huge response served repeatedly.
+/// 1 MiB matches the limit nuget.org enforces on embedded readmes, and is far
+/// above any real one.
+const MAX_README_BYTES: u64 = 1024 * 1024;
+const MAX_ICON_BYTES: u64 = 1024 * 1024;
 
 /// Options influencing how a package is indexed into a feed.
 #[derive(Debug, Clone, Default)]
@@ -34,6 +40,22 @@ pub struct IndexOptions {
     pub pending: bool,
     /// The feed's offline license policy, evaluated against the package.
     pub license_policy: LicensePolicyConfig,
+    /// The identity the caller asked for, when it knows one up front.
+    ///
+    /// A push is self-describing — whatever the manifest says *is* the package.
+    /// A mirror or migration is not: the caller requested a specific id/version
+    /// from an upstream that could answer with something else entirely. Setting
+    /// this makes the manifest prove it is what was asked for, so a hostile or
+    /// compromised upstream cannot substitute a different package under a name
+    /// local clients already trust.
+    pub expect: Option<ExpectedIdentity>,
+}
+
+/// The id/version a caller requires the indexed manifest to declare.
+#[derive(Debug, Clone)]
+pub struct ExpectedIdentity {
+    pub id: String,
+    pub version: NuGetVersion,
 }
 
 /// The identity (and outcome) of a successfully indexed package.
@@ -89,6 +111,20 @@ async fn index_inner(
     let id = manifest.id.clone();
     let normalized = version.normalized();
 
+    // The caller pinned an identity (mirror/migrate): the fetched payload must
+    // be the package that was requested, not merely a valid package.
+    if let Some(want) = &options.expect {
+        if !want.id.eq_ignore_ascii_case(&id) || want.version != version {
+            return Err(Error::InvalidPackage(format!(
+                "manifest declares {}/{} but {}/{} was requested",
+                id,
+                normalized,
+                want.id,
+                want.version.normalized(),
+            )));
+        }
+    }
+
     // 2. Resolve sidecar presence and pull readme/icon out while we still have
     //    the file (before it is moved into storage).
     let readme_bytes = match &manifest.readme {
@@ -127,14 +163,24 @@ async fn index_inner(
     let _guard = crate::locks::lock_version(&id, &normalized).await;
 
     // 4. Honour immutability / overwrite policy *within this feed*.
+    //
+    // An overwrite drops the metadata rows so the store below runs, but it must
+    // **not** delete the payload first. `store_package` finishes with a rename,
+    // which replaces the file atomically — so deleting up front bought nothing
+    // and cost the version: if the store then failed (a full disk, a permission
+    // change, a cross-device fallback erroring mid-copy), the previously
+    // published package was already gone from disk with nothing to put back,
+    // and the caller saw a 500. The old bytes now stay in place until the new
+    // ones have landed on top of them.
+    let mut overwriting = false;
     if db.exists(feed, &id, &version).await? {
         if options.overwrite.allows(version.is_prerelease()) {
             db.remove_membership(feed, &id, &version).await?;
             // If no other feed references the version, drop the orphaned global
-            // data and payload so the re-push stores fresh content.
+            // metadata so the re-push records its own.
             if db.feed_count(&id, &version).await? == 0 {
                 let _ = db.delete_package_data(&id, &version).await;
-                let _ = storage.delete(&id, &normalized).await;
+                overwriting = true;
             }
         } else {
             return Err(Error::PackageAlreadyExists);
@@ -166,7 +212,27 @@ async fn index_inner(
                 .store_aux(&id, &normalized, AuxFile::Icon, bytes)
                 .await?;
         }
+        // Only once the replacement is safely on disk: the previous build's
+        // PDBs have different SSQP keys, so leaving their mappings behind would
+        // keep serving them to anyone debugging the new build — the mappings
+        // still resolve to an id/version that exists. Doing this before the
+        // store would throw the symbols away even when the store then failed.
+        if overwriting {
+            crate::retention::purge_symbols(storage, db, &id, &version).await?;
+        }
     } else {
+        // Another feed already holds this exact id/version, so its payload — not
+        // ours — is what every client will download. Publishing our metadata
+        // over it would advertise a hash and size that do not describe those
+        // bytes, and a NuGet client verifying `packageHash` would reject the
+        // restore. Only adopt the existing payload when it really is the same
+        // content; otherwise this push is a different package wearing a taken
+        // name, and it is refused.
+        if let Some(existing) = db.get_package_data(&id, &version).await? {
+            if existing.package_hash != package.package_hash {
+                return Err(Error::PackageAlreadyExists);
+            }
+        }
         let _ = tokio::fs::remove_file(temp_path).await;
     }
 
@@ -233,6 +299,7 @@ fn build_package(
         has_readme: readme_bytes.is_some(),
         has_embedded_icon: icon_bytes.is_some(),
         is_development_dependency: n.development_dependency,
+        require_license_acceptance: n.require_license_acceptance,
         package_size: summary.size,
         package_hash: summary.sha512_base64.clone(),
         package_hash_algorithm: "SHA512".to_string(),

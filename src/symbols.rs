@@ -21,6 +21,13 @@ use crate::{nupkg, pdb};
 /// Hard cap on a single `.pdb` we will read into memory to index/store it.
 const MAX_PDB_BYTES: u64 = 256 * 1024 * 1024;
 
+/// Caps on a symbol package as a whole. Without them a `.snupkg` of a few
+/// hundred KiB — entry names and deflated zeros both compress enormously —
+/// decides how much memory and disk one request consumes. A real symbol package
+/// carries one PDB per assembly, so a few hundred is already generous.
+const MAX_PDB_ENTRIES: usize = 512;
+const MAX_PDB_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
+
 /// The outcome of indexing a symbol package.
 #[derive(Debug, Clone)]
 pub struct SymbolResult {
@@ -75,16 +82,52 @@ async fn index_inner(
         .cloned()
         .collect();
 
+    if pdb_entries.len() > MAX_PDB_ENTRIES {
+        return Err(Error::InvalidPackage(format!(
+            "symbol package contains {} .pdb entries, more than the {MAX_PDB_ENTRIES} allowed",
+            pdb_entries.len()
+        )));
+    }
+
+    // One pass over the archive rather than one pass *per entry*. Extracting
+    // each entry separately re-opened the file and re-scanned the central
+    // directory every time, so the cost grew with the square of the entry
+    // count: a 200 KiB upload naming 2000 PDBs took 25 seconds of a blocking
+    // thread, and the entry count had no upper bound at all.
+    let extracted =
+        nupkg::extract_entries(temp_path, &pdb_entries, MAX_PDB_BYTES, MAX_PDB_TOTAL_BYTES).await?;
+
     let mut indexed = 0;
     let mut skipped = 0;
-    for entry in &pdb_entries {
-        let Some(bytes) = nupkg::extract_file(temp_path, entry, MAX_PDB_BYTES).await? else {
-            continue;
-        };
+    let lower_id = id.to_lowercase();
+    for (entry, bytes) in &extracted {
         let filename = file_name(entry);
-        match pdb::portable_pdb_signature(&bytes) {
+        match pdb::portable_pdb_signature(bytes) {
             Some(key) => {
-                storage.store_symbol(&key, &filename, &bytes).await?;
+                // The SSQP key comes out of the uploaded PDB and the filename
+                // out of the zip entry name, so both are entirely chosen by
+                // whoever is pushing. The symbol store is global — it has no
+                // feed column, because a debugger asks for a key and nothing
+                // else — so without this check any push credential, on any
+                // feed, could claim a key already owned by another package:
+                // the stored bytes and the ownership row were both replaced
+                // last-writer-wins. A developer debugging the victim package
+                // would then be served the attacker's PDB, with its Source Link
+                // URLs and embedded sources.
+                //
+                // A genuine collision is a re-push of the same package's own
+                // symbols, which is allowed. Anything else is refused rather
+                // than skipped, so it is visible instead of silent.
+                if let Some(owner) = db.find_symbol(&key, &filename).await? {
+                    if owner.lower_id != lower_id {
+                        return Err(Error::InvalidPackage(format!(
+                            "symbol {filename} ({key}) is already owned by {}; \
+                             a symbol package may not claim another package's symbols",
+                            owner.lower_id
+                        )));
+                    }
+                }
+                storage.store_symbol(&key, &filename, bytes).await?;
                 db.add_symbol(&key, &filename, &id, &version).await?;
                 indexed += 1;
             }
@@ -212,6 +255,7 @@ mod tests {
             has_readme: false,
             has_embedded_icon: false,
             is_development_dependency: false,
+            require_license_acceptance: false,
             is_semver2: false,
             package_size: 1,
             package_hash: "h".into(),

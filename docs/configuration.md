@@ -7,7 +7,7 @@ YANuget reads configuration from three layers, each overriding the previous:
 3. **Environment variables** (`YANUGET_*`) — these win.
 
 A fully commented template lives in
-[`yanuget.example.toml`](../yanuget.example.toml).
+[`yanuget.example.toml`](https://github.com/thoscut/yanuget/blob/main/yanuget.example.toml).
 
 ## Options
 
@@ -40,17 +40,69 @@ Booleans accept `1/true/yes/on` (case-insensitive) via environment variables.
 Per-client-IP request throttling under the `[rate_limit]` table. A fixed window
 of `window_secs` allows at most `max_requests` requests per client IP; exceeding
 it returns `429 Too Many Requests` with a `Retry-After` header. It is **on by
-default** with a generous limit so ordinary restores are unaffected while online
-API-key guessing is throttled. The client IP is taken from `X-Forwarded-For` /
-`X-Real-IP` (behind a proxy) and otherwise the peer address; requests with no
-determinable IP are not throttled. For very high read volume, raise the limit or
-disable it and rely on a reverse proxy.
+default**. The limit has to clear a *large restore*, not a typical request
+rate: a few hundred packages means roughly three requests each, mostly in
+parallel, and behind corporate NAT or a CI egress gateway every developer shares
+one bucket. NuGet also treats `429` as terminal — it neither retries nor honours
+`Retry-After` — so being throttled mid-restore fails the build outright. The
+default is far above anything legitimate while still bounding online API-key
+guessing. The client IP is taken from `X-Forwarded-For` /
+`X-Real-IP` **when the connection peer is a trusted proxy** (see
+[Trusted proxies](#trusted-proxies)) and otherwise the peer address; requests
+with no determinable IP are not throttled. For very high read volume, raise the
+limit or disable it and rely on a reverse proxy.
 
 | TOML key | Env var | Type | Default | Description |
 | --- | --- | --- | --- | --- |
 | `rate_limit.enabled` | `YANUGET_RATELIMIT_ENABLED` | bool | `true` | Master switch. |
-| `rate_limit.max_requests` | `YANUGET_RATELIMIT_MAX_REQUESTS` | int | `1000` | Max requests per IP per window (min 1). |
+| `rate_limit.max_requests` | `YANUGET_RATELIMIT_MAX_REQUESTS` | int | `10000` | Max requests per IP per window (min 1). |
 | `rate_limit.window_secs` | `YANUGET_RATELIMIT_WINDOW_SECS` | int | `60` | Window length in seconds. |
+
+## Trusted proxies
+
+`X-Forwarded-Host`, `X-Forwarded-Proto`, `X-Forwarded-For`, `X-Real-IP` and
+`Forwarded` are **request** headers — any client can send them. Two things
+downstream depend on them:
+
+* the externally visible base URL, and therefore every absolute
+  `packageContent` / registration URL a NuGet client is told to fetch;
+* the identity the rate limiter throttles.
+
+So they are only honoured when the connection peer is a proxy you vouched for.
+From anyone else they are **stripped before any handler sees them**. Without
+that gate, a caller can point restoring clients at a host of their choosing —
+directly, or by poisoning a shared HTTP cache in front of the server — and can
+walk through the per-IP throttle by rotating `X-Forwarded-For`.
+
+| TOML key | Env var | Type | Default | Description |
+| --- | --- | --- | --- | --- |
+| `trusted_proxies` | `YANUGET_TRUSTED_PROXIES` | list | `[]` | Peers allowed to set forwarding headers. Empty trusts nobody. |
+
+Each entry is one of:
+
+| Entry | Meaning |
+| --- | --- |
+| `private` | Loopback, link-local and RFC1918/ULA ranges — where reverse proxies actually live. |
+| `10.0.0.0/8`, `2001:db8::/32` | An explicit CIDR block. |
+| `10.1.2.3` | A single address. |
+| `*` | Trust every peer (the old, unguarded behaviour). |
+
+**The default is an empty list — nobody is trusted.** Trusting private ranges
+out of the box reads as convenient, since that is where proxies live, but the
+most common deployment is an internal feed on a LAN with *no* proxy, and there
+every client machine sits inside those ranges. Any of them could then send a
+fresh `X-Forwarded-For` per request and land in a fresh rate-limit bucket,
+defeating the throttle that is supposed to bound API-key guessing.
+
+Behind a proxy, set this to that proxy's address (or `private` if it is on the
+same host or network). The environment variable is comma-separated and replaces
+the list wholesale.
+
+Setting `base_url` pins generated URLs regardless of any header, and is the
+most robust option when you know the public address.
+
+Responses carry `Vary: Host, X-Forwarded-Host, X-Forwarded-Proto` so a shared
+cache keys on the inputs that determine those URLs.
 
 ## Retention
 
@@ -103,6 +155,24 @@ deleted only when the **last** feed referencing it lets go.
 | `feeds[].mirror.auth.username` / `.password` | string | *(none)* | HTTP Basic credentials for the upstream. |
 | `feeds[].mirror.auth.token` | string | *(none)* | Bearer token for the upstream (`Authorization: Bearer …`). |
 | `feeds[].mirror.auth.headers` | table | `{}` | Arbitrary extra request headers (e.g. a private-feed API key). |
+| `feeds[].mirror.max_versions_per_package` | int | `50` | Newest-first cap on how many versions one read-through miss fetches. |
+| `feeds[].mirror.max_package_size_bytes` | int | *(server-wide cap, else 2 GiB)* | Cap on a single mirrored `.nupkg`. |
+| `feeds[].mirror.allow_private_upstream` | bool | `false` | Permit an upstream on a private/loopback address. |
+
+Three things bound a read-through miss, because it is started by an
+*unauthenticated read* and writes what it fetches to your disk:
+
+* **`max_versions_per_package`** caps how many versions are fetched, newest
+  first. The default of 50 means a package with a long history is mirrored
+  only in part — which is usually what you want from a cache, but is worth
+  knowing before you conclude the upstream is missing versions.
+* **`max_package_size_bytes`** caps each `.nupkg`. It inherits the server-wide
+  `max_package_size_bytes` and, if that is unset too, falls back to 2 GiB
+  rather than to "unlimited".
+* A **60-second budget** per miss. When it runs out the request answers with
+  what has been mirrored so far and the remaining versions are fetched on a
+  later request. Nothing is lost — a mirror is a cache, and it warms up
+  incrementally rather than holding one connection open for the whole job.
 | `feeds[].license_policy.enabled` | bool | `false` | Evaluate the offline license policy. |
 | `feeds[].license_policy.allowed` | string[] | `[]` | If non-empty, license must match one. |
 | `feeds[].license_policy.blocked` | string[] | `[]` | Always rejected (even if also allowed). |
@@ -162,6 +232,28 @@ responses also carry a `Strict-Transport-Security` header (one year).
   that case. The key is compared in constant time.
 - The `/admin` area (set `admin_api_key`) and the gallery should only be exposed
   over HTTPS — keep TLS on, or terminate it at a proxy.
+- Admin **state changes** additionally require a CSRF token (embedded in the
+  admin forms, derived from the admin key) and reject a request a browser
+  labels cross-site. HTTP Basic credentials are replayed automatically by the
+  browser, so without this a signed-in operator merely visiting a hostile page
+  would be enough to delete packages. Scripted callers can send the token as an
+  `X-CSRF-Token` header instead of the `_csrf` form field.
+- Every response carries `X-Content-Type-Options: nosniff`,
+  `X-Frame-Options: DENY` and `Referrer-Policy: no-referrer`. Gallery pages also
+  carry a `Content-Security-Policy` of `default-src 'none'` whose only permitted
+  inline style and script are the two the server itself emits, pinned by
+  SHA-256 — so an escaping bug could not become script execution.
+- `5xx` responses return a generic message; the underlying I/O, SQL or upstream
+  detail goes to the log only.
+- Unknown keys in the TOML file are a **hard error**, so a mistyped security
+  setting fails loudly instead of silently reverting to its default.
+- A feed with `[feeds.mirror]` follows resource URLs chosen by the
+  *upstream*. Non-HTTP schemes and private/loopback targets are refused unless
+  `allow_private_upstream = true`, mirrored downloads are bounded by
+  `max_package_size_bytes` and `max_versions_per_package`, and a mirrored
+  package must declare the id/version that was actually requested — so a
+  compromised upstream cannot substitute a different package under a name your
+  clients already trust.
 
 ## Reverse proxy
 
@@ -181,3 +273,8 @@ location / {
     proxy_read_timeout 3600s;        # allow slow, large transfers
 }
 ```
+
+The `X-Forwarded-*` headers above are only honoured if this proxy's address is
+covered by `trusted_proxies`. A proxy on the same host or a private network is
+covered by the `private` default; one reaching YANuget from a public address
+needs listing explicitly.

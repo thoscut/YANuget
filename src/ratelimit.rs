@@ -65,7 +65,17 @@ impl RateLimiter {
     }
 
     fn check_at(&self, ip: IpAddr, now: Instant) -> bool {
-        let mut inner = self.inner.lock().expect("rate-limit registry poisoned");
+        // Never `expect`: this runs on every request when the limiter is on,
+        // and a poisoned mutex is permanent. One panic anywhere under this
+        // guard would turn every subsequent request into a panic in
+        // middleware, with the process still answering `/health/live` while
+        // serving nothing. The guarded data is a plain map — a panic mid-update
+        // leaves it merely stale, which is a far better outcome than a server
+        // that is up and refuses everything.
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // Amortised cleanup of expired buckets keeps the map bounded.
         if inner.buckets.len() >= inner.sweep_at {
             let window = self.window;

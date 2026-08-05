@@ -37,13 +37,23 @@ pub fn service_index(urls: &UrlBuilder, web_ui_enabled: bool) -> Value {
         &["PackageBaseAddress/3.0.0"],
         "Base URL of where NuGet packages are stored.",
     );
+    // Two registration hives, as nuget.org exposes them. The SemVer1 hive omits
+    // versions a pre-SemVer2 client cannot parse (dotted pre-release labels,
+    // build metadata); advertising one hive under both sets of `@type`s would
+    // hand such a client versions it chokes on.
     push(
-        urls.registration_base(),
+        urls.registration_base_semver1(),
         &[
             "RegistrationsBaseUrl",
             "RegistrationsBaseUrl/3.0.0-beta",
             "RegistrationsBaseUrl/3.0.0-rc",
             "RegistrationsBaseUrl/3.4.0",
+        ],
+        "Base URL of package registration info (SemVer1).",
+    );
+    push(
+        urls.registration_base_semver2(),
+        &[
             "RegistrationsBaseUrl/3.6.0",
             "RegistrationsBaseUrl/Versioned",
         ],
@@ -254,7 +264,7 @@ fn catalog_entry(urls: &UrlBuilder, lower_id: &str, p: &Package, content_url: &s
         "projectUrl": p.project_url,
         "published": published,
         "releaseNotes": p.release_notes,
-        "requireLicenseAcceptance": false,
+        "requireLicenseAcceptance": p.require_license_acceptance,
         "summary": p.summary,
         "tags": p.tags,
         "title": p.title,
@@ -293,7 +303,14 @@ fn dependency_groups(
                         "@id": format!("{group_id}/{}", d.id.to_lowercase()),
                         "@type": "PackageDependency",
                         "id": d.id,
-                        "range": d.version_range,
+                        // `<dependency id="X" />` with no `version` attribute is
+                        // legal and means "any version". Emitting it as JSON
+                        // `null` is not: nuget.org writes the unbounded range as
+                        // `(, )`, and NuGet.Protocol hands the value straight to
+                        // `VersionRange.Parse`, which throws on null rather than
+                        // degrading to `VersionRange.All` — so reading the
+                        // metadata fails instead of the dependency being open.
+                        "range": d.version_range.clone().unwrap_or_else(|| "(, )".into()),
                         "registration": urls.registration_index(&d.id.to_lowercase()),
                     })
                 })
@@ -419,6 +436,7 @@ mod tests {
             has_readme: false,
             has_embedded_icon: false,
             is_development_dependency: false,
+            require_license_acceptance: false,
             is_semver2: false,
             package_size: 10,
             package_hash: "aGFzaA==".into(),

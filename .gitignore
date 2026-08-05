@@ -5,6 +5,10 @@
 # Generated documentation site (built with `mkdocs build`, embedded at compile time)
 /site
 
+# Playwright, installed on demand by the media capture script
+/scripts/media/node_modules
+/scripts/media/out
+
 # Local runtime data / config
 /data
 /packages

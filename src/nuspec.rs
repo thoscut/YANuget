@@ -4,8 +4,7 @@
 //! We match on *local* element names so the parser is agnostic to the (several)
 //! XML namespaces NuGet has used over the years.
 
-use quick_xml::escape::unescape;
-use quick_xml::events::Event;
+use quick_xml::events::{BytesRef, Event};
 use quick_xml::{Reader, XmlVersion};
 
 use crate::error::Error;
@@ -67,17 +66,39 @@ impl Nuspec {
     }
 }
 
+/// Bounds on a single manifest. A real nuspec is a few KiB with a handful of
+/// dependency groups; these are far above anything legitimate and exist only so
+/// a hostile manifest cannot turn its (already capped) 16 MiB of XML into an
+/// unbounded pile of allocations, database rows and rendered HTML.
+const MAX_ELEMENT_DEPTH: usize = 64;
+const MAX_DEPENDENCY_GROUPS: usize = 512;
+const MAX_DEPENDENCIES: usize = 10_000;
+const MAX_PACKAGE_TYPES: usize = 64;
+
 /// Parse a `.nuspec` document. Returns [`Error::InvalidPackage`] when the XML is
-/// malformed or is missing the mandatory `id`/`version` fields.
+/// malformed, exceeds the structural limits above, or is missing the mandatory
+/// `id`/`version` fields.
 pub fn parse_nuspec(xml: &str) -> Result<Nuspec, Error> {
     let mut reader = Reader::from_str(xml);
-    reader.config_mut().trim_text(true);
+    // Text is *not* trimmed per event, because an element's text can arrive as
+    // several events (see `text` below) and trimming each one would eat the
+    // spaces between them. The accumulated value is trimmed once, at the end.
+    reader.config_mut().trim_text(false);
 
     let mut nuspec = Nuspec::default();
     // Lower-cased local-name stack of currently open elements.
     let mut path: Vec<String> = Vec::new();
     // Index into `dependency_groups` for the currently open `<group>`, if any.
     let mut current_group: Option<usize> = None;
+    // Text accumulated for the element currently open.
+    //
+    // quick-xml reports the content of one element as *one event per run
+    // between entity references*: `Alice &amp; Bob` arrives as "Alice ", "&",
+    // " Bob". Assigning each event in turn would keep only the last, silently
+    // truncating every field that contains an entity — and `&` is ordinary in a
+    // description or an author list. So the runs are joined and assigned once,
+    // when the element closes.
+    let mut text = String::new();
 
     loop {
         match reader.read_event() {
@@ -87,9 +108,26 @@ pub fn parse_nuspec(xml: &str) -> Result<Nuspec, Error> {
             Ok(Event::Empty(e)) => {
                 let name = local_name(e.name().as_ref());
                 handle_attr_element(&name, &e, &mut nuspec, current_group);
+                check_limits(&nuspec)?;
             }
             Ok(Event::Start(e)) => {
                 let name = local_name(e.name().as_ref());
+
+                // Checked before anything is pushed, so every branch below is
+                // covered. `<license>` used to push its synthetic entry and
+                // `continue` past a check that sat further down, which left the
+                // depth entirely unbounded for that one element name: nesting
+                // `<license>` some 800k times inside a 16 MiB manifest grew
+                // `path` without limit and made `assign_text`'s ancestor scan —
+                // O(depth) on every closing tag — quadratic. Measured at 834ms
+                // for a 1 MiB manifest, and `parse_nuspec` runs on a tokio
+                // worker rather than a blocking thread, so a few concurrent
+                // pushes of a tiny, highly compressible file stall the runtime.
+                if path.len() >= MAX_ELEMENT_DEPTH {
+                    return Err(Error::InvalidPackage(format!(
+                        "nuspec nests deeper than {MAX_ELEMENT_DEPTH} elements"
+                    )));
+                }
 
                 // `<license type="...">` carries its value as following text, so
                 // remember which flavour we are inside via a synthetic path entry.
@@ -105,26 +143,46 @@ pub fn parse_nuspec(xml: &str) -> Result<Nuspec, Error> {
 
                 handle_attr_element(&name, &e, &mut nuspec, current_group);
                 if name == "group" {
-                    current_group = Some(nuspec.dependency_groups.len() - 1);
+                    // `handle_attr_element` always pushes a group for this name,
+                    // so the list is non-empty here.
+                    current_group = nuspec.dependency_groups.len().checked_sub(1);
                 }
                 path.push(name);
+                // Any text seen before this child belongs to the parent, which
+                // in a nuspec is never a scalar field — drop it rather than let
+                // it bleed into the child's value.
+                text.clear();
+                check_limits(&nuspec)?;
             }
             Ok(Event::Text(e)) => {
-                // quick-xml 0.41 split text handling: `xml10_content` decodes and
-                // normalizes EOLs, then `unescape` resolves XML entities — together
-                // they replace the old one-shot `BytesText::unescape`.
-                let Ok(decoded) = e.xml10_content() else {
-                    continue;
-                };
-                let text = unescape(&decoded)
-                    .map(|u| u.into_owned())
-                    .unwrap_or_else(|_| decoded.into_owned());
-                if text.trim().is_empty() {
-                    continue;
+                // `xml10_content` decodes the bytes and normalizes EOLs. It does
+                // not resolve entities — quick-xml 0.41 reports those separately,
+                // as `GeneralRef` events, which is why an element's content
+                // arrives as several events and has to be reassembled.
+                match e.xml10_content() {
+                    Ok(decoded) => text.push_str(&decoded),
+                    Err(_) => continue,
                 }
-                assign_text(&mut nuspec, &path, text);
             }
+            // `&amp;`, `&lt;`, `&#233;` … — the entity between two text runs.
+            Ok(Event::GeneralRef(e)) => {
+                if let Some(resolved) = resolve_reference(&e) {
+                    text.push(resolved);
+                }
+            }
+            // A `<description><![CDATA[...]]></description>` is how a manifest
+            // carries markup without escaping it. Ignoring the event dropped the
+            // field entirely.
+            Ok(Event::CData(e)) => match e.decode() {
+                Ok(decoded) => text.push_str(&decoded),
+                Err(_) => continue,
+            },
             Ok(Event::End(_)) => {
+                let value = std::mem::take(&mut text);
+                let value = value.trim();
+                if !value.is_empty() {
+                    assign_text(&mut nuspec, &path, value.to_string());
+                }
                 if let Some(top) = path.pop() {
                     if top == "group" {
                         current_group = None;
@@ -146,6 +204,52 @@ pub fn parse_nuspec(xml: &str) -> Result<Nuspec, Error> {
         return Err(Error::InvalidPackage("nuspec is missing <version>".into()));
     }
     Ok(nuspec)
+}
+
+/// Resolve one entity reference to its character.
+///
+/// A nuspec is a standalone document with no DTD, so the only references that
+/// can legitimately appear are numeric character references and the five XML
+/// predefined entities. Anything else is undefined and is dropped rather than
+/// reproduced literally, which would silently turn `&foo;` into text that looks
+/// like markup.
+fn resolve_reference(e: &BytesRef) -> Option<char> {
+    if let Ok(Some(ch)) = e.resolve_char_ref() {
+        return Some(ch);
+    }
+    match e.decode().ok()?.as_ref() {
+        "amp" => Some('&'),
+        "lt" => Some('<'),
+        "gt" => Some('>'),
+        "quot" => Some('"'),
+        "apos" => Some('\''),
+        _ => None,
+    }
+}
+
+/// Reject a manifest that has grown past the structural limits.
+fn check_limits(n: &Nuspec) -> Result<(), Error> {
+    if n.dependency_groups.len() > MAX_DEPENDENCY_GROUPS {
+        return Err(Error::InvalidPackage(format!(
+            "nuspec declares more than {MAX_DEPENDENCY_GROUPS} dependency groups"
+        )));
+    }
+    if n.package_types.len() > MAX_PACKAGE_TYPES {
+        return Err(Error::InvalidPackage(format!(
+            "nuspec declares more than {MAX_PACKAGE_TYPES} package types"
+        )));
+    }
+    let deps: usize = n
+        .dependency_groups
+        .iter()
+        .map(|g| g.dependencies.len())
+        .sum();
+    if deps > MAX_DEPENDENCIES {
+        return Err(Error::InvalidPackage(format!(
+            "nuspec declares more than {MAX_DEPENDENCIES} dependencies"
+        )));
+    }
+    Ok(())
 }
 
 /// Process an element whose data lives entirely in its attributes. Shared by
@@ -278,7 +382,106 @@ fn attr(e: &quick_xml::events::BytesStart, name: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    /// Every element name has to be bounded by the depth cap, including the
+    /// ones handled by a special branch.
+    ///
+    /// `<license>` used to push its synthetic path entry and `continue` past
+    /// the check. Depth was then unbounded for that name alone, which made the
+    /// ancestor scan in `assign_text` quadratic — a 1 MiB manifest of nested
+    /// `<license>` took 834ms, on a tokio worker rather than a blocking thread,
+    /// from an upload that compresses to a few KiB.
+    #[test]
+    fn no_element_can_nest_past_the_depth_cap() {
+        for (name, wrapper) in [
+            ("license", ("<package><metadata>", "</metadata></package>")),
+            // Outside `<metadata>` the ancestor scan has no early exit, which
+            // is the shape that actually went quadratic.
+            ("license", ("<package>", "</package>")),
+            ("group", ("<package><metadata>", "</metadata></package>")),
+        ] {
+            let n = MAX_ELEMENT_DEPTH + 50;
+            let mut xml = String::from(wrapper.0);
+            xml.push_str(&format!("<{name}>").repeat(n));
+            xml.push_str(&format!("</{name}>t").repeat(n));
+            xml.push_str(wrapper.1);
+
+            let start = std::time::Instant::now();
+            let err = parse_nuspec(&xml).expect_err("{name} nested past the cap must be rejected");
+            assert!(
+                err.to_string().contains("nests deeper"),
+                "{name}: unexpected error {err}"
+            );
+            // Bailing at the cap means the cost cannot scale with the input.
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(1),
+                "{name}: parsing took {:?}, which suggests the cap was not applied",
+                start.elapsed()
+            );
+        }
+    }
+
+    /// Nesting up to the cap still parses, so the check is not off by one in
+    /// the direction that would reject ordinary manifests.
+    #[test]
+    fn nesting_within_the_cap_still_parses() {
+        let depth = 8;
+        let mut xml = String::from("<package><metadata>");
+        xml.push_str("<a>".repeat(depth).as_str());
+        xml.push_str("</a>".repeat(depth).as_str());
+        xml.push_str("<id>A</id><version>1.0.0</version><description>d</description>");
+        xml.push_str("<authors>x</authors><license type=\"expression\">MIT</license>");
+        xml.push_str("</metadata></package>");
+        let parsed = parse_nuspec(&xml).expect("ordinary nesting must parse");
+        assert_eq!(parsed.id, "A");
+        assert_eq!(parsed.license_expression.as_deref(), Some("MIT"));
+    }
+
     use super::*;
+
+    #[test]
+    fn entities_do_not_truncate_a_field() {
+        // quick-xml reports one text event per run between entity references.
+        // Keeping only the last one silently truncated every field containing an
+        // entity — and `&` is ordinary in a description or an author list.
+        let xml = r#"<package><metadata>
+            <id>P</id><version>1.0.0</version>
+            <description>Foo &amp; Bar &lt;T&gt; tail</description>
+            <authors>Alice &amp; Bob, Carol</authors>
+            <title>A &quot;quoted&quot; title</title>
+            <tags>a&amp;b c</tags>
+        </metadata></package>"#;
+        let n = parse_nuspec(xml).unwrap();
+        assert_eq!(n.description.as_deref(), Some("Foo & Bar <T> tail"));
+        assert_eq!(n.authors.as_deref(), Some("Alice & Bob, Carol"));
+        assert_eq!(n.author_list(), vec!["Alice & Bob", "Carol"]);
+        assert_eq!(n.title.as_deref(), Some(r#"A "quoted" title"#));
+        assert_eq!(n.tag_list(), vec!["a&b", "c"]);
+    }
+
+    #[test]
+    fn cdata_content_is_kept() {
+        // CDATA is how a manifest carries markup without escaping it; the event
+        // used to be ignored, dropping the field.
+        let xml = r#"<package><metadata>
+            <id>P</id><version>1.0.0</version>
+            <description><![CDATA[Raw <b>markup</b> & symbols]]></description>
+        </metadata></package>"#;
+        let n = parse_nuspec(xml).unwrap();
+        assert_eq!(
+            n.description.as_deref(),
+            Some("Raw <b>markup</b> & symbols")
+        );
+    }
+
+    #[test]
+    fn surrounding_whitespace_is_trimmed_but_interior_is_kept() {
+        let xml = "<package><metadata>\n  <id>P</id>\n  <version>1.0.0</version>\n  \
+                   <description>\n    one &amp; two   three\n  </description>\n\
+                   </metadata></package>";
+        let n = parse_nuspec(xml).unwrap();
+        assert_eq!(n.description.as_deref(), Some("one & two   three"));
+        assert_eq!(n.id, "P");
+    }
 
     const SAMPLE: &str = r#"<?xml version="1.0" encoding="utf-8"?>
 <package xmlns="http://schemas.microsoft.com/packaging/2013/05/nuspec.xsd">

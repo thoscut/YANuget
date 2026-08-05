@@ -67,6 +67,21 @@ impl SearchGroup {
             .expect("a search group always has at least one package")
     }
 
+    /// The version to headline: the newest stable one, or the newest of any
+    /// kind when every version is a pre-release.
+    ///
+    /// This is what a person should be shown and offered an install command
+    /// for. [`Self::latest`] includes pre-releases, so using it made the gallery
+    /// headline `2.0.0-beta` while a NuGet client searching the same feed —
+    /// which excludes pre-releases unless asked — offered `1.9.0`.
+    pub fn headline(&self) -> &Package {
+        self.packages
+            .iter()
+            .rev()
+            .find(|p| !p.is_prerelease())
+            .unwrap_or_else(|| self.latest())
+    }
+
     /// Total downloads across all versions in the group.
     pub fn total_downloads(&self) -> u64 {
         self.packages.iter().map(|p| p.downloads).sum()
@@ -130,6 +145,13 @@ pub struct FeedVersion {
 /// Metadata store for indexed packages.
 #[async_trait]
 pub trait PackageDatabase: Send + Sync {
+    /// Cheap round-trip proving the store is reachable and answering.
+    ///
+    /// Backs the readiness probe: a server whose database file has been deleted
+    /// or whose volume was unmounted still accepts connections and still serves
+    /// a static "OK", which is exactly the failure an orchestrator needs to see.
+    async fn ping(&self) -> Result<()>;
+
     // --- global package data (shared by every feed) ---
 
     /// Insert global package metadata if absent. Idempotent: returns `true` when
@@ -237,13 +259,25 @@ pub trait PackageDatabase: Send + Sync {
     async fn search(&self, feed: &str, request: &SearchRequest) -> Result<SearchPage>;
 
     /// Autocomplete package ids in `feed` by prefix/substring.
+    /// Package ids matching `query`, for the autocomplete service.
+    ///
+    /// `include_prerelease`/`include_semver2` mirror the search filters: an id
+    /// whose only versions are excluded by them must not be suggested, or the
+    /// caller is pointed at a package it will then find nothing in.
+    ///
+    /// Returns the requested page and the total number of matching ids. The
+    /// total is what a caller pages on, so it must count every match rather
+    /// than the page — reporting the page size stops a client at the first
+    /// page and hides everything after it.
     async fn autocomplete(
         &self,
         feed: &str,
         query: &str,
+        include_prerelease: bool,
+        include_semver2: bool,
         skip: i64,
         take: i64,
-    ) -> Result<Vec<String>>;
+    ) -> Result<(Vec<String>, i64)>;
 
     /// Every distinct package id in `feed` (original casing), ascending. Used by
     /// the retention sweep, which must visit packages search would not return.

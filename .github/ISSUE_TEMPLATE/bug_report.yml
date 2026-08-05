@@ -1,0 +1,68 @@
+name: Bug report
+description: Something does not work the way it should
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please do not report security problems here — see
+        [SECURITY.md](https://github.com/thoscut/yanuget/blob/main/SECURITY.md).
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what you got instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: How to reproduce
+      description: >
+        The request, command or `.nupkg` that triggers it. If a client is
+        involved, the exact command line and its output help a great deal.
+      render: shell
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: YANuget version
+      description: Output of `yanuget --version`, or the commit you built.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: client
+    attributes:
+      label: Which client
+      multiple: true
+      options:
+        - dotnet CLI
+        - nuget.exe
+        - Chocolatey
+        - Visual Studio
+        - A debugger fetching symbols
+        - A browser (web gallery)
+        - curl or another HTTP client
+        - Not client-related
+
+  - type: textarea
+    id: config
+    attributes:
+      label: Relevant configuration
+      description: >
+        The parts of your TOML or `YANUGET_*` environment that matter — TLS on or
+        off, behind a proxy or not, feeds/mirroring/admin enabled. **Redact your
+        API keys.**
+      render: toml
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Server log
+      description: Run with `RUST_LOG=yanuget=debug` if you can.
+      render: shell

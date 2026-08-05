@@ -72,7 +72,16 @@ pub fn versions_to_prune(
         .or_else(|| prerelease.first())
         .map(|p| &p.version);
 
-    let cutoff = policy.max_age_days.map(|d| now - Duration::days(d as i64));
+    // `Duration::days` panics outside its representable range, and a `u64` day
+    // count from configuration can easily exceed it — so build the cutoff with
+    // checked arithmetic. An unrepresentably distant cutoff means "never too
+    // old", which is the safe reading: it prunes nothing rather than, via a
+    // wrapped negative duration, treating every version as expired.
+    let cutoff = policy
+        .max_age_days
+        .and_then(|d| i64::try_from(d).ok())
+        .and_then(Duration::try_days)
+        .and_then(|d| now.checked_sub_signed(d));
 
     let mut prune = Vec::new();
     for (channel, keep) in [
@@ -114,14 +123,59 @@ pub async fn purge_version(
     let _guard = crate::locks::lock_version(id, &version.normalized()).await;
     let removed = db.remove_membership(feed, id, version).await?;
     if db.feed_count(id, version).await? == 0 {
-        for sym in db.find_symbols(id, version).await.unwrap_or_default() {
-            let _ = storage.delete_symbol(&sym.key, &sym.filename).await;
-        }
-        let _ = db.delete_symbols(id, version).await;
-        let _ = db.delete_package_data(id, version).await;
-        let _ = storage.delete(id, &version.normalized()).await;
+        purge_global_data(storage, db, id, version).await?;
     }
     Ok(removed)
+}
+
+/// Hard-delete the data shared by every feed: symbol files and rows, the stored
+/// payload and sidecars, and the `packages` row.
+///
+/// **The caller must already hold the version lock** — this does not take it, so
+/// that code which is mid-way through a locked sequence (an overwriting push)
+/// can reuse it without deadlocking.
+///
+/// The order is chosen for recoverability. Files go first and rows last, because
+/// the rows are the only index of what there is to delete: aborting with the
+/// rows intact leaves a state a retry can finish, whereas deleting the rows
+/// first and then failing on the files orphans bytes nothing will ever find
+/// again. Every step propagates its error rather than being discarded — the
+/// previous version reported success after silently failing to delete anything,
+/// so a read-only mount or a permissions change looked exactly like a clean
+/// sweep.
+pub(crate) async fn purge_global_data(
+    storage: &dyn PackageStorage,
+    db: &dyn PackageDatabase,
+    id: &str,
+    version: &NuGetVersion,
+) -> Result<()> {
+    purge_symbols(storage, db, id, version).await?;
+    storage.delete(id, &version.normalized()).await?;
+    db.delete_package_data(id, version).await?;
+    Ok(())
+}
+
+/// Drop every symbol file and mapping belonging to one version, leaving the
+/// package itself alone.
+///
+/// Separate from [`purge_global_data`] because an overwriting push needs exactly
+/// this and nothing else: the replacement build's PDBs have different SSQP keys,
+/// so the old mappings would otherwise survive and — since they still resolve to
+/// an id/version that exists — keep serving the *previous* build's PDBs to
+/// anyone debugging the new one.
+///
+/// Same contract: the caller must already hold the version lock.
+pub(crate) async fn purge_symbols(
+    storage: &dyn PackageStorage,
+    db: &dyn PackageDatabase,
+    id: &str,
+    version: &NuGetVersion,
+) -> Result<()> {
+    for sym in db.find_symbols(id, version).await? {
+        storage.delete_symbol(&sym.key, &sym.filename).await?;
+    }
+    db.delete_symbols(id, version).await?;
+    Ok(())
 }
 
 /// Apply the policy to a single package id within `feed`. Returns the number of
@@ -206,6 +260,7 @@ mod tests {
             has_readme: false,
             has_embedded_icon: false,
             is_development_dependency: false,
+            require_license_acceptance: false,
             is_semver2: false,
             package_size: 1,
             package_hash: "h".into(),
@@ -215,6 +270,36 @@ mod tests {
             package_types: vec![],
             dependencies: vec![],
         }
+    }
+
+    #[test]
+    fn an_absurd_max_age_prunes_nothing_instead_of_panicking() {
+        // A day count this large is out of `Duration`'s range. Building the
+        // cutoff must not panic, and — critically — must not wrap into a future
+        // date, which would mark every version as expired and delete the feed.
+        // 1.0.0 is ancient; 2.0.0 is current and is the protected newest stable.
+        let packages = vec![pkg("1.0.0", 5_000), pkg("2.0.0", 0)];
+        for days in [u64::MAX, i64::MAX as u64, 1 << 60] {
+            let policy = RetentionPolicy {
+                max_age_days: Some(days),
+                ..Default::default()
+            };
+            assert!(
+                versions_to_prune(&packages, &policy, Utc::now()).is_empty(),
+                "max_age_days = {days} pruned versions"
+            );
+        }
+
+        // A sane large-but-representable value still works normally.
+        let policy = RetentionPolicy {
+            max_age_days: Some(1_000),
+            ..Default::default()
+        };
+        assert_eq!(
+            names(versions_to_prune(&packages, &policy, Utc::now())),
+            vec!["1.0.0".to_string()],
+            "the 5000-day-old 1.0.0 should be pruned; 2.0.0 is the protected newest"
+        );
     }
 
     fn names(mut v: Vec<NuGetVersion>) -> Vec<String> {

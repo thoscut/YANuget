@@ -53,10 +53,82 @@ pub fn evaluate_license(policy: &LicensePolicyConfig, package: &Package) -> Poli
     if policy.blocked.iter().any(|b| matches_license(b, license)) {
         return violation(policy, format!("license {license:?} is blocked"));
     }
-    if !policy.allowed.is_empty() && !policy.allowed.iter().any(|a| matches_license(a, license)) {
+    if !policy.allowed.is_empty() && !expression_is_allowed(&policy.allowed, license) {
         return violation(policy, format!("license {license:?} is not allowed"));
     }
     PolicyOutcome::ok()
+}
+
+/// Whether an SPDX expression is satisfied by the allow-list.
+///
+/// The two SPDX operators mean opposite things for an allow-list, and treating
+/// them alike is what makes a naive "does any component match?" check wrong:
+///
+/// * `A OR B` lets the consumer pick either, so it is allowed if **either** side
+///   is allowed.
+/// * `A AND B` obliges the consumer to satisfy **both**, so `MIT AND Proprietary`
+///   must *not* pass a policy that only permits `MIT` — the package still
+///   carries the proprietary terms.
+///
+/// Precedence with parentheses is not modelled. Rather than guess (and guess
+/// permissively), a parenthesised expression is allowed only on an exact match
+/// against a configured rule.
+fn expression_is_allowed(allowed: &[String], license: &str) -> bool {
+    if allowed
+        .iter()
+        .any(|a| a.trim().eq_ignore_ascii_case(license.trim()))
+    {
+        return true;
+    }
+    if license.contains('(') || license.contains(')') {
+        return false;
+    }
+    // OR binds looser than AND: the expression is a disjunction of conjunctions.
+    split_operator(license, "OR")
+        .into_iter()
+        .any(|alternative| {
+            let conjuncts = split_operator(&alternative, "AND");
+            !conjuncts.is_empty()
+                && conjuncts
+                    .iter()
+                    .all(|term| allowed.iter().any(|a| matches_identifier(a, term)))
+        })
+}
+
+/// Split an expression on a top-level SPDX operator, case-insensitively.
+fn split_operator(expr: &str, op: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current: Vec<&str> = Vec::new();
+    for token in expr.split_whitespace() {
+        if token.eq_ignore_ascii_case(op) {
+            parts.push(current.join(" "));
+            current.clear();
+        } else {
+            current.push(token);
+        }
+    }
+    parts.push(current.join(" "));
+    parts
+        .into_iter()
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+        .collect()
+}
+
+/// Whether `rule` matches a single SPDX identifier, which may carry a `WITH`
+/// exception. An exception only ever *relaxes* the base licence, so a rule
+/// naming the base identifier matches the `WITH` form too.
+fn matches_identifier(rule: &str, identifier: &str) -> bool {
+    let rule = rule.trim();
+    let identifier = identifier.trim();
+    if rule.eq_ignore_ascii_case(identifier) {
+        return true;
+    }
+    let base = split_operator(identifier, "WITH")
+        .into_iter()
+        .next()
+        .unwrap_or_default();
+    !base.is_empty() && rule.eq_ignore_ascii_case(&base)
 }
 
 fn violation(policy: &LicensePolicyConfig, reason: String) -> PolicyOutcome {
@@ -122,6 +194,7 @@ mod tests {
             has_readme: false,
             has_embedded_icon: false,
             is_development_dependency: false,
+            require_license_acceptance: false,
             is_semver2: false,
             package_size: 1,
             package_hash: "h".into(),
@@ -164,6 +237,76 @@ mod tests {
         let out = evaluate_license(&policy, &pkg_with_license(Some("GPL-3.0-only"), None));
         assert!(out.allowed);
         assert!(out.violation.is_some());
+    }
+
+    #[test]
+    fn and_requires_every_component_to_be_allowed() {
+        let policy = LicensePolicyConfig {
+            enabled: true,
+            allowed: vec!["MIT".into(), "Apache-2.0".into()],
+            action: PolicyAction::Block,
+            ..Default::default()
+        };
+
+        // `A OR B` lets the consumer pick, so one allowed side is enough.
+        for ok in ["MIT", "MIT OR GPL-3.0-only", "GPL-3.0-only OR Apache-2.0"] {
+            assert!(
+                evaluate_license(&policy, &pkg_with_license(Some(ok), None)).allowed,
+                "{ok:?} should be allowed"
+            );
+        }
+
+        // `A AND B` obliges the consumer to satisfy both. A package licensed
+        // "MIT AND Proprietary" still carries the proprietary terms, so a
+        // policy permitting only MIT must not let it through.
+        for bad in [
+            "MIT AND Proprietary",
+            "Proprietary AND MIT",
+            "GPL-3.0-only AND Apache-2.0",
+        ] {
+            assert!(
+                !evaluate_license(&policy, &pkg_with_license(Some(bad), None)).allowed,
+                "{bad:?} should be rejected"
+            );
+        }
+
+        // Both sides allowed is fine.
+        assert!(
+            evaluate_license(&policy, &pkg_with_license(Some("MIT AND Apache-2.0"), None)).allowed
+        );
+
+        // Parenthesised expressions are not second-guessed: precedence is not
+        // modelled, so only an exact rule match allows them.
+        assert!(
+            !evaluate_license(&policy, &pkg_with_license(Some("(MIT OR X) AND Y"), None)).allowed
+        );
+        let exact = LicensePolicyConfig {
+            allowed: vec!["(MIT OR X) AND Y".into()],
+            ..policy.clone()
+        };
+        assert!(
+            evaluate_license(&exact, &pkg_with_license(Some("(MIT OR X) AND Y"), None)).allowed
+        );
+    }
+
+    #[test]
+    fn a_with_exception_matches_its_base_identifier() {
+        let policy = LicensePolicyConfig {
+            enabled: true,
+            allowed: vec!["GPL-2.0-only".into()],
+            action: PolicyAction::Block,
+            ..Default::default()
+        };
+        // An exception only relaxes the base licence, so allowing the base
+        // allows the `WITH` form.
+        assert!(
+            evaluate_license(
+                &policy,
+                &pkg_with_license(Some("GPL-2.0-only WITH Classpath-exception-2.0"), None)
+            )
+            .allowed
+        );
+        assert!(!evaluate_license(&policy, &pkg_with_license(Some("GPL-3.0-only"), None)).allowed);
     }
 
     #[test]

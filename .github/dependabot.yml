@@ -1,0 +1,28 @@
+version: 2
+updates:
+  # Cargo dependencies. This is a package server, so a known-vulnerable
+  # dependency is not merely a hygiene problem — `cargo audit` runs in CI and
+  # these updates are what keep it quiet.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      # Patch and minor bumps are almost always mechanical; batching them keeps
+      # the queue readable and leaves majors as individual, reviewable PRs.
+      minor-and-patch:
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      actions:
+        patterns: ["*"]
+
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: monthly

@@ -41,5 +41,7 @@ nav:
   - Home: index.md
   - HTTP API: api.md
   - Configuration: configuration.md
+  - Deployment: deployment.md
+  - Bulk migration: migrate.md
   - Architecture: architecture.md
   - Large packages: large-packages.md

@@ -20,7 +20,7 @@ being sent.
 The push handler (`web::push_package` → `web::write_upload`) takes the request
 body as a **stream** of chunks. Whether the client sends `multipart/form-data`
 (the `dotnet`/`nuget` default) or a raw body, the bytes are handed to
-[`streaming::stream_to_writer_limited`](../src/streaming.rs), which:
+[`streaming::stream_to_writer_limited`](https://github.com/thoscut/yanuget/blob/main/src/streaming.rs), which:
 
 1. writes each chunk to a temp file, and
 2. feeds each chunk into a running SHA-512 hasher,
@@ -35,7 +35,7 @@ stream, so the multipart envelope never forces buffering either.
 ### Manifest read → seek, don't scan
 
 A `.nupkg` is a ZIP, and a ZIP's *central directory* lives at the **end** of the
-file. [`nupkg::read_archive`](../src/nupkg.rs) opens the temp file and lets the
+file. [`nupkg::read_archive`](https://github.com/thoscut/yanuget/blob/main/src/nupkg.rs) opens the temp file and lets the
 `zip` crate **seek** to that directory and then to the single `.nuspec` entry.
 A 25 GB archive is therefore touched in two tiny reads (directory + manifest),
 never scanned front-to-back. The blocking ZIP work runs on a
@@ -54,7 +54,7 @@ different filesystems, it falls back to a streaming copy (still no buffering).
 ### Download → stream + Range
 
 `web::download_package` resolves the file to a local path and serves it via
-[`web::files::serve_local_file`](../src/web/files.rs), which streams the file
+[`web::files::serve_local_file`](https://github.com/thoscut/yanuget/blob/main/src/web/files.rs), which streams the file
 with `tokio_util::io::ReaderStream` and honours a `Range: bytes=...` header,
 replying `206 Partial Content`. This makes 25 GB downloads **resumable** (a
 dropped connection resumes from the last byte) and keeps server memory flat.
@@ -64,6 +64,42 @@ dropped connection resumes from the last byte) and keeps server memory flat.
 Package sizes are `u64` in the domain model, bound as `i64` in SQLite, and
 emitted as JSON numbers — nothing truncates at the 4 GB `u32` limit. The test
 suite explicitly stores and round-trips a 25 GB size to guard this.
+
+## Measured
+
+The design above is only worth stating if it holds in practice, so it was
+measured end to end against a release build serving a real **5 GiB** package
+(5,368,709,716 bytes — deliberately past the 4 GiB `u32` boundary, which also
+makes it a ZIP64 archive). Server resident memory was sampled every 300 ms
+throughout:
+
+| Operation | Peak server RSS |
+| --- | --- |
+| Idle, before any transfer | 11.7 MB |
+| 5 GiB push, raw body | 15.8 MB |
+| 5 GiB push, `multipart/form-data` (what `dotnet nuget push` sends) | 14.1 MB |
+| 5 GiB download | 15.9 MB |
+| **Six concurrent 5 GiB downloads** (30 GiB in flight) | **14.9 MB** |
+
+So a 5 GiB transfer costs single-digit megabytes above idle, and six of them at
+once cost no more than one — memory tracks the number of *buffers*, not the
+number of bytes.
+
+Alongside the memory numbers, the same run confirmed the correctness properties
+that matter to a client:
+
+- the stored file is byte-identical to the source, including via the multipart
+  path (which must strip its framing exactly);
+- the reported size is 5,368,709,716 — no truncation at 4 GiB;
+- the advertised SHA-512 matches a hash computed independently over the source
+  file, so the digest a client verifies really describes the bytes it received;
+- `Range` requests resolve correctly *past* the 4 GiB mark — a range at offset
+  5,368,709,000 returned the exact tail bytes with a correct `Content-Range`,
+  which is what makes a 25 GB download resumable.
+
+Worth noting for anyone reproducing this: `curl --data-binary @file` reads the
+whole body into memory and will run out on a file this size. Use `curl -T file`,
+which streams. The server is the part that does not buffer.
 
 ## Operational guidance
 

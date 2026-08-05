@@ -81,8 +81,17 @@ still restorable by exact version) — the same semantics as the NuGet client's
 GET /v3/package/{id}/index.json
 ```
 
-`{ "versions": ["1.0.0", "1.1.0", ...] }` — lower-cased, normalized, listed
-versions, ascending. `404` if the id is unknown.
+`{ "versions": ["1.0.0", "1.1.0", ...] }` — lower-cased, normalized versions,
+ascending. `404` if the id is unknown.
+
+**Unlisted versions are included.** This endpoint is how a client resolves a
+version it is about to restore, so omitting them would make a project pinned to
+an unlisted version fail with `NU1101` — which is precisely the difference
+between unlisting and deleting. Unlisted versions are still hidden from
+`/v3/search`, and registration reports them with `"listed": false`.
+
+Admin-**disabled** and still-**pending** versions are excluded here, as they are
+everywhere else: those are withheld from clients outright.
 
 ```
 GET /v3/package/{id}/{version}/{id}.{version}.nupkg
@@ -92,6 +101,13 @@ Streams the `.nupkg`. Supports `Range: bytes=...` (responds `206 Partial
 Content` with `Content-Range`); always sends `Accept-Ranges: bytes`. Each
 successful fetch increments the download counter.
 
+A published id/version is immutable, so the response carries a strong `ETag`
+(the package's SHA-512 — a content hash of exactly the bytes served) and
+`Cache-Control: public, max-age=31536000, immutable`. Repeating the request with
+`If-None-Match` returns `304 Not Modified` with an empty body, so a client that
+already holds a multi-gigabyte package pays for a header exchange rather than
+the payload.
+
 ```
 GET /v3/package/{id}/{version}/{id}.nuspec
 ```
@@ -100,20 +116,45 @@ Returns the package's `.nuspec` manifest as `application/xml`.
 
 ## Registration
 
+NuGet exposes **two registration hives** and a client picks one from the service
+index:
+
+| Hive | Path | `@type`s | Contents |
+| --- | --- | --- | --- |
+| SemVer1 | `/v3/registration/` | `RegistrationsBaseUrl`, `…/3.0.0-beta`, `…/3.0.0-rc`, `…/3.4.0` | Only versions a pre-SemVer2 client can parse |
+| SemVer2 | `/v3/registration-semver2/` | `…/3.6.0`, `…/Versioned` | Every version |
+
+A version is SemVer2 when it carries build metadata or more than one
+dot-separated pre-release identifier (`2.0.0-alpha.1`, `3.0.0+build`). Those are
+withheld from the SemVer1 hive — advertising a single hive under both sets of
+`@type`s would hand an older client versions it chokes on. Each hive's documents
+keep their self-references inside that hive, and a SemVer2-only version returns
+`404` from a SemVer1 leaf. `/v3/search` links results into the hive matching the
+request's `semVerLevel`.
+
+
 ```
 GET /v3/registration/{id}/index.json
 ```
 
-A registration index with a single inlined page containing every version
-(listed and unlisted, with a `listed` flag) and full `catalogEntry` metadata,
-including `dependencyGroups`. Unlisted versions additionally report
-`published` in the year 1900, per NuGet convention. `dependencyGroups` is
-omitted when a version has no dependencies. `404` if unknown.
+A registration index containing every version (listed and unlisted, with a
+`listed` flag) and full `catalogEntry` metadata, including `dependencyGroups`.
+Unlisted versions additionally report `published` in the year 1900, per NuGet
+convention. `dependencyGroups` is omitted when a version has no dependencies.
+`404` if unknown.
 
-> All versions are currently inlined into one page. nuget.org pages packages
-> with ≥128 versions into pages of 64; YANuget does not yet do this, which is
-> only relevant for packages with an extreme number of versions (not large
-> package *size*). See the roadmap.
+Packages with **fewer than 128 versions** get a single inlined page — the
+whole registration in one response. At 128 versions or more the index instead
+lists external pages of 64 versions each, without inline `items`, and the
+client follows each page's `@id`:
+
+```
+GET /v3/registration/{id}/page/{lower}/{upper}.json
+```
+
+This matches how nuget.org pages large registrations, and is the reason a
+client may issue page requests you did not expect for a heavily versioned
+package. It has nothing to do with package *size*.
 
 ```
 GET /v3/registration/{id}/{version}.json
@@ -179,6 +220,7 @@ GET /                                  # searchable package list
 GET /packages?q=&skip=&take=           # same, as a search page
 GET /packages/{id}                     # detail for the newest version
 GET /packages/{id}/{version}           # detail for a specific version
+GET /packages/{id}/{version}/icon      # the package's embedded icon
 GET /stats                             # feed-wide statistics
 GET /settings                          # read-only policy overview
 ```
@@ -191,7 +233,16 @@ links, readme, symbol availability, and the install command for Chocolatey /
 and most-recently-published lists. `/settings` summarises the feed's policy
 (auth mode incl. download auth, size/overwrite/delete behaviour, approval &
 promotion ring, upstream mirror, license policy, symbol server, retention) and
-never exposes the API key or storage paths.
+never exposes the API key or storage paths. All of these honour the feed's
+`read_api_key` when one is set.
+
+`/packages/{id}/{version}/icon` serves the icon embedded in the package. Those
+bytes come from an uploaded `.nupkg`, so the content type is decided by
+**sniffing the bytes** rather than by trusting any declared name, and only
+raster formats (PNG, JPEG, GIF, WebP, BMP, ICO) are recognised — an "icon" that
+is really an SVG, which is a script-bearing document, returns `404` instead. The
+response also carries its own `Content-Security-Policy: default-src 'none'`.
+
 Requires `enable_web_ui` (on by default); when disabled, `/` serves a minimal
 info page and `/packages/*` return `404`.
 
@@ -227,12 +278,59 @@ the version to be a member of the current feed. The POST actions return
 `303 See Other` back to the package page; without credentials they return `401`
 with a `WWW-Authenticate: Basic` challenge.
 
+### CSRF
+
+The POST actions additionally require a CSRF token. Browsers replay HTTP Basic
+credentials automatically on any request to this origin, so authentication alone
+does not distinguish a click in `/admin` from a form auto-submitted by a page on
+someone else's site — without this, a signed-in operator merely visiting a
+hostile page would be enough to delete packages.
+
+The token is derived from the admin key, so producing it requires already
+knowing that key. The admin page embeds it in every form as a hidden `_csrf`
+field; a scripted caller may instead send it as an `X-CSRF-Token` header:
+
+```
+curl -u admin:$ADMIN_KEY -X POST \
+     -H "X-CSRF-Token: $TOKEN" \
+     https://host/admin/packages/foo/1.0.0/disable
+```
+
+A request without the token, or one a browser labels `Sec-Fetch-Site:
+cross-site`, returns `400`. Admin POST bodies are capped at 64 KiB.
+
 ## Health
 
 ```
-GET /health      → 200 "OK"
+GET /health         → 200 "OK"   (readiness: also probes the database)
+GET /health/ready   → same as /health
+GET /health/live    → 200 "OK"   (liveness: this process only)
 ```
+
+`/health` returns `503` with `database unavailable` when the store cannot be
+reached — the case an orchestrator has to act on, and one a static `OK` would
+hide. `/health/live` touches nothing else, so a slow dependency cannot trigger
+a restart loop through it.
+
+## Response headers
+
+Every response carries `X-Content-Type-Options: nosniff`,
+`X-Frame-Options: DENY`, `Referrer-Policy: no-referrer` and
+`Vary: Host, X-Forwarded-Host, X-Forwarded-Proto` — protocol documents embed
+absolute URLs derived from those inputs, so a shared cache must key on them.
+With TLS terminated by YANuget itself, responses also carry
+`Strict-Transport-Security`.
+
+Gallery pages carry a `Content-Security-Policy` of `default-src 'none'` whose
+only permitted inline style and script are the two the server itself emits,
+pinned by SHA-256. The embedded documentation site sets its own, looser policy
+(mkdocs emits inline bootstrap code this crate does not control).
 
 ## Error bodies
 
 Errors return the appropriate status with a JSON body `{ "error": "<message>" }`.
+
+`4xx` messages describe what the caller did wrong and are safe to act on. `5xx`
+responses return a generic `internal server error`: the underlying I/O,
+SQL or upstream detail would otherwise disclose filesystem paths, queries and
+upstream URLs, so it goes to the server log only.

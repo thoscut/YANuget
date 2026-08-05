@@ -43,7 +43,9 @@ jobs:
       - name: Build documentation site
         run: |
           pip install -r requirements-docs.txt
-          mkdocs build
+          # `--strict` so a broken cross-reference fails here rather than 404ing
+          # for someone reading the docs the binary serves.
+          mkdocs build --strict
           # Enforce offline: HTML/CSS (the files that *declare* loaded resources)
           # must reference no external asset hosts. JS bundles are served locally,
           # so substrings inside them (e.g. UMD comments) are not flagged.
@@ -109,3 +111,99 @@ jobs:
       # build never compiles. Ignored deliberately; revisit if a fix ships.
       - name: Audit dependencies for known vulnerabilities
         run: cargo audit --ignore RUSTSEC-2023-0071
+
+  package:
+    # The release path is not the same as the build path: `cargo publish`
+    # packages a tarball from a clean checkout and rebuilds it in isolation, and
+    # the container image builds from a context that has no `site/` and no
+    # network guarantee. Both have broken while `cargo build` stayed green, so
+    # both are checked on every push rather than discovered at tag time.
+    name: Packaging
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-package-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-package-
+
+      # Deliberately without a docs site present: this is how crates.io builds
+      # it, and it is what caught `build.rs` writing outside `OUT_DIR`.
+      - name: Verify the crate packages and builds from its tarball
+        run: cargo publish --dry-run --locked
+
+      # REQUIRE_DOCS=1 matches how the release workflow builds it, so a docs
+      # failure is a build failure here rather than an image that quietly ships
+      # the "documentation not bundled" placeholder.
+      - name: Build the container image
+        run: docker build --build-arg REQUIRE_DOCS=1 -t yanuget:ci .
+
+      - name: Container starts, reports healthy and serves the real docs
+        run: |
+          set -euo pipefail
+          docker run -d --name yanuget-ci -p 5000:5000 \
+            -e YANUGET_API_KEY=ci-key yanuget:ci
+          for _ in $(seq 1 30); do
+            state=$(docker inspect -f '{{.State.Health.Status}}' yanuget-ci)
+            [ "$state" = healthy ] && break
+            [ "$state" = unhealthy ] && break
+            sleep 2
+          done
+          docker logs yanuget-ci
+          [ "$(docker inspect -f '{{.State.Health.Status}}' yanuget-ci)" = healthy ]
+          curl -fsSk https://127.0.0.1:5000/v3/index.json >/dev/null
+          if curl -fsSk https://127.0.0.1:5000/docs/ | grep -q "Documentation not bundled"; then
+            echo "::error::the image embedded the placeholder docs page"
+            exit 1
+          fi
+          docker rm -f yanuget-ci
+
+  client-compat:
+    # The Rust tests drive the server with `reqwest` — a faithful HTTP client,
+    # but not a NuGet client. It does not care whether the service index
+    # advertises the resources NuGet probes for, whether the flat container
+    # lists a version NuGet is about to restore, or whether a symbol key
+    # matches what a debugger computes. Real defects have hidden behind a green
+    # test suite for exactly that reason, including one where unlisting a
+    # package broke every build pinned to it.
+    #
+    # So this job runs the real toolchain against a real TLS server. The
+    # GitHub-hosted Ubuntu image already ships a .NET SDK, so `setup-dotnet`
+    # only pins the version — nothing large is downloaded.
+    name: NuGet client compatibility
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-compat-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-compat-
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Build the server
+        run: cargo build --release
+
+      - name: Push, restore, build and run with the real client
+        run: scripts/verify-with-dotnet.sh "${{ runner.temp }}/yanuget-compat"

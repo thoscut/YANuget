@@ -63,6 +63,7 @@ CREATE TABLE IF NOT EXISTS packages (
     has_readme                INTEGER NOT NULL,
     has_embedded_icon         INTEGER NOT NULL,
     is_development_dependency INTEGER NOT NULL,
+    require_license_acceptance INTEGER NOT NULL DEFAULT 0,
     package_size              INTEGER NOT NULL,
     package_hash              TEXT    NOT NULL,
     package_hash_algorithm    TEXT    NOT NULL,
@@ -157,6 +158,15 @@ impl SqliteDatabase {
         sqlx::raw_sql(SCHEMA).execute(&pool).await?;
         // Migrate databases created before the admin `enabled` column existed.
         ensure_column(&pool, "packages", "enabled", "INTEGER NOT NULL DEFAULT 1").await?;
+        // Databases predating the requireLicenseAcceptance passthrough. The
+        // default is `false`, which is exactly what those rows were reported as.
+        ensure_column(
+            &pool,
+            "packages",
+            "require_license_acceptance",
+            "INTEGER NOT NULL DEFAULT 0",
+        )
+        .await?;
         // Drop the legacy (feed, lower_id) index, now subsumed by the wider
         // covering index `idx_feed_packages_rank` created above.
         sqlx::query("DROP INDEX IF EXISTS idx_feed_packages_feed")
@@ -168,24 +178,37 @@ impl SqliteDatabase {
         // copying its state. Gated by `PRAGMA user_version` so it runs exactly
         // once on a pre-feeds database and never resurrects memberships that
         // were later deleted (which an "is feed_packages empty?" guard would).
+        //
+        // In one transaction, and with `OR IGNORE`, because neither the crash
+        // nor the concurrency case is hypothetical: as three separate
+        // autocommit statements, a crash between the insert and the version
+        // bump left the rows written and the version unset, so every later
+        // start re-ran an insert that now violated the primary key — the server
+        // refused to start again, permanently, until someone set
+        // `user_version` by hand. Two processes opening the same file (the
+        // server and `yanuget migrate`) both read 0 and produced the same
+        // failure. Together these make re-running the migration a no-op instead
+        // of an error.
+        let mut tx = pool.begin().await?;
         let schema_version: i64 = sqlx::query_scalar("PRAGMA user_version")
-            .fetch_one(&pool)
+            .fetch_one(&mut *tx)
             .await?;
         if schema_version < 1 {
             sqlx::query(
-                r#"INSERT INTO feed_packages
+                r#"INSERT OR IGNORE INTO feed_packages
                        (feed, lower_id, normalized_version, listed, enabled, pending,
                         flagged, flag_reason, added, downloads)
                    SELECT 'default', lower_id, normalized_version, listed, enabled, 0, 0, NULL,
                           published, downloads
                    FROM packages"#,
             )
-            .execute(&pool)
+            .execute(&mut *tx)
             .await?;
             sqlx::query("PRAGMA user_version = 1")
-                .execute(&pool)
+                .execute(&mut *tx)
                 .await?;
         }
+        tx.commit().await?;
         Ok(Self { pool })
     }
 
@@ -247,6 +270,15 @@ impl SqliteDatabase {
 
 #[async_trait]
 impl PackageDatabase for SqliteDatabase {
+    async fn ping(&self) -> Result<()> {
+        // Touch a real table rather than `SELECT 1`, so a database file that has
+        // vanished or been replaced by an empty one is reported as unhealthy.
+        sqlx::query("SELECT COUNT(*) FROM packages LIMIT 1")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     async fn upsert_package_data(&self, p: &Package) -> Result<bool> {
         let (major, minor, patch, revision) = p.version.core();
         let result = sqlx::query(
@@ -258,13 +290,14 @@ impl PackageDatabase for SqliteDatabase {
                 project_url, repository_url, repository_type, min_client_version,
                 release_notes, language, title, summary, tags,
                 has_readme, has_embedded_icon, is_development_dependency,
+                require_license_acceptance,
                 package_size, package_hash, package_hash_algorithm,
                 published, downloads, package_types, dependencies
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
                 ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21,
                 ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29,
-                ?30, ?31, ?32, ?33, ?34, ?35, ?36
+                ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37
             )
             ON CONFLICT(lower_id, normalized_version) DO NOTHING"#,
         )
@@ -297,6 +330,7 @@ impl PackageDatabase for SqliteDatabase {
         .bind(i64::from(p.has_readme))
         .bind(i64::from(p.has_embedded_icon))
         .bind(i64::from(p.is_development_dependency))
+        .bind(i64::from(p.require_license_acceptance))
         .bind(p.package_size as i64)
         .bind(&p.package_hash)
         .bind(&p.package_hash_algorithm)
@@ -648,28 +682,52 @@ impl PackageDatabase for SqliteDatabase {
         &self,
         feed: &str,
         query: &str,
+        include_prerelease: bool,
+        include_semver2: bool,
         skip: i64,
         take: i64,
-    ) -> Result<Vec<String>> {
+    ) -> Result<(Vec<String>, i64)> {
         let q = query.trim().to_lowercase();
         let pattern = like_pattern(&q);
-        let rows = sqlx::query(
-            r#"SELECT MAX(p.id) AS id FROM packages p JOIN feed_packages fp
-                   ON fp.lower_id = p.lower_id AND fp.normalized_version = p.normalized_version
-               WHERE fp.feed = ?1 AND fp.listed = 1 AND fp.enabled = 1 AND fp.pending = 0
-                 AND (?2 = '' OR p.lower_id LIKE ?3 ESCAPE '\')
-               GROUP BY p.lower_id
-               ORDER BY p.lower_id ASC
-               LIMIT ?4 OFFSET ?5"#,
-        )
+        // The version predicates sit inside the grouped scan, so an id survives
+        // only if it still has at least one version the caller would accept.
+        const MATCHING_IDS: &str = r#"
+            FROM packages p JOIN feed_packages fp
+                ON fp.lower_id = p.lower_id AND fp.normalized_version = p.normalized_version
+            WHERE fp.feed = ?1 AND fp.listed = 1 AND fp.enabled = 1 AND fp.pending = 0
+              AND (?2 = '' OR p.lower_id LIKE ?3 ESCAPE '\')
+              AND (?4 = 1 OR p.is_prerelease = 0)
+              AND (?5 = 1 OR p.is_semver2 = 0)
+            GROUP BY p.lower_id"#;
+
+        let rows = sqlx::query(&format!(
+            "SELECT MAX(p.id) AS id {MATCHING_IDS} ORDER BY p.lower_id ASC LIMIT ?6 OFFSET ?7"
+        ))
         .bind(feed)
         .bind(&q)
         .bind(&pattern)
+        .bind(i64::from(include_prerelease))
+        .bind(i64::from(include_semver2))
         .bind(take.max(0))
         .bind(skip.max(0))
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows.iter().map(|r| r.get::<String, _>("id")).collect())
+        let ids: Vec<String> = rows.iter().map(|r| r.get::<String, _>("id")).collect();
+
+        // `GROUP BY` makes this a count of groups, not of rows, so it has to be
+        // wrapped rather than written as a bare `COUNT(*)`.
+        let total: i64 = sqlx::query_scalar(&format!(
+            "SELECT COUNT(*) FROM (SELECT p.lower_id {MATCHING_IDS})"
+        ))
+        .bind(feed)
+        .bind(&q)
+        .bind(&pattern)
+        .bind(i64::from(include_prerelease))
+        .bind(i64::from(include_semver2))
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok((ids, total))
     }
 
     async fn all_package_ids(&self, feed: &str) -> Result<Vec<String>> {
@@ -742,11 +800,18 @@ impl PackageDatabase for SqliteDatabase {
         version: &NuGetVersion,
     ) -> Result<()> {
         sqlx::query(
+            // The `WHERE` is what keeps a symbol key attached to the package
+            // that first claimed it. Both halves of the key are chosen by the
+            // uploader, so without it any push credential could repoint another
+            // package's — or another feed's — symbols at itself. A package may
+            // still update its own key, which is what re-pushing a `.snupkg`
+            // does; a different package's attempt becomes a no-op here.
             r#"INSERT INTO symbols (ssqp_key, filename, lower_id, normalized_version)
                VALUES (?1, ?2, ?3, ?4)
                ON CONFLICT(ssqp_key, filename) DO UPDATE SET
                    lower_id = excluded.lower_id,
-                   normalized_version = excluded.normalized_version"#,
+                   normalized_version = excluded.normalized_version
+               WHERE symbols.lower_id = excluded.lower_id"#,
         )
         .bind(key.to_uppercase())
         .bind(filename.to_lowercase())
@@ -834,11 +899,29 @@ async fn ensure_column(pool: &SqlitePool, table: &str, column: &str, def: &str) 
         .iter()
         .any(|r| r.get::<String, _>("name").eq_ignore_ascii_case(column));
     if !exists {
-        sqlx::query(&format!("ALTER TABLE {table} ADD COLUMN {column} {def}"))
+        // Check-then-act, so two processes opening the same file — the server
+        // and `yanuget migrate`, or two replicas on a shared volume — can both
+        // decide to add it and the loser gets `duplicate column name`. SQLite
+        // has no `ADD COLUMN IF NOT EXISTS`, so the race is absorbed here: the
+        // column existing is precisely the outcome this function is asking for.
+        if let Err(e) = sqlx::query(&format!("ALTER TABLE {table} ADD COLUMN {column} {def}"))
             .execute(pool)
-            .await?;
+            .await
+        {
+            if !is_duplicate_column(&e) {
+                return Err(e.into());
+            }
+        }
     }
     Ok(())
+}
+
+/// Whether a failed `ALTER TABLE … ADD COLUMN` failed only because the column
+/// was already added — by an earlier run, or by another process just now.
+fn is_duplicate_column(e: &sqlx::Error) -> bool {
+    e.as_database_error()
+        .map(|d| d.message().contains("duplicate column name"))
+        .unwrap_or(false)
 }
 
 fn is_unique_violation(e: &sqlx::Error) -> bool {
@@ -886,6 +969,7 @@ fn build_package(row: &SqliteRow, listed: bool, enabled: bool, downloads: u64) -
         has_readme: row.try_get::<i64, _>("has_readme")? != 0,
         has_embedded_icon: row.try_get::<i64, _>("has_embedded_icon")? != 0,
         is_development_dependency: row.try_get::<i64, _>("is_development_dependency")? != 0,
+        require_license_acceptance: row.try_get::<i64, _>("require_license_acceptance")? != 0,
         is_semver2: row.try_get::<i64, _>("is_semver2")? != 0,
         package_size: row.try_get::<i64, _>("package_size")? as u64,
         package_hash: row.try_get("package_hash")?,
@@ -949,6 +1033,7 @@ mod tests {
             has_readme: false,
             has_embedded_icon: false,
             is_development_dependency: false,
+            require_license_acceptance: false,
             is_semver2: NuGetVersion::parse(version).unwrap().is_semver2(),
             package_size: 25_000_000_000, // 25 GB — exercises i64 sizing
             package_hash: "aGFzaA==".into(),
@@ -1224,15 +1309,32 @@ mod tests {
             .await
             .unwrap();
 
-        let ac = db.autocomplete(FEED, "contoso", 0, 20).await.unwrap();
+        let (ac, total) = db
+            .autocomplete(FEED, "contoso", true, true, 0, 20)
+            .await
+            .unwrap();
         assert_eq!(ac.len(), 2);
+        assert_eq!(total, 2);
         assert!(ac.contains(&"Contoso.Cli".to_string()));
+
+        // The total counts every match, not the page: a caller paging on it
+        // must be able to reach the ids the first page left out.
+        let (page, total) = db
+            .autocomplete(FEED, "contoso", true, true, 0, 1)
+            .await
+            .unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(total, 2, "totalHits must count matches, not the page");
 
         let v = NuGetVersion::parse("1.0.0").unwrap();
         assert!(db.delete_package_data("contoso.cli", &v).await.unwrap());
         assert!(!db.exists(FEED, "contoso.cli", &v).await.unwrap());
-        let ac = db.autocomplete(FEED, "contoso", 0, 20).await.unwrap();
+        let (ac, total) = db
+            .autocomplete(FEED, "contoso", true, true, 0, 20)
+            .await
+            .unwrap();
         assert_eq!(ac, vec!["Contoso.Core".to_string()]);
+        assert_eq!(total, 1);
     }
 
     #[tokio::test]

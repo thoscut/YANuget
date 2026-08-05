@@ -70,17 +70,62 @@ enable_web_ui = true          # YANUGET_ENABLE_WEB_UI
 primary_client = "choco"      # YANUGET_PRIMARY_CLIENT
 
 # ---------------------------------------------------------------------------
+# Trusted proxies — who may set X-Forwarded-* / X-Real-IP.
+#
+# These headers are sent by the *client*, and two things depend on them: the
+# base URL of every absolute package URL handed to NuGet clients, and the
+# identity the rate limiter throttles. Honouring them from anyone lets a caller
+# point restoring clients at a host of their choosing (directly, or by
+# poisoning a shared cache in front of this server) and lets a rotating
+# X-Forwarded-For walk straight through the throttle.
+#
+# So they are only honoured from a peer listed here; from anyone else they are
+# stripped before any handler sees them. Entries may be an IP, a CIDR block,
+# "private" (loopback + link-local + RFC1918/ULA — where reverse proxies
+# actually live), or "*" to trust every peer.
+#
+# EMPTY BY DEFAULT — nobody is trusted. Trusting private ranges out of the box
+# reads as convenient, since that is where proxies live, but the most common
+# deployment is an internal feed on a LAN with no proxy at all, and there every
+# client machine sits inside those ranges. Any of them could then send a fresh
+# X-Forwarded-For per request and land in a fresh rate-limit bucket.
+#
+# Behind a proxy, list that proxy's address (or "private" when it is on the same
+# host). Setting base_url pins the generated URLs regardless of any header.
+# ---------------------------------------------------------------------------
+# YANUGET_TRUSTED_PROXIES (comma-separated) replaces this list entirely.
+trusted_proxies = []
+
+# ---------------------------------------------------------------------------
+# CORS — which browser origins may read this server cross-origin.
+#
+# Empty by default, so no CORS headers are sent at all. This only ever affects
+# browsers: a NuGet client neither sends Origin nor looks at the response
+# header. Sending "*" would let any page a user with network reach happens to
+# visit read /v3/search and the package bytes — so a feed protected only by
+# being on the intranet would have no protection against a browser.
+#
+# List the origins that genuinely need it, or "*" for a feed that really is
+# public. TOML only; there is no environment variable.
+# ---------------------------------------------------------------------------
+cors_allowed_origins = []
+
+# ---------------------------------------------------------------------------
 # Rate limiting — per-client-IP request throttling (brute-force mitigation).
 #
-# On by default with a generous limit so ordinary restores are unaffected while
-# online API-key guessing is throttled. The client IP is taken from
-# X-Forwarded-For / X-Real-IP (behind a proxy) and otherwise the peer address.
-# Tune up for very high-volume read traffic, or disable and rely on a reverse
-# proxy. Exceeding the limit returns 429 with a Retry-After header.
+# On by default. The limit has to clear a LARGE RESTORE, not a typical request
+# rate: a few hundred packages means roughly three requests each, mostly in
+# parallel, and behind corporate NAT or a CI egress gateway every developer
+# shares one bucket. NuGet also treats 429 as terminal — it neither retries nor
+# honours Retry-After — so being throttled mid-restore fails the build. The
+# default is far above anything legitimate while still bounding key guessing.
+#
+# The client IP is taken from X-Forwarded-For / X-Real-IP when the peer is a
+# trusted proxy (see trusted_proxies above) and otherwise the peer address.
 # ---------------------------------------------------------------------------
 [rate_limit]
 enabled = true                # YANUGET_RATELIMIT_ENABLED
-max_requests = 1000           # YANUGET_RATELIMIT_MAX_REQUESTS — per IP per window
+max_requests = 10000          # YANUGET_RATELIMIT_MAX_REQUESTS — per IP per window
 window_secs = 60              # YANUGET_RATELIMIT_WINDOW_SECS
 
 # ---------------------------------------------------------------------------
@@ -115,6 +160,11 @@ interval_hours = 24           # YANUGET_RETENTION_INTERVAL_HOURS — background 
 # stored ONCE and referenced by each feed (no duplication on disk).
 #
 # Feeds are configured in TOML only — there are no YANUGET_* env vars for them.
+#
+# NOTE on the sub-tables below: a feed's `mirror`, `license_policy` and
+# `retention` blocks attach to the **most recently declared** [[feeds]] entry
+# and are written `[feeds.mirror]`, not `[feeds.<name>.mirror]`. The latter
+# declares a table called `<name>` inside the feed and is rejected at startup.
 # ---------------------------------------------------------------------------
 
 # [[feeds]]
@@ -129,15 +179,26 @@ interval_hours = 24           # YANUGET_RETENTION_INTERVAL_HOURS — background 
 # requires_approval = false     # true = incoming versions are pending until approved
 # promotes_to = "stable"        # the next release ring (must name another feed)
 #
-#   [feeds.dev.mirror]          # read-through cache of an upstream V3 feed
+#   [feeds.mirror]              # read-through cache of an upstream V3 feed
 #   enabled = true
 #   upstream = "https://api.nuget.org/v3/index.json"
 #   timeout_secs = 30
+#   # A mirror fetch is triggered by an ordinary (possibly anonymous) read, so
+#   # it is bounded by default: at most this many versions of one package per
+#   # miss, newest first. Set to a large number, or omit, to fetch everything.
+#   max_versions_per_package = 50
+#   # Cap on a single mirrored package. Unset inherits max_package_size_bytes.
+#   # max_package_size_bytes = 5_000_000_000
+#   # The resource URLs the mirror follows come from the upstream's own service
+#   # index, so an upstream could aim them at this server's network or a cloud
+#   # metadata endpoint. Private/loopback targets are refused unless you opt in
+#   # because your upstream really is on the private network.
+#   allow_private_upstream = false
 #
 #     # Credentials for an authenticated upstream (all optional). Set the
 #     # username/password pair for HTTP Basic, token for a Bearer token, and/or
 #     # headers for a custom header (e.g. a private-feed API key).
-#     [feeds.dev.mirror.auth]
+#     [feeds.mirror.auth]
 #     # username = "ci"
 #     # password = "secret"
 #     # token = "ghp_xxx"
@@ -147,7 +208,7 @@ interval_hours = 24           # YANUGET_RETENTION_INTERVAL_HOURS — background 
 # name = "stable"
 # requires_approval = true      # promoted/pushed versions wait for /admin approval
 #
-#   [feeds.stable.license_policy]   # offline SPDX allow/deny (no network)
+#   [feeds.license_policy]          # offline SPDX allow/deny (no network)
 #   enabled = true
 #   allowed = ["MIT", "Apache-2.0"] # if non-empty, license must match one
 #   blocked = ["GPL-3.0-only"]      # always rejected, even if also allowed
@@ -155,6 +216,6 @@ interval_hours = 24           # YANUGET_RETENTION_INTERVAL_HOURS — background 
 #   action = "warn"                 # "warn" = accept + flag; "block" = reject
 #
 #   # Per-feed retention overrides the global [retention] for this feed.
-#   [feeds.stable.retention]
+#   [feeds.retention]
 #   enabled = true
 #   keep_latest_stable = 20
