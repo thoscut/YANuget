@@ -183,6 +183,11 @@ async fn run_server(config_path: Option<&str>) -> anyhow::Result<()> {
                         _ = shutdown.changed() => break,
                     }
                 }
+                // Only reached on shutdown. If this task ever ends any other
+                // way it panicked, and a dropped `JoinHandle` would swallow
+                // that silently — retention would stop for the life of the
+                // process while `/settings` kept advertising "every N h".
+                tracing::debug!(feed = %feed_name, "retention sweep stopped");
             });
         }
     }
@@ -438,19 +443,34 @@ async fn wait_for_shutdown(mut rx: tokio::sync::watch::Receiver<bool>) {
 }
 
 /// Wait for Ctrl-C (or SIGTERM on Unix) for graceful shutdown.
+///
+/// A handler that cannot be installed is logged and then simply never fires,
+/// rather than panicking this task. Panicking here loses the whole shutdown
+/// path: `shutdown_tx` is never sent, the server ignores SIGTERM for the rest
+/// of its life, and the orchestrator falls through to SIGKILL — which is
+/// exactly the case that leaves a half-written upload behind.
 async fn shutdown_signal() {
     let ctrl_c = async {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("failed to install Ctrl-C handler");
+        match tokio::signal::ctrl_c().await {
+            Ok(()) => {}
+            Err(e) => {
+                tracing::error!(error = %e, "cannot listen for Ctrl-C; shutdown must come from SIGTERM");
+                std::future::pending::<()>().await
+            }
+        }
     };
 
     #[cfg(unix)]
     let terminate = async {
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("failed to install SIGTERM handler")
-            .recv()
-            .await;
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "cannot listen for SIGTERM; shutdown must come from Ctrl-C");
+                std::future::pending::<()>().await
+            }
+        }
     };
     #[cfg(not(unix))]
     let terminate = std::future::pending::<()>();

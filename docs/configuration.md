@@ -155,6 +155,24 @@ deleted only when the **last** feed referencing it lets go.
 | `feeds[].mirror.auth.username` / `.password` | string | *(none)* | HTTP Basic credentials for the upstream. |
 | `feeds[].mirror.auth.token` | string | *(none)* | Bearer token for the upstream (`Authorization: Bearer …`). |
 | `feeds[].mirror.auth.headers` | table | `{}` | Arbitrary extra request headers (e.g. a private-feed API key). |
+| `feeds[].mirror.max_versions_per_package` | int | `50` | Newest-first cap on how many versions one read-through miss fetches. |
+| `feeds[].mirror.max_package_size_bytes` | int | *(server-wide cap, else 2 GiB)* | Cap on a single mirrored `.nupkg`. |
+| `feeds[].mirror.allow_private_upstream` | bool | `false` | Permit an upstream on a private/loopback address. |
+
+Three things bound a read-through miss, because it is started by an
+*unauthenticated read* and writes what it fetches to your disk:
+
+* **`max_versions_per_package`** caps how many versions are fetched, newest
+  first. The default of 50 means a package with a long history is mirrored
+  only in part — which is usually what you want from a cache, but is worth
+  knowing before you conclude the upstream is missing versions.
+* **`max_package_size_bytes`** caps each `.nupkg`. It inherits the server-wide
+  `max_package_size_bytes` and, if that is unset too, falls back to 2 GiB
+  rather than to "unlimited".
+* A **60-second budget** per miss. When it runs out the request answers with
+  what has been mirrored so far and the remaining versions are fetched on a
+  later request. Nothing is lost — a mirror is a cache, and it warms up
+  incrementally rather than holding one connection open for the whole job.
 | `feeds[].license_policy.enabled` | bool | `false` | Evaluate the offline license policy. |
 | `feeds[].license_policy.allowed` | string[] | `[]` | If non-empty, license must match one. |
 | `feeds[].license_policy.blocked` | string[] | `[]` | Always rejected (even if also allowed). |

@@ -73,7 +73,11 @@ fn mutex_for(id: &str, normalized_version: &str) -> Arc<AsyncMutex<()>> {
         id.to_ascii_lowercase(),
         normalized_version.to_ascii_lowercase()
     );
-    let mut reg = registry().lock().expect("version-lock registry poisoned");
+    // See the note in `ratelimit`: a poisoned process-global mutex on a hot
+    // path is a permanent outage, and the guarded map degrades gracefully.
+    let mut reg = registry()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     acquire(&mut reg, key)
 }
 

@@ -51,6 +51,21 @@ struct MirrorResources {
     catalog: Option<String>,
 }
 
+/// How long one read-through miss may spend fetching before it gives up and
+/// answers with what it has.
+///
+/// `ensure_package` downloads up to `max_versions_per_package` (50 by default)
+/// `.nupkg`s one after another, each bounded only by the per-request timeout —
+/// so a single `GET /v3/package/{id}/index.json`, which needs no
+/// authentication, could hold a connection open for twenty-five minutes. The
+/// mirror is a cache: stopping early is not a failure, because the versions
+/// already fetched are kept and the next request continues from there.
+const MIRROR_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Default cap on a single mirrored `.nupkg` when neither the feed nor the
+/// server configured one.
+const DEFAULT_MIRROR_MAX_PACKAGE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
 impl MirrorClient {
     /// Build a client from a feed's [`MirrorConfig`]. Returns `None` when
     /// mirroring is disabled for the feed.
@@ -211,6 +226,13 @@ impl MirrorClient {
     pub fn set_default_size_limit(&mut self, limit: Option<u64>) {
         if self.max_package_size_bytes.is_none() {
             self.max_package_size_bytes = limit;
+        }
+        // A mirror fetch is started by an *anonymous read*, and it writes what
+        // it fetches to the operator's disk. "No limit" is a defensible default
+        // for a push, which needs a credential; it is not one here. A feed that
+        // genuinely mirrors enormous packages says so.
+        if self.max_package_size_bytes.is_none() {
+            self.max_package_size_bytes = Some(DEFAULT_MIRROR_MAX_PACKAGE_BYTES);
         }
     }
 
@@ -575,11 +597,22 @@ pub async fn ensure_package(
         );
     }
     let mut mirrored = 0;
+    let deadline = tokio::time::Instant::now() + MIRROR_BUDGET;
 
     for version in versions {
         // Skip versions the feed already exposes.
         if db.exists(feed, &lower_id, &version).await.unwrap_or(false) {
             continue;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            tracing::info!(
+                %feed,
+                id = %lower_id,
+                mirrored,
+                "mirror budget spent; the rest of this package's versions will \
+                 be fetched on a later request"
+            );
+            break;
         }
 
         let normalized = version.normalized().to_lowercase();

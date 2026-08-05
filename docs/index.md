@@ -17,6 +17,8 @@ on an air-gapped network.
   retention, and multi-feed / mirroring / license-policy options.
 - **[Deployment](deployment.md)** — running it as a service: systemd, Docker
   Compose, Kubernetes probes, backup/restore and upgrades.
+- **[Bulk migration](migrate.md)** — `yanuget migrate`: importing every
+  package from another server in one pass.
 - **[Architecture](architecture.md)** — the module map and trait boundaries.
 - **[Large packages](large-packages.md)** — the bounded-memory streaming design.
 
