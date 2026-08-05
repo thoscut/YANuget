@@ -137,6 +137,11 @@ interval_hours = 24           # YANUGET_RETENTION_INTERVAL_HOURS — background 
 # stored ONCE and referenced by each feed (no duplication on disk).
 #
 # Feeds are configured in TOML only — there are no YANUGET_* env vars for them.
+#
+# NOTE on the sub-tables below: a feed's `mirror`, `license_policy` and
+# `retention` blocks attach to the **most recently declared** [[feeds]] entry
+# and are written `[feeds.mirror]`, not `[feeds.<name>.mirror]`. The latter
+# declares a table called `<name>` inside the feed and is rejected at startup.
 # ---------------------------------------------------------------------------
 
 # [[feeds]]
@@ -151,7 +156,7 @@ interval_hours = 24           # YANUGET_RETENTION_INTERVAL_HOURS — background 
 # requires_approval = false     # true = incoming versions are pending until approved
 # promotes_to = "stable"        # the next release ring (must name another feed)
 #
-#   [feeds.dev.mirror]          # read-through cache of an upstream V3 feed
+#   [feeds.mirror]              # read-through cache of an upstream V3 feed
 #   enabled = true
 #   upstream = "https://api.nuget.org/v3/index.json"
 #   timeout_secs = 30
@@ -170,7 +175,7 @@ interval_hours = 24           # YANUGET_RETENTION_INTERVAL_HOURS — background 
 #     # Credentials for an authenticated upstream (all optional). Set the
 #     # username/password pair for HTTP Basic, token for a Bearer token, and/or
 #     # headers for a custom header (e.g. a private-feed API key).
-#     [feeds.dev.mirror.auth]
+#     [feeds.mirror.auth]
 #     # username = "ci"
 #     # password = "secret"
 #     # token = "ghp_xxx"
@@ -180,7 +185,7 @@ interval_hours = 24           # YANUGET_RETENTION_INTERVAL_HOURS — background 
 # name = "stable"
 # requires_approval = true      # promoted/pushed versions wait for /admin approval
 #
-#   [feeds.stable.license_policy]   # offline SPDX allow/deny (no network)
+#   [feeds.license_policy]          # offline SPDX allow/deny (no network)
 #   enabled = true
 #   allowed = ["MIT", "Apache-2.0"] # if non-empty, license must match one
 #   blocked = ["GPL-3.0-only"]      # always rejected, even if also allowed
@@ -188,6 +193,6 @@ interval_hours = 24           # YANUGET_RETENTION_INTERVAL_HOURS — background 
 #   action = "warn"                 # "warn" = accept + flag; "block" = reject
 #
 #   # Per-feed retention overrides the global [retention] for this feed.
-#   [feeds.stable.retention]
+#   [feeds.retention]
 #   enabled = true
 #   keep_latest_stable = 20

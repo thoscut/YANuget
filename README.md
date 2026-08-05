@@ -276,14 +276,17 @@ name = "dev"
 requires_approval = false
 promotes_to = "stable"
 
-  [feeds.dev.mirror]            # read-through cache of nuget.org
+  # Sub-tables attach to the most recently declared [[feeds]] entry, so this
+  # is `[feeds.mirror]` — not `[feeds.dev.mirror]`, which declares a table
+  # called "dev" inside the feed and is rejected at startup.
+  [feeds.mirror]                # read-through cache of nuget.org
   enabled = true
 
 [[feeds]]
 name = "stable"
 requires_approval = true        # versions are pending until approved
 
-  [feeds.stable.license_policy]
+  [feeds.license_policy]
   enabled = true
   allowed = ["MIT", "Apache-2.0"]
   action = "warn"               # or "block" to reject the push
