@@ -249,6 +249,11 @@ pub trait PackageDatabase: Send + Sync {
     /// `include_prerelease`/`include_semver2` mirror the search filters: an id
     /// whose only versions are excluded by them must not be suggested, or the
     /// caller is pointed at a package it will then find nothing in.
+    ///
+    /// Returns the requested page and the total number of matching ids. The
+    /// total is what a caller pages on, so it must count every match rather
+    /// than the page — reporting the page size stops a client at the first
+    /// page and hides everything after it.
     async fn autocomplete(
         &self,
         feed: &str,
@@ -257,7 +262,7 @@ pub trait PackageDatabase: Send + Sync {
         include_semver2: bool,
         skip: i64,
         take: i64,
-    ) -> Result<Vec<String>>;
+    ) -> Result<(Vec<String>, i64)>;
 
     /// Every distinct package id in `feed` (original casing), ascending. Used by
     /// the retention sweep, which must visit packages search would not return.

@@ -137,16 +137,24 @@ request's `semVerLevel`.
 GET /v3/registration/{id}/index.json
 ```
 
-A registration index with a single inlined page containing every version
-(listed and unlisted, with a `listed` flag) and full `catalogEntry` metadata,
-including `dependencyGroups`. Unlisted versions additionally report
-`published` in the year 1900, per NuGet convention. `dependencyGroups` is
-omitted when a version has no dependencies. `404` if unknown.
+A registration index containing every version (listed and unlisted, with a
+`listed` flag) and full `catalogEntry` metadata, including `dependencyGroups`.
+Unlisted versions additionally report `published` in the year 1900, per NuGet
+convention. `dependencyGroups` is omitted when a version has no dependencies.
+`404` if unknown.
 
-> All versions are currently inlined into one page. nuget.org pages packages
-> with ≥128 versions into pages of 64; YANuget does not yet do this, which is
-> only relevant for packages with an extreme number of versions (not large
-> package *size*). See the roadmap.
+Packages with **fewer than 128 versions** get a single inlined page — the
+whole registration in one response. At 128 versions or more the index instead
+lists external pages of 64 versions each, without inline `items`, and the
+client follows each page's `@id`:
+
+```
+GET /v3/registration/{id}/page/{lower}/{upper}.json
+```
+
+This matches how nuget.org pages large registrations, and is the reason a
+client may issue page requests you did not expect for a heavily versioned
+package. It has nothing to do with package *size*.
 
 ```
 GET /v3/registration/{id}/{version}.json

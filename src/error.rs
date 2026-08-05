@@ -102,14 +102,25 @@ impl IntoResponse for Error {
         } else {
             self.to_string()
         };
-        // The admin area challenges via Basic auth so browsers prompt for it.
-        let challenge = matches!(self, Error::AdminUnauthorized);
+        // Both 401s carry a Basic challenge, and the feed one is not optional.
+        // A NuGet client configured with `-u user -p key` hands the credential
+        // to `HttpClientHandler.Credentials`, and .NET only attaches an
+        // `Authorization` header once the server has actually challenged for
+        // it. Answering a read-gated feed with a bare 401 means the client
+        // retries unauthenticated forever and `dotnet restore` fails outright —
+        // even though the key it was given is correct.
+        let challenge = matches!(self, Error::AdminUnauthorized | Error::Unauthorized);
         let body = Json(json!({ "error": message }));
         let mut response = (status, body).into_response();
         if challenge {
+            let realm = if matches!(self, Error::AdminUnauthorized) {
+                "Basic realm=\"YANuget Admin\""
+            } else {
+                "Basic realm=\"YANuget\""
+            };
             response.headers_mut().insert(
                 axum::http::header::WWW_AUTHENTICATE,
-                axum::http::HeaderValue::from_static("Basic realm=\"YANuget Admin\""),
+                axum::http::HeaderValue::from_static(realm),
             );
         }
         response
@@ -184,11 +195,21 @@ mod tests {
     }
 
     #[test]
-    fn plain_unauthorized_has_no_challenge() {
-        let resp = Error::Unauthorized.into_response();
-        assert!(resp
-            .headers()
-            .get(axum::http::header::WWW_AUTHENTICATE)
-            .is_none());
+    fn both_unauthorized_variants_challenge_for_basic() {
+        // A read-gated feed that answers with a bare 401 is unusable from a
+        // NuGet client: .NET only attaches the credential the user configured
+        // after it has been challenged, so restore fails with a correct key.
+        for (error, realm) in [
+            (Error::Unauthorized, "Basic realm=\"YANuget\""),
+            (Error::AdminUnauthorized, "Basic realm=\"YANuget Admin\""),
+        ] {
+            let resp = error.into_response();
+            assert_eq!(
+                resp.headers()
+                    .get(axum::http::header::WWW_AUTHENTICATE)
+                    .and_then(|v| v.to_str().ok()),
+                Some(realm)
+            );
+        }
     }
 }

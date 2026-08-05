@@ -673,22 +673,23 @@ impl PackageDatabase for SqliteDatabase {
         include_semver2: bool,
         skip: i64,
         take: i64,
-    ) -> Result<Vec<String>> {
+    ) -> Result<(Vec<String>, i64)> {
         let q = query.trim().to_lowercase();
         let pattern = like_pattern(&q);
         // The version predicates sit inside the grouped scan, so an id survives
         // only if it still has at least one version the caller would accept.
-        let rows = sqlx::query(
-            r#"SELECT MAX(p.id) AS id FROM packages p JOIN feed_packages fp
-                   ON fp.lower_id = p.lower_id AND fp.normalized_version = p.normalized_version
-               WHERE fp.feed = ?1 AND fp.listed = 1 AND fp.enabled = 1 AND fp.pending = 0
-                 AND (?2 = '' OR p.lower_id LIKE ?3 ESCAPE '\')
-                 AND (?4 = 1 OR p.is_prerelease = 0)
-                 AND (?5 = 1 OR p.is_semver2 = 0)
-               GROUP BY p.lower_id
-               ORDER BY p.lower_id ASC
-               LIMIT ?6 OFFSET ?7"#,
-        )
+        const MATCHING_IDS: &str = r#"
+            FROM packages p JOIN feed_packages fp
+                ON fp.lower_id = p.lower_id AND fp.normalized_version = p.normalized_version
+            WHERE fp.feed = ?1 AND fp.listed = 1 AND fp.enabled = 1 AND fp.pending = 0
+              AND (?2 = '' OR p.lower_id LIKE ?3 ESCAPE '\')
+              AND (?4 = 1 OR p.is_prerelease = 0)
+              AND (?5 = 1 OR p.is_semver2 = 0)
+            GROUP BY p.lower_id"#;
+
+        let rows = sqlx::query(&format!(
+            "SELECT MAX(p.id) AS id {MATCHING_IDS} ORDER BY p.lower_id ASC LIMIT ?6 OFFSET ?7"
+        ))
         .bind(feed)
         .bind(&q)
         .bind(&pattern)
@@ -698,7 +699,22 @@ impl PackageDatabase for SqliteDatabase {
         .bind(skip.max(0))
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows.iter().map(|r| r.get::<String, _>("id")).collect())
+        let ids: Vec<String> = rows.iter().map(|r| r.get::<String, _>("id")).collect();
+
+        // `GROUP BY` makes this a count of groups, not of rows, so it has to be
+        // wrapped rather than written as a bare `COUNT(*)`.
+        let total: i64 = sqlx::query_scalar(&format!(
+            "SELECT COUNT(*) FROM (SELECT p.lower_id {MATCHING_IDS})"
+        ))
+        .bind(feed)
+        .bind(&q)
+        .bind(&pattern)
+        .bind(i64::from(include_prerelease))
+        .bind(i64::from(include_semver2))
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok((ids, total))
     }
 
     async fn all_package_ids(&self, feed: &str) -> Result<Vec<String>> {
@@ -1255,21 +1271,32 @@ mod tests {
             .await
             .unwrap();
 
-        let ac = db
+        let (ac, total) = db
             .autocomplete(FEED, "contoso", true, true, 0, 20)
             .await
             .unwrap();
         assert_eq!(ac.len(), 2);
+        assert_eq!(total, 2);
         assert!(ac.contains(&"Contoso.Cli".to_string()));
+
+        // The total counts every match, not the page: a caller paging on it
+        // must be able to reach the ids the first page left out.
+        let (page, total) = db
+            .autocomplete(FEED, "contoso", true, true, 0, 1)
+            .await
+            .unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(total, 2, "totalHits must count matches, not the page");
 
         let v = NuGetVersion::parse("1.0.0").unwrap();
         assert!(db.delete_package_data("contoso.cli", &v).await.unwrap());
         assert!(!db.exists(FEED, "contoso.cli", &v).await.unwrap());
-        let ac = db
+        let (ac, total) = db
             .autocomplete(FEED, "contoso", true, true, 0, 20)
             .await
             .unwrap();
         assert_eq!(ac, vec!["Contoso.Core".to_string()]);
+        assert_eq!(total, 1);
     }
 
     #[tokio::test]

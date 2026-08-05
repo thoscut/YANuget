@@ -1130,7 +1130,7 @@ async fn autocomplete(
 
     let take = params.take.unwrap_or(20).clamp(0, MAX_SEARCH_TAKE);
     let skip = params.skip.unwrap_or(0).max(0);
-    let ids = state
+    let (ids, total) = state
         .db
         .autocomplete(
             state.feed(),
@@ -1141,7 +1141,6 @@ async fn autocomplete(
             take,
         )
         .await?;
-    let total = ids.len() as i64;
     Ok(Json(nuget::autocomplete_response(&ids, total)))
 }
 
