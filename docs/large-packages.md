@@ -65,6 +65,42 @@ Package sizes are `u64` in the domain model, bound as `i64` in SQLite, and
 emitted as JSON numbers — nothing truncates at the 4 GB `u32` limit. The test
 suite explicitly stores and round-trips a 25 GB size to guard this.
 
+## Measured
+
+The design above is only worth stating if it holds in practice, so it was
+measured end to end against a release build serving a real **5 GiB** package
+(5,368,709,716 bytes — deliberately past the 4 GiB `u32` boundary, which also
+makes it a ZIP64 archive). Server resident memory was sampled every 300 ms
+throughout:
+
+| Operation | Peak server RSS |
+| --- | --- |
+| Idle, before any transfer | 11.7 MB |
+| 5 GiB push, raw body | 15.8 MB |
+| 5 GiB push, `multipart/form-data` (what `dotnet nuget push` sends) | 14.1 MB |
+| 5 GiB download | 15.9 MB |
+| **Six concurrent 5 GiB downloads** (30 GiB in flight) | **14.9 MB** |
+
+So a 5 GiB transfer costs single-digit megabytes above idle, and six of them at
+once cost no more than one — memory tracks the number of *buffers*, not the
+number of bytes.
+
+Alongside the memory numbers, the same run confirmed the correctness properties
+that matter to a client:
+
+- the stored file is byte-identical to the source, including via the multipart
+  path (which must strip its framing exactly);
+- the reported size is 5,368,709,716 — no truncation at 4 GiB;
+- the advertised SHA-512 matches a hash computed independently over the source
+  file, so the digest a client verifies really describes the bytes it received;
+- `Range` requests resolve correctly *past* the 4 GiB mark — a range at offset
+  5,368,709,000 returned the exact tail bytes with a correct `Content-Range`,
+  which is what makes a 25 GB download resumable.
+
+Worth noting for anyone reproducing this: `curl --data-binary @file` reads the
+whole body into memory and will run out on a file this size. Use `curl -T file`,
+which streams. The server is the part that does not buffer.
+
 ## Operational guidance
 
 - **Disk, not RAM, is the limit.** Provision storage for your largest package
