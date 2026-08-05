@@ -2425,3 +2425,130 @@ async fn embedded_icons_are_served_only_when_they_really_are_images() {
         .unwrap();
     assert!(!without.contains("/icon\""));
 }
+
+#[tokio::test]
+async fn the_semver1_hive_withholds_versions_that_client_cannot_parse() {
+    let server = spawn().await;
+
+    // `1.0.0` is SemVer1-safe. `2.0.0-alpha.1` has a dotted pre-release label
+    // and `3.0.0+build` carries build metadata — both are SemVer2-only.
+    for version in ["1.0.0", "2.0.0-alpha.1", "3.0.0+build"] {
+        let resp = push_multipart(&server, API_KEY, build_nupkg("Hive.Pkg", version, b"x")).await;
+        assert_eq!(resp.status(), reqwest::StatusCode::CREATED, "{version}");
+    }
+
+    // The service index points the two hives at different bases.
+    let index: serde_json::Value = server
+        .client
+        .get(server.url("/v3/index.json"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let resource = |ty: &str| -> String {
+        index["resources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["@type"] == ty)
+            .unwrap_or_else(|| panic!("{ty} missing from the service index"))["@id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let sv1_base = resource("RegistrationsBaseUrl/3.4.0");
+    let sv2_base = resource("RegistrationsBaseUrl/3.6.0");
+    assert_ne!(
+        sv1_base, sv2_base,
+        "advertising one hive under both @types hands a SemVer1 client versions it cannot parse"
+    );
+
+    let versions_in = |doc: &serde_json::Value| -> Vec<String> {
+        doc["items"][0]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["catalogEntry"]["version"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    let sv1: serde_json::Value = server
+        .client
+        .get(format!("{sv1_base}hive.pkg/index.json"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(versions_in(&sv1), vec!["1.0.0".to_string()]);
+
+    let sv2: serde_json::Value = server
+        .client
+        .get(format!("{sv2_base}hive.pkg/index.json"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        versions_in(&sv2),
+        vec![
+            "1.0.0".to_string(),
+            "2.0.0-alpha.1".to_string(),
+            "3.0.0".to_string()
+        ]
+    );
+
+    // A hive's documents must keep their self-references inside that hive,
+    // otherwise a client following them crosses over and sees the versions the
+    // hive just withheld.
+    let sv1_leaf = sv1["items"][0]["items"][0]["@id"].as_str().unwrap();
+    assert!(sv1_leaf.starts_with(&sv1_base), "leaked hive: {sv1_leaf}");
+    let sv2_leaf = sv2["items"][0]["items"][0]["@id"].as_str().unwrap();
+    assert!(sv2_leaf.starts_with(&sv2_base), "leaked hive: {sv2_leaf}");
+
+    // A SemVer2-only version simply has no leaf in the SemVer1 hive.
+    let missing = server
+        .client
+        .get(format!("{sv1_base}hive.pkg/2.0.0-alpha.1.json"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), reqwest::StatusCode::NOT_FOUND);
+    let present = server
+        .client
+        .get(format!("{sv2_base}hive.pkg/2.0.0-alpha.1.json"))
+        .send()
+        .await
+        .unwrap();
+    assert!(present.status().is_success());
+
+    // Search links into the hive matching the caller's semVerLevel.
+    let sv1_search: serde_json::Value = server
+        .client
+        .get(server.url("/v3/search?q=Hive.Pkg&prerelease=true"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let reg = sv1_search["data"][0]["registration"].as_str().unwrap();
+    assert!(reg.starts_with(&sv1_base), "search linked to {reg}");
+
+    let sv2_search: serde_json::Value = server
+        .client
+        .get(server.url("/v3/search?q=Hive.Pkg&prerelease=true&semVerLevel=2.0.0"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let reg = sv2_search["data"][0]["registration"].as_str().unwrap();
+    assert!(reg.starts_with(&sv2_base), "search linked to {reg}");
+}

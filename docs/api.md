@@ -107,6 +107,23 @@ Returns the package's `.nuspec` manifest as `application/xml`.
 
 ## Registration
 
+NuGet exposes **two registration hives** and a client picks one from the service
+index:
+
+| Hive | Path | `@type`s | Contents |
+| --- | --- | --- | --- |
+| SemVer1 | `/v3/registration/` | `RegistrationsBaseUrl`, `…/3.0.0-beta`, `…/3.0.0-rc`, `…/3.4.0` | Only versions a pre-SemVer2 client can parse |
+| SemVer2 | `/v3/registration-semver2/` | `…/3.6.0`, `…/Versioned` | Every version |
+
+A version is SemVer2 when it carries build metadata or more than one
+dot-separated pre-release identifier (`2.0.0-alpha.1`, `3.0.0+build`). Those are
+withheld from the SemVer1 hive — advertising a single hive under both sets of
+`@type`s would hand an older client versions it chokes on. Each hive's documents
+keep their self-references inside that hive, and a SemVer2-only version returns
+`404` from a SemVer1 leaf. `/v3/search` links results into the hive matching the
+request's `semVerLevel`.
+
+
 ```
 GET /v3/registration/{id}/index.json
 ```

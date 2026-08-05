@@ -37,13 +37,23 @@ pub fn service_index(urls: &UrlBuilder, web_ui_enabled: bool) -> Value {
         &["PackageBaseAddress/3.0.0"],
         "Base URL of where NuGet packages are stored.",
     );
+    // Two registration hives, as nuget.org exposes them. The SemVer1 hive omits
+    // versions a pre-SemVer2 client cannot parse (dotted pre-release labels,
+    // build metadata); advertising one hive under both sets of `@type`s would
+    // hand such a client versions it chokes on.
     push(
-        urls.registration_base(),
+        urls.registration_base_semver1(),
         &[
             "RegistrationsBaseUrl",
             "RegistrationsBaseUrl/3.0.0-beta",
             "RegistrationsBaseUrl/3.0.0-rc",
             "RegistrationsBaseUrl/3.4.0",
+        ],
+        "Base URL of package registration info (SemVer1).",
+    );
+    push(
+        urls.registration_base_semver2(),
+        &[
             "RegistrationsBaseUrl/3.6.0",
             "RegistrationsBaseUrl/Versioned",
         ],

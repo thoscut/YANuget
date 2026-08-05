@@ -463,6 +463,24 @@ fn feed_routes(state: AppState) -> Router {
         .route("/v3/search", get(search))
         .route("/v3/autocomplete", get(autocomplete));
 
+    // The SemVer2 hive mirrors the routes above. A client picks a hive from the
+    // service index, so each has to be reachable at its own path and to keep
+    // its self-referencing URLs inside itself.
+    let sv2 = UrlBuilder::semver2_hive_segment();
+    router = router
+        .route(
+            &format!("/v3/{sv2}/{{id}}/index.json"),
+            get(registration_index_semver2),
+        )
+        .route(
+            &format!("/v3/{sv2}/{{id}}/page/{{lower}}/{{upper}}"),
+            get(registration_page_semver2),
+        )
+        .route(
+            &format!("/v3/{sv2}/{{id}}/{{version}}"),
+            get(registration_leaf_semver2),
+        );
+
     // Symbol server: push `.snupkg` and serve PDBs over the SSQP path.
     if state.config.enable_symbol_server {
         router = router
@@ -856,23 +874,48 @@ async fn download_package(
 // Registration
 // ---------------------------------------------------------------------------
 
+/// NuGet exposes two registration hives and a client picks one from the service
+/// index. The SemVer1 hive must omit versions such a client cannot parse —
+/// dotted pre-release labels and build metadata — so each handler pair differs
+/// only in which hive it filters and links to.
 async fn registration_index(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>> {
-    state.require_read(&headers)?;
+    registration_index_for(&state, &headers, &id, false).await
+}
+
+async fn registration_index_semver2(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>> {
+    registration_index_for(&state, &headers, &id, true).await
+}
+
+async fn registration_index_for(
+    state: &AppState,
+    headers: &HeaderMap,
+    id: &str,
+    semver2: bool,
+) -> Result<Json<serde_json::Value>> {
+    state.require_read(headers)?;
     // Registration includes unlisted versions (flagged listed=false).
-    let mut packages = state.db.find_versions(state.feed(), &id, true).await?;
+    let mut packages = state.db.find_versions(state.feed(), id, true).await?;
     if packages.is_empty() {
-        state.mirror_if_needed(&id).await;
-        packages = state.db.find_versions(state.feed(), &id, true).await?;
+        state.mirror_if_needed(id).await;
+        packages = state.db.find_versions(state.feed(), id, true).await?;
     }
     if packages.is_empty() {
         return Err(Error::PackageNotFound);
     }
-    let urls = state.url_builder(&headers);
-    Ok(Json(nuget::registration_index(&urls, &id, &packages)))
+    let packages = filter_hive(packages, semver2);
+    if packages.is_empty() {
+        return Err(Error::PackageNotFound);
+    }
+    let urls = state.url_builder(headers).with_hive(semver2);
+    Ok(Json(nuget::registration_index(&urls, id, &packages)))
 }
 
 async fn registration_page(
@@ -880,18 +923,38 @@ async fn registration_page(
     headers: HeaderMap,
     Path((id, lower, upper)): Path<(String, String, String)>,
 ) -> Result<Json<serde_json::Value>> {
-    state.require_read(&headers)?;
-    let upper = upper.strip_suffix(".json").unwrap_or(&upper);
-    let lower = parse_version(&lower)?;
+    registration_page_for(&state, &headers, &id, &lower, &upper, false).await
+}
+
+async fn registration_page_semver2(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((id, lower, upper)): Path<(String, String, String)>,
+) -> Result<Json<serde_json::Value>> {
+    registration_page_for(&state, &headers, &id, &lower, &upper, true).await
+}
+
+async fn registration_page_for(
+    state: &AppState,
+    headers: &HeaderMap,
+    id: &str,
+    lower: &str,
+    upper: &str,
+    semver2: bool,
+) -> Result<Json<serde_json::Value>> {
+    state.require_read(headers)?;
+    let upper = upper.strip_suffix(".json").unwrap_or(upper);
+    let lower = parse_version(lower)?;
     let upper = parse_version(upper)?;
     // Registration includes unlisted versions; restrict to the page's range.
-    let mut packages = state.db.find_versions(state.feed(), &id, true).await?;
+    let packages = state.db.find_versions(state.feed(), id, true).await?;
+    let mut packages = filter_hive(packages, semver2);
     packages.retain(|p| p.version >= lower && p.version <= upper);
     if packages.is_empty() {
         return Err(Error::PackageNotFound);
     }
-    let urls = state.url_builder(&headers);
-    Ok(Json(nuget::registration_page(&urls, &id, &packages)))
+    let urls = state.url_builder(headers).with_hive(semver2);
+    Ok(Json(nuget::registration_page(&urls, id, &packages)))
 }
 
 async fn registration_leaf(
@@ -899,16 +962,50 @@ async fn registration_leaf(
     headers: HeaderMap,
     Path((id, version)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>> {
-    state.require_read(&headers)?;
-    let version = version.strip_suffix(".json").unwrap_or(&version);
+    registration_leaf_for(&state, &headers, &id, &version, false).await
+}
+
+async fn registration_leaf_semver2(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((id, version)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>> {
+    registration_leaf_for(&state, &headers, &id, &version, true).await
+}
+
+async fn registration_leaf_for(
+    state: &AppState,
+    headers: &HeaderMap,
+    id: &str,
+    version: &str,
+    semver2: bool,
+) -> Result<Json<serde_json::Value>> {
+    state.require_read(headers)?;
+    let version = version.strip_suffix(".json").unwrap_or(version);
     let version = parse_version(version)?;
     let package = state
         .db
-        .find(state.feed(), &id, &version)
+        .find(state.feed(), id, &version)
         .await?
         .ok_or(Error::PackageNotFound)?;
-    let urls = state.url_builder(&headers);
-    Ok(Json(nuget::registration_leaf(&urls, &id, &package)))
+    // A SemVer2 version has no leaf in the SemVer1 hive at all.
+    if !semver2 && package.is_semver2 {
+        return Err(Error::PackageNotFound);
+    }
+    let urls = state.url_builder(headers).with_hive(semver2);
+    Ok(Json(nuget::registration_leaf(&urls, id, &package)))
+}
+
+/// Restrict a version list to what the requested hive may expose.
+fn filter_hive(
+    packages: Vec<crate::models::Package>,
+    semver2: bool,
+) -> Vec<crate::models::Package> {
+    if semver2 {
+        packages
+    } else {
+        packages.into_iter().filter(|p| !p.is_semver2).collect()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -946,7 +1043,12 @@ async fn search(
         package_type: params.package_type.filter(|s| !s.is_empty()),
     };
     let page = state.db.search(state.feed(), &request).await?;
-    let urls = state.url_builder(&headers);
+    // Link results into the hive matching the caller's semVerLevel, so a client
+    // that asked for SemVer1 is not sent to registration documents holding
+    // versions it cannot parse.
+    let urls = state
+        .url_builder(&headers)
+        .with_hive(request.include_semver2);
     Ok(Json(nuget::search_response(&urls, &page)))
 }
 
@@ -1114,7 +1216,7 @@ async fn gallery(
         package_type: params.package_type.filter(|s| !s.is_empty()),
     };
     let page = state.db.search(state.feed(), &request).await?;
-    let urls = state.url_builder(&headers);
+    let urls = state.url_builder(&headers).with_hive(true);
     Ok(Html(ui::gallery_page(
         &urls,
         &page,

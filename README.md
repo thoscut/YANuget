@@ -106,7 +106,8 @@ YANuget implements the NuGet v3 protocol. Full reference in
 | Relist | `POST /api/v2/package/{id}/{version}` |
 | Versions (flat container) | `GET /v3/package/{id}/index.json` |
 | Download | `GET /v3/package/{id}/{version}/{id}.{version}.nupkg` |
-| Registration index | `GET /v3/registration/{id}/index.json` |
+| Registration index | `GET /v3/registration/{id}/index.json` (SemVer1) |
+| Registration index (SemVer2) | `GET /v3/registration-semver2/{id}/index.json` |
 | Registration page | `GET /v3/registration/{id}/page/{lower}/{upper}` |
 | Registration leaf | `GET /v3/registration/{id}/{version}.json` |
 | Search | `GET /v3/search?q=&skip=&take=&prerelease=&semVerLevel=&packageType=` |

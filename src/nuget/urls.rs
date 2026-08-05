@@ -14,7 +14,18 @@ pub struct UrlBuilder {
     /// App-relative path prefix for the current feed (`""` or `/{feed}`), used
     /// to build the gallery/admin links that stay within the feed.
     prefix: String,
+    /// Which registration hive this builder addresses. NuGet exposes two: the
+    /// SemVer1 hive, which a client that predates SemVer2 can parse in full,
+    /// and the SemVer2 hive, which also carries versions with dotted
+    /// pre-release labels or build metadata. Every URL a hive's documents emit
+    /// about themselves has to stay inside that hive, so it is carried here
+    /// rather than threaded through each call.
+    registration_segment: &'static str,
 }
+
+/// The URL segment of each registration hive.
+const HIVE_SEMVER1: &str = "registration";
+const HIVE_SEMVER2: &str = "registration-semver2";
 
 impl UrlBuilder {
     /// Create a builder from a base URL. A trailing slash is normalized away.
@@ -26,7 +37,19 @@ impl UrlBuilder {
         Self {
             base,
             prefix: String::new(),
+            registration_segment: HIVE_SEMVER1,
         }
+    }
+
+    /// Return this builder addressing the requested registration hive.
+    pub fn with_hive(mut self, semver2: bool) -> Self {
+        self.registration_segment = if semver2 { HIVE_SEMVER2 } else { HIVE_SEMVER1 };
+        self
+    }
+
+    /// The URL segment of the SemVer2 hive, for route registration.
+    pub const fn semver2_hive_segment() -> &'static str {
+        HIVE_SEMVER2
     }
 
     /// Create a builder rooted at `root` with an app path `prefix` (e.g.
@@ -38,6 +61,17 @@ impl UrlBuilder {
         let mut b = Self::new(format!("{}{}", root.trim_end_matches('/'), prefix));
         b.prefix = prefix;
         b
+    }
+
+    /// Base of the SemVer1 registration hive, with trailing slash — advertised
+    /// independently of whichever hive this builder addresses.
+    pub fn registration_base_semver1(&self) -> String {
+        format!("{}/v3/{HIVE_SEMVER1}/", self.base)
+    }
+
+    /// Base of the SemVer2 registration hive, with trailing slash.
+    pub fn registration_base_semver2(&self) -> String {
+        format!("{}/v3/{HIVE_SEMVER2}/", self.base)
     }
 
     /// The configured base URL (no trailing slash).
@@ -89,21 +123,28 @@ impl UrlBuilder {
         )
     }
 
-    /// Registration base, with trailing slash (`RegistrationsBaseUrl`).
+    /// Registration base for this builder's hive, with trailing slash
+    /// (`RegistrationsBaseUrl`).
     pub fn registration_base(&self) -> String {
-        format!("{}/v3/registration/", self.base)
+        format!("{}/v3/{}/", self.base, self.registration_segment)
     }
 
     /// `/v3/registration/{id}/index.json`
     pub fn registration_index(&self, lower_id: &str) -> String {
-        format!("{}/v3/registration/{}/index.json", self.base, enc(lower_id))
+        format!(
+            "{}/v3/{}/{}/index.json",
+            self.base,
+            self.registration_segment,
+            enc(lower_id)
+        )
     }
 
     /// `/v3/registration/{id}/{version}.json`
     pub fn registration_leaf(&self, lower_id: &str, normalized_version: &str) -> String {
         format!(
-            "{}/v3/registration/{}/{}.json",
+            "{}/v3/{}/{}/{}.json",
             self.base,
+            self.registration_segment,
             enc(lower_id),
             enc(&normalized_version.to_lowercase()),
         )
@@ -113,8 +154,9 @@ impl UrlBuilder {
     /// covering the version range `[lower, upper]`.
     pub fn registration_page(&self, lower_id: &str, lower: &str, upper: &str) -> String {
         format!(
-            "{}/v3/registration/{}/page/{}/{}.json",
+            "{}/v3/{}/{}/page/{}/{}.json",
             self.base,
+            self.registration_segment,
             enc(lower_id),
             enc(&lower.to_lowercase()),
             enc(&upper.to_lowercase()),
