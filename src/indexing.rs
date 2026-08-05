@@ -21,8 +21,14 @@ use crate::version::NuGetVersion;
 use crate::{nupkg, validation};
 
 /// Caps for embedded sidecar files extracted into auxiliary storage.
-const MAX_README_BYTES: u64 = 8 * 1024 * 1024;
-const MAX_ICON_BYTES: u64 = 4 * 1024 * 1024;
+///
+/// These bound decompression work per push *and* the size of what the gallery
+/// later renders on every page view — a highly compressible readme is otherwise
+/// a cheap way to turn a small upload into a huge response served repeatedly.
+/// 1 MiB matches the limit nuget.org enforces on embedded readmes, and is far
+/// above any real one.
+const MAX_README_BYTES: u64 = 1024 * 1024;
+const MAX_ICON_BYTES: u64 = 1024 * 1024;
 
 /// Options influencing how a package is indexed into a feed.
 #[derive(Debug, Clone, Default)]

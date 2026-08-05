@@ -997,16 +997,46 @@ fn render_icon(urls: &UrlBuilder, p: &Package) -> String {
     )
 }
 
+/// How much of a readme the detail page renders inline.
+///
+/// A readme is package-supplied and highly compressible, so a small upload can
+/// carry a very large one — and the detail page is served on every view, to
+/// anyone who can read the feed. Rendering it whole turns one cheap push into a
+/// permanently expensive response, so the page shows a generous prefix and
+/// points at the package itself for the rest.
+const MAX_RENDERED_README_BYTES: usize = 64 * 1024;
+
 fn render_readme(readme: Option<&str>) -> String {
     match readme {
         Some(text) if !text.trim().is_empty() => {
+            let (shown, truncated) = truncate_bytes(text, MAX_RENDERED_README_BYTES);
+            let notice = if truncated {
+                "<p class=\"muted\">Readme truncated; the full text is inside the package.</p>"
+            } else {
+                ""
+            };
             format!(
-                "<h3 class=\"muted\">Readme</h3><div class=\"card readme\">{}</div>",
-                escape_html(text)
+                "<h3 class=\"muted\">Readme</h3><div class=\"card readme\">{}</div>{notice}",
+                escape_html(shown)
             )
         }
         _ => String::new(),
     }
+}
+
+/// Cut `s` to at most `max` bytes without splitting a character, reporting
+/// whether anything was dropped.
+fn truncate_bytes(s: &str, max: usize) -> (&str, bool) {
+    if s.len() <= max {
+        return (s, false);
+    }
+    // Walk back to the nearest character boundary; `is_char_boundary` is true at
+    // 0, so this always terminates.
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    (&s[..end], true)
 }
 
 fn render_tags(tags: &[String]) -> String {
@@ -1071,6 +1101,40 @@ mod tests {
     /// whose inline content drifts from the policy silently loses its styling
     /// and its copy buttons. Extract both from a real rendered page and check
     /// the policy actually covers them.
+    #[test]
+    fn a_huge_readme_does_not_become_a_huge_page() {
+        // A readme is package-supplied and compresses well, so a small upload
+        // can carry a very large one. The detail page is served on every view,
+        // so rendering it whole turns one push into a permanent cost.
+        let huge = "A".repeat(super::MAX_RENDERED_README_BYTES * 4);
+        let rendered = super::render_readme(Some(&huge));
+        assert!(
+            rendered.len() < super::MAX_RENDERED_README_BYTES * 2,
+            "rendered {} bytes from a {} byte readme",
+            rendered.len(),
+            huge.len()
+        );
+        assert!(rendered.contains("Readme truncated"));
+
+        // An ordinary readme is untouched and unannotated.
+        let small = super::render_readme(Some("# Hello\n\nSome docs."));
+        assert!(small.contains("Some docs."));
+        assert!(!small.contains("truncated"));
+    }
+
+    #[test]
+    fn truncation_never_splits_a_character() {
+        // Cutting at a byte offset inside a multi-byte character would panic on
+        // slicing; the boundary walk has to handle it.
+        let s = "\u{00e9}".repeat(100); // two bytes each
+        for max in 0..s.len() {
+            let (cut, truncated) = super::truncate_bytes(&s, max);
+            assert!(cut.len() <= max);
+            assert_eq!(truncated, s.len() > max);
+            assert!(s.starts_with(cut));
+        }
+    }
+
     #[test]
     fn credentials_in_an_upstream_url_are_not_displayed() {
         assert_eq!(
