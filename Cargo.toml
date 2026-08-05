@@ -57,7 +57,7 @@ indicatif = "0.17"
 
 [dev-dependencies]
 tempfile = "3"
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "multipart", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "multipart", "rustls-tls", "http2"] }
 tokio = { version = "1", features = ["full"] }
 tokio-test = "0.4"
 zip = { version = "2", default-features = false, features = ["deflate"] }

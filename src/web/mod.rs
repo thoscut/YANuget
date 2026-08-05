@@ -382,7 +382,31 @@ async fn filter_forwarded_headers(
             headers.remove(name);
         }
     }
+    adopt_authority_as_host(&mut req);
     next.run(req).await
+}
+
+/// Make the request's authority visible as a `Host` header.
+///
+/// HTTP/1.1 carries the target host in `Host`; HTTP/2 and HTTP/3 carry it in
+/// the `:authority` pseudo-header instead, which hyper surfaces on the URI and
+/// *not* as a header. Everything downstream reads `Host` to work out the
+/// server's externally visible name, so without this an HTTP/2 client falls
+/// through to the `localhost` default and is handed absolute package URLs
+/// pointing at `https://localhost/…` — every restore over HTTP/2 then fails.
+///
+/// Both forms are equally client-supplied, so this changes what is read, not
+/// how far it is trusted.
+fn adopt_authority_as_host(req: &mut Request) {
+    if req.headers().contains_key(header::HOST) {
+        return;
+    }
+    let Some(authority) = req.uri().authority().map(|a| a.to_string()) else {
+        return;
+    };
+    if let Ok(value) = HeaderValue::from_str(&authority) {
+        req.headers_mut().insert(header::HOST, value);
+    }
 }
 
 /// Add the baseline security response headers, plus a one-year

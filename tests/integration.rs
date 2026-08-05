@@ -2552,3 +2552,43 @@ async fn the_semver1_hive_withholds_versions_that_client_cannot_parse() {
     let reg = sv2_search["data"][0]["registration"].as_str().unwrap();
     assert!(reg.starts_with(&sv2_base), "search linked to {reg}");
 }
+
+#[tokio::test]
+async fn http2_clients_are_given_this_servers_urls_not_localhost() {
+    // HTTP/1.1 carries the target host in `Host`; HTTP/2 carries it in the
+    // `:authority` pseudo-header, which hyper surfaces on the URI rather than as
+    // a header. A server that only reads `Host` falls through to its default and
+    // hands an HTTP/2 client absolute package URLs pointing at `localhost` —
+    // every restore over HTTP/2 then fails.
+    let server = spawn().await;
+    let h2 = reqwest::Client::builder()
+        .http2_prior_knowledge()
+        .build()
+        .unwrap();
+
+    let index: serde_json::Value = h2
+        .get(server.url("/v3/index.json"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let base = package_base_address(&index);
+    assert!(
+        base.starts_with(&server.base),
+        "HTTP/2 request produced {base}, expected it under {}",
+        server.base
+    );
+    assert!(!base.contains("localhost"), "fell back to the default host");
+
+    // And the URL it produced is actually fetchable.
+    push_multipart(&server, API_KEY, build_nupkg("H2.Pkg", "1.0.0", b"x")).await;
+    let versions = h2
+        .get(format!("{base}h2.pkg/index.json"))
+        .send()
+        .await
+        .unwrap();
+    assert!(versions.status().is_success());
+}
