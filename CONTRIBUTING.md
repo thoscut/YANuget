@@ -53,6 +53,22 @@ the flat container lists a version NuGet is about to restore, or whether a symbo
 key matches what a debugger computes. Real defects have hidden behind a green
 test suite for exactly that reason.
 
+## Screenshots on the README
+
+The images under `.github/media/` are generated, never hand-edited. If you
+change the gallery, regenerate them:
+
+```bash
+scripts/capture-media.sh
+```
+
+It builds the server, starts two throwaway instances (one seeded with a
+realistic feed, one empty for the first-run panel), drives a real browser
+against them and assembles the GIFs. A push to `main` that touches the UI and
+leaves the committed media stale fails CI, so this is not something you can
+forget quietly; the `Refresh product media` workflow also regenerates them on
+demand and opens a pull request.
+
 ## What good changes look like
 
 - **Tests come with the change.** A bug fix should include a test that fails
@@ -100,6 +116,7 @@ Branch off `main` and open the pull request against `main`.
 | `docs/` | MkDocs sources for the site embedded at `/docs` |
 | `tests/` | Integration tests |
 | `scripts/verify-with-dotnet.sh` | End-to-end check against the real .NET SDK |
+| `scripts/capture-media.sh`, `scripts/media/` | Regenerates the README screenshots and GIFs |
 
 Releases are described in [RELEASING.md](RELEASING.md).
 

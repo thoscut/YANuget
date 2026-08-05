@@ -80,7 +80,6 @@ await mkdir(outDir, { recursive: true });
 
 console.log("stills:");
 await still(context, `${baseUrl}/`, "gallery.png");
-await still(context, `${baseUrl}/`, "gallery-light.png", "light");
 await still(context, `${baseUrl}/packages/contoso.build.tools`, "package.png");
 await still(context, `${baseUrl}/stats`, "stats.png");
 await still(context, `${baseUrl}/docs/`, "docs.png");
