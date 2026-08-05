@@ -855,9 +855,13 @@ fn status_badges(p: &Package) -> String {
 }
 
 fn render_install(urls: &UrlBuilder, p: &Package, primary_client: &str) -> String {
-    let idx = escape_html(&urls.service_index());
-    let id = escape_html(&p.id);
-    let ver = escape_html(&p.normalized_version());
+    // Assembled from raw values and escaped once, at output. Escaping here as
+    // well would double-encode: the page would show `&amp;amp;` and the copy
+    // button — which reads `innerText`, undoing exactly one level — would put a
+    // command carrying a literal `&amp;` on the clipboard.
+    let idx = urls.service_index();
+    let id = &p.id;
+    let ver = p.normalized_version();
 
     let choco = (
         "Chocolatey",
@@ -1101,6 +1105,27 @@ mod tests {
     /// whose inline content drifts from the policy silently loses its styling
     /// and its copy buttons. Extract both from a real rendered page and check
     /// the policy actually covers them.
+    #[test]
+    fn install_snippets_are_escaped_exactly_once() {
+        // A base URL may legitimately contain `&`. Escaping the parts and then
+        // the assembled command again shows `&amp;amp;` on the page, and the
+        // copy button (which reads `innerText`, undoing one level) would put a
+        // literal `&amp;` on the clipboard — a command that does not work.
+        let urls = super::UrlBuilder::new("https://host.test/a&b");
+        let mut p = sample();
+        p.id = "Contoso.Utils".into();
+        let html = super::render_install(&urls, &p, "choco");
+
+        assert!(
+            html.contains("https://host.test/a&amp;b/v3/index.json"),
+            "expected a singly-escaped URL, got: {html}"
+        );
+        assert!(
+            !html.contains("&amp;amp;"),
+            "command was escaped twice: {html}"
+        );
+    }
+
     #[test]
     fn a_huge_readme_does_not_become_a_huge_page() {
         // A readme is package-supplied and compresses well, so a small upload
