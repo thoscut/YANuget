@@ -15,15 +15,23 @@ use crate::nuget::UrlBuilder;
 /// Minimal, dependency-free styling, inlined so the UI needs no static assets
 /// and works fully offline.
 const STYLE: &str = "\
-:root{--bg:#0d1117;--card:#161b22;--border:#30363d;--fg:#e6edf3;--muted:#9aa4af;\
---accent:#58a6ff;--accent2:#1f6feb;--code:#010409;--warn:#d29922}\
+:root{color-scheme:dark light;\
+--bg:#0d1117;--card:#161b22;--border:#30363d;--fg:#e6edf3;--muted:#9aa4af;\
+--accent:#58a6ff;--accent2:#1f6feb;--accent2h:#2d76f0;--onaccent:#fff;\
+--code:#010409;--warn:#d29922;--subtle:#21262d;--subtleh:#30363d;\
+--ok:#3fb950;--danger:#b62324;--dangerfg:#ff7b72}\
+@media(prefers-color-scheme:light){:root{\
+--bg:#f6f8fa;--card:#fff;--border:#d0d7de;--fg:#1f2328;--muted:#59636e;\
+--accent:#0969da;--accent2:#0969da;--accent2h:#0a5fc2;--onaccent:#fff;\
+--code:#f6f8fa;--warn:#9a6700;--subtle:#eaeef2;--subtleh:#dde3ea;\
+--ok:#1a7f37;--danger:#cf222e;--dangerfg:#cf222e}}\
 *{box-sizing:border-box}\
 body{margin:0;background:var(--bg);color:var(--fg);\
 font:15px/1.55 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif}\
 a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}\
 a:focus-visible,button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline-offset:2px}\
 .vh{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);border:0}\
-.skip{position:absolute;left:-999px;top:0;background:var(--accent2);color:#fff;padding:8px 12px;border-radius:0 0 6px 0;z-index:10}\
+.skip{position:absolute;left:-999px;top:0;background:var(--accent2);color:var(--onaccent);padding:8px 12px;border-radius:0 0 6px 0;z-index:10}\
 .skip:focus{left:0}\
 header{background:var(--card);border-bottom:1px solid var(--border);padding:14px 0}\
 .wrap{max-width:980px;margin:0 auto;padding:0 20px}\
@@ -35,8 +43,8 @@ input[type=search]{flex:1;padding:9px 12px;border-radius:6px;border:1px solid va
 background:var(--bg);color:var(--fg);font-size:15px;min-height:44px}\
 input[type=search]:focus{border-color:var(--accent)}\
 button{padding:9px 16px;border-radius:6px;border:1px solid var(--accent2);\
-background:var(--accent2);color:#fff;font-size:15px;cursor:pointer;min-height:44px}\
-button:hover{background:#2d76f0}\
+background:var(--accent2);color:var(--onaccent);font-size:15px;cursor:pointer;min-height:44px}\
+button:hover{background:var(--accent2h)}\
 @media(max-width:560px){header .wrap{flex-wrap:wrap}form.search{flex:1 0 100%}}\
 main{padding:26px 0 60px}\
 .card{background:var(--card);border:1px solid var(--border);border-radius:10px;\
@@ -45,7 +53,7 @@ padding:18px 20px;margin:0 0 14px}\
 .meta{color:var(--muted);font-size:13px;margin:2px 0}\
 .crumbs{font-size:13px;color:var(--muted);margin:0 0 6px}\
 .tags{margin-top:8px;list-style:none;padding:0;display:flex;flex-wrap:wrap}\
-.tag{display:inline-block;background:#21262d;border:1px solid var(--border);border-radius:20px;\
+.tag{display:inline-block;background:var(--subtle);border:1px solid var(--border);border-radius:20px;\
 padding:1px 10px;font-size:12px;color:var(--muted);margin:0 4px 4px 0}\
 .badge{display:inline-block;font-size:11px;padding:0 7px;border-radius:20px;border:1px solid var(--border);vertical-align:middle}\
 .badge.pre{color:var(--warn);border-color:var(--warn)}\
@@ -63,8 +71,8 @@ code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}\
 .install pre{white-space:pre-wrap;overflow-wrap:anywhere}\
 .snip{position:relative}\
 .snip .copy{position:absolute;top:6px;right:6px;padding:3px 10px;font-size:12px;min-height:0;\
-background:#21262d;border:1px solid var(--border);color:var(--fg)}\
-.snip .copy:hover{background:#30363d}\
+background:var(--subtle);border:1px solid var(--border);color:var(--fg)}\
+.snip .copy:hover{background:var(--subtleh)}\
 .snip pre{padding-right:64px}\
 .versions{list-style:none;margin:0;padding:0;max-height:340px;overflow:auto}\
 .versions li{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:5px 0;border-bottom:1px solid var(--border)}\
@@ -73,9 +81,15 @@ background:#21262d;border:1px solid var(--border);color:var(--fg)}\
 table.deps{width:100%;border-collapse:collapse;font-size:13px}\
 table.deps td{padding:3px 8px 3px 0}\
 .readme{white-space:pre-wrap;word-wrap:break-word;overflow-wrap:anywhere}\
-img.picon{width:32px;height:32px;object-fit:contain;vertical-align:-6px;margin-right:10px;border-radius:6px;background:#21262d}\
+img.picon{width:32px;height:32px;object-fit:contain;vertical-align:-6px;margin-right:10px;border-radius:6px;background:var(--subtle)}\
 .links a[rel~=nofollow]::after{content:\" \u{2197}\";color:var(--muted);font-size:11px}\
 .empty{text-align:center;color:var(--muted);padding:60px 0}\
+.hero{text-align:center;padding:30px 0 4px}\
+.hero h1{font-size:30px;margin:0 0 8px;letter-spacing:-.4px}\
+.hero p{margin:0 auto;max-width:46ch;color:var(--muted)}\
+.steps h3{margin:16px 0 4px;font-size:13px;text-transform:uppercase;letter-spacing:.4px;color:var(--muted)}\
+.steps h3:first-child{margin-top:0}\
+.steps pre{white-space:pre-wrap;overflow-wrap:anywhere}\
 .kv{font-size:13px}.kv div{display:flex;gap:10px;padding:3px 0;border-bottom:1px solid var(--border)}\
 .kv b{color:var(--muted);font-weight:500;min-width:120px;flex:0 0 auto}\
 @media(max-width:480px){.kv div{flex-direction:column;gap:0}.kv b{min-width:0}}\
@@ -89,16 +103,16 @@ img.picon{width:32px;height:32px;object-fit:contain;vertical-align:-6px;margin-r
 .pager{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:18px 0;flex-wrap:wrap}\
 .btn{border:1px solid var(--border);border-radius:6px;padding:8px 14px;color:var(--fg)}\
 .btn[aria-disabled=true]{opacity:.4;pointer-events:none}\
-.badge.ok{color:#3fb950;border-color:#3fb950}\
+.badge.ok{color:var(--ok);border-color:var(--ok)}\
 .atbl{width:100%;border-collapse:collapse}\
 .atbl th,.atbl td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--border);font-size:14px;vertical-align:middle}\
 .atbl th{color:var(--muted);font-weight:500;font-size:12px;text-transform:uppercase;letter-spacing:.4px}\
 .actions{display:flex;gap:8px;flex-wrap:wrap}\
 .actions form{margin:0}\
-.actions button{padding:5px 12px;font-size:13px;min-height:0;background:#21262d;border:1px solid var(--border);color:var(--fg)}\
-.actions button:hover{background:#30363d}\
-.actions button.danger{border-color:#b62324;color:#ff7b72}\
-.actions button.danger:hover{background:#b62324;color:#fff}\
+.actions button{padding:5px 12px;font-size:13px;min-height:0;background:var(--subtle);border:1px solid var(--border);color:var(--fg)}\
+.actions button:hover{background:var(--subtleh)}\
+.actions button.danger{border-color:var(--danger);color:var(--dangerfg)}\
+.actions button.danger:hover{background:var(--danger);color:var(--onaccent)}\
 footer{border-top:1px solid var(--border);color:var(--muted);font-size:13px;padding:18px 0}\
 footer a[aria-current=page]{color:var(--fg);font-weight:600}\
 ";
@@ -245,22 +259,16 @@ pub fn gallery_page(
     take: i64,
 ) -> String {
     let body = if page.groups.is_empty() {
-        let what = if query.trim().is_empty() {
-            "No packages have been published yet.".to_string()
-        } else {
-            format!("No packages match \u{201c}{}\u{201d}.", escape_html(query))
-        };
-        let clear = if query.trim().is_empty() {
-            "<p class=\"muted\">Push one with <code>dotnet nuget push</code> or \
-             <code>choco push</code>.</p>"
-                .to_string()
+        if query.trim().is_empty() {
+            first_run_panel(urls)
         } else {
             format!(
-                "<p><a href=\"{}\">Clear search and browse all packages</a></p>",
+                "<div class=\"empty\"><p>No packages match \u{201c}{}\u{201d}.</p>\
+                 <p><a href=\"{}\">Clear search and browse all packages</a></p></div>",
+                escape_html(query),
                 escape_html(&urls.app("/packages"))
             )
-        };
-        format!("<div class=\"empty\"><p>{what}</p>{clear}</div>")
+        }
     } else {
         let mut cards = String::new();
         let heading = if query.trim().is_empty() {
@@ -309,6 +317,54 @@ pub fn gallery_page(
         cards
     };
     layout(urls, "YANuget", query, "", &body)
+}
+
+/// What an empty feed shows instead of "no packages": the three commands that
+/// take someone from a running server to a restored package, already carrying
+/// this server's own service-index URL.
+///
+/// This is the first page most people ever see, and the thing they need at that
+/// moment is not an apology for being empty — it is the URL to point a client
+/// at, which they would otherwise have to go and find.
+fn first_run_panel(urls: &UrlBuilder) -> String {
+    // Assembled raw and escaped once at output, like `render_install`: escaping
+    // twice would put a literal `&amp;` on the clipboard.
+    let idx = urls.service_index();
+    let steps = [
+        (
+            "1 \u{2014} Add this feed",
+            format!("dotnet nuget add source {idx} -n yanuget"),
+        ),
+        (
+            "2 \u{2014} Push a package",
+            "dotnet nuget push MyPackage.1.0.0.nupkg --source yanuget --api-key <your-api-key>"
+                .to_string(),
+        ),
+        (
+            "3 \u{2014} Restore from it",
+            format!("dotnet restore --source {idx}"),
+        ),
+    ];
+
+    let mut snippets = String::new();
+    for (label, cmd) in steps {
+        snippets.push_str(&format!(
+            "<h3>{label}</h3><div class=\"snip\">\
+             <button type=\"button\" class=\"copy\" aria-label=\"Copy command\">Copy</button>\
+             <pre><code>{cmd}</code></pre></div>",
+            cmd = escape_html(&cmd),
+        ));
+    }
+
+    format!(
+        "<div class=\"hero\"><h1>Your feed is live</h1>\
+         <p>Nothing published to it yet. Three commands change that.</p></div>\
+         <div class=\"card steps\">{snippets}</div>\
+         <p class=\"muted\">Using Chocolatey, <code>nuget.exe</code> or Visual Studio? \
+         The same service-index URL works for all of them \u{2014} see \
+         <a href=\"{docs}\">the documentation</a>.</p>",
+        docs = escape_html(&urls.app("/docs/")),
+    )
 }
 
 /// Previous/next pagination control for the gallery.
@@ -1336,6 +1392,53 @@ mod tests {
         // Empty result for a query offers a "clear search" link.
         let empty = gallery_page(&urls, &page_of(&[]), "zzz", 0, 20);
         assert!(empty.contains("Clear search"));
+    }
+
+    #[test]
+    fn an_empty_feed_shows_the_commands_that_fill_it() {
+        // The first page anyone sees. It has to carry *this* server's service
+        // index, not a placeholder host, or it is just decoration.
+        let urls = UrlBuilder::new("https://nuget.example.com");
+        let html = gallery_page(&urls, &page_of(&[]), "", 0, 20);
+        assert!(html.contains("Your feed is live"), "{html}");
+        assert!(
+            html.contains("dotnet nuget add source https://nuget.example.com/v3/index.json"),
+            "{html}"
+        );
+        assert!(html.contains("dotnet nuget push"), "{html}");
+        assert!(
+            html.contains("dotnet restore --source https://nuget.example.com/v3/index.json"),
+            "{html}"
+        );
+        // Each command gets a copy button, which reads `innerText` — so the
+        // command must be escaped exactly once or the clipboard gets entities.
+        assert_eq!(html.matches("class=\"copy\"").count(), 3, "{html}");
+        assert!(!html.contains("&amp;amp;"), "{html}");
+
+        // A search that finds nothing is a different situation and must not be
+        // answered with onboarding instructions.
+        let no_match = gallery_page(&urls, &page_of(&[]), "zzz", 0, 20);
+        assert!(!no_match.contains("Your feed is live"), "{no_match}");
+    }
+
+    #[test]
+    fn the_palette_adapts_to_a_light_browser_theme() {
+        // Every colour has to come from a custom property, or a light-themed
+        // browser gets dark text on dark chrome in whatever was left hardcoded.
+        let style = STYLE;
+        let vars = style
+            .split_once("*{box-sizing:border-box}")
+            .expect("variable block precedes the rules")
+            .0;
+        assert!(vars.contains("prefers-color-scheme:light"), "{vars}");
+        let rules = style
+            .split_once("*{box-sizing:border-box}")
+            .expect("rules follow the variable block")
+            .1;
+        assert!(
+            !rules.contains('#'),
+            "hardcoded colour outside the variable block: {rules}"
+        );
     }
 
     #[test]

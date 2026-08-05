@@ -75,7 +75,14 @@ First public release.
   detail pages with readme and install commands for Chocolatey / `dotnet` /
   `nuget.exe`, embedded package icons, a statistics page and a read-only
   settings overview that never reveals secrets. No external resources are
-  loaded, so it works on an air-gapped network.
+  loaded, so it works on an air-gapped network, and the palette follows the
+  browser's light or dark preference.
+- An empty feed answers with the three commands that fill it — add source,
+  push, restore — already carrying this server's own service-index URL, rather
+  than with "no packages".
+- A startup summary listing the gallery, service index and documentation URLs,
+  the configured feeds and the data directory, with a wildcard bind shown as a
+  URL a client will actually accept.
 - An `/admin` area (HTTP Basic) to disable, re-enable, delete, approve and
   promote individual versions.
 - The full MkDocs documentation site, embedded in the binary and served offline
