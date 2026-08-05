@@ -30,16 +30,24 @@ API_KEY="verify-key"
 mkdir -p "$WORK"
 cd "$WORK"
 
-# --- .NET SDK (cached in the work directory) --------------------------------
-export DOTNET_ROOT="$WORK/dotnet"
-export PATH="$DOTNET_ROOT:$PATH"
+# --- .NET SDK ---------------------------------------------------------------
+# Prefer an SDK that is already present (CI runners ship one, and a previous run
+# may have installed one here); only fetch as a last resort. `DOTNET_ROOT` is set
+# only when we are pointing at our own copy — exporting it for a system SDK sends
+# it looking for the shared runtime in the wrong place.
 export DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_NOLOGO=1
-if ! command -v dotnet >/dev/null 2>&1; then
-    echo "==> installing the .NET SDK into $DOTNET_ROOT"
+LOCAL_DOTNET="$WORK/dotnet"
+if [ -x "$LOCAL_DOTNET/dotnet" ]; then
+    export DOTNET_ROOT="$LOCAL_DOTNET"
+    export PATH="$LOCAL_DOTNET:$PATH"
+elif ! command -v dotnet >/dev/null 2>&1; then
+    echo "==> no .NET SDK found; installing one into $LOCAL_DOTNET"
     curl -sSL -o dotnet-install.sh https://dot.net/v1/dotnet-install.sh
-    bash dotnet-install.sh --channel 8.0 --install-dir "$DOTNET_ROOT" --no-path >/dev/null
+    bash dotnet-install.sh --channel 8.0 --install-dir "$LOCAL_DOTNET" --no-path >/dev/null
+    export DOTNET_ROOT="$LOCAL_DOTNET"
+    export PATH="$LOCAL_DOTNET:$PATH"
 fi
-echo "==> dotnet $(dotnet --version), NuGet $(dotnet nuget --version | tail -1)"
+echo "==> dotnet $(dotnet --version) from $(command -v dotnet), NuGet $(dotnet nuget --version | tail -1)"
 
 # --- server (TLS, self-signed, as shipped by default) -----------------------
 rm -rf server && mkdir -p server

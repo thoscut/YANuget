@@ -109,3 +109,44 @@ jobs:
       # build never compiles. Ignored deliberately; revisit if a fix ships.
       - name: Audit dependencies for known vulnerabilities
         run: cargo audit --ignore RUSTSEC-2023-0071
+
+  client-compat:
+    # The Rust tests drive the server with `reqwest` — a faithful HTTP client,
+    # but not a NuGet client. It does not care whether the service index
+    # advertises the resources NuGet probes for, whether the flat container
+    # lists a version NuGet is about to restore, or whether a symbol key
+    # matches what a debugger computes. Real defects have hidden behind a green
+    # test suite for exactly that reason, including one where unlisting a
+    # package broke every build pinned to it.
+    #
+    # So this job runs the real toolchain against a real TLS server. The
+    # GitHub-hosted Ubuntu image already ships a .NET SDK, so `setup-dotnet`
+    # only pins the version — nothing large is downloaded.
+    name: NuGet client compatibility
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-compat-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-compat-
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Build the server
+        run: cargo build --release
+
+      - name: Push, restore, build and run with the real client
+        run: scripts/verify-with-dotnet.sh "${{ runner.temp }}/yanuget-compat"

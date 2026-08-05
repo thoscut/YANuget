@@ -184,6 +184,11 @@ things only a real client can confirm:
   entry — the key a debugger actually requests — with the served PDB
   byte-identical to the one in the `.snupkg`.
 
+CI runs this as its own job, so a protocol regression fails the build rather
+than waiting to be discovered by a client. The GitHub-hosted runner already
+ships a .NET SDK; locally the script fetches one into its work directory on
+first use and reuses it afterwards.
+
 ---
 
 ## Using YANuget with Chocolatey
