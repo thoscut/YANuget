@@ -279,6 +279,12 @@ pip install -r requirements-docs.txt
 mkdocs build      # outputs site/, embedded at compile time
 ```
 
+It covers the [HTTP API](docs/api.md), every
+[configuration option](docs/configuration.md),
+[deploying it as a service](docs/deployment.md) (systemd, Compose, Kubernetes
+probes, backup/restore, upgrades), the [architecture](docs/architecture.md) and
+the [large-package design](docs/large-packages.md).
+
 Release binaries and the container image ship the rendered docs; a plain
 `cargo build` without MkDocs still compiles (a small placeholder page is embedded
 instead), as does an install from crates.io. The Markdown sources live in

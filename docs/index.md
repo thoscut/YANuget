@@ -15,6 +15,8 @@ on an air-gapped network.
 - **[Configuration](configuration.md)** — all settings and `YANUGET_*`
   environment variables, including TLS, rate limiting, multiple API keys,
   retention, and multi-feed / mirroring / license-policy options.
+- **[Deployment](deployment.md)** — running it as a service: systemd, Docker
+  Compose, Kubernetes probes, backup/restore and upgrades.
 - **[Architecture](architecture.md)** — the module map and trait boundaries.
 - **[Large packages](large-packages.md)** — the bounded-memory streaming design.
 
