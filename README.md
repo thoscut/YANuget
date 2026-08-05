@@ -157,11 +157,32 @@ HTTP (axum)  ──▶  indexing pipeline  ──▶  PackageStorage (trait)  �
 cargo test            # unit + integration tests
 cargo clippy --all-targets   # lints (CI requires zero warnings)
 cargo fmt --check     # formatting
+
+# End-to-end against the real .NET SDK (downloads it on first run).
+cargo build --release && scripts/verify-with-dotnet.sh
 ```
 
 The test suite covers version semantics, nuspec parsing, the streaming hash,
 storage, the database/search, the protocol builders, the indexing pipeline, and
 full end-to-end HTTP flows (push, download, Range, search, unlist/relist).
+
+Those tests drive the server with `reqwest`, which is a faithful HTTP client but
+not a *NuGet* client: it does not care whether the service index advertises the
+resources NuGet probes for, whether the flat container lists a version NuGet is
+about to restore, or whether a symbol key matches what a debugger computes.
+[`scripts/verify-with-dotnet.sh`](scripts/verify-with-dotnet.sh) closes that gap
+by running the real toolchain — `dotnet pack`, `dotnet nuget push`,
+`dotnet restore`, `dotnet run` — against a real TLS server, and asserting the
+things only a real client can confirm:
+
+* a transitive restore over HTTPS/HTTP-2, then building and **running** code
+  from the restored packages;
+* `409` on a duplicate push and `401` on a bad key, as the client reports them;
+* an unlisted version disappearing from search while a project pinned to it
+  still restores (unlist must not break existing builds);
+* the SSQP symbol key matching the GUID in the assembly's own CodeView debug
+  entry — the key a debugger actually requests — with the served PDB
+  byte-identical to the one in the `.snupkg`.
 
 ---
 
