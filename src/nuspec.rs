@@ -4,8 +4,7 @@
 //! We match on *local* element names so the parser is agnostic to the (several)
 //! XML namespaces NuGet has used over the years.
 
-use quick_xml::escape::unescape;
-use quick_xml::events::Event;
+use quick_xml::events::{BytesRef, Event};
 use quick_xml::{Reader, XmlVersion};
 
 use crate::error::Error;
@@ -81,13 +80,25 @@ const MAX_PACKAGE_TYPES: usize = 64;
 /// `id`/`version` fields.
 pub fn parse_nuspec(xml: &str) -> Result<Nuspec, Error> {
     let mut reader = Reader::from_str(xml);
-    reader.config_mut().trim_text(true);
+    // Text is *not* trimmed per event, because an element's text can arrive as
+    // several events (see `text` below) and trimming each one would eat the
+    // spaces between them. The accumulated value is trimmed once, at the end.
+    reader.config_mut().trim_text(false);
 
     let mut nuspec = Nuspec::default();
     // Lower-cased local-name stack of currently open elements.
     let mut path: Vec<String> = Vec::new();
     // Index into `dependency_groups` for the currently open `<group>`, if any.
     let mut current_group: Option<usize> = None;
+    // Text accumulated for the element currently open.
+    //
+    // quick-xml reports the content of one element as *one event per run
+    // between entity references*: `Alice &amp; Bob` arrives as "Alice ", "&",
+    // " Bob". Assigning each event in turn would keep only the last, silently
+    // truncating every field that contains an entity — and `&` is ordinary in a
+    // description or an author list. So the runs are joined and assigned once,
+    // when the element closes.
+    let mut text = String::new();
 
     loop {
         match reader.read_event() {
@@ -126,24 +137,41 @@ pub fn parse_nuspec(xml: &str) -> Result<Nuspec, Error> {
                     )));
                 }
                 path.push(name);
+                // Any text seen before this child belongs to the parent, which
+                // in a nuspec is never a scalar field — drop it rather than let
+                // it bleed into the child's value.
+                text.clear();
                 check_limits(&nuspec)?;
             }
             Ok(Event::Text(e)) => {
-                // quick-xml 0.41 split text handling: `xml10_content` decodes and
-                // normalizes EOLs, then `unescape` resolves XML entities — together
-                // they replace the old one-shot `BytesText::unescape`.
-                let Ok(decoded) = e.xml10_content() else {
-                    continue;
-                };
-                let text = unescape(&decoded)
-                    .map(|u| u.into_owned())
-                    .unwrap_or_else(|_| decoded.into_owned());
-                if text.trim().is_empty() {
-                    continue;
+                // `xml10_content` decodes the bytes and normalizes EOLs. It does
+                // not resolve entities — quick-xml 0.41 reports those separately,
+                // as `GeneralRef` events, which is why an element's content
+                // arrives as several events and has to be reassembled.
+                match e.xml10_content() {
+                    Ok(decoded) => text.push_str(&decoded),
+                    Err(_) => continue,
                 }
-                assign_text(&mut nuspec, &path, text);
             }
+            // `&amp;`, `&lt;`, `&#233;` … — the entity between two text runs.
+            Ok(Event::GeneralRef(e)) => {
+                if let Some(resolved) = resolve_reference(&e) {
+                    text.push(resolved);
+                }
+            }
+            // A `<description><![CDATA[...]]></description>` is how a manifest
+            // carries markup without escaping it. Ignoring the event dropped the
+            // field entirely.
+            Ok(Event::CData(e)) => match e.decode() {
+                Ok(decoded) => text.push_str(&decoded),
+                Err(_) => continue,
+            },
             Ok(Event::End(_)) => {
+                let value = std::mem::take(&mut text);
+                let value = value.trim();
+                if !value.is_empty() {
+                    assign_text(&mut nuspec, &path, value.to_string());
+                }
                 if let Some(top) = path.pop() {
                     if top == "group" {
                         current_group = None;
@@ -165,6 +193,27 @@ pub fn parse_nuspec(xml: &str) -> Result<Nuspec, Error> {
         return Err(Error::InvalidPackage("nuspec is missing <version>".into()));
     }
     Ok(nuspec)
+}
+
+/// Resolve one entity reference to its character.
+///
+/// A nuspec is a standalone document with no DTD, so the only references that
+/// can legitimately appear are numeric character references and the five XML
+/// predefined entities. Anything else is undefined and is dropped rather than
+/// reproduced literally, which would silently turn `&foo;` into text that looks
+/// like markup.
+fn resolve_reference(e: &BytesRef) -> Option<char> {
+    if let Ok(Some(ch)) = e.resolve_char_ref() {
+        return Some(ch);
+    }
+    match e.decode().ok()?.as_ref() {
+        "amp" => Some('&'),
+        "lt" => Some('<'),
+        "gt" => Some('>'),
+        "quot" => Some('"'),
+        "apos" => Some('\''),
+        _ => None,
+    }
 }
 
 /// Reject a manifest that has grown past the structural limits.
@@ -323,6 +372,51 @@ fn attr(e: &quick_xml::events::BytesStart, name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn entities_do_not_truncate_a_field() {
+        // quick-xml reports one text event per run between entity references.
+        // Keeping only the last one silently truncated every field containing an
+        // entity — and `&` is ordinary in a description or an author list.
+        let xml = r#"<package><metadata>
+            <id>P</id><version>1.0.0</version>
+            <description>Foo &amp; Bar &lt;T&gt; tail</description>
+            <authors>Alice &amp; Bob, Carol</authors>
+            <title>A &quot;quoted&quot; title</title>
+            <tags>a&amp;b c</tags>
+        </metadata></package>"#;
+        let n = parse_nuspec(xml).unwrap();
+        assert_eq!(n.description.as_deref(), Some("Foo & Bar <T> tail"));
+        assert_eq!(n.authors.as_deref(), Some("Alice & Bob, Carol"));
+        assert_eq!(n.author_list(), vec!["Alice & Bob", "Carol"]);
+        assert_eq!(n.title.as_deref(), Some(r#"A "quoted" title"#));
+        assert_eq!(n.tag_list(), vec!["a&b", "c"]);
+    }
+
+    #[test]
+    fn cdata_content_is_kept() {
+        // CDATA is how a manifest carries markup without escaping it; the event
+        // used to be ignored, dropping the field.
+        let xml = r#"<package><metadata>
+            <id>P</id><version>1.0.0</version>
+            <description><![CDATA[Raw <b>markup</b> & symbols]]></description>
+        </metadata></package>"#;
+        let n = parse_nuspec(xml).unwrap();
+        assert_eq!(
+            n.description.as_deref(),
+            Some("Raw <b>markup</b> & symbols")
+        );
+    }
+
+    #[test]
+    fn surrounding_whitespace_is_trimmed_but_interior_is_kept() {
+        let xml = "<package><metadata>\n  <id>P</id>\n  <version>1.0.0</version>\n  \
+                   <description>\n    one &amp; two   three\n  </description>\n\
+                   </metadata></package>";
+        let n = parse_nuspec(xml).unwrap();
+        assert_eq!(n.description.as_deref(), Some("one & two   three"));
+        assert_eq!(n.id, "P");
+    }
 
     const SAMPLE: &str = r#"<?xml version="1.0" encoding="utf-8"?>
 <package xmlns="http://schemas.microsoft.com/packaging/2013/05/nuspec.xsd">
