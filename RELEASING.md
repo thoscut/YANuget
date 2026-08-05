@@ -33,13 +33,24 @@ incompatibly at any version.
    add a fresh empty `## [Unreleased]`, and update the two link definitions at
    the bottom of the file.
 
-4. **Bump `version` in `Cargo.toml`**, then `cargo build` so `Cargo.lock`
-   records the new version too. Commit both.
+4. **Check what has already been released.**
+
+   ```bash
+   git fetch --tags && git tag --sort=-v:refname | head
+   ```
+
+   `git tag` without `--fetch` lists only the tags your clone happens to have,
+   which is not the same question. Getting this wrong once meant preparing an
+   0.1.0 release of a project that had already shipped 0.4.0.
+
+5. **Bump `version` in `Cargo.toml`** past the highest released tag, then
+   `cargo build` so `Cargo.lock` records the new version too. Commit both, and
+   update the supported-versions table in `SECURITY.md`.
 
    The release workflow refuses to build if the tag does not equal
    `v` + the `Cargo.toml` version, or if the changelog has no section for it.
 
-5. **Check the dependency audit.** `cargo audit` runs in CI; a release is a
+6. **Check the dependency audit.** `cargo audit` runs in CI; a release is a
    reasonable moment to also run `cargo update` on a branch and see whether
    anything wants upgrading.
 

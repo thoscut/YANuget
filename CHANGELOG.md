@@ -14,9 +14,24 @@ expected to change incompatibly at any version.
 
 Nothing yet.
 
-## [0.1.0] — 2026-08-05
+## [0.5.0] — 2026-08-05
 
-First public release.
+The first release with a changelog. Versions 0.1.0 to 0.4.0 predate it; what
+follows describes the server as it stands, not only what changed since 0.4.0,
+because there is no earlier entry to read it against.
+
+**Upgrading from 0.4.0 or earlier needs attention.** Three defaults changed to
+fail closed, and a deployment relying on the old ones will behave differently:
+
+- `trusted_proxies` is now empty rather than trusting private ranges, so
+  `X-Forwarded-*` is ignored unless you list your proxy. **Behind a reverse
+  proxy, set `trusted_proxies` — or better, set `base_url`** — or the URLs
+  handed to clients will be derived from the `Host` header alone.
+- CORS headers are no longer sent unless `cors_allowed_origins` lists an
+  origin. Browser tooling that read the feed cross-origin will need listing.
+- The rate limit rose from 1000 to 10 000 requests/minute per IP.
+
+The on-disk layout and the database are unchanged, and no migration is needed.
 
 ### Added
 
@@ -163,5 +178,6 @@ Beyond the defaults:
 - Symbol downloads require read authorisation and resolve to a package the
   requester is allowed to see.
 
-[Unreleased]: https://github.com/thoscut/yanuget/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/thoscut/yanuget/releases/tag/v0.1.0
+[Unreleased]: https://github.com/thoscut/yanuget/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/thoscut/yanuget/compare/v0.4.0...v0.5.0
+[0.4.0]: https://github.com/thoscut/yanuget/releases/tag/v0.4.0
