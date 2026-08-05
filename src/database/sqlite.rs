@@ -178,24 +178,37 @@ impl SqliteDatabase {
         // copying its state. Gated by `PRAGMA user_version` so it runs exactly
         // once on a pre-feeds database and never resurrects memberships that
         // were later deleted (which an "is feed_packages empty?" guard would).
+        //
+        // In one transaction, and with `OR IGNORE`, because neither the crash
+        // nor the concurrency case is hypothetical: as three separate
+        // autocommit statements, a crash between the insert and the version
+        // bump left the rows written and the version unset, so every later
+        // start re-ran an insert that now violated the primary key — the server
+        // refused to start again, permanently, until someone set
+        // `user_version` by hand. Two processes opening the same file (the
+        // server and `yanuget migrate`) both read 0 and produced the same
+        // failure. Together these make re-running the migration a no-op instead
+        // of an error.
+        let mut tx = pool.begin().await?;
         let schema_version: i64 = sqlx::query_scalar("PRAGMA user_version")
-            .fetch_one(&pool)
+            .fetch_one(&mut *tx)
             .await?;
         if schema_version < 1 {
             sqlx::query(
-                r#"INSERT INTO feed_packages
+                r#"INSERT OR IGNORE INTO feed_packages
                        (feed, lower_id, normalized_version, listed, enabled, pending,
                         flagged, flag_reason, added, downloads)
                    SELECT 'default', lower_id, normalized_version, listed, enabled, 0, 0, NULL,
                           published, downloads
                    FROM packages"#,
             )
-            .execute(&pool)
+            .execute(&mut *tx)
             .await?;
             sqlx::query("PRAGMA user_version = 1")
-                .execute(&pool)
+                .execute(&mut *tx)
                 .await?;
         }
+        tx.commit().await?;
         Ok(Self { pool })
     }
 
@@ -886,11 +899,29 @@ async fn ensure_column(pool: &SqlitePool, table: &str, column: &str, def: &str) 
         .iter()
         .any(|r| r.get::<String, _>("name").eq_ignore_ascii_case(column));
     if !exists {
-        sqlx::query(&format!("ALTER TABLE {table} ADD COLUMN {column} {def}"))
+        // Check-then-act, so two processes opening the same file — the server
+        // and `yanuget migrate`, or two replicas on a shared volume — can both
+        // decide to add it and the loser gets `duplicate column name`. SQLite
+        // has no `ADD COLUMN IF NOT EXISTS`, so the race is absorbed here: the
+        // column existing is precisely the outcome this function is asking for.
+        if let Err(e) = sqlx::query(&format!("ALTER TABLE {table} ADD COLUMN {column} {def}"))
             .execute(pool)
-            .await?;
+            .await
+        {
+            if !is_duplicate_column(&e) {
+                return Err(e.into());
+            }
+        }
     }
     Ok(())
+}
+
+/// Whether a failed `ALTER TABLE … ADD COLUMN` failed only because the column
+/// was already added — by an earlier run, or by another process just now.
+fn is_duplicate_column(e: &sqlx::Error) -> bool {
+    e.as_database_error()
+        .map(|d| d.message().contains("duplicate column name"))
+        .unwrap_or(false)
 }
 
 fn is_unique_violation(e: &sqlx::Error) -> bool {

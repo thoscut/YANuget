@@ -2843,3 +2843,66 @@ async fn a_symbol_package_with_absurdly_many_pdbs_is_refused_quickly() {
         "took {elapsed:?}; the entry count should be rejected before any extraction"
     );
 }
+
+/// Overwriting a version must not leave the previous build's symbols behind.
+///
+/// The replacement build's PDBs carry different SSQP keys, so the old mappings
+/// survived an overwrite and still resolved to an id/version that existed —
+/// meaning a debugger attached to the new build was served the old build's PDB,
+/// with its stale source mapping.
+#[tokio::test]
+async fn overwriting_a_version_retires_its_old_symbols() {
+    let server = spawn_with(|c| c.allow_overwrite = yanuget::config::OverwriteMode::Enabled).await;
+
+    push_multipart(&server, API_KEY, build_nupkg("Rebuilt.Lib", "1.0.0", b"v1")).await;
+    let old_pdb = build_portable_pdb(&[0xA1; 16]);
+    let old_key = yanuget::pdb::portable_pdb_signature(&old_pdb).unwrap();
+    let response = push_symbol(
+        &server,
+        API_KEY,
+        build_snupkg("Rebuilt.Lib", "1.0.0", "rebuilt.lib.pdb", &old_pdb),
+    )
+    .await;
+    assert_eq!(response.status(), 201);
+
+    let old_url = server.url(&format!(
+        "/download/symbols/rebuilt.lib.pdb/{old_key}/rebuilt.lib.pdb"
+    ));
+    assert_eq!(
+        server.client.get(&old_url).send().await.unwrap().status(),
+        200,
+        "the first build's symbols should be servable before the rebuild"
+    );
+
+    // Same version, rebuilt with different content.
+    let response = push_multipart(
+        &server,
+        API_KEY,
+        build_nupkg("Rebuilt.Lib", "1.0.0", b"v2-different"),
+    )
+    .await;
+    assert_eq!(response.status(), 201);
+
+    assert_eq!(
+        server.client.get(&old_url).send().await.unwrap().status(),
+        404,
+        "the superseded build's PDB must no longer be served"
+    );
+
+    // And the rebuild can publish its own symbols under a new key.
+    let new_pdb = build_portable_pdb(&[0xB2; 16]);
+    let new_key = yanuget::pdb::portable_pdb_signature(&new_pdb).unwrap();
+    let response = push_symbol(
+        &server,
+        API_KEY,
+        build_snupkg("Rebuilt.Lib", "1.0.0", "rebuilt.lib.pdb", &new_pdb),
+    )
+    .await;
+    assert_eq!(response.status(), 201);
+    let new_url = server.url(&format!(
+        "/download/symbols/rebuilt.lib.pdb/{new_key}/rebuilt.lib.pdb"
+    ));
+    let served = server.client.get(&new_url).send().await.unwrap();
+    assert_eq!(served.status(), 200);
+    assert_eq!(served.bytes().await.unwrap().as_ref(), new_pdb.as_slice());
+}

@@ -149,6 +149,7 @@ impl AppState {
         // is an atomic rename rather than a multi-gigabyte copy.
         let temp_dir = config.storage_path().join(".uploads");
         tokio::fs::create_dir_all(&temp_dir).await?;
+        sweep_stale_uploads(&temp_dir).await;
         let feed = Arc::new(FeedContext::from_resolved(
             resolved,
             config.max_package_size_bytes,
@@ -301,6 +302,43 @@ struct GlobalLayers {
     /// Stamp HSTS (only when this process terminates TLS itself).
     hsts: bool,
     trusted_proxies: Arc<TrustedProxies>,
+}
+
+/// Delete upload temp files left over from a previous run.
+///
+/// Every error path removes its own temp file, but nothing can run when the
+/// process does not get to return: a SIGKILL, an OOM, or the forced close after
+/// the shutdown grace period while an upload is still streaming. Each leak is as
+/// large as the package that was in flight, they accumulate across restarts, and
+/// they sit on the same filesystem as the package store — so left alone they
+/// eventually fill the volume holding the packages.
+///
+/// Startup is the safe moment: none of this process's uploads can be in flight
+/// yet. Best-effort throughout — a directory we cannot read is not a reason to
+/// refuse to start.
+async fn sweep_stale_uploads(temp_dir: &std::path::Path) {
+    let Ok(mut entries) = tokio::fs::read_dir(temp_dir).await else {
+        return;
+    };
+    let (mut removed, mut bytes) = (0u64, 0u64);
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("tmp") {
+            continue;
+        }
+        let size = entry.metadata().await.map(|m| m.len()).unwrap_or(0);
+        if tokio::fs::remove_file(&path).await.is_ok() {
+            removed += 1;
+            bytes = bytes.saturating_add(size);
+        }
+    }
+    if removed > 0 {
+        tracing::info!(
+            files = removed,
+            bytes,
+            "removed upload temp files left by a previous run"
+        );
+    }
 }
 
 impl GlobalLayers {

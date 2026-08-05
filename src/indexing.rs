@@ -163,14 +163,24 @@ async fn index_inner(
     let _guard = crate::locks::lock_version(&id, &normalized).await;
 
     // 4. Honour immutability / overwrite policy *within this feed*.
+    //
+    // An overwrite drops the metadata rows so the store below runs, but it must
+    // **not** delete the payload first. `store_package` finishes with a rename,
+    // which replaces the file atomically — so deleting up front bought nothing
+    // and cost the version: if the store then failed (a full disk, a permission
+    // change, a cross-device fallback erroring mid-copy), the previously
+    // published package was already gone from disk with nothing to put back,
+    // and the caller saw a 500. The old bytes now stay in place until the new
+    // ones have landed on top of them.
+    let mut overwriting = false;
     if db.exists(feed, &id, &version).await? {
         if options.overwrite.allows(version.is_prerelease()) {
             db.remove_membership(feed, &id, &version).await?;
             // If no other feed references the version, drop the orphaned global
-            // data and payload so the re-push stores fresh content.
+            // metadata so the re-push records its own.
             if db.feed_count(&id, &version).await? == 0 {
                 let _ = db.delete_package_data(&id, &version).await;
-                let _ = storage.delete(&id, &normalized).await;
+                overwriting = true;
             }
         } else {
             return Err(Error::PackageAlreadyExists);
@@ -201,6 +211,14 @@ async fn index_inner(
             storage
                 .store_aux(&id, &normalized, AuxFile::Icon, bytes)
                 .await?;
+        }
+        // Only once the replacement is safely on disk: the previous build's
+        // PDBs have different SSQP keys, so leaving their mappings behind would
+        // keep serving them to anyone debugging the new build — the mappings
+        // still resolve to an id/version that exists. Doing this before the
+        // store would throw the symbols away even when the store then failed.
+        if overwriting {
+            crate::retention::purge_symbols(storage, db, &id, &version).await?;
         }
     } else {
         // Another feed already holds this exact id/version, so its payload — not

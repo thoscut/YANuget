@@ -123,14 +123,59 @@ pub async fn purge_version(
     let _guard = crate::locks::lock_version(id, &version.normalized()).await;
     let removed = db.remove_membership(feed, id, version).await?;
     if db.feed_count(id, version).await? == 0 {
-        for sym in db.find_symbols(id, version).await.unwrap_or_default() {
-            let _ = storage.delete_symbol(&sym.key, &sym.filename).await;
-        }
-        let _ = db.delete_symbols(id, version).await;
-        let _ = db.delete_package_data(id, version).await;
-        let _ = storage.delete(id, &version.normalized()).await;
+        purge_global_data(storage, db, id, version).await?;
     }
     Ok(removed)
+}
+
+/// Hard-delete the data shared by every feed: symbol files and rows, the stored
+/// payload and sidecars, and the `packages` row.
+///
+/// **The caller must already hold the version lock** — this does not take it, so
+/// that code which is mid-way through a locked sequence (an overwriting push)
+/// can reuse it without deadlocking.
+///
+/// The order is chosen for recoverability. Files go first and rows last, because
+/// the rows are the only index of what there is to delete: aborting with the
+/// rows intact leaves a state a retry can finish, whereas deleting the rows
+/// first and then failing on the files orphans bytes nothing will ever find
+/// again. Every step propagates its error rather than being discarded — the
+/// previous version reported success after silently failing to delete anything,
+/// so a read-only mount or a permissions change looked exactly like a clean
+/// sweep.
+pub(crate) async fn purge_global_data(
+    storage: &dyn PackageStorage,
+    db: &dyn PackageDatabase,
+    id: &str,
+    version: &NuGetVersion,
+) -> Result<()> {
+    purge_symbols(storage, db, id, version).await?;
+    storage.delete(id, &version.normalized()).await?;
+    db.delete_package_data(id, version).await?;
+    Ok(())
+}
+
+/// Drop every symbol file and mapping belonging to one version, leaving the
+/// package itself alone.
+///
+/// Separate from [`purge_global_data`] because an overwriting push needs exactly
+/// this and nothing else: the replacement build's PDBs have different SSQP keys,
+/// so the old mappings would otherwise survive and — since they still resolve to
+/// an id/version that exists — keep serving the *previous* build's PDBs to
+/// anyone debugging the new one.
+///
+/// Same contract: the caller must already hold the version lock.
+pub(crate) async fn purge_symbols(
+    storage: &dyn PackageStorage,
+    db: &dyn PackageDatabase,
+    id: &str,
+    version: &NuGetVersion,
+) -> Result<()> {
+    for sym in db.find_symbols(id, version).await? {
+        storage.delete_symbol(&sym.key, &sym.filename).await?;
+    }
+    db.delete_symbols(id, version).await?;
+    Ok(())
 }
 
 /// Apply the policy to a single package id within `feed`. Returns the number of
