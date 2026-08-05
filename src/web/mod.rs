@@ -556,8 +556,12 @@ fn feed_routes(state: AppState) -> Router {
     }
 
     // Human-facing gallery. When disabled, `/` falls back to a minimal page.
+    //
+    // Built as its own router so `html_errors` wraps only the pages a person
+    // reads. The v3 endpoints must keep answering errors as JSON — that is what
+    // a NuGet client parses.
     if state.config.enable_web_ui {
-        router = router
+        let mut ui = Router::new()
             .route("/", get(gallery))
             .route("/packages", get(gallery))
             .route("/packages/{id}", get(package_detail))
@@ -574,7 +578,7 @@ fn feed_routes(state: AppState) -> Router {
         // Admin area (disable/enable/delete/approve/promote versions), behind
         // HTTP Basic auth. Only mounted when an admin key is configured.
         if state.feed.admin.is_enabled() {
-            router = router
+            ui = ui
                 .route("/admin", get(admin_dashboard))
                 .route("/admin/packages/{id}", get(admin_package))
                 .route(
@@ -598,11 +602,50 @@ fn feed_routes(state: AppState) -> Router {
                     admin_post(admin_promote),
                 );
         }
+        router = router.merge(ui.layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            html_errors,
+        )));
     } else {
         router = router.route("/", get(index_page));
     }
 
     router.with_state(state)
+}
+
+/// Re-render an error from a gallery route as an HTML page.
+///
+/// These routes are read in a browser, and every one of them could answer with
+/// a bare `{"error":"package not found"}` — no chrome, no styling, no way back.
+/// That is not a rare path: the detail page links every dependency by id, and on
+/// a private feed most dependencies come from nuget.org and are not held here,
+/// so the most obvious click on the page produced raw JSON. A mistyped URL, a
+/// bad version and a cancelled login prompt did the same.
+///
+/// Only the gallery is wrapped. The v3 endpoints keep their JSON, because that
+/// is what a NuGet client parses.
+async fn html_errors(
+    State(state): State<AppState>,
+    request: Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let headers = request.headers().clone();
+    let response = next.run(request).await;
+    let status = response.status();
+    if !(status.is_client_error() || status.is_server_error()) {
+        return response;
+    }
+    // Keep whatever headers the error already carried — notably the
+    // `WWW-Authenticate` challenge on a 401, without which a browser never
+    // prompts — and replace only the body and its content type.
+    let (mut parts, _) = response.into_parts();
+    let page = ui::error_page(&state.url_builder(&headers), status);
+    parts.headers.remove(header::CONTENT_LENGTH);
+    parts.headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/html; charset=utf-8"),
+    );
+    Response::from_parts(parts, axum::body::Body::from(page))
 }
 
 /// An admin form POST, capped at a size a form can plausibly be.
@@ -1447,10 +1490,20 @@ async fn render_detail(
                 .cloned()
                 .ok_or(Error::PackageNotFound)?
         }
+        // Newest listed *stable* version, falling back to the newest listed
+        // version of any kind, then to the newest version at all.
+        //
+        // Defaulting to the newest version outright meant the page — and the
+        // `choco install …`/`dotnet add package …` command under the copy
+        // button — headlined `2.0.0-beta` while Visual Studio and `dotnet`
+        // searching the same feed offered `1.9.0`, because `/v3/search`
+        // excludes pre-releases unless asked. Copying the command then pulled a
+        // pre-release into a project that had not opted into one.
         None => packages
             .iter()
             .rev()
-            .find(|p| p.listed)
+            .find(|p| p.listed && !p.is_prerelease())
+            .or_else(|| packages.iter().rev().find(|p| p.listed))
             .or_else(|| packages.last())
             .cloned()
             .ok_or(Error::PackageNotFound)?,

@@ -67,6 +67,21 @@ impl SearchGroup {
             .expect("a search group always has at least one package")
     }
 
+    /// The version to headline: the newest stable one, or the newest of any
+    /// kind when every version is a pre-release.
+    ///
+    /// This is what a person should be shown and offered an install command
+    /// for. [`Self::latest`] includes pre-releases, so using it made the gallery
+    /// headline `2.0.0-beta` while a NuGet client searching the same feed —
+    /// which excludes pre-releases unless asked — offered `1.9.0`.
+    pub fn headline(&self) -> &Package {
+        self.packages
+            .iter()
+            .rev()
+            .find(|p| !p.is_prerelease())
+            .unwrap_or_else(|| self.latest())
+    }
+
     /// Total downloads across all versions in the group.
     pub fn total_downloads(&self) -> u64 {
         self.packages.iter().map(|p| p.downloads).sum()

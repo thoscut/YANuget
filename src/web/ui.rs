@@ -59,7 +59,7 @@ padding:1px 10px;font-size:12px;color:var(--muted);margin:0 4px 4px 0}\
 .badge.pre{color:var(--warn);border-color:var(--warn)}\
 .badge.un{color:var(--muted)}\
 .muted{color:var(--muted)}\
-.grid{display:grid;grid-template-columns:1fr 280px;gap:22px}\
+.grid{display:grid;grid-template-columns:1fr 340px;gap:22px}\
 @media(max-width:760px){.grid{grid-template-columns:1fr}}\
 @media(min-width:761px){.side .install{position:sticky;top:20px}}\
 h1.title{font-size:26px;margin:0 0 2px;overflow-wrap:anywhere}\
@@ -68,15 +68,15 @@ overflow:auto;font-size:13px;margin:6px 0}\
 code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}\
 .install h3{margin:14px 0 4px;font-size:13px;text-transform:uppercase;letter-spacing:.4px;color:var(--muted)}\
 .install .primary h3{color:var(--accent)}\
-.install pre{white-space:pre-wrap;overflow-wrap:anywhere}\
-.snip{position:relative}\
-.snip .copy{position:absolute;top:6px;right:6px;padding:3px 10px;font-size:12px;min-height:0;\
+.install pre{white-space:pre-wrap;overflow-wrap:break-word}\
+.snip{display:flex;flex-direction:column;align-items:flex-end}\
+.snip .copy{padding:6px 12px;font-size:12px;min-height:32px;margin-bottom:-4px;\
 background:var(--subtle);border:1px solid var(--border);color:var(--fg)}\
 .snip .copy:hover{background:var(--subtleh)}\
-.snip pre{padding-right:64px}\
+.snip pre{width:100%}\
 .versions{list-style:none;margin:0;padding:0;max-height:340px;overflow:auto}\
 .versions li{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:5px 0;border-bottom:1px solid var(--border)}\
-.versions a{min-height:32px;display:inline-flex;align-items:center}\
+.versions a{min-height:40px;display:inline-flex;align-items:center}\
 .versions a.sel{font-weight:700}\
 table.deps{width:100%;border-collapse:collapse;font-size:13px}\
 table.deps td{padding:3px 8px 3px 0}\
@@ -89,7 +89,7 @@ img.picon{width:32px;height:32px;object-fit:contain;vertical-align:-6px;margin-r
 .hero p{margin:0 auto;max-width:46ch;color:var(--muted)}\
 .steps h3{margin:16px 0 4px;font-size:13px;text-transform:uppercase;letter-spacing:.4px;color:var(--muted)}\
 .steps h3:first-child{margin-top:0}\
-.steps pre{white-space:pre-wrap;overflow-wrap:anywhere}\
+.steps pre{white-space:pre-wrap;overflow-wrap:break-word}\
 .kv{font-size:13px}.kv div{display:flex;gap:10px;padding:3px 0;border-bottom:1px solid var(--border)}\
 .kv b{color:var(--muted);font-weight:500;min-width:120px;flex:0 0 auto}\
 @media(max-width:480px){.kv div{flex-direction:column;gap:0}.kv b{min-width:0}}\
@@ -109,7 +109,7 @@ img.picon{width:32px;height:32px;object-fit:contain;vertical-align:-6px;margin-r
 .atbl th{color:var(--muted);font-weight:500;font-size:12px;text-transform:uppercase;letter-spacing:.4px}\
 .actions{display:flex;gap:8px;flex-wrap:wrap}\
 .actions form{margin:0}\
-.actions button{padding:5px 12px;font-size:13px;min-height:0;background:var(--subtle);border:1px solid var(--border);color:var(--fg)}\
+.actions button{padding:8px 14px;font-size:13px;min-height:40px;background:var(--subtle);border:1px solid var(--border);color:var(--fg)}\
 .actions button:hover{background:var(--subtleh)}\
 .actions button.danger{border-color:var(--danger);color:var(--dangerfg)}\
 .actions button.danger:hover{background:var(--danger);color:var(--onaccent)}\
@@ -297,6 +297,56 @@ fn layout_with_chrome(
     )
 }
 
+/// A styled error page for the gallery, so a browser never sees a bare JSON
+/// error body.
+///
+/// The text is derived from the status alone. The JSON body it replaces is
+/// deliberately not parsed through: a 5xx message is generic on purpose (the
+/// underlying I/O, SQL or upstream detail goes to the log), and re-rendering an
+/// error string into HTML is a needless place to get escaping wrong.
+pub fn error_page(urls: &UrlBuilder, status: axum::http::StatusCode) -> String {
+    use axum::http::StatusCode;
+    let (heading, detail) = match status {
+        StatusCode::NOT_FOUND => (
+            "Not found",
+            "This feed does not have that package, version or page. It may never              have been published here, or it may have been deleted.",
+        ),
+        StatusCode::UNAUTHORIZED => (
+            "Sign-in required",
+            "This feed requires credentials to browse. Use the API key configured              for reading it.",
+        ),
+        StatusCode::BAD_REQUEST => (
+            "That request did not make sense",
+            "Check the package id and version in the address bar.",
+        ),
+        StatusCode::TOO_MANY_REQUESTS => (
+            "Too many requests",
+            "This client has been throttled. Wait a moment and try again.",
+        ),
+        StatusCode::SERVICE_UNAVAILABLE => (
+            "Temporarily unavailable",
+            "The server cannot reach its database right now. It should recover on              its own.",
+        ),
+        s if s.is_server_error() => (
+            "Something went wrong",
+            "The server hit an unexpected error. The details are in its log.",
+        ),
+        _ => (
+            "That did not work",
+            "The request could not be completed.",
+        ),
+    };
+    let body = format!(
+        "<div class=\"empty\"><h1 class=\"title\">{heading}</h1>\
+         <p>{detail}</p>\
+         <p><a href=\"{home}\">Back to the package list</a></p>\
+         <p class=\"muted\">HTTP {code}</p></div>",
+        home = escape_html(&urls.app("/")),
+        code = status.as_u16(),
+    );
+    layout(urls, &format!("{heading} \u{2014} YANuget"), "", "", &body)
+}
+
 /// The gallery / search-results page. `skip`/`take` drive pagination.
 pub fn gallery_page(
     urls: &UrlBuilder,
@@ -328,18 +378,25 @@ pub fn gallery_page(
         }
     } else {
         let mut cards = String::new();
+        // A real `<h1>`, not a muted paragraph: this is the landing page, and
+        // without one a screen reader announces no page heading at all — while
+        // the *empty* state did have one, so the structure changed with the
+        // content.
         let heading = if query.trim().is_empty() {
-            format!("{} package(s)", page.total_hits)
+            format!("{} package{}", page.total_hits, plural(page.total_hits))
         } else {
             format!(
-                "{} result(s) for \u{201c}{}\u{201d}",
+                "{} result{} for \u{201c}{}\u{201d}",
                 page.total_hits,
+                plural(page.total_hits),
                 escape_html(query)
             )
         };
-        cards.push_str(&format!("<p class=\"muted\">{heading}</p>"));
+        cards.push_str(&format!("<h1 class=\"title\">{heading}</h1>"));
         for group in &page.groups {
-            let p = group.latest();
+            // The newest *stable* version, matching what a NuGet client
+            // searching this feed is offered.
+            let p = group.headline();
             let id = escape_html(&p.id);
             let url = escape_html(&urls.app(&format!("/packages/{}", enc_path(&p.lower_id()))));
             let pre = if p.is_prerelease() {
@@ -355,10 +412,10 @@ pub fn gallery_page(
             cards.push_str(&format!(
                 "<div class=\"card\"><h2><a href=\"{url}\">{id}</a> \
                  <span class=\"muted\">{ver}</span>{pre}</h2>\
-                 <div class=\"meta\">{dl} downloads{authors}</div>\
+                 <div class=\"meta\">{dl} downloads, all versions{authors}</div>\
                  <p>{desc}</p>{tags}</div>",
                 ver = escape_html(&p.normalized_version()),
-                dl = group.total_downloads(),
+                dl = group_digits(group.total_downloads() as i64),
                 desc = escape_html(&truncate(&p.description, 240)),
                 tags = render_tags(&p.tags),
             ));
@@ -373,7 +430,14 @@ pub fn gallery_page(
         ));
         cards
     };
-    layout(urls, "YANuget", query, "", &body)
+    let title = if query.trim().is_empty() {
+        "YANuget".to_string()
+    } else {
+        // Otherwise every search result page shares one <title>, so tabs,
+        // bookmarks and history entries for different queries look identical.
+        format!("Search: \u{201c}{query}\u{201d} \u{2014} YANuget")
+    };
+    layout(urls, &title, query, "", &body)
 }
 
 /// What an empty feed shows instead of "no packages": the three commands that
@@ -539,6 +603,15 @@ pub fn stats_page(
 }
 
 /// Group a non-negative integer into thousands with `,` separators.
+/// `""` or `"s"`, so counts read as "1 package" rather than "1 package(s)".
+fn plural(n: i64) -> &'static str {
+    if n == 1 {
+        ""
+    } else {
+        "s"
+    }
+}
+
 fn group_digits(n: i64) -> String {
     let s = n.max(0).to_string();
     let bytes = s.as_bytes();
@@ -812,7 +885,7 @@ pub fn admin_package_page(
                 ""
             },
             dv = escape_html(&v),
-            dl = p.downloads,
+            dl = group_digits(p.downloads as i64),
         ));
     }
 
@@ -914,12 +987,12 @@ pub fn detail_page(
         let sel = if v == version { " class=\"sel\"" } else { "" };
         versions.push_str(&format!(
             "<li><span><a{sel} href=\"{href}\">{dv}</a>{badges}</span>\
-             <span class=\"muted\">{dls} dl</span></li>",
+             <span class=\"muted\">{dls} downloads</span></li>",
             href =
                 escape_html(&urls.app(&format!("/packages/{}/{}", enc_path(&lower), enc_path(&v)))),
             dv = escape_html(&v),
             badges = status_badges(p),
-            dls = p.downloads,
+            dls = group_digits(p.downloads as i64),
         ));
     }
     versions.push_str("</ul>");
@@ -928,13 +1001,13 @@ pub fn detail_page(
         "<nav class=\"crumbs\" aria-label=\"Breadcrumb\">\
          <a href=\"{packages}\">Packages</a> <span aria-hidden=\"true\">/</span> <span>{id}</span></nav>\
          <h1 class=\"title\">{icon}{id}</h1>\
-         <div class=\"meta\">{version}{badges} \u{2022} {dl} downloads \u{2022} published {pub}</div>\
+         <div class=\"meta\">{version}{badges} \u{2022} {dl} downloads of this version \u{2022} published {pub}</div>\
          <p>{desc}</p>{tags}{links}{deps}{symbols}{readme}",
         packages = escape_html(&urls.app("/packages")),
         icon = render_icon(urls, selected),
         version = escape_html(&version),
         badges = status_badges(selected),
-        dl = selected.downloads,
+        dl = group_digits(selected.downloads as i64),
         pub = escape_html(&selected.published.format("%Y-%m-%d").to_string()),
         desc = escape_html(&selected.description),
         tags = render_tags(&selected.tags),
@@ -959,7 +1032,13 @@ pub fn detail_page(
     let body = format!(
         "<div class=\"grid\"><div class=\"content\">{main}</div><div class=\"side\">{side}</div></div>"
     );
-    layout(urls, &format!("{} {}", selected.id, version), "", "", &body)
+    layout(
+        urls,
+        &format!("{} {} \u{2014} YANuget", selected.id, version),
+        "",
+        "",
+        &body,
+    )
 }
 
 /// Prerelease / unlisted status badges for a version (empty when stable+listed).
@@ -1487,6 +1566,55 @@ mod tests {
         // The feed links themselves are the point of the page.
         assert!(html.contains("href=\"/stable\""), "{html}");
         assert!(html.contains("href=\"/dev/v3/index.json\""), "{html}");
+    }
+
+    #[test]
+    fn the_gallery_headlines_the_version_a_client_would_offer() {
+        // `/v3/search` excludes pre-releases unless asked, so headlining the
+        // newest version outright made the card — and the install command under
+        // its copy button — offer `2.0.0-beta` while Visual Studio showed
+        // `1.9.0`.
+        let urls = UrlBuilder::new("https://host");
+        let versioned = |v: &str| {
+            let mut p = sample();
+            p.id = "Mixed".into();
+            p.version = crate::version::NuGetVersion::parse(v).unwrap();
+            p
+        };
+        let mut group = crate::database::SearchGroup {
+            packages: vec![versioned("1.9.0"), versioned("2.0.0-beta")],
+        };
+        assert_eq!(group.latest().normalized_version(), "2.0.0-beta");
+        assert_eq!(group.headline().normalized_version(), "1.9.0");
+
+        // A package that has only ever shipped pre-releases still shows one.
+        group.packages = vec![versioned("0.1.0-alpha")];
+        assert_eq!(group.headline().normalized_version(), "0.1.0-alpha");
+
+        let page = crate::database::SearchPage {
+            groups: vec![crate::database::SearchGroup {
+                packages: vec![versioned("1.9.0"), versioned("2.0.0-beta")],
+            }],
+            total_hits: 1,
+        };
+        let html = gallery_page(&urls, &page, "", 0, 20);
+        assert!(html.contains("1.9.0"), "{html}");
+    }
+
+    #[test]
+    fn the_landing_page_has_a_heading_and_searches_have_distinct_titles() {
+        let urls = UrlBuilder::new("https://host");
+        let mut page = page_of(&["A"]);
+        page.total_hits = 1;
+        let html = gallery_page(&urls, &page, "", 0, 20);
+        assert!(html.contains("<h1"), "no h1 on the landing page: {html}");
+        // "1 package", not "1 package(s)".
+        assert!(html.contains("1 package<"), "{html}");
+        assert!(html.contains("<title>YANuget</title>"), "{html}");
+
+        let searched = gallery_page(&urls, &page, "logging", 0, 20);
+        assert!(searched.contains("<title>Search:"), "{searched}");
+        assert!(searched.contains("logging"), "{searched}");
     }
 
     #[test]

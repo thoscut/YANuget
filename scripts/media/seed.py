@@ -160,15 +160,28 @@ def build(pkg_id, version, description, authors, tags, deps, colour) -> bytes:
     return buf.getvalue()
 
 
-# Roughly how often each package has been restored. Real feeds have a long
-# tail, and a gallery where every row says "0 downloads" reads as broken.
+# How many times to restore each package after pushing it. Real feeds have a
+# long tail, and a gallery where every row reads "0 downloads" looks broken.
+# These are actual GETs through the download endpoint rather than rows poked
+# into the database, so the counters are exercised the same way a client would
+# exercise them — which keeps the numbers modest on purpose.
 DOWNLOADS = {
-    "Contoso.Build.Tools": 1284,
-    "Acme.Logging": 3907,
-    "Internal.Deploy.Cli": 412,
-    "Fabrikam.Data.Sqlite": 176,
-    "Northwind.Analyzers": 58,
+    "Acme.Logging": 47,
+    "Contoso.Build.Tools": 31,
+    "Internal.Deploy.Cli": 12,
+    "Fabrikam.Data.Sqlite": 6,
+    "Northwind.Analyzers": 2,
 }
+
+
+def download(base_url: str, path: str) -> int:
+    """Fetch a package so its download counter advances."""
+    try:
+        with urllib.request.urlopen(f"{base_url.rstrip('/')}{path}", timeout=30) as r:
+            r.read()
+            return r.status
+    except urllib.error.HTTPError as e:
+        return e.code
 
 
 def push(base_url: str, api_key: str, payload: bytes) -> int:
@@ -200,7 +213,19 @@ def main() -> int:
                 print(f"push {pkg_id} {version} -> HTTP {status}", file=sys.stderr)
                 return 1
             pushed += 1
-    print(f"seeded {pushed} package versions")
+
+    restored = 0
+    for pkg_id, versions, *_ in PACKAGES:
+        lid, lver = pkg_id.lower(), versions[0].lower()
+        path = f"/v3/package/{lid}/{lver}/{lid}.{lver}.nupkg"
+        for _ in range(DOWNLOADS.get(pkg_id, 0)):
+            status = download(base_url, path)
+            if status != 200:
+                print(f"download {pkg_id} -> HTTP {status}", file=sys.stderr)
+                return 1
+            restored += 1
+
+    print(f"seeded {pushed} package versions, {restored} downloads")
     return 0
 
 

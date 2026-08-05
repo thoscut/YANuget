@@ -2906,3 +2906,52 @@ async fn overwriting_a_version_retires_its_old_symbols() {
     assert_eq!(served.status(), 200);
     assert_eq!(served.bytes().await.unwrap().as_ref(), new_pdb.as_slice());
 }
+
+/// The gallery is read in a browser, so its errors have to be pages.
+///
+/// Every one of them used to answer with a bare `{"error":"package not found"}`
+/// — no chrome, no styling, no way back. Not a rare path either: the detail page
+/// links every dependency by id, and on a private feed most dependencies come
+/// from nuget.org and are not held locally, so the most obvious click on the
+/// page produced raw JSON.
+#[tokio::test]
+async fn gallery_errors_are_pages_but_api_errors_stay_json() {
+    let server = spawn().await;
+    push_multipart(&server, API_KEY, build_nupkg("Real.Pkg", "1.0.0", b"x")).await;
+
+    let response = server
+        .client
+        .get(server.url("/packages/no.such.package"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 404);
+    assert!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .starts_with("text/html"),
+        "gallery 404 should be HTML"
+    );
+    let body = response.text().await.unwrap();
+    assert!(body.contains("<html"), "{body}");
+    assert!(body.contains("Not found"), "{body}");
+    assert!(body.contains("Back to the package list"), "{body}");
+    assert!(!body.contains(r#"{"error""#), "{body}");
+
+    // A NuGet client still gets JSON, because that is what it parses.
+    let response = server
+        .client
+        .get(server.url("/v3/package/no.such.package/index.json"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 404);
+    let body = response.text().await.unwrap();
+    assert!(
+        !body.contains("<html"),
+        "v3 errors must not be HTML: {body}"
+    );
+}
