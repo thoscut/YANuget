@@ -166,7 +166,9 @@ jobs:
           tags: |
             type=semver,pattern={{version}},value=${{ needs.guard.outputs.tag }}
             type=semver,pattern={{major}}.{{minor}},value=${{ needs.guard.outputs.tag }}
-            type=raw,value=latest
+            # `latest` must not follow a pre-release, or `docker pull yanuget`
+            # starts handing people a release candidate.
+            type=raw,value=latest,enable=${{ !contains(needs.guard.outputs.version, '-') }}
 
       - uses: docker/build-push-action@v6
         with:
@@ -205,9 +207,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # Stop at the next version heading, or at the link definitions that
+          # close the file when this is the oldest section.
           awk -v v="${{ needs.guard.outputs.version }}" '
             $0 ~ "^## \\[" v "\\]" { inside = 1; next }
             inside && /^## / { exit }
+            inside && /^\[[^]]+\]: / { exit }
             inside { print }
           ' CHANGELOG.md > RELEASE_NOTES.md
           test -s RELEASE_NOTES.md
