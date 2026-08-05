@@ -34,6 +34,22 @@ pub struct IndexOptions {
     pub pending: bool,
     /// The feed's offline license policy, evaluated against the package.
     pub license_policy: LicensePolicyConfig,
+    /// The identity the caller asked for, when it knows one up front.
+    ///
+    /// A push is self-describing — whatever the manifest says *is* the package.
+    /// A mirror or migration is not: the caller requested a specific id/version
+    /// from an upstream that could answer with something else entirely. Setting
+    /// this makes the manifest prove it is what was asked for, so a hostile or
+    /// compromised upstream cannot substitute a different package under a name
+    /// local clients already trust.
+    pub expect: Option<ExpectedIdentity>,
+}
+
+/// The id/version a caller requires the indexed manifest to declare.
+#[derive(Debug, Clone)]
+pub struct ExpectedIdentity {
+    pub id: String,
+    pub version: NuGetVersion,
 }
 
 /// The identity (and outcome) of a successfully indexed package.
@@ -88,6 +104,20 @@ async fn index_inner(
 
     let id = manifest.id.clone();
     let normalized = version.normalized();
+
+    // The caller pinned an identity (mirror/migrate): the fetched payload must
+    // be the package that was requested, not merely a valid package.
+    if let Some(want) = &options.expect {
+        if !want.id.eq_ignore_ascii_case(&id) || want.version != version {
+            return Err(Error::InvalidPackage(format!(
+                "manifest declares {}/{} but {}/{} was requested",
+                id,
+                normalized,
+                want.id,
+                want.version.normalized(),
+            )));
+        }
+    }
 
     // 2. Resolve sidecar presence and pull readme/icon out while we still have
     //    the file (before it is moved into storage).
@@ -167,6 +197,18 @@ async fn index_inner(
                 .await?;
         }
     } else {
+        // Another feed already holds this exact id/version, so its payload — not
+        // ours — is what every client will download. Publishing our metadata
+        // over it would advertise a hash and size that do not describe those
+        // bytes, and a NuGet client verifying `packageHash` would reject the
+        // restore. Only adopt the existing payload when it really is the same
+        // content; otherwise this push is a different package wearing a taken
+        // name, and it is refused.
+        if let Some(existing) = db.get_package_data(&id, &version).await? {
+            if existing.package_hash != package.package_hash {
+                return Err(Error::PackageAlreadyExists);
+            }
+        }
         let _ = tokio::fs::remove_file(temp_path).await;
     }
 

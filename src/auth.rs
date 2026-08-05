@@ -137,6 +137,35 @@ impl AdminAuth {
         };
         constant_time_eq(password.as_bytes(), expected.as_bytes())
     }
+
+    /// The CSRF token embedded in every admin form and required by every admin
+    /// state-changing POST.
+    ///
+    /// The admin area authenticates with HTTP Basic, which browsers replay
+    /// automatically on *any* request to the origin — including a form POST
+    /// submitted by a page on an attacker's site. Without a secret the attacker
+    /// cannot know, a signed-in operator merely visiting a hostile page is
+    /// enough to delete packages. The token is derived from the admin key, so
+    /// producing it requires already knowing that key; it never appears outside
+    /// same-origin admin pages, and it is stateless (no session store, no
+    /// cookie, nothing to expire).
+    pub fn csrf_token(&self) -> Option<String> {
+        use base64::Engine;
+        use sha2::{Digest, Sha256};
+        let expected = self.expected.as_deref()?;
+        let mut hasher = Sha256::new();
+        hasher.update(b"yanuget-admin-csrf-v1\0");
+        hasher.update(expected.as_bytes());
+        Some(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hasher.finalize()))
+    }
+
+    /// Whether `presented` is this feed's CSRF token (constant-time).
+    pub fn check_csrf(&self, presented: Option<&str>) -> bool {
+        let Some(expected) = self.csrf_token() else {
+            return false;
+        };
+        presented.is_some_and(|p| constant_time_eq(p.as_bytes(), expected.as_bytes()))
+    }
 }
 
 /// Extract the password from a `Basic base64(user:pass)` header value.

@@ -113,7 +113,7 @@ impl<'de> Deserialize<'de> for OverwriteMode {
 
 /// Top-level server configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Config {
     /// Interface to bind to.
     pub host: IpAddr,
@@ -171,6 +171,16 @@ pub struct Config {
     pub retention: RetentionConfig,
     /// Per-IP request rate limiting (brute-force mitigation).
     pub rate_limit: RateLimitConfig,
+    /// Peers whose `X-Forwarded-*`/`X-Real-IP` headers are honoured. Those
+    /// headers decide the base URL of every absolute package URL handed to
+    /// clients and the identity the rate limiter throttles, so they are only
+    /// trusted from a proxy the operator vouched for; from anyone else they are
+    /// stripped before any handler sees them.
+    ///
+    /// Each entry is an IP, a CIDR block, `private` (loopback, link-local and
+    /// RFC1918/ULA — where reverse proxies actually live, and the default), or
+    /// `*` to trust every peer. An empty list trusts nobody.
+    pub trusted_proxies: Vec<String>,
     /// Hosted feeds. When empty, a single implicit feed named `default` is
     /// served at the server root (the historical single-feed behaviour). When
     /// non-empty, each feed is mounted under `/{name}` and the root serves a
@@ -193,7 +203,7 @@ pub enum PolicyAction {
 /// A feed's offline license policy. Evaluated from the package's SPDX license
 /// expression (or legacy `licenseUrl`); needs no network access.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct LicensePolicyConfig {
     /// Master switch. Off by default.
     pub enabled: bool,
@@ -226,7 +236,7 @@ impl Default for LicensePolicyConfig {
 /// `headers` for arbitrary custom headers (e.g. a private-feed API key). When
 /// more than one is set they are all sent.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct MirrorAuthConfig {
     /// HTTP Basic username (sent with `password`).
     pub username: Option<String>,
@@ -247,7 +257,7 @@ impl MirrorAuthConfig {
 
 /// Per-feed upstream mirroring (read-through caching of a public NuGet feed).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct MirrorConfig {
     /// Master switch. Off by default.
     pub enabled: bool,
@@ -257,6 +267,22 @@ pub struct MirrorConfig {
     pub timeout_secs: u64,
     /// Credentials for an authenticated upstream feed (default: none).
     pub auth: MirrorAuthConfig,
+    /// Allow upstream URLs that point at loopback/link-local/private addresses.
+    ///
+    /// Off by default: the resource URLs the mirror follows come from the
+    /// upstream's own service index, so a hostile upstream could otherwise
+    /// aim them at the server's network or a cloud metadata endpoint. Turn it
+    /// on when the upstream really is a feed on your private network.
+    pub allow_private_upstream: bool,
+    /// Cap on a single mirrored package, in bytes. `None` inherits the server's
+    /// `max_package_size_bytes`; set it here to bound the mirror more tightly
+    /// than pushes, since a mirror fetch is triggered by an ordinary read.
+    pub max_package_size_bytes: Option<u64>,
+    /// Upper bound on how many upstream versions of one package a single
+    /// read-through miss will fetch, newest first. A popular upstream id can
+    /// have hundreds of versions and tens of gigabytes behind it; without a
+    /// bound one anonymous request for it pulls the lot.
+    pub max_versions_per_package: Option<usize>,
 }
 
 impl Default for MirrorConfig {
@@ -266,6 +292,9 @@ impl Default for MirrorConfig {
             upstream: "https://api.nuget.org/v3/index.json".to_string(),
             timeout_secs: 30,
             auth: MirrorAuthConfig::default(),
+            allow_private_upstream: false,
+            max_package_size_bytes: None,
+            max_versions_per_package: Some(50),
         }
     }
 }
@@ -273,7 +302,7 @@ impl Default for MirrorConfig {
 /// A configured feed. Most fields are optional and fall back to the matching
 /// top-level setting when unset.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct FeedConfig {
     /// URL slug and database key. Must be a non-empty, path-safe token.
     pub name: String,
@@ -335,7 +364,7 @@ pub struct ResolvedFeed {
 
 /// Configuration for the package retention sweep.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct RetentionConfig {
     /// Master switch. Off by default — retention is destructive.
     pub enabled: bool,
@@ -383,7 +412,7 @@ impl RetentionConfig {
 /// are unaffected while online key brute-forcing is throttled; a reverse proxy
 /// can complement it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct RateLimitConfig {
     /// Master switch.
     pub enabled: bool,
@@ -427,6 +456,7 @@ impl Default for Config {
             primary_client: "choco".to_string(),
             retention: RetentionConfig::default(),
             rate_limit: RateLimitConfig::default(),
+            trusted_proxies: vec!["private".to_string()],
             feeds: Vec::new(),
         }
     }
@@ -555,6 +585,21 @@ impl Config {
                 self.rate_limit.window_secs = n;
             }
         }
+        // Set (even to the empty string) this replaces the list wholesale, so an
+        // operator can pin trust to their proxy — or revoke it entirely.
+        if let Ok(v) = std::env::var("YANUGET_TRUSTED_PROXIES") {
+            self.trusted_proxies = v
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect();
+        }
+    }
+
+    /// The resolved set of peers allowed to set forwarding headers.
+    pub fn trusted_proxies(&self) -> crate::proxy::TrustedProxies {
+        crate::proxy::TrustedProxies::new(self.trusted_proxies.iter().map(String::as_str))
     }
 
     /// The socket address to bind.
@@ -675,8 +720,15 @@ impl Config {
     }
 }
 
-/// Validate a feed name: non-empty and made only of URL-path-safe characters so
-/// it can be a path segment and a storage/database key.
+/// Route path segments a feed may not shadow. A feed is mounted at `/{name}`,
+/// so a feed called `health` or `v3` would collide with (or mask) a real route.
+const RESERVED_FEED_NAMES: [&str; 10] = [
+    "health", "admin", "docs", "packages", "stats", "settings", "v3", "api", "download", "metrics",
+];
+
+/// Validate a feed name: non-empty, made only of URL-path-safe characters (so it
+/// can be a path segment and a storage/database key), not a relative-path token,
+/// and not the name of an existing route.
 fn validate_feed_name(name: &str) -> Result<()> {
     if name.is_empty()
         || !name
@@ -685,6 +737,19 @@ fn validate_feed_name(name: &str) -> Result<()> {
     {
         return Err(Error::BadRequest(format!(
             "invalid feed name {name:?}: use only letters, digits, '-', '_' or '.'"
+        )));
+    }
+    // `.` and `..` pass the character check but are path traversal tokens, and
+    // the name becomes a URL prefix (`/..`).
+    if name.chars().all(|c| c == '.') {
+        return Err(Error::BadRequest(format!(
+            "invalid feed name {name:?}: a name of only dots is a relative path"
+        )));
+    }
+    let lower = name.to_ascii_lowercase();
+    if RESERVED_FEED_NAMES.contains(&lower.as_str()) {
+        return Err(Error::BadRequest(format!(
+            "feed name {name:?} is reserved: it would shadow the /{lower} route"
         )));
     }
     Ok(())
@@ -717,6 +782,56 @@ fn combine_keys(single: &Option<String>, list: &[String]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_mistyped_setting_is_an_error_not_a_silent_default() {
+        // Silently ignoring an unknown key is how a security setting ends up
+        // believed-on and actually off. `admin_api_keys` is not a real key.
+        let typo = r#"
+            port = 8080
+            admin_api_keys = "secret"
+        "#;
+        let err = toml::from_str::<Config>(typo).unwrap_err().to_string();
+        assert!(err.contains("admin_api_keys"), "unhelpful error: {err}");
+
+        // A nested table is checked too.
+        let nested = r#"
+            [rate_limit]
+            enabled = true
+            max_request = 5
+        "#;
+        assert!(toml::from_str::<Config>(nested).is_err());
+    }
+
+    #[test]
+    fn feed_names_cannot_traverse_or_shadow_routes() {
+        for bad in [".", "..", "...", "health", "ADMIN", "v3", "docs", "metrics"] {
+            assert!(
+                validate_feed_name(bad).is_err(),
+                "{bad:?} should be rejected"
+            );
+        }
+        for good in ["stable", "dev", "team-a", "ring_2", "net8.0"] {
+            assert!(validate_feed_name(good).is_ok(), "{good:?} should be valid");
+        }
+    }
+
+    #[test]
+    fn trusted_proxies_default_to_private_ranges() {
+        let c = Config::default();
+        let trusted = c.trusted_proxies();
+        assert!(trusted.trusts("127.0.0.1".parse().unwrap()));
+        assert!(trusted.trusts("10.9.8.7".parse().unwrap()));
+        // A public peer is never allowed to declare its own forwarded host.
+        assert!(!trusted.trusts("198.51.100.4".parse().unwrap()));
+
+        // An explicitly empty list trusts nobody.
+        let none = Config {
+            trusted_proxies: Vec::new(),
+            ..Config::default()
+        };
+        assert!(none.trusted_proxies().is_empty());
+    }
 
     #[test]
     fn defaults_are_sane() {

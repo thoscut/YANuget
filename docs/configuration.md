@@ -42,15 +42,55 @@ of `window_secs` allows at most `max_requests` requests per client IP; exceeding
 it returns `429 Too Many Requests` with a `Retry-After` header. It is **on by
 default** with a generous limit so ordinary restores are unaffected while online
 API-key guessing is throttled. The client IP is taken from `X-Forwarded-For` /
-`X-Real-IP` (behind a proxy) and otherwise the peer address; requests with no
-determinable IP are not throttled. For very high read volume, raise the limit or
-disable it and rely on a reverse proxy.
+`X-Real-IP` **when the connection peer is a trusted proxy** (see
+[Trusted proxies](#trusted-proxies)) and otherwise the peer address; requests
+with no determinable IP are not throttled. For very high read volume, raise the
+limit or disable it and rely on a reverse proxy.
 
 | TOML key | Env var | Type | Default | Description |
 | --- | --- | --- | --- | --- |
 | `rate_limit.enabled` | `YANUGET_RATELIMIT_ENABLED` | bool | `true` | Master switch. |
 | `rate_limit.max_requests` | `YANUGET_RATELIMIT_MAX_REQUESTS` | int | `1000` | Max requests per IP per window (min 1). |
 | `rate_limit.window_secs` | `YANUGET_RATELIMIT_WINDOW_SECS` | int | `60` | Window length in seconds. |
+
+## Trusted proxies
+
+`X-Forwarded-Host`, `X-Forwarded-Proto`, `X-Forwarded-For`, `X-Real-IP` and
+`Forwarded` are **request** headers — any client can send them. Two things
+downstream depend on them:
+
+* the externally visible base URL, and therefore every absolute
+  `packageContent` / registration URL a NuGet client is told to fetch;
+* the identity the rate limiter throttles.
+
+So they are only honoured when the connection peer is a proxy you vouched for.
+From anyone else they are **stripped before any handler sees them**. Without
+that gate, a caller can point restoring clients at a host of their choosing —
+directly, or by poisoning a shared HTTP cache in front of the server — and can
+walk through the per-IP throttle by rotating `X-Forwarded-For`.
+
+| TOML key | Env var | Type | Default | Description |
+| --- | --- | --- | --- | --- |
+| `trusted_proxies` | `YANUGET_TRUSTED_PROXIES` | list | `["private"]` | Peers allowed to set forwarding headers. |
+
+Each entry is one of:
+
+| Entry | Meaning |
+| --- | --- |
+| `private` | Loopback, link-local and RFC1918/ULA ranges — where reverse proxies actually live. The default. |
+| `10.0.0.0/8`, `2001:db8::/32` | An explicit CIDR block. |
+| `10.1.2.3` | A single address. |
+| `*` | Trust every peer (the old, unguarded behaviour). |
+
+An **empty list trusts nobody**, which is the right setting when YANuget faces
+the internet directly. The environment variable is comma-separated and replaces
+the list wholesale, so `YANUGET_TRUSTED_PROXIES=` disables forwarding entirely.
+
+Setting `base_url` pins generated URLs regardless of any header, and is the
+most robust option when you know the public address.
+
+Responses carry `Vary: Host, X-Forwarded-Host, X-Forwarded-Proto` so a shared
+cache keys on the inputs that determine those URLs.
 
 ## Retention
 
@@ -162,6 +202,28 @@ responses also carry a `Strict-Transport-Security` header (one year).
   that case. The key is compared in constant time.
 - The `/admin` area (set `admin_api_key`) and the gallery should only be exposed
   over HTTPS — keep TLS on, or terminate it at a proxy.
+- Admin **state changes** additionally require a CSRF token (embedded in the
+  admin forms, derived from the admin key) and reject a request a browser
+  labels cross-site. HTTP Basic credentials are replayed automatically by the
+  browser, so without this a signed-in operator merely visiting a hostile page
+  would be enough to delete packages. Scripted callers can send the token as an
+  `X-CSRF-Token` header instead of the `_csrf` form field.
+- Every response carries `X-Content-Type-Options: nosniff`,
+  `X-Frame-Options: DENY` and `Referrer-Policy: no-referrer`. Gallery pages also
+  carry a `Content-Security-Policy` of `default-src 'none'` whose only permitted
+  inline style and script are the two the server itself emits, pinned by
+  SHA-256 — so an escaping bug could not become script execution.
+- `5xx` responses return a generic message; the underlying I/O, SQL or upstream
+  detail goes to the log only.
+- Unknown keys in the TOML file are a **hard error**, so a mistyped security
+  setting fails loudly instead of silently reverting to its default.
+- A feed with `[feeds.<name>.mirror]` follows resource URLs chosen by the
+  *upstream*. Non-HTTP schemes and private/loopback targets are refused unless
+  `allow_private_upstream = true`, mirrored downloads are bounded by
+  `max_package_size_bytes` and `max_versions_per_package`, and a mirrored
+  package must declare the id/version that was actually requested — so a
+  compromised upstream cannot substitute a different package under a name your
+  clients already trust.
 
 ## Reverse proxy
 
@@ -181,3 +243,8 @@ location / {
     proxy_read_timeout 3600s;        # allow slow, large transfers
 }
 ```
+
+The `X-Forwarded-*` headers above are only honoured if this proxy's address is
+covered by `trusted_proxies`. A proxy on the same host or a private network is
+covered by the `private` default; one reaching YANuget from a public address
+needs listing explicitly.

@@ -25,6 +25,7 @@ pub mod nupkg;
 pub mod nuspec;
 pub mod pdb;
 pub mod policy;
+pub mod proxy;
 pub mod ratelimit;
 pub mod retention;
 pub mod storage;

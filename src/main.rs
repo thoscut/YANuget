@@ -70,6 +70,9 @@ struct MigrateArgs {
     /// Only discover and report what would be migrated; download nothing.
     #[arg(long)]
     dry_run: bool,
+    /// Skip any source package larger than this many bytes (default: no limit).
+    #[arg(long)]
+    max_package_size_bytes: Option<u64>,
 }
 
 #[tokio::main]
@@ -343,6 +346,13 @@ fn build_source_config(args: &MigrateArgs) -> MirrorConfig {
             token: args.source_token.clone(),
             headers,
         },
+        // A migration is an operator running a command against a source they
+        // chose, so a source on the private network is expected and allowed —
+        // unlike the read-through mirror, which anonymous requests can trigger.
+        allow_private_upstream: true,
+        max_package_size_bytes: args.max_package_size_bytes,
+        // A migration is meant to copy everything.
+        max_versions_per_package: None,
     }
 }
 

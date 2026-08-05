@@ -70,13 +70,35 @@ enable_web_ui = true          # YANUGET_ENABLE_WEB_UI
 primary_client = "choco"      # YANUGET_PRIMARY_CLIENT
 
 # ---------------------------------------------------------------------------
+# Trusted proxies — who may set X-Forwarded-* / X-Real-IP.
+#
+# These headers are sent by the *client*, and two things depend on them: the
+# base URL of every absolute package URL handed to NuGet clients, and the
+# identity the rate limiter throttles. Honouring them from anyone lets a caller
+# point restoring clients at a host of their choosing (directly, or by
+# poisoning a shared cache in front of this server) and lets a rotating
+# X-Forwarded-For walk straight through the throttle.
+#
+# So they are only honoured from a peer listed here; from anyone else they are
+# stripped before any handler sees them. Entries may be an IP, a CIDR block,
+# "private" (loopback + link-local + RFC1918/ULA — where reverse proxies
+# actually live, and the default), or "*" to trust every peer.
+#
+# An empty list trusts nobody, which is right when this server faces the
+# internet directly. Setting base_url pins the generated URLs regardless.
+# ---------------------------------------------------------------------------
+# YANUGET_TRUSTED_PROXIES (comma-separated) replaces this list entirely.
+trusted_proxies = ["private"]
+
+# ---------------------------------------------------------------------------
 # Rate limiting — per-client-IP request throttling (brute-force mitigation).
 #
 # On by default with a generous limit so ordinary restores are unaffected while
 # online API-key guessing is throttled. The client IP is taken from
-# X-Forwarded-For / X-Real-IP (behind a proxy) and otherwise the peer address.
-# Tune up for very high-volume read traffic, or disable and rely on a reverse
-# proxy. Exceeding the limit returns 429 with a Retry-After header.
+# X-Forwarded-For / X-Real-IP when the peer is a trusted proxy (see
+# trusted_proxies above) and otherwise the peer address. Tune up for very
+# high-volume read traffic, or disable and rely on a reverse proxy. Exceeding
+# the limit returns 429 with a Retry-After header.
 # ---------------------------------------------------------------------------
 [rate_limit]
 enabled = true                # YANUGET_RATELIMIT_ENABLED
@@ -133,6 +155,17 @@ interval_hours = 24           # YANUGET_RETENTION_INTERVAL_HOURS — background 
 #   enabled = true
 #   upstream = "https://api.nuget.org/v3/index.json"
 #   timeout_secs = 30
+#   # A mirror fetch is triggered by an ordinary (possibly anonymous) read, so
+#   # it is bounded by default: at most this many versions of one package per
+#   # miss, newest first. Set to a large number, or omit, to fetch everything.
+#   max_versions_per_package = 50
+#   # Cap on a single mirrored package. Unset inherits max_package_size_bytes.
+#   # max_package_size_bytes = 5_000_000_000
+#   # The resource URLs the mirror follows come from the upstream's own service
+#   # index, so an upstream could aim them at this server's network or a cloud
+#   # metadata endpoint. Private/loopback targets are refused unless you opt in
+#   # because your upstream really is on the private network.
+#   allow_private_upstream = false
 #
 #     # Credentials for an authenticated upstream (all optional). Set the
 #     # username/password pair for HTTP Basic, token for a Bearer token, and/or

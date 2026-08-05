@@ -91,15 +91,20 @@ impl Error {
 impl IntoResponse for Error {
     fn into_response(self) -> Response {
         let status = self.status();
-        // Log server-side faults; client errors are expected and stay quiet.
-        if status.is_server_error() {
+        // Client errors describe what the caller did wrong and are safe to
+        // return verbatim. Server faults are not: `Io`, `Database` and `Other`
+        // are transparent wrappers, so their text carries filesystem paths, SQL
+        // and upstream URLs. Those go to the log, and the caller gets a generic
+        // message with the status code as the only signal.
+        let message = if status.is_server_error() {
             tracing::error!(error = %self, "request failed");
-        }
+            "internal server error".to_string()
+        } else {
+            self.to_string()
+        };
         // The admin area challenges via Basic auth so browsers prompt for it.
         let challenge = matches!(self, Error::AdminUnauthorized);
-        let body = Json(json!({
-            "error": self.to_string(),
-        }));
+        let body = Json(json!({ "error": message }));
         let mut response = (status, body).into_response();
         if challenge {
             response.headers_mut().insert(
@@ -154,6 +159,28 @@ mod tests {
             .to_str()
             .unwrap();
         assert!(header.contains("Basic"));
+    }
+
+    #[tokio::test]
+    async fn server_faults_do_not_leak_internals() {
+        use axum::body::to_bytes;
+
+        // An I/O error's text names a path; a database error names SQL. Neither
+        // may reach the caller.
+        let io = Error::Io(std::io::Error::other("/srv/data/packages/secret.nupkg"));
+        let resp = io.into_response();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!text.contains("secret.nupkg"), "leaked path: {text}");
+        assert!(text.contains("internal server error"));
+
+        // Client errors stay descriptive — they tell the caller what to fix.
+        let bad = Error::InvalidVersion("not-a-version".into());
+        let resp = bad.into_response();
+        let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("not-a-version"), "over-redacted: {text}");
     }
 
     #[test]

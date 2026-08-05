@@ -130,6 +130,13 @@ pub struct FeedVersion {
 /// Metadata store for indexed packages.
 #[async_trait]
 pub trait PackageDatabase: Send + Sync {
+    /// Cheap round-trip proving the store is reachable and answering.
+    ///
+    /// Backs the readiness probe: a server whose database file has been deleted
+    /// or whose volume was unmounted still accepts connections and still serves
+    /// a static "OK", which is exactly the failure an orchestrator needs to see.
+    async fn ping(&self) -> Result<()>;
+
     // --- global package data (shared by every feed) ---
 
     /// Insert global package metadata if absent. Idempotent: returns `true` when

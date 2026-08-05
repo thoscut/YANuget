@@ -102,6 +102,9 @@ footer{border-top:1px solid var(--border);color:var(--muted);font-size:13px;padd
 footer a[aria-current=page]{color:var(--fg);font-weight:600}\
 ";
 
+/// The form field (and header) carrying the admin CSRF token.
+pub const CSRF_FIELD: &str = "_csrf";
+
 /// Escape the five HTML-significant characters.
 pub fn escape_html(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -145,11 +148,49 @@ pub fn safe_href(url: &str) -> Option<&str> {
 /// Tiny inline script giving the install-command "Copy" buttons their
 /// behaviour. It degrades gracefully: without JS the `<pre>` stays selectable
 /// and the button simply does nothing.
-const COPY_SCRIPT: &str = "<script>document.addEventListener('click',function(e){\
+///
+/// Kept separate from its `<script>` wrapper because the CSP hash below must be
+/// taken over exactly this text — the element's content, not the tags.
+/// It also carries the admin area's destructive-action confirmation. That used
+/// to be an inline `onsubmit=` attribute, which the CSP below cannot whitelist
+/// by hash — so the prompt is delegated from here off a `data-confirm`
+/// attribute instead, keeping the guard rail and the policy both intact.
+const COPY_SCRIPT_BODY: &str = "document.addEventListener('click',function(e){\
 var b=e.target.closest('.copy');if(!b)return;\
 var c=b.parentNode.querySelector('code');if(!c||!navigator.clipboard)return;\
 navigator.clipboard.writeText(c.innerText).then(function(){\
-var o=b.textContent;b.textContent='Copied';setTimeout(function(){b.textContent=o},1200)})});</script>";
+var o=b.textContent;b.textContent='Copied';setTimeout(function(){b.textContent=o},1200)})});\
+document.addEventListener('submit',function(e){\
+var m=e.target.getAttribute&&e.target.getAttribute('data-confirm');\
+if(m&&!confirm(m))e.preventDefault()});";
+
+/// The `Content-Security-Policy` served with every gallery/admin page.
+///
+/// The gallery renders package-supplied metadata (descriptions, readmes, links,
+/// dependency ids). [`escape_html`] and [`safe_href`] are the primary defence;
+/// this policy is the backstop that keeps an escaping bug from becoming script
+/// execution. `default-src 'none'` denies everything not listed, and the only
+/// inline style/script permitted are the two the server itself emits, pinned by
+/// SHA-256 — an injected `<script>` has a different hash and will not run.
+pub static CSP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!(
+        "default-src 'none'; img-src 'self' data:; style-src '{style}'; script-src '{script}'; \
+         base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
+        style = csp_hash(STYLE),
+        script = csp_hash(COPY_SCRIPT_BODY),
+    )
+});
+
+/// The `sha256-<base64>` source expression for an inline element's content.
+fn csp_hash(content: &str) -> String {
+    use base64::Engine;
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(content.as_bytes());
+    format!(
+        "sha256-{}",
+        base64::engine::general_purpose::STANDARD.encode(digest)
+    )
+}
 
 /// Wrap a page body in the shared layout (head, header bar, footer).
 ///
@@ -180,7 +221,7 @@ fn layout(urls: &UrlBuilder, title: &str, query: &str, active: &str, body: &str)
 <a href=\"{idx}\">v3 service index</a> \u{2022} <a href=\"{docs}\">Docs</a> \u{2022} \
 <a href=\"{stats}\"{cs}>Stats</a> \u{2022} \
 <a href=\"{settings}\"{cg}>Settings</a></nav></div></footer>\
-{COPY_SCRIPT}</body></html>",
+<script>{COPY_SCRIPT_BODY}</script></body></html>",
         title = escape_html(title),
         q = escape_html(query),
         home = escape_html(&urls.app("/")),
@@ -564,6 +605,7 @@ pub fn admin_package_page(
     id: &str,
     versions: &[crate::database::FeedVersion],
     promote_target: Option<&str>,
+    csrf_token: &str,
 ) -> String {
     let mut ordered: Vec<&crate::database::FeedVersion> = versions.iter().collect();
     ordered.sort_by(|a, b| b.package.version.cmp(&a.package.version));
@@ -576,6 +618,13 @@ pub fn admin_package_page(
             op
         )))
     };
+    // Every admin form carries the CSRF token; the handlers reject a POST
+    // without it, so a cross-site form submission cannot ride the browser's
+    // auto-replayed Basic credentials.
+    let csrf = format!(
+        "<input type=\"hidden\" name=\"{CSRF_FIELD}\" value=\"{}\">",
+        escape_html(csrf_token)
+    );
 
     let mut rows = String::new();
     for fv in ordered {
@@ -597,13 +646,13 @@ pub fn admin_package_page(
         let mut actions = String::new();
         if fv.pending {
             actions.push_str(&format!(
-                "<form method=\"post\" action=\"{}\"><button type=\"submit\">Approve</button></form>",
+                "<form method=\"post\" action=\"{}\">{csrf}<button type=\"submit\">Approve</button></form>",
                 action(&v, "approve")
             ));
         }
         if let Some(target) = promote_target {
             actions.push_str(&format!(
-                "<form method=\"post\" action=\"{}\"><button type=\"submit\">Promote \u{2192} {}</button></form>",
+                "<form method=\"post\" action=\"{}\">{csrf}<button type=\"submit\">Promote \u{2192} {}</button></form>",
                 action(&v, "promote"),
                 escape_html(target),
             ));
@@ -611,22 +660,22 @@ pub fn admin_package_page(
         // Enable/disable toggle depending on current state.
         if p.enabled {
             actions.push_str(&format!(
-                "<form method=\"post\" action=\"{}\"><button type=\"submit\">Disable</button></form>",
+                "<form method=\"post\" action=\"{}\">{csrf}<button type=\"submit\">Disable</button></form>",
                 action(&v, "disable")
             ));
         } else {
             actions.push_str(&format!(
-                "<form method=\"post\" action=\"{}\"><button type=\"submit\">Enable</button></form>",
+                "<form method=\"post\" action=\"{}\">{csrf}<button type=\"submit\">Enable</button></form>",
                 action(&v, "enable")
             ));
         }
         actions.push_str(&format!(
-            "<form method=\"post\" action=\"{a}\" \
-             onsubmit=\"return confirm('Remove {dv} {dvv} from this feed? If no other feed uses it, the files are deleted.')\">\
+            "<form method=\"post\" action=\"{a}\" data-confirm=\"{confirm}\">{csrf}\
              <button type=\"submit\" class=\"danger\">Delete</button></form>",
             a = action(&v, "delete"),
-            dv = escape_html(&id.replace('\'', "")),
-            dvv = escape_html(&v.replace('\'', "")),
+            confirm = escape_html(&format!(
+                "Remove {id} {v} from this feed? If no other feed uses it, the files are deleted."
+            )),
         ));
 
         let reason = match (fv.flagged, fv.flag_reason.as_deref()) {
@@ -973,6 +1022,31 @@ fn human_size(bytes: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// The CSP pins the inline `<style>` and `<script>` by SHA-256, so a page
+    /// whose inline content drifts from the policy silently loses its styling
+    /// and its copy buttons. Extract both from a real rendered page and check
+    /// the policy actually covers them.
+    #[test]
+    fn csp_hashes_cover_the_inline_assets_the_page_emits() {
+        let urls = super::UrlBuilder::new("https://host");
+        let html = super::settings_page(
+            &urls,
+            &crate::config::Config::default(),
+            &feed_ctx(None, None),
+        );
+
+        for (open, close) in [("<style>", "</style>"), ("<script>", "</script>")] {
+            let start = html.find(open).expect("inline block present") + open.len();
+            let end = html[start..].find(close).expect("closing tag") + start;
+            let hash = super::csp_hash(&html[start..end]);
+            assert!(
+                super::CSP.contains(&hash),
+                "CSP does not cover the emitted {open} block (expected {hash})\nCSP: {}",
+                *super::CSP
+            );
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -1199,7 +1273,7 @@ mod tests {
             feed_version(sample(), false, false),
             feed_version(disabled, false, false),
         ];
-        let pkg = admin_package_page(&urls, "Contoso.Utils", &versions, None);
+        let pkg = admin_package_page(&urls, "Contoso.Utils", &versions, None, "tok");
         assert!(pkg.contains("/disable"));
         assert!(pkg.contains("/enable"));
         assert!(pkg.contains("/delete"));
@@ -1211,7 +1285,7 @@ mod tests {
     fn admin_page_shows_pending_and_promote() {
         let urls = UrlBuilder::new("https://host");
         let versions = vec![feed_version(sample(), true, true)];
-        let pkg = admin_package_page(&urls, "Contoso.Utils", &versions, Some("stable"));
+        let pkg = admin_package_page(&urls, "Contoso.Utils", &versions, Some("stable"), "tok");
         assert!(pkg.contains("/approve"));
         assert!(pkg.contains("/promote"));
         assert!(pkg.contains("pending"));

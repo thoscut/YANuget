@@ -84,11 +84,12 @@ The essentials:
 | API key | `YANUGET_API_KEY` | *(none)* | Required to push/delete. **Set this.** |
 | Listen port | `YANUGET_PORT` | `5000` | |
 | Data directory | `YANUGET_DATA_DIR` | `./data` | Holds the package store and SQLite DB. |
-| Base URL | `YANUGET_BASE_URL` | *(per-request)* | Derived from `Host`/`X-Forwarded-*` if unset. |
+| Base URL | `YANUGET_BASE_URL` | *(per-request)* | Derived from `Host`/`X-Forwarded-*` (trusted peers only) if unset. |
 | Max upload size | `YANUGET_MAX_PACKAGE_SIZE_BYTES` | *(unlimited)* | Streams to disk regardless. |
 | Overwrite | `YANUGET_ALLOW_OVERWRITE` | `false` | `false`/`true`/`prerelease-only`. |
 | Hard delete | `YANUGET_HARD_DELETE_ENABLED` | `false` | Otherwise DELETE unlists. |
 | Rate limit | `YANUGET_RATELIMIT_*` | on, 1000/60s | Per-IP throttle; returns `429`. |
+| Trusted proxies | `YANUGET_TRUSTED_PROXIES` | `private` | Peers whose `X-Forwarded-*` is honoured. |
 
 ---
 
@@ -342,6 +343,14 @@ Basic/Bearer/custom-header **upstream auth**), **bulk migration** (`migrate`
 command — copy every package from another server, with progress/ETA/transfer
 rate), **release-ring promotion & approval gates**, and an **offline license
 policy**.
+
+Hardening that protects the *client* consuming this feed: forwarding headers are
+only honoured from a configured **trusted proxy** (so nothing can steer the
+absolute URLs a restoring client is handed, or slip past the throttle), package
+downloads are **conditional and immutable-cacheable** (`ETag` + `304`), admin
+actions require a **CSRF token**, gallery pages ship a hash-pinned **CSP**, and
+mirroring **verifies that an upstream returned the package that was asked for**
+before publishing it locally under a trusted name.
 
 Not yet implemented (contributions welcome): additional storage backends
 (S3/Azure Blob) and database backends (PostgreSQL/MySQL), online vulnerability

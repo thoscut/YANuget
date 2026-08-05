@@ -269,6 +269,9 @@ pub async fn run(
         overwrite: opts.overwrite,
         pending: feed.requires_approval,
         license_policy: feed.license_policy.clone(),
+        // Pinned per item in `migrate_one` — the source is asked for a specific
+        // id/version and must not be able to answer with a different package.
+        expect: None,
     };
 
     let outcomes: Vec<Outcome> = stream::iter(work)
@@ -347,9 +350,23 @@ async fn migrate_one(
     };
     let bytes = summary.size;
 
+    // Require the downloaded manifest to declare the id/version this item asked
+    // the source for, so a rogue source cannot slip a different package into the
+    // target feed under a name that is already trusted there.
+    let index_opts = match crate::version::NuGetVersion::parse(&item.display_version) {
+        Ok(version) => IndexOptions {
+            expect: Some(indexing::ExpectedIdentity {
+                id: item.lower_id.clone(),
+                version,
+            }),
+            ..index_opts.clone()
+        },
+        Err(_) => index_opts.clone(),
+    };
+
     // index_package moves the temp file into storage on success and removes it
     // on failure, so we never leave the download behind.
-    match indexing::index_package(storage, db, feed, temp_path, summary, index_opts).await {
+    match indexing::index_package(storage, db, feed, temp_path, summary, &index_opts).await {
         Ok(_) => Outcome {
             kind: OutcomeKind::Imported,
             bytes,

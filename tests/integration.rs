@@ -60,7 +60,7 @@ async fn spawn_with(customize: impl FnOnce(&mut Config)) -> TestServer {
         .unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
+        axum::serve(listener, connect_info(app)).await.unwrap();
     });
 
     TestServer {
@@ -68,6 +68,18 @@ async fn spawn_with(customize: impl FnOnce(&mut Config)) -> TestServer {
         client: reqwest::Client::new(),
         _dir: dir,
     }
+}
+
+/// Serve with peer connection info, exactly as `main.rs` does.
+///
+/// The server only honours `X-Forwarded-*` from a peer in `trusted_proxies`,
+/// which it can only identify when connection info is wired up. Tests connect
+/// from `127.0.0.1`, which the default `private` trust set covers — so with this
+/// in place the harness exercises the same trusted-proxy path production uses.
+fn connect_info(
+    app: axum::Router,
+) -> axum::extract::connect_info::IntoMakeServiceWithConnectInfo<axum::Router, SocketAddr> {
+    app.into_make_service_with_connect_info::<SocketAddr>()
 }
 
 /// Build a minimal but valid `.nupkg` in memory.
@@ -815,6 +827,22 @@ async fn spawn_admin() -> TestServer {
 }
 
 /// A client that does not auto-follow redirects, so 303s can be asserted.
+/// The CSRF token the admin UI embeds in its forms, derived from the admin key.
+///
+/// Admin state changes require it, so a signed-in operator visiting a hostile
+/// page cannot have their browser's auto-replayed Basic credentials used to
+/// delete packages.
+fn admin_csrf(key: &str) -> String {
+    yanuget::auth::AdminAuth::new(Some(key.to_string()))
+        .csrf_token()
+        .unwrap()
+}
+
+/// A form-encoded admin action body carrying the CSRF token.
+fn admin_body(key: &str) -> String {
+    format!("_csrf={}", admin_csrf(key))
+}
+
 fn no_redirect() -> reqwest::Client {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -871,6 +899,8 @@ async fn admin_disable_withholds_then_enable_restores() {
     let resp = client
         .post(server.url("/admin/packages/adm.pkg/1.0.0/disable"))
         .basic_auth("admin", Some(ADMIN_KEY))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(admin_body(ADMIN_KEY))
         .send()
         .await
         .unwrap();
@@ -909,6 +939,8 @@ async fn admin_disable_withholds_then_enable_restores() {
     let resp = client
         .post(server.url("/admin/packages/adm.pkg/1.0.0/enable"))
         .basic_auth("admin", Some(ADMIN_KEY))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(admin_body(ADMIN_KEY))
         .send()
         .await
         .unwrap();
@@ -945,6 +977,8 @@ async fn admin_delete_removes_version_and_symbols() {
     let resp = no_redirect()
         .post(server.url("/admin/packages/del.pkg/1.0.0/delete"))
         .basic_auth("admin", Some(ADMIN_KEY))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(admin_body(ADMIN_KEY))
         .send()
         .await
         .unwrap();
@@ -1234,7 +1268,7 @@ async fn graceful_shutdown_stops_the_server() {
     let addr = listener.local_addr().unwrap();
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let server = tokio::spawn(async move {
-        axum::serve(listener, app)
+        axum::serve(listener, connect_info(app))
             .with_graceful_shutdown(async {
                 let _ = rx.await;
             })
@@ -1432,7 +1466,7 @@ async fn spawn_feeds(customize: impl FnOnce(&mut Config)) -> TestServer {
         .unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
+        axum::serve(listener, connect_info(app)).await.unwrap();
     });
     TestServer {
         base: format!("http://{addr}"),
@@ -1564,6 +1598,8 @@ async fn approval_ring_withholds_until_approved() {
         .unwrap()
         .post(server.url("/gated/admin/packages/ring.pkg/1.0.0/approve"))
         .basic_auth("admin", Some(ADMIN_KEY))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(admin_body(ADMIN_KEY))
         .send()
         .await
         .unwrap();
@@ -1617,6 +1653,8 @@ async fn promotion_moves_a_version_into_the_next_ring() {
         .unwrap()
         .post(server.url("/dev/admin/packages/prom.pkg/1.0.0/promote"))
         .basic_auth("admin", Some(ADMIN_KEY))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(admin_body(ADMIN_KEY))
         .send()
         .await
         .unwrap();
@@ -1758,6 +1796,10 @@ async fn migrate_imports_all_packages_and_is_idempotent() {
     let source_cfg = MirrorConfig {
         enabled: true,
         upstream: source.url("/v3/index.json"),
+        // The test source is on loopback; a migration is an operator-driven
+        // command against a source they picked, so this is the same opt-in the
+        // `migrate` sub-command applies.
+        allow_private_upstream: true,
         ..Default::default()
     };
     let opts = MigrateOptions {
@@ -1827,6 +1869,10 @@ async fn migrate_dry_run_reports_without_importing() {
     let source_cfg = MirrorConfig {
         enabled: true,
         upstream: source.url("/v3/index.json"),
+        // The test source is on loopback; a migration is an operator-driven
+        // command against a source they picked, so this is the same opt-in the
+        // `migrate` sub-command applies.
+        allow_private_upstream: true,
         ..Default::default()
     };
 
@@ -1851,4 +1897,314 @@ async fn migrate_dry_run_reports_without_importing() {
     // Nothing was actually written to the target.
     let v = NuGetVersion::parse("1.0.0").unwrap();
     assert!(!target.db.exists(&feed.name, "dry.run", &v).await.unwrap());
+}
+
+// ---------------------------------------------------------------------------
+// Hardening: forwarding-header trust, response headers, auth gaps, CSRF,
+// conditional downloads and cross-feed payload integrity.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn forwarded_headers_are_ignored_from_an_untrusted_peer() {
+    // Nobody is trusted, so the loopback test client is not a proxy either.
+    let server = spawn_with(|c| c.trusted_proxies = Vec::new()).await;
+
+    let index: serde_json::Value = server
+        .client
+        .get(server.url("/v3/index.json"))
+        .header("X-Forwarded-Host", "evil.example.com")
+        .header("X-Forwarded-Proto", "https")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    // Every advertised resource must still point at this server. A client that
+    // followed a poisoned packageContent URL would fetch its packages from
+    // whoever set the header.
+    let base = package_base_address(&index);
+    assert!(
+        !base.contains("evil.example.com"),
+        "spoofed forwarded host reached a generated URL: {base}"
+    );
+    assert!(base.starts_with(&server.base), "unexpected base: {base}");
+}
+
+#[tokio::test]
+async fn rate_limit_survives_spoofed_forwarded_for() {
+    // With no trusted proxy, X-Forwarded-For is stripped, so every request is
+    // attributed to the real peer and the throttle actually holds.
+    let server = spawn_with(|c| {
+        c.trusted_proxies = Vec::new();
+        c.rate_limit.enabled = true;
+        c.rate_limit.max_requests = 3;
+        c.rate_limit.window_secs = 60;
+    })
+    .await;
+
+    let mut statuses = Vec::new();
+    for i in 0..8u8 {
+        let resp = server
+            .client
+            .get(server.url("/v3/index.json"))
+            // A fresh "client IP" every time — which is the whole point of the
+            // bypass this guards against.
+            .header("X-Forwarded-For", format!("203.0.113.{i}"))
+            .send()
+            .await
+            .unwrap();
+        statuses.push(resp.status());
+    }
+    assert!(
+        statuses.contains(&reqwest::StatusCode::TOO_MANY_REQUESTS),
+        "rotating X-Forwarded-For bypassed the rate limit: {statuses:?}"
+    );
+}
+
+#[tokio::test]
+async fn responses_carry_baseline_security_headers() {
+    let server = spawn().await;
+
+    let resp = server.client.get(server.url("/")).send().await.unwrap();
+    let headers = resp.headers().clone();
+    assert_eq!(headers.get("x-content-type-options").unwrap(), "nosniff");
+    assert_eq!(headers.get("x-frame-options").unwrap(), "DENY");
+    assert_eq!(headers.get("referrer-policy").unwrap(), "no-referrer");
+    let vary = headers.get("vary").unwrap().to_str().unwrap();
+    assert!(vary.contains("X-Forwarded-Host"), "vary was {vary}");
+
+    // The gallery renders package-supplied metadata, so it gets a policy that
+    // denies everything except the two inline assets the server itself emits.
+    let csp = headers
+        .get("content-security-policy")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(csp.contains("default-src 'none'"), "csp was {csp}");
+    assert!(csp.contains("frame-ancestors 'none'"), "csp was {csp}");
+    assert!(csp.contains("script-src 'sha256-"), "csp was {csp}");
+
+    // JSON protocol documents get the headers too, but no gallery CSP.
+    let json = server
+        .client
+        .get(server.url("/v3/index.json"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        json.headers().get("x-content-type-options").unwrap(),
+        "nosniff"
+    );
+}
+
+#[tokio::test]
+async fn symbol_download_and_settings_require_read_auth() {
+    let server = spawn_feeds(|c| {
+        c.api_key = Some(API_KEY.into());
+        let mut private = feed("private");
+        private.read_api_key = Some("read-key".into());
+        c.feeds = vec![private];
+    })
+    .await;
+
+    // A PDB carries source paths and, with embedded sources, code — so a gated
+    // feed must gate it like any other package content.
+    let sym = server
+        .client
+        .get(server.url("/private/download/symbols/app.pdb/ABCDEF01FFFFFFFF/app.pdb"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(sym.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    let settings = server
+        .client
+        .get(server.url("/private/settings"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(settings.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    // With the read key the settings page is reachable again.
+    let ok = server
+        .client
+        .get(server.url("/private/settings"))
+        .header("X-NuGet-ApiKey", "read-key")
+        .send()
+        .await
+        .unwrap();
+    assert!(ok.status().is_success());
+}
+
+#[tokio::test]
+async fn admin_actions_require_a_csrf_token() {
+    let server = spawn_admin().await;
+    push_multipart(&server, API_KEY, build_nupkg("Csrf.Pkg", "1.0.0", b"x")).await;
+    let client = no_redirect();
+    let url = server.url("/admin/packages/csrf.pkg/1.0.0/disable");
+
+    // Authenticated but with no token: this is what a cross-site form POST
+    // looks like, since the browser attaches the Basic credentials by itself.
+    let no_token = client
+        .post(&url)
+        .basic_auth("admin", Some(ADMIN_KEY))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(no_token.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    // A guessed token is no better.
+    let bad_token = client
+        .post(&url)
+        .basic_auth("admin", Some(ADMIN_KEY))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body("_csrf=not-the-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad_token.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    // A browser that tells us the request came from another site is refused
+    // even when it somehow carries the token.
+    let cross_site = client
+        .post(&url)
+        .basic_auth("admin", Some(ADMIN_KEY))
+        .header("sec-fetch-site", "cross-site")
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(admin_body(ADMIN_KEY))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(cross_site.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    // The real thing, as the admin page submits it, still works.
+    let good = client
+        .post(&url)
+        .basic_auth("admin", Some(ADMIN_KEY))
+        .header("sec-fetch-site", "same-origin")
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(admin_body(ADMIN_KEY))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(good.status(), reqwest::StatusCode::SEE_OTHER);
+
+    // And the page really does hand out that token, so the UI keeps working.
+    let page = server
+        .client
+        .get(server.url("/admin/packages/csrf.pkg"))
+        .basic_auth("admin", Some(ADMIN_KEY))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(page.contains(&admin_csrf(ADMIN_KEY)));
+}
+
+#[tokio::test]
+async fn package_download_is_conditional_and_cacheable() {
+    let server = spawn().await;
+    push_multipart(
+        &server,
+        API_KEY,
+        build_nupkg("Cache.Pkg", "1.0.0", &vec![7u8; 4096]),
+    )
+    .await;
+    let url = server.url("/v3/package/cache.pkg/1.0.0/cache.pkg.1.0.0.nupkg");
+
+    let first = server.client.get(&url).send().await.unwrap();
+    assert!(first.status().is_success());
+    let etag = first
+        .headers()
+        .get("etag")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let cache_control = first
+        .headers()
+        .get("cache-control")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(cache_control.contains("immutable"), "{cache_control}");
+
+    // A restore that already holds the package pays for a header exchange, not
+    // for the payload again.
+    let second = server
+        .client
+        .get(&url)
+        .header("If-None-Match", &etag)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(second.status(), reqwest::StatusCode::NOT_MODIFIED);
+    assert!(second.bytes().await.unwrap().is_empty());
+
+    // A stale validator still gets the bytes.
+    let changed = server
+        .client
+        .get(&url)
+        .header("If-None-Match", "\"something-else\"")
+        .send()
+        .await
+        .unwrap();
+    assert!(changed.status().is_success());
+}
+
+#[tokio::test]
+async fn a_second_feed_cannot_republish_different_bytes_under_a_taken_version() {
+    let server = spawn_feeds(|c| {
+        c.api_key = Some(API_KEY.into());
+        c.feeds = vec![feed("one"), feed("two")];
+    })
+    .await;
+
+    // The payload is stored once and shared by every feed that holds the
+    // version, so the *first* upload's bytes are what all of them serve.
+    let original = build_nupkg("Shared.Pkg", "1.0.0", b"original-payload");
+    let resp = push_to(&server, "/one/api/v2/package", API_KEY, original.clone()).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+
+    // Pushing *different* bytes for the same id/version into another feed must
+    // not succeed: the advertised hash would stop describing the served bytes,
+    // and a client verifying packageHash would fail the restore.
+    let different = build_nupkg("Shared.Pkg", "1.0.0", b"a-completely-different-payload");
+    let resp = push_to(&server, "/two/api/v2/package", API_KEY, different).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
+
+    // The identical package is still free to join a second feed.
+    let resp = push_to(&server, "/two/api/v2/package", API_KEY, original).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+
+    // ...and what that feed advertises matches what it serves.
+    let reg: serde_json::Value = server
+        .client
+        .get(server.url("/two/v3/registration/shared.pkg/index.json"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let advertised = reg["items"][0]["items"][0]["packageContent"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let served = server.client.get(&advertised).send().await.unwrap();
+    assert!(served.status().is_success());
+}
+
+#[tokio::test]
+async fn health_reports_readiness_and_liveness() {
+    let server = spawn().await;
+    for path in ["/health", "/health/ready", "/health/live"] {
+        let resp = server.client.get(server.url(path)).send().await.unwrap();
+        assert!(resp.status().is_success(), "{path} was {}", resp.status());
+    }
 }

@@ -247,6 +247,15 @@ impl SqliteDatabase {
 
 #[async_trait]
 impl PackageDatabase for SqliteDatabase {
+    async fn ping(&self) -> Result<()> {
+        // Touch a real table rather than `SELECT 1`, so a database file that has
+        // vanished or been replaced by an empty one is reported as unhealthy.
+        sqlx::query("SELECT COUNT(*) FROM packages LIMIT 1")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     async fn upsert_package_data(&self, p: &Package) -> Result<bool> {
         let (major, minor, patch, revision) = p.version.core();
         let result = sqlx::query(
