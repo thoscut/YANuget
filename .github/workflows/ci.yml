@@ -141,10 +141,13 @@ jobs:
       - name: Verify the crate packages and builds from its tarball
         run: cargo publish --dry-run --locked
 
+      # REQUIRE_DOCS=1 matches how the release workflow builds it, so a docs
+      # failure is a build failure here rather than an image that quietly ships
+      # the "documentation not bundled" placeholder.
       - name: Build the container image
-        run: docker build -t yanuget:ci .
+        run: docker build --build-arg REQUIRE_DOCS=1 -t yanuget:ci .
 
-      - name: Container starts and reports healthy
+      - name: Container starts, reports healthy and serves the real docs
         run: |
           set -euo pipefail
           docker run -d --name yanuget-ci -p 5000:5000 \
@@ -158,6 +161,10 @@ jobs:
           docker logs yanuget-ci
           [ "$(docker inspect -f '{{.State.Health.Status}}' yanuget-ci)" = healthy ]
           curl -fsSk https://127.0.0.1:5000/v3/index.json >/dev/null
+          if curl -fsSk https://127.0.0.1:5000/docs/ | grep -q "Documentation not bundled"; then
+            echo "::error::the image embedded the placeholder docs page"
+            exit 1
+          fi
           docker rm -f yanuget-ci
 
   client-compat:

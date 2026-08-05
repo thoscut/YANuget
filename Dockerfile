@@ -17,8 +17,13 @@ RUN mkdir src \
 RUN rm -rf src
 
 # Render the documentation so the real site is embedded rather than the
-# placeholder. Optional by design: a build without network access still produces
-# a working binary, just with the "docs not bundled" page.
+# placeholder. Best-effort by default: a build without network access still
+# produces a working binary, just with the "docs not bundled" page.
+#
+# Pass `--build-arg REQUIRE_DOCS=1` to make a failure here fatal instead. The
+# release workflow does, because an image that silently ships the placeholder
+# looks exactly like a good one until someone opens /docs.
+ARG REQUIRE_DOCS=0
 COPY docs ./docs
 COPY mkdocs.yml requirements-docs.txt README.md ./
 RUN set -eu; \
@@ -28,6 +33,9 @@ RUN set -eu; \
        && /opt/docs-venv/bin/pip install --no-cache-dir -r requirements-docs.txt \
        && /opt/docs-venv/bin/mkdocs build --strict; then \
       echo "documentation site built"; \
+    elif [ "$REQUIRE_DOCS" = "1" ]; then \
+      echo "REQUIRE_DOCS=1 and the documentation site failed to build" >&2; \
+      exit 1; \
     else \
       echo "docs build skipped; the placeholder page will be embedded"; \
     fi; \
