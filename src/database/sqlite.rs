@@ -787,11 +787,18 @@ impl PackageDatabase for SqliteDatabase {
         version: &NuGetVersion,
     ) -> Result<()> {
         sqlx::query(
+            // The `WHERE` is what keeps a symbol key attached to the package
+            // that first claimed it. Both halves of the key are chosen by the
+            // uploader, so without it any push credential could repoint another
+            // package's — or another feed's — symbols at itself. A package may
+            // still update its own key, which is what re-pushing a `.snupkg`
+            // does; a different package's attempt becomes a no-op here.
             r#"INSERT INTO symbols (ssqp_key, filename, lower_id, normalized_version)
                VALUES (?1, ?2, ?3, ?4)
                ON CONFLICT(ssqp_key, filename) DO UPDATE SET
                    lower_id = excluded.lower_id,
-                   normalized_version = excluded.normalized_version"#,
+                   normalized_version = excluded.normalized_version
+               WHERE symbols.lower_id = excluded.lower_id"#,
         )
         .bind(key.to_uppercase())
         .bind(filename.to_lowercase())

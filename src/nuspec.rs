@@ -113,6 +113,22 @@ pub fn parse_nuspec(xml: &str) -> Result<Nuspec, Error> {
             Ok(Event::Start(e)) => {
                 let name = local_name(e.name().as_ref());
 
+                // Checked before anything is pushed, so every branch below is
+                // covered. `<license>` used to push its synthetic entry and
+                // `continue` past a check that sat further down, which left the
+                // depth entirely unbounded for that one element name: nesting
+                // `<license>` some 800k times inside a 16 MiB manifest grew
+                // `path` without limit and made `assign_text`'s ancestor scan —
+                // O(depth) on every closing tag — quadratic. Measured at 834ms
+                // for a 1 MiB manifest, and `parse_nuspec` runs on a tokio
+                // worker rather than a blocking thread, so a few concurrent
+                // pushes of a tiny, highly compressible file stall the runtime.
+                if path.len() >= MAX_ELEMENT_DEPTH {
+                    return Err(Error::InvalidPackage(format!(
+                        "nuspec nests deeper than {MAX_ELEMENT_DEPTH} elements"
+                    )));
+                }
+
                 // `<license type="...">` carries its value as following text, so
                 // remember which flavour we are inside via a synthetic path entry.
                 if name == "license" {
@@ -130,11 +146,6 @@ pub fn parse_nuspec(xml: &str) -> Result<Nuspec, Error> {
                     // `handle_attr_element` always pushes a group for this name,
                     // so the list is non-empty here.
                     current_group = nuspec.dependency_groups.len().checked_sub(1);
-                }
-                if path.len() >= MAX_ELEMENT_DEPTH {
-                    return Err(Error::InvalidPackage(format!(
-                        "nuspec nests deeper than {MAX_ELEMENT_DEPTH} elements"
-                    )));
                 }
                 path.push(name);
                 // Any text seen before this child belongs to the parent, which
@@ -371,6 +382,60 @@ fn attr(e: &quick_xml::events::BytesStart, name: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    /// Every element name has to be bounded by the depth cap, including the
+    /// ones handled by a special branch.
+    ///
+    /// `<license>` used to push its synthetic path entry and `continue` past
+    /// the check. Depth was then unbounded for that name alone, which made the
+    /// ancestor scan in `assign_text` quadratic — a 1 MiB manifest of nested
+    /// `<license>` took 834ms, on a tokio worker rather than a blocking thread,
+    /// from an upload that compresses to a few KiB.
+    #[test]
+    fn no_element_can_nest_past_the_depth_cap() {
+        for (name, wrapper) in [
+            ("license", ("<package><metadata>", "</metadata></package>")),
+            // Outside `<metadata>` the ancestor scan has no early exit, which
+            // is the shape that actually went quadratic.
+            ("license", ("<package>", "</package>")),
+            ("group", ("<package><metadata>", "</metadata></package>")),
+        ] {
+            let n = MAX_ELEMENT_DEPTH + 50;
+            let mut xml = String::from(wrapper.0);
+            xml.push_str(&format!("<{name}>").repeat(n));
+            xml.push_str(&format!("</{name}>t").repeat(n));
+            xml.push_str(wrapper.1);
+
+            let start = std::time::Instant::now();
+            let err = parse_nuspec(&xml).expect_err("{name} nested past the cap must be rejected");
+            assert!(
+                err.to_string().contains("nests deeper"),
+                "{name}: unexpected error {err}"
+            );
+            // Bailing at the cap means the cost cannot scale with the input.
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(1),
+                "{name}: parsing took {:?}, which suggests the cap was not applied",
+                start.elapsed()
+            );
+        }
+    }
+
+    /// Nesting up to the cap still parses, so the check is not off by one in
+    /// the direction that would reject ordinary manifests.
+    #[test]
+    fn nesting_within_the_cap_still_parses() {
+        let depth = 8;
+        let mut xml = String::from("<package><metadata>");
+        xml.push_str("<a>".repeat(depth).as_str());
+        xml.push_str("</a>".repeat(depth).as_str());
+        xml.push_str("<id>A</id><version>1.0.0</version><description>d</description>");
+        xml.push_str("<authors>x</authors><license type=\"expression\">MIT</license>");
+        xml.push_str("</metadata></package>");
+        let parsed = parse_nuspec(&xml).expect("ordinary nesting must parse");
+        assert_eq!(parsed.id, "A");
+        assert_eq!(parsed.license_expression.as_deref(), Some("MIT"));
+    }
+
     use super::*;
 
     #[test]

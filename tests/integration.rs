@@ -2725,3 +2725,121 @@ async fn a_case_variant_of_a_published_prerelease_is_the_same_version() {
         );
     }
 }
+
+/// The SSQP key comes out of the uploaded PDB and the filename out of the zip
+/// entry name, so both are chosen by whoever pushes. The symbol store is global
+/// — a debugger asks for a key and nothing else — so a package must not be able
+/// to claim a key another package already owns.
+///
+/// Before this was fixed, the second push below overwrote both the stored bytes
+/// and the ownership row, and a debugger asking for the victim's key was served
+/// the attacker's PDB.
+#[tokio::test]
+async fn a_package_cannot_claim_another_packages_symbols() {
+    let server = spawn().await;
+
+    // The victim publishes a package and its symbols.
+    let guid = [7u8; 16];
+    let victim_pdb = build_portable_pdb(&guid);
+    let key = yanuget::pdb::portable_pdb_signature(&victim_pdb).expect("portable pdb key");
+    push_multipart(&server, API_KEY, build_nupkg("Victim.Lib", "1.0.0", b"dll")).await;
+    let response = push_symbol(
+        &server,
+        API_KEY,
+        build_snupkg("Victim.Lib", "1.0.0", "victim.pdb", &victim_pdb),
+    )
+    .await;
+    assert_eq!(response.status(), 201);
+
+    // The path a debugger actually requests.
+    let symbol_url = server.url(&format!("/download/symbols/victim.pdb/{key}/victim.pdb"));
+    let fetch = || server.client.get(&symbol_url).send();
+
+    let original = fetch().await.unwrap();
+    assert_eq!(original.status(), 200);
+    assert_eq!(
+        original.bytes().await.unwrap().as_ref(),
+        victim_pdb.as_slice()
+    );
+
+    // The attacker publishes their own package, then a symbol package carrying
+    // a PDB with the victim's debug GUID under the victim's PDB name. Both are
+    // public information, readable straight out of the victim's own assembly.
+    push_multipart(
+        &server,
+        API_KEY,
+        build_nupkg("Attacker.Lib", "1.0.0", b"dll"),
+    )
+    .await;
+    let attacker_pdb = build_portable_pdb(&guid);
+    let response = push_symbol(
+        &server,
+        API_KEY,
+        build_snupkg("Attacker.Lib", "1.0.0", "victim.pdb", &attacker_pdb),
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        400,
+        "claiming another package's symbol key must be refused"
+    );
+
+    // And the victim's symbols are untouched and still theirs.
+    let after = fetch().await.unwrap();
+    assert_eq!(after.status(), 200);
+    assert_eq!(after.bytes().await.unwrap().as_ref(), victim_pdb.as_slice());
+}
+
+/// A symbol package names as many entries as it likes, and each one used to be
+/// extracted by re-opening the archive and re-scanning its central directory —
+/// quadratic in the entry count. A 200 KiB upload naming a couple of thousand
+/// PDBs occupied a blocking thread for tens of seconds, and `tokio::fs` shares
+/// that pool, so enough of them stall file I/O server-wide.
+///
+/// The entry count is now capped, and the check has to be cheap: this test
+/// fails on the time as well as the status.
+#[tokio::test]
+async fn a_symbol_package_with_absurdly_many_pdbs_is_refused_quickly() {
+    let server = spawn().await;
+    push_multipart(&server, API_KEY, build_nupkg("Many.Pdbs", "1.0.0", b"dll")).await;
+
+    // Entry names compress away to almost nothing, so this is a small upload.
+    let mut cursor = Cursor::new(Vec::new());
+    {
+        let mut zip = zip::ZipWriter::new(&mut cursor);
+        let opts =
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        zip.start_file("Many.Pdbs.nuspec", opts).unwrap();
+        zip.write_all(
+            br#"<?xml version="1.0"?><package><metadata><id>Many.Pdbs</id>
+                <version>1.0.0</version><authors>a</authors>
+                <description>d</description></metadata></package>"#,
+        )
+        .unwrap();
+        for i in 0..4000 {
+            zip.start_file(format!("lib/net8.0/f{i}.pdb"), opts)
+                .unwrap();
+            zip.write_all(&[0u8; 64]).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+    let snupkg = cursor.into_inner();
+    assert!(
+        snupkg.len() < 1024 * 1024,
+        "the point is that the upload is small"
+    );
+
+    let started = std::time::Instant::now();
+    let response = push_symbol(&server, API_KEY, snupkg).await;
+    let elapsed = started.elapsed();
+
+    assert_eq!(
+        response.status(),
+        400,
+        "an absurd entry count must be refused"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(10),
+        "took {elapsed:?}; the entry count should be rejected before any extraction"
+    );
+}

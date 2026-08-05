@@ -103,6 +103,72 @@ pub async fn extract_file(
         .map_err(|e| Error::Other(anyhow::anyhow!("nupkg extract task panicked: {e}")))?
 }
 
+/// Extract several named entries in **one** pass over the archive.
+///
+/// [`extract_file`] re-opens the file and re-parses the central directory on
+/// every call, then scans it linearly for the name. Calling it once per entry is
+/// therefore quadratic in the entry count, and a `.snupkg` can name as many
+/// entries as it likes — so an upload of a few hundred KiB could occupy a
+/// blocking thread for tens of minutes. This opens and parses once.
+///
+/// `max_bytes_each` caps an individual entry and `max_total_bytes` caps the sum,
+/// because the results are held in memory. Entries that would push the total
+/// over the cap are not read, and the returned vector is short — the caller is
+/// expected to notice and report rather than silently proceed.
+///
+/// Returns the entries in archive order, each as `(original name, bytes)`.
+/// Names that are absent are skipped.
+pub async fn extract_entries(
+    path: impl AsRef<Path>,
+    entry_names: &[String],
+    max_bytes_each: u64,
+    max_total_bytes: u64,
+) -> Result<Vec<(String, Vec<u8>)>, Error> {
+    let path: PathBuf = path.as_ref().to_path_buf();
+    let wanted: std::collections::HashSet<String> =
+        entry_names.iter().map(|n| normalize_entry(n)).collect();
+    tokio::task::spawn_blocking(move || {
+        extract_entries_blocking(&path, &wanted, max_bytes_each, max_total_bytes)
+    })
+    .await
+    .map_err(|e| Error::Other(anyhow::anyhow!("nupkg extract task panicked: {e}")))?
+}
+
+fn extract_entries_blocking(
+    path: &Path,
+    wanted: &std::collections::HashSet<String>,
+    max_bytes_each: u64,
+    max_total_bytes: u64,
+) -> Result<Vec<(String, Vec<u8>)>, Error> {
+    let file = std::fs::File::open(path)?;
+    let mut archive = zip::ZipArchive::new(file)
+        .map_err(|e| Error::InvalidPackage(format!("not a valid zip/nupkg: {e}")))?;
+
+    let mut out = Vec::new();
+    let mut total: u64 = 0;
+    for i in 0..archive.len() {
+        let mut entry = archive
+            .by_index(i)
+            .map_err(|e| Error::InvalidPackage(format!("corrupt zip entry: {e}")))?;
+        let name = entry.name().to_string();
+        if !wanted.contains(&normalize_entry(&name)) {
+            continue;
+        }
+        let remaining = max_total_bytes.saturating_sub(total);
+        if remaining == 0 {
+            break;
+        }
+        let mut buf = Vec::new();
+        (&mut entry)
+            .take(max_bytes_each.min(remaining))
+            .read_to_end(&mut buf)
+            .map_err(Error::Io)?;
+        total = total.saturating_add(buf.len() as u64);
+        out.push((name, buf));
+    }
+    Ok(out)
+}
+
 fn extract_file_blocking(
     path: &Path,
     needle: &str,
