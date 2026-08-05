@@ -64,10 +64,13 @@ scripts/capture-media.sh
 
 It builds the server, starts two throwaway instances (one seeded with a
 realistic feed, one empty for the first-run panel), drives a real browser
-against them and assembles the GIFs. A push to `main` that touches the UI and
-leaves the committed media stale fails CI, so this is not something you can
-forget quietly; the `Refresh product media` workflow also regenerates them on
-demand and opens a pull request.
+against them and assembles the GIFs.
+
+Forgetting is handled too: the `Refresh product media` workflow re-runs the
+same script whenever the UI or docs change on `main`, and opens a pull request
+when the result differs from what is committed. Review that pull request rather
+than merging it blind — a CI runner does not render byte-identically to your
+machine, so part of any diff is the runner rather than your change.
 
 ## What good changes look like
 

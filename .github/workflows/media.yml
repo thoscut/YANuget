@@ -4,11 +4,14 @@ name: Refresh product media
 # so they go stale the moment the gallery changes — and a stale screenshot is
 # worse than none, because it is believed.
 #
-# Manual runs regenerate and open a pull request. Pushes that touch the UI or
-# the docs regenerate too, and *fail* if the result differs from what is
-# committed: that turns "the media is out of date" into a visible signal
-# instead of something nobody notices for months. The fix is one click on the
-# manual run.
+# Any run that finds the committed media out of date opens a pull request with
+# the new captures. It deliberately does *not* fail the build on a difference:
+# these are screenshots rendered by a headless browser, and a GitHub runner will
+# not produce byte-identical PNGs to a developer's machine — different font
+# packages, different Chromium build, different subpixel rounding. A byte
+# comparison would therefore go red on the first push after merge and stay red,
+# which trains everyone to ignore it. A pull request someone can look at is the
+# honest signal.
 on:
   workflow_dispatch:
   push:
@@ -74,9 +77,8 @@ jobs:
             git diff --stat -- .github/media
           fi
 
-      # A manual run is someone asking for an update, so it produces one.
       - name: Open a pull request
-        if: github.event_name == 'workflow_dispatch' && steps.diff.outputs.changed == 'true'
+        if: steps.diff.outputs.changed == 'true'
         uses: peter-evans/create-pull-request@v7
         with:
           add-paths: .github/media
@@ -90,13 +92,13 @@ jobs:
             renders — review the diff as you would a UI change, because that is
             what it is.
 
-      # A push is not, so it only says so, loudly.
-      - name: Fail if the committed media is stale
-        if: github.event_name == 'push' && steps.diff.outputs.changed == 'true'
+      - name: Note that a refresh is pending
+        if: steps.diff.outputs.changed == 'true'
         run: |
-          echo "::error::The gallery changed but .github/media did not. Run the \
-          'Refresh product media' workflow (or scripts/capture-media.sh) to update it."
-          exit 1
+          echo "::notice::The captures differ from what is committed; a pull \
+          request with the new ones has been opened. Some of the difference may \
+          be this runner rendering differently, so review it rather than merging \
+          it blind."
 
       # Either way, the freshly captured media is downloadable from the run.
       - name: Upload the captures
