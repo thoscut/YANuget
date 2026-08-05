@@ -305,6 +305,42 @@ struct GlobalLayers {
     /// Stamp HSTS (only when this process terminates TLS itself).
     hsts: bool,
     trusted_proxies: Arc<TrustedProxies>,
+    /// Browser origins allowed to read this server. Empty means no CORS headers.
+    cors_allowed_origins: Vec<String>,
+}
+
+/// The CORS layer for the configured origins.
+///
+/// Nothing at all when none are configured, which is the default. CORS only
+/// constrains browsers — a NuGet client neither sends `Origin` nor cares about
+/// the response header — so the permissive `*` this replaces bought clients
+/// nothing while letting any page an employee visited read a network-gated
+/// feed's whole inventory out of `/v3/search`.
+///
+/// `*` remains available as an explicit choice, and is the right one for a feed
+/// that really is public.
+fn cors_layer(origins: &[String]) -> CorsLayer {
+    if origins.is_empty() {
+        // `CorsLayer::new()` adds no headers at all.
+        return CorsLayer::new();
+    }
+    if origins.iter().any(|o| o == "*") {
+        return CorsLayer::permissive();
+    }
+    let parsed: Vec<HeaderValue> = origins
+        .iter()
+        .filter_map(|o| match HeaderValue::from_str(o) {
+            Ok(v) => Some(v),
+            Err(_) => {
+                tracing::warn!(origin = %o, "ignoring unparseable cors_allowed_origins entry");
+                None
+            }
+        })
+        .collect();
+    CorsLayer::new()
+        .allow_origin(parsed)
+        .allow_methods(tower_http::cors::Any)
+        .allow_headers(tower_http::cors::Any)
 }
 
 /// Delete upload temp files left over from a previous run.
@@ -350,6 +386,10 @@ impl GlobalLayers {
         Self {
             rate_limit: config.as_ref().map(|c| c.rate_limit.clone()),
             hsts: config.as_ref().is_some_and(|c| c.tls_enabled),
+            cors_allowed_origins: config
+                .as_ref()
+                .map(|c| c.cors_allowed_origins.clone())
+                .unwrap_or_default(),
             trusted_proxies: Arc::new(
                 config
                     .as_ref()
@@ -373,7 +413,7 @@ impl GlobalLayers {
 fn apply_global_layers(router: Router, layers: GlobalLayers) -> Router {
     let mut router = router
         .layer(DefaultBodyLimit::disable())
-        .layer(CorsLayer::permissive())
+        .layer(cors_layer(&layers.cors_allowed_origins))
         .layer(TraceLayer::new_for_http());
     // Added before HSTS so it stays inner: short-circuits abusive callers, and
     // its 429 response still flows out through the HSTS layer below.

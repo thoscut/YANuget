@@ -82,27 +82,50 @@ primary_client = "choco"      # YANUGET_PRIMARY_CLIENT
 # So they are only honoured from a peer listed here; from anyone else they are
 # stripped before any handler sees them. Entries may be an IP, a CIDR block,
 # "private" (loopback + link-local + RFC1918/ULA — where reverse proxies
-# actually live, and the default), or "*" to trust every peer.
+# actually live), or "*" to trust every peer.
 #
-# An empty list trusts nobody, which is right when this server faces the
-# internet directly. Setting base_url pins the generated URLs regardless.
+# EMPTY BY DEFAULT — nobody is trusted. Trusting private ranges out of the box
+# reads as convenient, since that is where proxies live, but the most common
+# deployment is an internal feed on a LAN with no proxy at all, and there every
+# client machine sits inside those ranges. Any of them could then send a fresh
+# X-Forwarded-For per request and land in a fresh rate-limit bucket.
+#
+# Behind a proxy, list that proxy's address (or "private" when it is on the same
+# host). Setting base_url pins the generated URLs regardless of any header.
 # ---------------------------------------------------------------------------
 # YANUGET_TRUSTED_PROXIES (comma-separated) replaces this list entirely.
-trusted_proxies = ["private"]
+trusted_proxies = []
+
+# ---------------------------------------------------------------------------
+# CORS — which browser origins may read this server cross-origin.
+#
+# Empty by default, so no CORS headers are sent at all. This only ever affects
+# browsers: a NuGet client neither sends Origin nor looks at the response
+# header. Sending "*" would let any page a user with network reach happens to
+# visit read /v3/search and the package bytes — so a feed protected only by
+# being on the intranet would have no protection against a browser.
+#
+# List the origins that genuinely need it, or "*" for a feed that really is
+# public. TOML only; there is no environment variable.
+# ---------------------------------------------------------------------------
+cors_allowed_origins = []
 
 # ---------------------------------------------------------------------------
 # Rate limiting — per-client-IP request throttling (brute-force mitigation).
 #
-# On by default with a generous limit so ordinary restores are unaffected while
-# online API-key guessing is throttled. The client IP is taken from
-# X-Forwarded-For / X-Real-IP when the peer is a trusted proxy (see
-# trusted_proxies above) and otherwise the peer address. Tune up for very
-# high-volume read traffic, or disable and rely on a reverse proxy. Exceeding
-# the limit returns 429 with a Retry-After header.
+# On by default. The limit has to clear a LARGE RESTORE, not a typical request
+# rate: a few hundred packages means roughly three requests each, mostly in
+# parallel, and behind corporate NAT or a CI egress gateway every developer
+# shares one bucket. NuGet also treats 429 as terminal — it neither retries nor
+# honours Retry-After — so being throttled mid-restore fails the build. The
+# default is far above anything legitimate while still bounding key guessing.
+#
+# The client IP is taken from X-Forwarded-For / X-Real-IP when the peer is a
+# trusted proxy (see trusted_proxies above) and otherwise the peer address.
 # ---------------------------------------------------------------------------
 [rate_limit]
 enabled = true                # YANUGET_RATELIMIT_ENABLED
-max_requests = 1000           # YANUGET_RATELIMIT_MAX_REQUESTS — per IP per window
+max_requests = 10000          # YANUGET_RATELIMIT_MAX_REQUESTS — per IP per window
 window_secs = 60              # YANUGET_RATELIMIT_WINDOW_SECS
 
 # ---------------------------------------------------------------------------

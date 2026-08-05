@@ -73,10 +73,15 @@ Configuration choices that matter most:
 
 - **Set `api_key`.** Without one, anybody who can reach the server can push and
   delete.
-- **Set `trusted_proxies` to match reality.** The default trusts private ranges.
-  If the server is directly reachable from the internet, set it to `[]`; if it
-  sits behind a proxy on a public address, list that address. Getting this wrong
-  is what lets a client be pointed elsewhere.
+- **Set `trusted_proxies` when, and only when, you run behind a proxy.** It is
+  empty by default, so forwarding headers are ignored — which is what keeps a
+  client from steering the URLs handed to other clients, or rotating
+  `X-Forwarded-For` to walk through the rate limiter. Behind a proxy, list that
+  proxy's address.
+- **Set `cors_allowed_origins` only if a browser really needs cross-origin
+  access.** It is empty by default, so no CORS headers are sent. `*` makes the
+  feed's whole inventory readable by any page a user with network reach
+  visits.
 - **Set `base_url`** when the server is behind a proxy, rather than relying on
   forwarded headers, if you can.
 - **Use a real certificate** (`tls_cert_path`/`tls_key_path`), or terminate TLS

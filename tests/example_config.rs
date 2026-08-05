@@ -16,8 +16,15 @@ fn shipped_example_config_parses() {
 
     // Spot-check that it really deserialized rather than falling back to
     // defaults for everything.
-    assert!(!config.trusted_proxies.is_empty());
     assert!(config.rate_limit.enabled);
+    assert_eq!(config.rate_limit.max_requests, 10_000);
+    // Empty is the *default*, so it proves nothing on its own; the port does.
+    assert_eq!(config.port, 5000);
+    assert!(
+        config.trusted_proxies.is_empty(),
+        "example ships the secure default"
+    );
+    assert!(config.cors_allowed_origins.is_empty());
 }
 
 /// The `[[feeds]]` documentation is all commented out in the example file, so

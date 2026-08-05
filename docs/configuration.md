@@ -40,8 +40,13 @@ Booleans accept `1/true/yes/on` (case-insensitive) via environment variables.
 Per-client-IP request throttling under the `[rate_limit]` table. A fixed window
 of `window_secs` allows at most `max_requests` requests per client IP; exceeding
 it returns `429 Too Many Requests` with a `Retry-After` header. It is **on by
-default** with a generous limit so ordinary restores are unaffected while online
-API-key guessing is throttled. The client IP is taken from `X-Forwarded-For` /
+default**. The limit has to clear a *large restore*, not a typical request
+rate: a few hundred packages means roughly three requests each, mostly in
+parallel, and behind corporate NAT or a CI egress gateway every developer shares
+one bucket. NuGet also treats `429` as terminal — it neither retries nor honours
+`Retry-After` — so being throttled mid-restore fails the build outright. The
+default is far above anything legitimate while still bounding online API-key
+guessing. The client IP is taken from `X-Forwarded-For` /
 `X-Real-IP` **when the connection peer is a trusted proxy** (see
 [Trusted proxies](#trusted-proxies)) and otherwise the peer address; requests
 with no determinable IP are not throttled. For very high read volume, raise the
@@ -50,7 +55,7 @@ limit or disable it and rely on a reverse proxy.
 | TOML key | Env var | Type | Default | Description |
 | --- | --- | --- | --- | --- |
 | `rate_limit.enabled` | `YANUGET_RATELIMIT_ENABLED` | bool | `true` | Master switch. |
-| `rate_limit.max_requests` | `YANUGET_RATELIMIT_MAX_REQUESTS` | int | `1000` | Max requests per IP per window (min 1). |
+| `rate_limit.max_requests` | `YANUGET_RATELIMIT_MAX_REQUESTS` | int | `10000` | Max requests per IP per window (min 1). |
 | `rate_limit.window_secs` | `YANUGET_RATELIMIT_WINDOW_SECS` | int | `60` | Window length in seconds. |
 
 ## Trusted proxies
@@ -71,20 +76,27 @@ walk through the per-IP throttle by rotating `X-Forwarded-For`.
 
 | TOML key | Env var | Type | Default | Description |
 | --- | --- | --- | --- | --- |
-| `trusted_proxies` | `YANUGET_TRUSTED_PROXIES` | list | `["private"]` | Peers allowed to set forwarding headers. |
+| `trusted_proxies` | `YANUGET_TRUSTED_PROXIES` | list | `[]` | Peers allowed to set forwarding headers. Empty trusts nobody. |
 
 Each entry is one of:
 
 | Entry | Meaning |
 | --- | --- |
-| `private` | Loopback, link-local and RFC1918/ULA ranges — where reverse proxies actually live. The default. |
+| `private` | Loopback, link-local and RFC1918/ULA ranges — where reverse proxies actually live. |
 | `10.0.0.0/8`, `2001:db8::/32` | An explicit CIDR block. |
 | `10.1.2.3` | A single address. |
 | `*` | Trust every peer (the old, unguarded behaviour). |
 
-An **empty list trusts nobody**, which is the right setting when YANuget faces
-the internet directly. The environment variable is comma-separated and replaces
-the list wholesale, so `YANUGET_TRUSTED_PROXIES=` disables forwarding entirely.
+**The default is an empty list — nobody is trusted.** Trusting private ranges
+out of the box reads as convenient, since that is where proxies live, but the
+most common deployment is an internal feed on a LAN with *no* proxy, and there
+every client machine sits inside those ranges. Any of them could then send a
+fresh `X-Forwarded-For` per request and land in a fresh rate-limit bucket,
+defeating the throttle that is supposed to bound API-key guessing.
+
+Behind a proxy, set this to that proxy's address (or `private` if it is on the
+same host or network). The environment variable is comma-separated and replaces
+the list wholesale.
 
 Setting `base_url` pins generated URLs regardless of any header, and is the
 most robust option when you know the public address.

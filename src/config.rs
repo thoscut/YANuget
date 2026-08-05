@@ -178,9 +178,32 @@ pub struct Config {
     /// stripped before any handler sees them.
     ///
     /// Each entry is an IP, a CIDR block, `private` (loopback, link-local and
-    /// RFC1918/ULA — where reverse proxies actually live, and the default), or
-    /// `*` to trust every peer. An empty list trusts nobody.
+    /// RFC1918/ULA — where reverse proxies actually live), or `*` to trust
+    /// every peer.
+    ///
+    /// **Empty by default**, which trusts nobody. Trusting whole private ranges
+    /// out of the box read as convenient — that is where proxies live — but the
+    /// most common deployment is an internal feed on a LAN with no proxy at
+    /// all, and there every client machine is inside those ranges. Any of them
+    /// could then set `X-Forwarded-For` to a fresh value per request and land
+    /// in a fresh rate-limit bucket, which is exactly the throttle documented
+    /// as the mitigation for online key guessing.
+    ///
+    /// Behind a proxy, set this to that proxy's address — and prefer setting
+    /// `base_url` as well, so the URLs handed to clients do not depend on a
+    /// header at all.
     pub trusted_proxies: Vec<String>,
+    /// Origins allowed to read this server from a browser, as
+    /// `Access-Control-Allow-Origin` values. Empty by default, which sends no
+    /// CORS headers at all.
+    ///
+    /// CORS only ever constrains browsers — a NuGet client is unaffected either
+    /// way. Sending `*`, as this used to, meant any web page an employee with
+    /// network reach visited could read `/v3/search` and the package bytes
+    /// cross-origin, so a feed whose only protection was being on the intranet
+    /// had none against a browser. List the origins that genuinely need it, or
+    /// `*` to restore the old behaviour deliberately.
+    pub cors_allowed_origins: Vec<String>,
     /// Hosted feeds. When empty, a single implicit feed named `default` is
     /// served at the server root (the historical single-feed behaviour). When
     /// non-empty, each feed is mounted under `/{name}` and the root serves a
@@ -408,9 +431,16 @@ impl RetentionConfig {
 /// `max_requests` requests per client IP, after which requests are answered with
 /// `429 Too Many Requests` until the window rolls over. The client IP is taken
 /// from `X-Forwarded-For`/`X-Real-IP` (for proxied deployments) and otherwise
-/// the peer address. On by default with a generous limit so ordinary restores
-/// are unaffected while online key brute-forcing is throttled; a reverse proxy
-/// can complement it.
+/// the peer address.
+///
+/// On by default. The limit has to clear a *large restore*, not a typical
+/// request rate: a solution with a few hundred packages issues roughly three
+/// requests each — registration, flat container, payload — mostly in parallel,
+/// and behind corporate NAT or a CI egress gateway every developer shares one
+/// bucket. NuGet also treats `429` as terminal: it neither retries nor honours
+/// `Retry-After`, so being throttled mid-restore fails the build outright. The
+/// default is therefore far above anything legitimate while still bounding
+/// online key guessing; a reverse proxy can complement it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RateLimitConfig {
@@ -426,7 +456,7 @@ impl Default for RateLimitConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            max_requests: 1000,
+            max_requests: 10_000,
             window_secs: 60,
         }
     }
@@ -456,7 +486,8 @@ impl Default for Config {
             primary_client: "choco".to_string(),
             retention: RetentionConfig::default(),
             rate_limit: RateLimitConfig::default(),
-            trusted_proxies: vec!["private".to_string()],
+            trusted_proxies: Vec::new(),
+            cors_allowed_origins: Vec::new(),
             feeds: Vec::new(),
         }
     }
@@ -817,20 +848,36 @@ mod tests {
     }
 
     #[test]
-    fn trusted_proxies_default_to_private_ranges() {
+    fn no_peer_is_trusted_to_forward_by_default() {
+        // The default deployment is a feed on a LAN with no proxy, where
+        // trusting private ranges means trusting every client machine — and a
+        // client that can set `X-Forwarded-For` can pick its own rate-limit
+        // bucket.
         let c = Config::default();
-        let trusted = c.trusted_proxies();
-        assert!(trusted.trusts("127.0.0.1".parse().unwrap()));
-        assert!(trusted.trusts("10.9.8.7".parse().unwrap()));
-        // A public peer is never allowed to declare its own forwarded host.
-        assert!(!trusted.trusts("198.51.100.4".parse().unwrap()));
+        assert!(c.trusted_proxies().is_empty());
 
-        // An explicitly empty list trusts nobody.
-        let none = Config {
-            trusted_proxies: Vec::new(),
+        // Opting in still works, and still refuses a public peer.
+        let private = Config {
+            trusted_proxies: vec!["private".into()],
             ..Config::default()
         };
-        assert!(none.trusted_proxies().is_empty());
+        let trusted = private.trusted_proxies();
+        assert!(trusted.trusts("127.0.0.1".parse().unwrap()));
+        assert!(trusted.trusts("10.9.8.7".parse().unwrap()));
+        assert!(!trusted.trusts("198.51.100.4".parse().unwrap()));
+    }
+
+    #[test]
+    fn the_rate_limit_default_clears_a_large_restore() {
+        // ~300 packages x 3 requests, with everyone behind one NAT address,
+        // must not hit the ceiling: NuGet treats 429 as terminal.
+        let c = RateLimitConfig::default();
+        assert!(c.enabled);
+        assert!(
+            c.max_requests >= 5_000,
+            "a large restore would be throttled at {}",
+            c.max_requests
+        );
     }
 
     #[test]

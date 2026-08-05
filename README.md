@@ -122,8 +122,9 @@ The essentials:
 | Max upload size | `YANUGET_MAX_PACKAGE_SIZE_BYTES` | *(unlimited)* | Streams to disk regardless. |
 | Overwrite | `YANUGET_ALLOW_OVERWRITE` | `false` | `false`/`true`/`prerelease-only`. |
 | Hard delete | `YANUGET_HARD_DELETE_ENABLED` | `false` | Otherwise DELETE unlists. |
-| Rate limit | `YANUGET_RATELIMIT_*` | on, 1000/60s | Per-IP throttle; returns `429`. |
-| Trusted proxies | `YANUGET_TRUSTED_PROXIES` | `private` | Peers whose `X-Forwarded-*` is honoured. |
+| Rate limit | `YANUGET_RATELIMIT_*` | on, 10000/60s | Per-IP throttle; returns `429`. |
+| Trusted proxies | `YANUGET_TRUSTED_PROXIES` | *(none)* | Peers whose `X-Forwarded-*` is honoured. Set behind a proxy. |
+| CORS origins | *(TOML only)* | *(none)* | Browser origins allowed to read the feed. |
 
 ---
 

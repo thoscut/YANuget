@@ -659,6 +659,9 @@ async fn rate_limit_returns_429_after_threshold() {
         c.rate_limit.enabled = true;
         c.rate_limit.max_requests = 3;
         c.rate_limit.window_secs = 60;
+        // This test identifies its client by `X-Forwarded-For`, which is only
+        // honoured from a trusted peer.
+        c.trusted_proxies = vec!["private".into()];
     })
     .await;
     let url = server.url("/health");
@@ -1275,7 +1278,9 @@ fn package_base_address(index: &serde_json::Value) -> String {
 
 #[tokio::test]
 async fn forwarded_headers_drive_generated_urls() {
-    let server = spawn().await;
+    // Forwarding headers are ignored by default now, so a test about them has
+    // to say the peer is a proxy — which is what a real proxy deployment does.
+    let server = spawn_with(|c| c.trusted_proxies = vec!["private".into()]).await;
     let index: serde_json::Value = server
         .client
         .get(server.url("/v3/index.json"))
@@ -1295,7 +1300,7 @@ async fn forwarded_headers_drive_generated_urls() {
 
 #[tokio::test]
 async fn forwarded_host_takes_first_of_a_list() {
-    let server = spawn().await;
+    let server = spawn_with(|c| c.trusted_proxies = vec!["private".into()]).await;
     let index: serde_json::Value = server
         .client
         .get(server.url("/v3/index.json"))
@@ -3040,4 +3045,54 @@ async fn promotion_is_held_to_the_target_feeds_license_policy() {
         .await
         .unwrap();
     assert_eq!(listed.status(), 404);
+}
+
+/// The three defaults that decide whether an out-of-the-box deployment is safe.
+#[tokio::test]
+async fn the_defaults_do_not_trust_the_network_around_them() {
+    let server = spawn().await;
+
+    // 1. Forwarding headers from an untrusted peer are ignored, so a client
+    //    cannot steer the URLs handed to other clients — nor pick its own
+    //    rate-limit bucket, which is what makes the throttle meaningful.
+    let index: serde_json::Value = server
+        .client
+        .get(server.url("/v3/index.json"))
+        .header("X-Forwarded-Proto", "https")
+        .header("X-Forwarded-Host", "attacker.example.com")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let advertised = index["resources"][0]["@id"].as_str().unwrap();
+    assert!(
+        !advertised.contains("attacker.example.com"),
+        "an untrusted peer steered a generated URL: {advertised}"
+    );
+
+    // 2. No CORS headers, so a page the operator's browser happens to load
+    //    cannot read this feed's inventory cross-origin.
+    let response = server
+        .client
+        .get(server.url("/v3/search?q="))
+        .header("Origin", "https://evil.example.com")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert!(
+        response
+            .headers()
+            .get("access-control-allow-origin")
+            .is_none(),
+        "a network-gated feed answered a cross-origin read"
+    );
+
+    // 3. The rate limit is on, but high enough that a large restore cannot
+    //    trip it — NuGet treats 429 as terminal and will not retry.
+    let config = yanuget::config::Config::default();
+    assert!(config.rate_limit.enabled);
+    assert!(config.rate_limit.max_requests >= 5_000);
 }
