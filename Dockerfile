@@ -7,13 +7,13 @@ FROM rust:1.88-slim AS builder
 WORKDIR /app
 
 # Cache dependencies first. `build.rs` has to be present even for this dummy
-# build: it is what guarantees the embeddable `site/` directory exists, and
+# build: it is what stages the embeddable documentation site into `OUT_DIR`, and
 # `src/web/docs.rs` does not compile without it.
 COPY Cargo.toml Cargo.lock build.rs ./
 RUN mkdir src \
     && echo "fn main() {}" > src/main.rs \
     && echo "" > src/lib.rs \
-    && cargo build --release 2>/dev/null || true
+    && cargo build --release --locked 2>/dev/null || true
 RUN rm -rf src
 
 # Render the documentation so the real site is embedded rather than the
@@ -26,7 +26,7 @@ RUN set -eu; \
        && apt-get install -y --no-install-recommends python3 python3-venv >/dev/null \
        && python3 -m venv /opt/docs-venv \
        && /opt/docs-venv/bin/pip install --no-cache-dir -r requirements-docs.txt \
-       && /opt/docs-venv/bin/mkdocs build; then \
+       && /opt/docs-venv/bin/mkdocs build --strict; then \
       echo "documentation site built"; \
     else \
       echo "docs build skipped; the placeholder page will be embedded"; \
@@ -35,10 +35,17 @@ RUN set -eu; \
 
 # Build the real sources.
 COPY src ./src
-RUN touch src/main.rs src/lib.rs && cargo build --release
+RUN touch src/main.rs src/lib.rs && cargo build --release --locked
 
 # Runtime stage
 FROM debian:bookworm-slim AS runtime
+
+LABEL org.opencontainers.image.title="YANuget" \
+      org.opencontainers.image.description="Yet Another NuGet server — a fast, streaming NuGet v3 server in Rust" \
+      org.opencontainers.image.source="https://github.com/thoscut/yanuget" \
+      org.opencontainers.image.documentation="https://github.com/thoscut/yanuget#readme" \
+      org.opencontainers.image.licenses="MIT"
+
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*

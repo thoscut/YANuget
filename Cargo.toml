@@ -6,10 +6,17 @@ rust-version = "1.88"
 description = "YANuget — Yet Another NuGet server. A fast, streaming NuGet V3 server written in Rust, reimplementing BaGetter."
 license = "MIT"
 repository = "https://github.com/thoscut/yanuget"
+homepage = "https://github.com/thoscut/yanuget"
+documentation = "https://docs.rs/yanuget"
 readme = "README.md"
 keywords = ["nuget", "server", "package", "registry"]
 categories = ["web-programming::http-server"]
 default-run = "yanuget"
+
+# The published crate is the source needed to build the server, nothing else.
+# `site/` is generated (and gitignored, so excluded anyway); this keeps CI
+# config and the end-to-end script out of every download.
+exclude = [".github/", "scripts/", "site/"]
 
 [lib]
 name = "yanuget"
@@ -52,7 +59,7 @@ mime = "0.3"
 percent-encoding = "2"
 toml = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
-rust-embed = { version = "8", features = ["debug-embed"] }
+rust-embed = { version = "8", features = ["debug-embed", "interpolate-folder-path"] }
 indicatif = "0.17"
 
 [dev-dependencies]

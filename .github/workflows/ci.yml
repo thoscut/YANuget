@@ -43,7 +43,9 @@ jobs:
       - name: Build documentation site
         run: |
           pip install -r requirements-docs.txt
-          mkdocs build
+          # `--strict` so a broken cross-reference fails here rather than 404ing
+          # for someone reading the docs the binary serves.
+          mkdocs build --strict
           # Enforce offline: HTML/CSS (the files that *declare* loaded resources)
           # must reference no external asset hosts. JS bundles are served locally,
           # so substrings inside them (e.g. UMD comments) are not flagged.
@@ -109,6 +111,54 @@ jobs:
       # build never compiles. Ignored deliberately; revisit if a fix ships.
       - name: Audit dependencies for known vulnerabilities
         run: cargo audit --ignore RUSTSEC-2023-0071
+
+  package:
+    # The release path is not the same as the build path: `cargo publish`
+    # packages a tarball from a clean checkout and rebuilds it in isolation, and
+    # the container image builds from a context that has no `site/` and no
+    # network guarantee. Both have broken while `cargo build` stayed green, so
+    # both are checked on every push rather than discovered at tag time.
+    name: Packaging
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-package-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-package-
+
+      # Deliberately without a docs site present: this is how crates.io builds
+      # it, and it is what caught `build.rs` writing outside `OUT_DIR`.
+      - name: Verify the crate packages and builds from its tarball
+        run: cargo publish --dry-run --locked
+
+      - name: Build the container image
+        run: docker build -t yanuget:ci .
+
+      - name: Container starts and reports healthy
+        run: |
+          set -euo pipefail
+          docker run -d --name yanuget-ci -p 5000:5000 \
+            -e YANUGET_API_KEY=ci-key yanuget:ci
+          for _ in $(seq 1 30); do
+            state=$(docker inspect -f '{{.State.Health.Status}}' yanuget-ci)
+            [ "$state" = healthy ] && break
+            [ "$state" = unhealthy ] && break
+            sleep 2
+          done
+          docker logs yanuget-ci
+          [ "$(docker inspect -f '{{.State.Health.Status}}' yanuget-ci)" = healthy ]
+          curl -fsSk https://127.0.0.1:5000/v3/index.json >/dev/null
+          docker rm -f yanuget-ci
 
   client-compat:
     # The Rust tests drive the server with `reqwest` — a faithful HTTP client,

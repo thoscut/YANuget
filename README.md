@@ -1,14 +1,19 @@
 # YANuget
 
+[![CI](https://github.com/thoscut/yanuget/actions/workflows/ci.yml/badge.svg)](https://github.com/thoscut/yanuget/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Rust 1.88+](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org)
+
 **Yet Another NuGet server** — a fast, streaming [NuGet v3](https://learn.microsoft.com/en-us/nuget/api/overview)
 server written in Rust. YANuget is a from-scratch reimplementation of
 [BaGetter](https://github.com/bagetter/BaGetter) (itself a fork of BaGet), built
 around one guiding constraint: **handle very large packages (25 GB and beyond)
 without ever loading them into memory.**
 
-> Status: feature-complete core. Push/restore/search/registration work with the
-> official `dotnet`/`nuget` clients. See [Roadmap](#roadmap) for what is not yet
-> implemented.
+> Status: the core is complete and verified end to end against the real `dotnet`
+> client in CI — pack, push, restore, build and run — alongside the symbol
+> server and the multi-feed features. See [Roadmap](#roadmap) for what is not
+> implemented, and the [changelog](CHANGELOG.md) for what changed.
 
 ---
 
@@ -34,6 +39,22 @@ See [docs/large-packages.md](docs/large-packages.md) for the full design.
 
 ## Quick start
 
+### Container
+
+```bash
+docker run -d --name yanuget -p 5000:5000 \
+  -e YANUGET_API_KEY=change-me \
+  -v yanuget-data:/data \
+  ghcr.io/thoscut/yanuget:latest
+```
+
+### Pre-built binary
+
+Download the archive for your platform from the
+[latest release](https://github.com/thoscut/yanuget/releases/latest), verify it
+against `SHA256SUMS`, unpack and run. Release binaries ship the full offline
+documentation.
+
 ### From source
 
 ```bash
@@ -43,6 +64,10 @@ cargo build --release
 # Run with an API key and a data directory
 YANUGET_API_KEY=change-me ./target/release/yanuget
 ```
+
+Or `cargo install yanuget` — same binary, except that `/docs` serves a
+placeholder linking to the online documentation, since the rendered site is
+generated rather than shipped in the crate.
 
 The server prints its listen address and service index URL on startup.
 **TLS is on by default**, so it listens on `https://0.0.0.0:5000` with an
@@ -254,9 +279,10 @@ pip install -r requirements-docs.txt
 mkdocs build      # outputs site/, embedded at compile time
 ```
 
-Release binaries ship the rendered docs; a plain `cargo build` without MkDocs
-still compiles (a small placeholder page is embedded instead). The Markdown
-sources live in [`docs/`](docs/).
+Release binaries and the container image ship the rendered docs; a plain
+`cargo build` without MkDocs still compiles (a small placeholder page is embedded
+instead), as does an install from crates.io. The Markdown sources live in
+[`docs/`](docs/).
 
 ## Admin moderation
 
@@ -390,6 +416,18 @@ Not yet implemented (contributions welcome): additional storage backends
 (S3/Azure Blob) and database backends (PostgreSQL/MySQL), online vulnerability
 scanning, and native (Windows) PDB indexing. These are deliberately behind trait
 boundaries so they can be added without touching the core.
+
+---
+
+## Contributing & security
+
+Bug reports and pull requests are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md)
+for how to build, what CI enforces, and how the code is laid out.
+
+Please report security problems privately rather than in a public issue:
+[SECURITY.md](SECURITY.md) explains how, and what is in scope.
+
+Releases are cut from tags; the process is in [RELEASING.md](RELEASING.md).
 
 ---
 

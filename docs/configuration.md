@@ -7,7 +7,7 @@ YANuget reads configuration from three layers, each overriding the previous:
 3. **Environment variables** (`YANUGET_*`) — these win.
 
 A fully commented template lives in
-[`yanuget.example.toml`](../yanuget.example.toml).
+[`yanuget.example.toml`](https://github.com/thoscut/yanuget/blob/main/yanuget.example.toml).
 
 ## Options
 

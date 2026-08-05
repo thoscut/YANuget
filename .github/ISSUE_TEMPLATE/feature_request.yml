@@ -1,0 +1,25 @@
+name: Feature request
+description: Suggest something YANuget should be able to do
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: >
+        What are you trying to do that YANuget makes hard or impossible? Describe
+        the situation rather than the solution — it often has more than one.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you have in mind
+      description: If you already have a shape in mind, sketch it here.
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What you tried instead
+      description: Workarounds, other servers, or configuration that nearly worked.

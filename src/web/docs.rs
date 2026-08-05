@@ -2,9 +2,10 @@
 //!
 //! The site is built with `mkdocs build` into `site/` and baked into the binary
 //! at compile time via [`rust_embed`], so the running server serves its own help
-//! with no filesystem dependency and no external network access. A `build.rs`
-//! guarantees `site/` exists (writing a placeholder when mkdocs has not run), so
-//! a plain `cargo build` works without Python.
+//! with no filesystem dependency and no external network access. `build.rs`
+//! stages that site into `$OUT_DIR/site` — writing a placeholder page there when
+//! mkdocs has not run — so a plain `cargo build` works without Python and the
+//! source tree is never written to.
 
 use axum::extract::{OriginalUri, Path};
 use axum::http::{header, StatusCode};
@@ -12,7 +13,7 @@ use axum::response::{IntoResponse, Redirect, Response};
 use rust_embed::RustEmbed;
 
 #[derive(RustEmbed)]
-#[folder = "site/"]
+#[folder = "$OUT_DIR/site/"]
 struct DocSite;
 
 /// `/docs` → redirect to `/docs/` so the site's relative asset/page links
