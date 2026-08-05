@@ -1,0 +1,13 @@
+{
+  "name": "yanuget-media",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Screenshot and walkthrough capture for the YANuget README. Not part of the server build.",
+  "type": "module",
+  "scripts": {
+    "capture": "node capture.mjs"
+  },
+  "dependencies": {
+    "playwright": "^1.56.1"
+  }
+}
