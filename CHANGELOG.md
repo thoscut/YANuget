@@ -101,16 +101,43 @@ The threat this release is most concerned with is not the server being
 compromised but the server becoming a hazard to the clients that restore from
 it. The following are properties of this release, not fixes to a shipped one:
 
-- `X-Forwarded-*` and `Forwarded` headers are honoured only from peers listed
-  in `trusted_proxies` (default: private ranges). Untrusted peers cannot steer
-  the absolute URLs a restoring client is handed, nor evade the rate limiter by
-  forging a client address.
+**The defaults fail closed.** Each of these is the safe answer rather than the
+convenient one, because the convenient one is what an unconfigured deployment
+gets:
+
+- `X-Forwarded-*` and `Forwarded` are honoured only from peers listed in
+  `trusted_proxies`, which is **empty by default**. Trusting private ranges
+  would cover reverse proxies, but the common deployment is an internal feed on
+  a LAN with no proxy — where every client machine is in those ranges and could
+  rotate `X-Forwarded-For` to evade the rate limiter, or steer the absolute
+  URLs a restoring client is handed.
+- **No CORS headers** unless `cors_allowed_origins` lists an origin. CORS
+  constrains browsers and nothing else, so a permissive default would buy
+  clients nothing while letting any page a user with network reach visits read
+  a private feed's whole inventory.
+- The rate limit is on at 10 000 requests/minute per IP — above what a large
+  restore needs (a few hundred packages behind one NAT address), because NuGet
+  treats `429` as terminal and neither retries nor honours `Retry-After`.
+
+Beyond the defaults:
+
 - Mirrored packages are verified to be the package that was requested — id,
   version and hash — before being published locally under a trusted name. A
   version already held by another feed with a different hash is rejected.
-- Mirror upstreams are checked for scheme and private-address targets (SSRF),
-  cross-host redirects are refused when credentials are attached, and downloads
-  are size-bounded.
+- Mirror upstreams are checked for scheme and private-address targets on
+  **every redirect hop, not just the first**, and DNS names are resolved before
+  being classified. Cross-host redirects are refused when credentials are
+  attached. Downloads are size-bounded (2 GiB unless configured) and one
+  read-through miss has a 60-second budget, so an anonymous read cannot hold a
+  connection open fetching fifty packages.
+- A symbol package cannot claim a symbol key another package already owns. Both
+  halves of an SSQP key come from the upload, so without that check any push
+  credential could repoint another feed's symbols at itself and serve its own
+  PDB to someone debugging the victim.
+- A version's identity is case-insensitive in its pre-release label, matching
+  what NuGet clients assume — so `1.0.0-Beta` and `1.0.0-beta` cannot become two
+  database rows sharing one file, where one advertises a hash the served bytes
+  no longer match.
 - Archives with mismatched or duplicate central-directory entries (split-view
   ZIPs, where a validator and a consumer disagree about the contents) are
   refused.
@@ -124,8 +151,15 @@ it. The following are properties of this release, not fixes to a shipped one:
   HSTS when serving TLS.
 - Downloads are conditional and immutably cacheable (`ETag` and `304`), and
   `Content-Disposition` filenames are sanitised.
-- Manifest parsing is bounded in depth and element count, and error responses
-  do not leak internal detail.
+- Manifest parsing is bounded in depth and element count — every element,
+  including the ones with their own handling — so a small, highly compressible
+  manifest cannot cost minutes of CPU on an async worker. Symbol packages are
+  bounded in entry count and total extracted bytes, and are read in one pass
+  rather than one pass per entry.
+- The stored `.nuspec` is served as an attachment with `default-src 'none'` and
+  `nosniff`, so a manifest carrying an XSLT processing instruction cannot
+  execute script in the feed's own origin.
+- Error responses do not leak internal detail.
 - Symbol downloads require read authorisation and resolve to a package the
   requester is allowed to see.
 
