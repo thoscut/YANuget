@@ -14,7 +14,7 @@ expected to change incompatibly at any version.
 
 Nothing yet.
 
-## [0.5.0] — 2026-08-05
+## [0.5.0] — 2026-08-11
 
 The first release with a changelog. Versions 0.1.0 to 0.4.0 predate it; what
 follows describes the server as it stands, not only what changed since 0.4.0,
