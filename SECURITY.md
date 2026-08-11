@@ -6,8 +6,8 @@ YANuget is pre-1.0. Only the latest released version receives security fixes.
 
 | Version | Supported |
 | --- | --- |
-| 0.1.x | ✅ |
-| < 0.1 | ❌ |
+| 0.5.x | ✅ |
+| < 0.5 | ❌ |
 
 ## Reporting a vulnerability
 

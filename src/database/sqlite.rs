@@ -222,12 +222,56 @@ impl SqliteDatabase {
         include_semver2: bool,
         listed_only: bool,
     ) -> Result<Vec<SearchGroup>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // One query per chunk rather than one per id. This ran once for every
+        // id on the page — twenty statements for a default gallery view, and up
+        // to a thousand at `take=1000`, against a sixteen-connection pool, on a
+        // page anyone can request.
+        //
+        // Chunked because each id is a bound parameter and SQLite builds before
+        // 3.32 cap those at 999; a single `IN` list of a thousand would be a
+        // latent failure on exactly the deployments least able to debug it.
+        const CHUNK: usize = 400;
+        let mut by_id: std::collections::HashMap<String, Vec<Package>> =
+            std::collections::HashMap::with_capacity(ids.len());
+
+        for chunk in ids.chunks(CHUNK) {
+            // Parameters ?1..?4 are the flags; the ids follow from ?5.
+            let placeholders = (0..chunk.len())
+                .map(|i| format!("?{}", i + 5))
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "{FEED_SELECT} WHERE fp.feed = ?1 \
+                   AND fp.enabled = 1 AND fp.pending = 0 \
+                   AND (?2 = 1 OR fp.listed = 1) \
+                   AND (?3 = 1 OR p.is_prerelease = 0) \
+                   AND (?4 = 1 OR p.is_semver2 = 0) \
+                   AND fp.lower_id IN ({placeholders})"
+            );
+            let mut query = sqlx::query(&sql)
+                .bind(feed)
+                .bind(i64::from(!listed_only))
+                .bind(i64::from(include_prerelease))
+                .bind(i64::from(include_semver2));
+            for id in chunk {
+                query = query.bind(id);
+            }
+            for row in query.fetch_all(&self.pool).await? {
+                let package = row_to_feed_package(&row)?.package;
+                by_id.entry(package.lower_id()).or_default().push(package);
+            }
+        }
+
+        // Emit in the order the caller asked for — that order is the search
+        // ranking, and a HashMap has none.
         let mut groups = Vec::with_capacity(ids.len());
         for id in ids {
-            let packages = self
-                .find_versions_filtered(feed, id, include_prerelease, include_semver2, listed_only)
-                .await?;
-            if !packages.is_empty() {
+            if let Some(mut packages) = by_id.remove(id) {
+                packages.sort_by(|a, b| a.version.cmp(&b.version));
                 groups.push(SearchGroup { packages });
             }
         }
@@ -1297,6 +1341,61 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(page.total_hits, 0);
+    }
+
+    /// `load_groups` batches its ids into one query per chunk and reassembles
+    /// the result. Two things have to survive that: the caller's order, which
+    /// *is* the search ranking and which a `HashMap` does not preserve, and the
+    /// version order inside each group.
+    #[tokio::test]
+    async fn grouped_loading_keeps_both_orderings() {
+        let db = SqliteDatabase::in_memory().await.unwrap();
+        for (id, version) in [
+            ("Alpha.Pkg", "1.0.0"),
+            ("Alpha.Pkg", "2.0.0"),
+            ("Alpha.Pkg", "1.5.0"),
+            ("Beta.Pkg", "0.1.0"),
+            ("Gamma.Pkg", "3.0.0"),
+        ] {
+            db.add_to_feed(FEED, &sample(id, version)).await.unwrap();
+        }
+
+        // Deliberately not alphabetical: this is the ranking the caller chose.
+        let ids = vec![
+            "gamma.pkg".to_string(),
+            "alpha.pkg".to_string(),
+            "beta.pkg".to_string(),
+        ];
+        let groups = db.load_groups(FEED, &ids, true, true, false).await.unwrap();
+
+        assert_eq!(groups.len(), 3);
+        assert_eq!(groups[0].latest().lower_id(), "gamma.pkg");
+        assert_eq!(groups[1].latest().lower_id(), "alpha.pkg");
+        assert_eq!(groups[2].latest().lower_id(), "beta.pkg");
+
+        // Versions ascend within a group, so `latest()` really is the latest.
+        let alpha: Vec<String> = groups[1]
+            .packages
+            .iter()
+            .map(|p| p.normalized_version())
+            .collect();
+        assert_eq!(alpha, ["1.0.0", "1.5.0", "2.0.0"]);
+
+        // An id with nothing visible is dropped rather than yielding an empty
+        // group, which `latest()` would panic on.
+        let missing = vec!["nope.pkg".to_string(), "beta.pkg".to_string()];
+        let groups = db
+            .load_groups(FEED, &missing, true, true, false)
+            .await
+            .unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].latest().lower_id(), "beta.pkg");
+
+        assert!(db
+            .load_groups(FEED, &[], true, true, false)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

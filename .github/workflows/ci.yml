@@ -108,7 +108,14 @@ jobs:
 
       # RUSTSEC-2023-0071 (rsa, Marvin attack) has no fixed release and reaches
       # the lockfile only via sqlx-mysql, an optional driver this sqlite-only
-      # build never compiles. Ignored deliberately; revisit if a fix ships.
+      # build never compiles. Verified rather than assumed: `cargo tree -i rsa
+      # -e normal` finds nothing, so the crate is in `Cargo.lock` and not in the
+      # binary. Ignored deliberately; revisit if a fix ships.
+      #
+      # RUSTSEC-2025-0134 (rustls-pemfile, unmaintained) arrives via
+      # axum-server 0.7, which has no release that drops it. It is a PEM parser
+      # used once at startup on operator-supplied certificate files, so the
+      # exposure is small — but it is tracked, not forgotten.
       - name: Audit dependencies for known vulnerabilities
         run: cargo audit --ignore RUSTSEC-2023-0071
 
