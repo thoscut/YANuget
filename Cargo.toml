@@ -45,7 +45,7 @@ bytes = "1"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 quick-xml = { version = "0.41", features = ["serialize"] }
 sha2 = "0.10"
-base64 = "0.22"
+base64 = "0.23"
 hex = "0.4"
 thiserror = "2"
 anyhow = "1"
