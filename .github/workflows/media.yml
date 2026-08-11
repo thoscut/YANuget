@@ -33,13 +33,13 @@ jobs:
     name: Regenerate screenshots and GIFs
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -48,11 +48,11 @@ jobs:
           key: ${{ runner.os }}-cargo-media-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-media-
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.x"
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: "22"
 
@@ -86,7 +86,7 @@ jobs:
         id: pr
         if: steps.diff.outputs.changed == 'true'
         continue-on-error: true
-        uses: peter-evans/create-pull-request@v7
+        uses: peter-evans/create-pull-request@v8
         with:
           add-paths: .github/media
           branch: chore/refresh-media
@@ -117,7 +117,7 @@ jobs:
       # Either way, the freshly captured media is downloadable from the run.
       - name: Upload the captures
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: product-media
           path: .github/media
