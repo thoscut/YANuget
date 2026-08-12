@@ -13,6 +13,19 @@ updates:
       # the queue readable and leaves majors as individual, reviewable PRs.
       minor-and-patch:
         update-types: [minor, patch]
+    ignore:
+      # sqlx 0.9 requires rustc 1.94 — six minor versions past this crate's
+      # declared MSRV of 1.88. Taking it is not a dependency decision, it is a
+      # decision to drop every toolchain between the two, and that belongs in a
+      # release rather than in a routine bump. The 0.9 API change it brings (SQL
+      # strings must be `&'static str` or explicitly asserted) has already been
+      # prepared for: the query builders are compile-time constants and the
+      # three interpolating call sites take `&'static str` only.
+      #
+      # Scoped to the 0.9 majors, so 0.8.x patches — the ones that would carry a
+      # security fix — still arrive.
+      - dependency-name: sqlx
+        versions: [">=0.9.0"]
 
   - package-ecosystem: github-actions
     directory: /

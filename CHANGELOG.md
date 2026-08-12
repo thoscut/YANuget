@@ -21,6 +21,12 @@ expected to change incompatibly at any version.
   in the crate used `ServeDir` or `RequestBodyLimitLayer` — the documentation is
   served from `rust-embed` and the upload limit is enforced while streaming — so
   they only added compile time.
+- The SQLite queries are assembled at compile time rather than with `format!` on
+  every request. Ten statements on the search, autocomplete and lookup paths were
+  building the same string on each call; they are now `concat!`ed constants. The
+  three places that genuinely must interpolate a name — `PRAGMA table_info` and
+  `ALTER TABLE` in the migration, and the `IN (?…)` placeholder list — take
+  `&'static str` or generated placeholders only, never caller data.
 
 ## [0.5.0] — 2026-08-11
 
