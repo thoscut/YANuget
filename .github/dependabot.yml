@@ -35,3 +35,15 @@ updates:
     directory: /
     schedule:
       interval: monthly
+    ignore:
+      # Same trap as `dtolnay/rust-toolchain` above: `rust:1.88-slim` does not
+      # name a version of a dependency, it declares the crate's MSRV. The
+      # builder stage is pinned there on purpose so the image build re-checks
+      # that the crate still compiles at its floor, and it is raised by hand
+      # together with `rust-version` in Cargo.toml. Taking a bump here would
+      # silently retire that check.
+      #
+      # `debian` — the runtime base, and the only layer that actually ships —
+      # is deliberately not ignored, so the released image keeps getting its
+      # security updates.
+      - dependency-name: rust

@@ -12,7 +12,15 @@ expected to change incompatibly at any version.
 
 ## [Unreleased]
 
-Nothing yet.
+### Changed
+
+- `base64` 0.22 → 0.23, `toml` 0.8 → 1.1 and `tower-http` 0.6 → 0.7. All three
+  are majors; none needed a source change. `toml` 1.x replaces `toml_edit` with
+  the smaller `toml_parser`/`toml_writer` pair.
+- The `fs` and `limit` features of `tower-http` are no longer requested. Nothing
+  in the crate used `ServeDir` or `RequestBodyLimitLayer` — the documentation is
+  served from `rust-embed` and the upload limit is enforced while streaming — so
+  they only added compile time.
 
 ## [0.5.0] — 2026-08-11
 
