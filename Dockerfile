@@ -1,8 +1,11 @@
 # Build stage
 #
-# The toolchain must satisfy the crate's `rust-version` (see Cargo.toml). Pinning
-# an older image compiles nothing — the build fails on the first dependency that
-# needs a newer compiler.
+# Pinned to the crate's `rust-version` (see Cargo.toml), not to the newest
+# stable. `rust-toolchain.toml` is deliberately not copied into this stage, so
+# this tag really is the compiler that runs — which makes the image build a
+# second, independent check that the crate still compiles at its declared MSRV.
+# Raise it only together with `rust-version`, the `msrv` job in CI, and the
+# floor documented in the README.
 FROM rust:1.88-slim AS builder
 WORKDIR /app
 

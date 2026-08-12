@@ -109,12 +109,21 @@ CREATE INDEX IF NOT EXISTS idx_symbols_owner
 
 /// The feed-scoped projection: every `packages` column plus the membership's
 /// state aliased so it does not collide with the package's own template flags.
-const FEED_SELECT: &str = "SELECT p.*, fp.listed AS m_listed, fp.enabled AS m_enabled, \
-     fp.pending AS m_pending, fp.flagged AS m_flagged, fp.flag_reason AS m_flag_reason, \
-     fp.downloads AS m_downloads \
-     FROM packages p \
-     JOIN feed_packages fp \
-       ON fp.lower_id = p.lower_id AND fp.normalized_version = p.normalized_version";
+///
+/// A macro rather than a `const` so call sites can `concat!` it into a whole
+/// statement at compile time. sqlx only accepts a `&'static str` without an
+/// explicit injection audit, and `format!`-ing a constant into a `String`
+/// would forfeit that check to say nothing new.
+macro_rules! feed_select {
+    () => {
+        "SELECT p.*, fp.listed AS m_listed, fp.enabled AS m_enabled, \
+         fp.pending AS m_pending, fp.flagged AS m_flagged, fp.flag_reason AS m_flag_reason, \
+         fp.downloads AS m_downloads \
+         FROM packages p \
+         JOIN feed_packages fp \
+           ON fp.lower_id = p.lower_id AND fp.normalized_version = p.normalized_version"
+    };
+}
 
 /// A SQLite package index.
 #[derive(Debug, Clone)]
@@ -245,13 +254,20 @@ impl SqliteDatabase {
                 .collect::<Vec<_>>()
                 .join(",");
             let sql = format!(
-                "{FEED_SELECT} WHERE fp.feed = ?1 \
-                   AND fp.enabled = 1 AND fp.pending = 0 \
-                   AND (?2 = 1 OR fp.listed = 1) \
-                   AND (?3 = 1 OR p.is_prerelease = 0) \
-                   AND (?4 = 1 OR p.is_semver2 = 0) \
-                   AND fp.lower_id IN ({placeholders})"
+                concat!(
+                    feed_select!(),
+                    " WHERE fp.feed = ?1 \
+                       AND fp.enabled = 1 AND fp.pending = 0 \
+                       AND (?2 = 1 OR fp.listed = 1) \
+                       AND (?3 = 1 OR p.is_prerelease = 0) \
+                       AND (?4 = 1 OR p.is_semver2 = 0) \
+                       AND fp.lower_id IN ({placeholders})"
+                ),
+                placeholders = placeholders
             );
+            // The only interpolation is `placeholders`, which is `?5,?6,…`
+            // generated from a range — the ids themselves are bound, never
+            // formatted in.
             let mut query = sqlx::query(&sql)
                 .bind(feed)
                 .bind(i64::from(!listed_only))
@@ -287,21 +303,21 @@ impl SqliteDatabase {
         listed_only: bool,
     ) -> Result<Vec<Package>> {
         // Public listings never include disabled or pending memberships.
-        let sql = format!(
-            "{FEED_SELECT} WHERE fp.feed = ?1 AND fp.lower_id = ?2 \
+        let rows = sqlx::query(concat!(
+            feed_select!(),
+            " WHERE fp.feed = ?1 AND fp.lower_id = ?2 \
                AND fp.enabled = 1 AND fp.pending = 0 \
                AND (?3 = 1 OR fp.listed = 1) \
                AND (?4 = 1 OR p.is_prerelease = 0) \
                AND (?5 = 1 OR p.is_semver2 = 0)"
-        );
-        let rows = sqlx::query(&sql)
-            .bind(feed)
-            .bind(lower_id)
-            .bind(i64::from(!listed_only))
-            .bind(i64::from(include_prerelease))
-            .bind(i64::from(include_semver2))
-            .fetch_all(&self.pool)
-            .await?;
+        ))
+        .bind(feed)
+        .bind(lower_id)
+        .bind(i64::from(!listed_only))
+        .bind(i64::from(include_prerelease))
+        .bind(i64::from(include_semver2))
+        .fetch_all(&self.pool)
+        .await?;
 
         let mut packages = rows
             .iter()
@@ -534,16 +550,16 @@ impl PackageDatabase for SqliteDatabase {
     }
 
     async fn find(&self, feed: &str, id: &str, version: &NuGetVersion) -> Result<Option<Package>> {
-        let sql = format!(
-            "{FEED_SELECT} WHERE fp.feed = ?1 AND fp.lower_id = ?2 \
+        let row = sqlx::query(concat!(
+            feed_select!(),
+            " WHERE fp.feed = ?1 AND fp.lower_id = ?2 \
                AND p.normalized_version = ?3 AND fp.enabled = 1 AND fp.pending = 0"
-        );
-        let row = sqlx::query(&sql)
-            .bind(feed)
-            .bind(id.to_lowercase())
-            .bind(version.normalized())
-            .fetch_optional(&self.pool)
-            .await?;
+        ))
+        .bind(feed)
+        .bind(id.to_lowercase())
+        .bind(version.normalized())
+        .fetch_optional(&self.pool)
+        .await?;
         row.as_ref()
             .map(|r| row_to_feed_package(r).map(|fv| fv.package))
             .transpose()
@@ -612,12 +628,14 @@ impl PackageDatabase for SqliteDatabase {
     }
 
     async fn find_all_versions(&self, feed: &str, id: &str) -> Result<Vec<FeedVersion>> {
-        let sql = format!("{FEED_SELECT} WHERE fp.feed = ?1 AND fp.lower_id = ?2");
-        let rows = sqlx::query(&sql)
-            .bind(feed)
-            .bind(id.to_lowercase())
-            .fetch_all(&self.pool)
-            .await?;
+        let rows = sqlx::query(concat!(
+            feed_select!(),
+            " WHERE fp.feed = ?1 AND fp.lower_id = ?2"
+        ))
+        .bind(feed)
+        .bind(id.to_lowercase())
+        .fetch_all(&self.pool)
+        .await?;
         let mut versions = rows
             .iter()
             .map(row_to_feed_package)
@@ -656,57 +674,62 @@ impl PackageDatabase for SqliteDatabase {
         let package_type = request.package_type.as_deref().unwrap_or("").to_lowercase();
 
         // Phase 1: pick the page of matching package ids, ranked by downloads.
-        let filter = "fp.feed = ?1 AND fp.listed = 1 AND fp.enabled = 1 AND fp.pending = 0 \
-             AND (?2 = 1 OR p.is_prerelease = 0) \
-             AND (?3 = 1 OR p.is_semver2 = 0) \
-             AND (?4 = '' \
-                  OR p.lower_id LIKE ?5 ESCAPE '\\' \
-                  OR lower(p.description) LIKE ?5 ESCAPE '\\' \
-                  OR lower(p.tags) LIKE ?5 ESCAPE '\\' \
-                  OR lower(IFNULL(p.title, '')) LIKE ?5 ESCAPE '\\') \
-             AND (?6 = '' OR EXISTS ( \
-                  SELECT 1 FROM json_each(p.package_types) je \
-                  WHERE lower(json_extract(je.value, '$.name')) = ?6))";
+        macro_rules! filter {
+            () => {
+                "fp.feed = ?1 AND fp.listed = 1 AND fp.enabled = 1 AND fp.pending = 0 \
+                 AND (?2 = 1 OR p.is_prerelease = 0) \
+                 AND (?3 = 1 OR p.is_semver2 = 0) \
+                 AND (?4 = '' \
+                      OR p.lower_id LIKE ?5 ESCAPE '\\' \
+                      OR lower(p.description) LIKE ?5 ESCAPE '\\' \
+                      OR lower(p.tags) LIKE ?5 ESCAPE '\\' \
+                      OR lower(IFNULL(p.title, '')) LIKE ?5 ESCAPE '\\') \
+                 AND (?6 = '' OR EXISTS ( \
+                      SELECT 1 FROM json_each(p.package_types) je \
+                      WHERE lower(json_extract(je.value, '$.name')) = ?6))"
+            };
+        }
 
-        let id_sql = format!(
+        let id_rows = sqlx::query(concat!(
             "SELECT p.lower_id AS lower_id, SUM(fp.downloads) AS total \
              FROM packages p JOIN feed_packages fp \
                ON fp.lower_id = p.lower_id AND fp.normalized_version = p.normalized_version \
-             WHERE {filter} \
-             GROUP BY p.lower_id ORDER BY total DESC, p.lower_id ASC LIMIT ?7 OFFSET ?8"
-        );
-        let id_rows = sqlx::query(&id_sql)
-            .bind(feed)
-            .bind(i64::from(request.include_prerelease))
-            .bind(i64::from(request.include_semver2))
-            .bind(&query)
-            .bind(&pattern)
-            .bind(&package_type)
-            .bind(request.take.max(0))
-            .bind(request.skip.max(0))
-            .fetch_all(&self.pool)
-            .await?;
+             WHERE ",
+            filter!(),
+            " GROUP BY p.lower_id ORDER BY total DESC, p.lower_id ASC LIMIT ?7 OFFSET ?8"
+        ))
+        .bind(feed)
+        .bind(i64::from(request.include_prerelease))
+        .bind(i64::from(request.include_semver2))
+        .bind(&query)
+        .bind(&pattern)
+        .bind(&package_type)
+        .bind(request.take.max(0))
+        .bind(request.skip.max(0))
+        .fetch_all(&self.pool)
+        .await?;
 
         let ids: Vec<String> = id_rows
             .iter()
             .map(|r| r.get::<String, _>("lower_id"))
             .collect();
 
-        let count_sql = format!(
+        let total_hits: i64 = sqlx::query_scalar(concat!(
             "SELECT COUNT(*) FROM ( \
                  SELECT p.lower_id FROM packages p JOIN feed_packages fp \
                    ON fp.lower_id = p.lower_id AND fp.normalized_version = p.normalized_version \
-                 WHERE {filter} GROUP BY p.lower_id )"
-        );
-        let total_hits: i64 = sqlx::query_scalar(&count_sql)
-            .bind(feed)
-            .bind(i64::from(request.include_prerelease))
-            .bind(i64::from(request.include_semver2))
-            .bind(&query)
-            .bind(&pattern)
-            .bind(&package_type)
-            .fetch_one(&self.pool)
-            .await?;
+                 WHERE ",
+            filter!(),
+            " GROUP BY p.lower_id )"
+        ))
+        .bind(feed)
+        .bind(i64::from(request.include_prerelease))
+        .bind(i64::from(request.include_semver2))
+        .bind(&query)
+        .bind(&pattern)
+        .bind(&package_type)
+        .fetch_one(&self.pool)
+        .await?;
 
         // Phase 2: load every visible version for the chosen ids.
         let groups = self
@@ -735,17 +758,23 @@ impl PackageDatabase for SqliteDatabase {
         let pattern = like_pattern(&q);
         // The version predicates sit inside the grouped scan, so an id survives
         // only if it still has at least one version the caller would accept.
-        const MATCHING_IDS: &str = r#"
+        macro_rules! matching_ids {
+            () => {
+                r#"
             FROM packages p JOIN feed_packages fp
                 ON fp.lower_id = p.lower_id AND fp.normalized_version = p.normalized_version
             WHERE fp.feed = ?1 AND fp.listed = 1 AND fp.enabled = 1 AND fp.pending = 0
               AND (?2 = '' OR p.lower_id LIKE ?3 ESCAPE '\')
               AND (?4 = 1 OR p.is_prerelease = 0)
               AND (?5 = 1 OR p.is_semver2 = 0)
-            GROUP BY p.lower_id"#;
+            GROUP BY p.lower_id"#
+            };
+        }
 
-        let rows = sqlx::query(&format!(
-            "SELECT MAX(p.id) AS id {MATCHING_IDS} ORDER BY p.lower_id ASC LIMIT ?6 OFFSET ?7"
+        let rows = sqlx::query(concat!(
+            "SELECT MAX(p.id) AS id ",
+            matching_ids!(),
+            " ORDER BY p.lower_id ASC LIMIT ?6 OFFSET ?7"
         ))
         .bind(feed)
         .bind(&q)
@@ -760,8 +789,10 @@ impl PackageDatabase for SqliteDatabase {
 
         // `GROUP BY` makes this a count of groups, not of rows, so it has to be
         // wrapped rather than written as a bare `COUNT(*)`.
-        let total: i64 = sqlx::query_scalar(&format!(
-            "SELECT COUNT(*) FROM (SELECT p.lower_id {MATCHING_IDS})"
+        let total: i64 = sqlx::query_scalar(concat!(
+            "SELECT COUNT(*) FROM (SELECT p.lower_id ",
+            matching_ids!(),
+            ")"
         ))
         .bind(feed)
         .bind(&q)
@@ -822,15 +853,15 @@ impl PackageDatabase for SqliteDatabase {
     }
 
     async fn recent_packages(&self, feed: &str, limit: i64) -> Result<Vec<Package>> {
-        let sql = format!(
-            "{FEED_SELECT} WHERE fp.feed = ?1 AND fp.enabled = 1 AND fp.pending = 0 \
+        let rows = sqlx::query(concat!(
+            feed_select!(),
+            " WHERE fp.feed = ?1 AND fp.enabled = 1 AND fp.pending = 0 \
              ORDER BY p.published DESC LIMIT ?2"
-        );
-        let rows = sqlx::query(&sql)
-            .bind(feed)
-            .bind(limit.max(0))
-            .fetch_all(&self.pool)
-            .await?;
+        ))
+        .bind(feed)
+        .bind(limit.max(0))
+        .fetch_all(&self.pool)
+        .await?;
         rows.iter()
             .map(|r| row_to_feed_package(r).map(|fv| fv.package))
             .collect()
@@ -935,7 +966,18 @@ fn from_json<T: serde::de::DeserializeOwned>(s: &str) -> Result<T> {
 /// Idempotently add a column to an existing table (SQLite has no
 /// `ADD COLUMN IF NOT EXISTS`). Checks `PRAGMA table_info` first so re-running
 /// migrations is a no-op.
-async fn ensure_column(pool: &SqlitePool, table: &str, column: &str, def: &str) -> Result<()> {
+///
+/// Every name is `&'static str` on purpose: neither `PRAGMA` nor `ALTER TABLE`
+/// takes bound parameters, so all three have to be interpolated. Requiring
+/// literals keeps that safe by construction rather than by convention — a caller
+/// cannot reach this with a request-supplied name without changing the signature
+/// first. It is also exactly what sqlx 0.9's injection guard will want.
+async fn ensure_column(
+    pool: &SqlitePool,
+    table: &'static str,
+    column: &'static str,
+    def: &'static str,
+) -> Result<()> {
     let rows = sqlx::query(&format!("PRAGMA table_info({table})"))
         .fetch_all(pool)
         .await?;
