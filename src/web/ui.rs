@@ -30,6 +30,7 @@ button,input,select{font-family:inherit}\
 body{margin:0;background:var(--bg);color:var(--fg);\
 font:15px/1.55 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif}\
 a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}\
+main p a,footer a{text-decoration:underline;text-underline-offset:.15em}\
 a:focus-visible,button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid var(--accent);outline-offset:2px}\
 .vh{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);border:0}\
 .skip{position:absolute;left:-999px;top:0;background:var(--accent2);color:var(--onaccent);padding:8px 12px;border-radius:0 0 6px 0;z-index:10}\
@@ -51,6 +52,9 @@ main{padding:26px 0 60px}\
 .card{background:var(--card);border:1px solid var(--border);border-radius:10px;\
 padding:18px 20px;margin:0 0 14px}\
 .card h2{margin:0 0 4px;font-size:18px;overflow-wrap:anywhere}\
+h2.muted{font-size:17px;margin:18px 0 8px}\
+.card>h2.muted:first-child{margin-top:0}\
+@media(max-width:560px){.wrap{padding:0 16px}.card{padding:14px 16px}}\
 .meta{color:var(--muted);font-size:13px;margin:2px 0}\
 .crumbs{font-size:13px;color:var(--muted);margin:0 0 6px}\
 .tags{margin-top:8px;list-style:none;padding:0;display:flex;flex-wrap:wrap}\
@@ -69,7 +73,7 @@ h1.title{font-size:26px;margin:0 0 2px;overflow-wrap:anywhere}\
 pre{background:var(--code);border:1px solid var(--border);border-radius:8px;padding:12px 14px;\
 overflow:auto;font-size:13px;margin:6px 0}\
 code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}\
-.install h3{margin:14px 0 4px;font-size:13px;text-transform:uppercase;letter-spacing:.4px;color:var(--muted)}\
+.install h3{margin:14px 0 4px;font-size:14px;color:var(--muted)}\
 .install .primary h3{color:var(--accent)}\
 .install pre{white-space:pre-wrap;overflow-wrap:break-word}\
 .snip{display:flex;flex-direction:column;align-items:flex-end}\
@@ -90,12 +94,14 @@ img.picon{width:32px;height:32px;object-fit:contain;vertical-align:-6px;margin-r
 .hero{text-align:center;padding:30px 0 4px}\
 .hero h1{font-size:30px;margin:0 0 8px;letter-spacing:-.4px}\
 .hero p{margin:0 auto;max-width:46ch;color:var(--muted)}\
-.steps h3{margin:16px 0 4px;font-size:13px;text-transform:uppercase;letter-spacing:.4px;color:var(--muted)}\
-.steps h3:first-child{margin-top:0}\
+ol.steps{padding-left:44px}\
+.steps h2{margin:16px 0 4px;font-size:14px;color:var(--muted)}\
+.steps li:first-child h2{margin-top:0}\
 .steps pre{white-space:pre-wrap;overflow-wrap:break-word}\
 .kv{font-size:13px}.kv div{display:flex;gap:10px;padding:3px 0;border-bottom:1px solid var(--border)}\
 .kv b{color:var(--muted);font-weight:500;min-width:120px;flex:0 0 auto}\
-@media(max-width:480px){.kv div{flex-direction:column;gap:0}.kv b{min-width:0}}\
+.kv.wide b{flex:0 0 13em}\
+@media(max-width:480px){.kv div{flex-direction:column;gap:0}.kv b{min-width:0}.kv.wide b{flex:0 0 auto}}\
 .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:14px;margin:0 0 8px}\
 .stat{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:16px 18px}\
 .stat .n{font-size:26px;font-weight:700}\
@@ -497,10 +503,13 @@ pub fn gallery_page(
             cards.push_str(&format!(
                 "<div class=\"card\"><h2><a href=\"{url}\">{id}</a> \
                  <span class=\"muted\">{ver}</span>{pre}</h2>\
-                 <div class=\"meta\">{dl} downloads, all versions{authors}</div>\
+                 <div class=\"meta\">{nv} version{vs}, {dl} download{ds}{authors}</div>\
                  <p>{desc}</p>{tags}</div>",
                 ver = escape_html(&p.normalized_version()),
+                nv = group.packages.len(),
+                vs = plural(group.packages.len() as i64),
                 dl = group_digits(group.total_downloads() as i64),
+                ds = plural(group.total_downloads() as i64),
                 desc = escape_html(&truncate(&p.description, 240)),
                 tags = render_tags(&p.tags),
             ));
@@ -549,26 +558,25 @@ fn first_run_panel(urls: &UrlBuilder) -> String {
     let idx = urls.service_index();
     let steps = [
         (
-            "1 \u{2014} Add this feed",
+            "Add this feed",
             format!("dotnet nuget add source {idx} -n yanuget"),
         ),
         (
-            "2 \u{2014} Push a package",
+            "Push a package",
             "dotnet nuget push MyPackage.1.0.0.nupkg --source yanuget --api-key <your-api-key>"
                 .to_string(),
         ),
-        (
-            "3 \u{2014} Restore from it",
-            format!("dotnet restore --source {idx}"),
-        ),
+        ("Restore from it", format!("dotnet restore --source {idx}")),
     ];
 
+    // A real ordered list: these are steps, so the numbers are the list's own
+    // rather than text in each heading.
     let mut snippets = String::new();
     for (label, cmd) in steps {
         snippets.push_str(&format!(
-            "<h3>{label}</h3><div class=\"snip\">\
+            "<li><h2>{label}</h2><div class=\"snip\">\
              <button type=\"button\" class=\"copy\" aria-label=\"Copy command\">Copy</button>\
-             <pre><code>{cmd}</code></pre></div>",
+             <pre><code>{cmd}</code></pre></div></li>",
             cmd = escape_html(&cmd),
         ));
     }
@@ -576,7 +584,7 @@ fn first_run_panel(urls: &UrlBuilder) -> String {
     format!(
         "<div class=\"hero\"><h1>Your feed is live</h1>\
          <p>Nothing published to it yet. Three commands change that.</p></div>\
-         <div class=\"card steps\">{snippets}</div>\
+         <ol class=\"card steps\">{snippets}</ol>\
          <p class=\"muted\">Using Chocolatey, <code>nuget.exe</code> or Visual Studio? \
          The same service-index URL works for all of them \u{2014} see \
          <a href=\"{docs}\">the documentation</a>.</p>",
@@ -711,10 +719,11 @@ pub fn stats_page(
             let p = g.latest();
             out.push_str(&format!(
                 "<li><a href=\"{href}\">{id}</a>\
-                 <span class=\"muted\">{dl} downloads</span></li>",
+                 <span class=\"muted\">{dl} download{ds}</span></li>",
                 href = escape_html(&urls.app(&format!("/packages/{}", enc_path(&p.lower_id())))),
                 id = escape_html(&p.id),
                 dl = group_digits(g.total_downloads() as i64),
+                ds = plural(g.total_downloads() as i64),
             ));
         }
         out.push_str("</ul>");
@@ -746,8 +755,8 @@ pub fn stats_page(
     let body = format!(
         "<h1 class=\"title\">Statistics</h1>{tiles}\
          <div class=\"grid\">\
-         <div class=\"card\"><h3 class=\"muted\">Most downloaded</h3>{top_list}</div>\
-         <div class=\"card\"><h3 class=\"muted\">Recently published</h3>{recent_list}</div>\
+         <div class=\"card\"><h2 class=\"muted\">Most downloaded</h2>{top_list}</div>\
+         <div class=\"card\"><h2 class=\"muted\">Recently published</h2>{recent_list}</div>\
          </div>"
     );
     layout(urls, "Statistics \u{2014} YANuget", "", "stats", &body)
@@ -805,7 +814,7 @@ pub fn settings_page(urls: &UrlBuilder, config: &Config, feed: &super::FeedConte
         "Unlist (restorable)"
     };
 
-    let mut server = String::from("<div class=\"kv\">");
+    let mut server = String::from("<div class=\"kv wide\">");
     server.push_str(&kv("Feed", &feed.name));
     server.push_str(&kv("Push / delete auth", auth));
     server.push_str(&kv("Download auth", read_auth));
@@ -825,7 +834,7 @@ pub fn settings_page(urls: &UrlBuilder, config: &Config, feed: &super::FeedConte
     server.push_str("</div>");
 
     // Upstream mirroring + license policy (per feed).
-    let mut policy = String::from("<div class=\"kv\">");
+    let mut policy = String::from("<div class=\"kv wide\">");
     match &feed.mirror {
         Some(m) => {
             policy.push_str(&kv("Upstream mirror", "Enabled"));
@@ -852,7 +861,7 @@ pub fn settings_page(urls: &UrlBuilder, config: &Config, feed: &super::FeedConte
     policy.push_str("</div>");
 
     let r = &feed.retention;
-    let mut retention = String::from("<div class=\"kv\">");
+    let mut retention = String::from("<div class=\"kv wide\">");
     retention.push_str(&kv("Retention", on_off(r.enabled)));
     if r.enabled {
         retention.push_str(&kv("Prune after each push", yes_no(r.prune_on_push)));
@@ -879,7 +888,7 @@ pub fn settings_page(urls: &UrlBuilder, config: &Config, feed: &super::FeedConte
 
     let admin = if feed.admin.is_enabled() {
         format!(
-            "<div class=\"card\"><h3 class=\"muted\">Administration</h3>\
+            "<div class=\"card\"><h2 class=\"muted\">Administration</h2>\
              <p>Manage package versions (approve / promote / disable / delete) in the \
              <a href=\"{}\">admin area</a>. Sign in with the admin key.</p></div>",
             escape_html(&urls.app("/admin"))
@@ -892,10 +901,10 @@ pub fn settings_page(urls: &UrlBuilder, config: &Config, feed: &super::FeedConte
         "<h1 class=\"title\">Settings</h1>\
          <p class=\"muted\">Read-only overview of this feed's policy. \
          Secrets and storage paths are not shown.</p>\
-         <div class=\"card\"><h3 class=\"muted\">Server</h3>{server}</div>\
-         <div class=\"card\"><h3 class=\"muted\">Mirror &amp; policy</h3>{policy}</div>\
-         <div class=\"card\"><h3 class=\"muted\">Retention</h3>{retention}</div>\
-         <div class=\"card\"><h3 class=\"muted\">Endpoints</h3><div class=\"kv\">\
+         <div class=\"card\"><h2 class=\"muted\">Server</h2>{server}</div>\
+         <div class=\"card\"><h2 class=\"muted\">Mirror &amp; policy</h2>{policy}</div>\
+         <div class=\"card\"><h2 class=\"muted\">Retention</h2>{retention}</div>\
+         <div class=\"card\"><h2 class=\"muted\">Endpoints</h2><div class=\"kv wide\">\
          {svc}{sym}</div></div>{admin}",
         svc = kv_html(
             "Service index",
@@ -1146,12 +1155,13 @@ pub fn detail_page(
         let sel = if v == version { " class=\"sel\"" } else { "" };
         versions.push_str(&format!(
             "<li><span><a{sel} href=\"{href}\">{dv}</a>{badges}</span>\
-             <span class=\"muted\">{dls} downloads</span></li>",
+             <span class=\"muted\">{dls} download{ds}</span></li>",
             href =
                 escape_html(&urls.app(&format!("/packages/{}/{}", enc_path(&lower), enc_path(&v)))),
             dv = escape_html(&v),
             badges = status_badges(p),
             dls = group_digits(p.downloads as i64),
+            ds = plural(p.downloads as i64),
         ));
     }
     versions.push_str("</ul>");
@@ -1160,13 +1170,14 @@ pub fn detail_page(
         "<nav class=\"crumbs\" aria-label=\"Breadcrumb\">\
          <a href=\"{packages}\">Packages</a> <span aria-hidden=\"true\">/</span> <span>{id}</span></nav>\
          <h1 class=\"title\">{icon}{id}</h1>\
-         <div class=\"meta\">{version}{badges} \u{2022} {dl} downloads of this version \u{2022} published {pub}</div>\
+         <div class=\"meta\">{version}{badges} \u{2022} {dl} download{ds} of this version \u{2022} published {pub}</div>\
          <p>{desc}</p>{tags}{links}{deps}{symbols}",
         packages = escape_html(&urls.app("/packages")),
         icon = render_icon(urls, selected),
         version = escape_html(&version),
         badges = status_badges(selected),
         dl = group_digits(selected.downloads as i64),
+        ds = plural(selected.downloads as i64),
         pub = escape_html(&selected.published.format("%Y-%m-%d").to_string()),
         desc = escape_html(&selected.description),
         tags = render_tags(&selected.tags),
@@ -1181,10 +1192,13 @@ pub fn detail_page(
 
     // Versions right under Install: picking another version is the common
     // next step, and Info repeats much of what the header already says.
+    // The section headings are all `<h2>`, one level under the package name,
+    // and the client labels inside Install are `<h3>` under it. A heading that
+    // jumps a level reads, to a screen reader user, like a missing section.
     let side = format!(
-        "<div class=\"card install\">{install}</div>\
-         <div class=\"card\"><h3 class=\"muted\">Versions</h3>{versions}</div>\
-         <div class=\"card\"><h3 class=\"muted\">Info</h3>{info}</div>",
+        "<div class=\"card install\"><h2 class=\"muted\">Install</h2>{install}</div>\
+         <div class=\"card\"><h2 class=\"muted\">Versions</h2>{versions}</div>\
+         <div class=\"card\"><h2 class=\"muted\">Info</h2>{info}</div>",
         install = render_install(urls, selected, primary_client),
         info = render_info(selected),
     );
@@ -1322,7 +1336,7 @@ fn render_dependencies(urls: &UrlBuilder, p: &Package) -> String {
     if p.dependencies.is_empty() {
         return String::new();
     }
-    let mut out = String::from("<h3 class=\"muted\">Dependencies</h3>");
+    let mut out = String::from("<h2 class=\"muted\">Dependencies</h2>");
     for group in &p.dependencies {
         let tfm = group
             .target_framework
@@ -1389,7 +1403,7 @@ fn render_readme(readme: Option<&str>) -> String {
                 ""
             };
             format!(
-                "<h3 class=\"muted\">Readme</h3><div class=\"card readme\">{}</div>{notice}",
+                "<h2 class=\"muted\">Readme</h2><div class=\"card readme\">{}</div>{notice}",
                 escape_html(shown)
             )
         }
@@ -2111,6 +2125,106 @@ mod tests {
         assert!(html.contains("1,234")); // grouped downloads
         assert!(html.contains("Top.Pkg"));
         assert!(html.contains("Recently published"));
+    }
+
+    /// The level of every heading in `html`, in document order.
+    fn heading_levels(html: &str) -> Vec<u8> {
+        let bytes = html.as_bytes();
+        (0..bytes.len().saturating_sub(3))
+            .filter(|&i| {
+                bytes[i] == b'<'
+                    && bytes[i + 1] == b'h'
+                    && (b'1'..=b'6').contains(&bytes[i + 2])
+                    && matches!(bytes[i + 3], b'>' | b' ')
+            })
+            .map(|i| bytes[i + 2] - b'0')
+            .collect()
+    }
+
+    #[test]
+    fn every_page_outlines_without_skipping_a_heading_level() {
+        // The stats, settings, package and first-run pages went from `<h1>`
+        // straight to `<h3>`, which a screen reader presents as a section
+        // missing its heading.
+        let urls = UrlBuilder::new("https://host");
+        let mut p = sample();
+        p.dependencies = vec![crate::models::DependencyGroup {
+            target_framework: Some("net8.0".into()),
+            dependencies: vec![],
+        }];
+        let stats = crate::database::DatabaseStats {
+            package_count: 1,
+            version_count: 1,
+            listed_count: 1,
+            total_downloads: 1,
+            total_size: 1,
+            symbol_count: 0,
+        };
+        let pages = [
+            (
+                "detail",
+                detail_page(
+                    &urls,
+                    std::slice::from_ref(&p),
+                    &p,
+                    Some("docs"),
+                    "choco",
+                    false,
+                ),
+            ),
+            (
+                "stats",
+                stats_page(&urls, &stats, &page_of(&["A"]), &[sample()]),
+            ),
+            (
+                "settings",
+                settings_page(&urls, &Config::default(), &feed_ctx(None, Some("adm"))),
+            ),
+            (
+                "first run",
+                gallery_page(&urls, &page_of(&[]), &view("", 0, 20)),
+            ),
+            (
+                "gallery",
+                gallery_page(&urls, &page_of(&["A", "B"]), &view("", 0, 20)),
+            ),
+        ];
+        for (name, html) in pages {
+            let levels = heading_levels(&html);
+            assert_eq!(levels.first(), Some(&1), "{name}: {levels:?}");
+            for pair in levels.windows(2) {
+                assert!(pair[1] <= pair[0] + 1, "{name} skips a level: {levels:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn counts_of_one_are_singular_and_steps_are_a_list() {
+        let urls = UrlBuilder::new("https://host");
+        let mut p = sample();
+        p.downloads = 1;
+        let html = detail_page(&urls, std::slice::from_ref(&p), &p, None, "choco", false);
+        assert!(html.contains("1 download of this version"), "{html}");
+        assert!(
+            html.contains("<span class=\"muted\">1 download</span>"),
+            "{html}"
+        );
+        assert!(!html.contains("1 downloads"), "{html}");
+
+        let mut page = page_of(&["A"]);
+        page.groups[0].packages[0].downloads = 1;
+        let html = gallery_page(&urls, &page, &view("", 0, 20));
+        assert!(html.contains("1 version, 1 download"), "{html}");
+
+        // The first-run steps are numbered by an ordered list, not by text in
+        // each heading, and no label is set in capitals.
+        let html = gallery_page(&urls, &page_of(&[]), &view("", 0, 20));
+        assert!(
+            html.contains("<ol class=\"card steps\"><li><h2>Add this feed</h2>"),
+            "{html}"
+        );
+        assert!(!STYLE.contains(".install h3{margin:14px 0 4px;font-size:13px;text-transform"));
+        assert!(!STYLE.contains(".steps h3"));
     }
 
     fn feed_ctx(api: Option<&str>, admin: Option<&str>) -> super::super::FeedContext {

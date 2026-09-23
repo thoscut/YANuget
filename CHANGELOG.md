@@ -44,6 +44,14 @@ expected to change incompatibly at any version.
 
 ### Fixed
 
+- The stats, settings, package and first-run pages went from `<h1>` straight to
+  `<h3>`; every section heading is now an `<h2>`, and the package page's client
+  labels sit under a new "Install" heading. Counts of one read "1 download" and
+  "1 version". Links in running text and the footer are underlined, not told
+  apart by colour alone. The install and first-run labels are no longer set in
+  capitals, the first-run steps are an ordered list, the settings labels get a
+  wider column, and a phone gets a little more width for content. Gallery
+  cards now show how many versions a package has.
 - The package page kept its version list out of reach. The sticky install card
   (over 500 px tall) covered Info and Versions while scrolling, and on a phone
   the list came only after the whole readme. The card no longer sticks, the
