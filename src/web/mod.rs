@@ -1394,33 +1394,66 @@ async fn download_symbol(
 // Web gallery (HTML)
 // ---------------------------------------------------------------------------
 
+/// The gallery's query string: a search, plus the pager's `page`.
+#[derive(Debug, Deserialize)]
+struct GalleryParams {
+    #[serde(default)]
+    q: Option<String>,
+    #[serde(default)]
+    skip: Option<i64>,
+    #[serde(default)]
+    take: Option<i64>,
+    /// A 1-based page number, from the pager's "go to page" form.
+    #[serde(default)]
+    page: Option<i64>,
+    #[serde(default)]
+    prerelease: Option<bool>,
+    #[serde(rename = "packageType", default)]
+    package_type: Option<String>,
+}
+
 async fn gallery(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(params): Query<SearchParams>,
+    Query(params): Query<GalleryParams>,
 ) -> Result<Html<String>> {
     state.require_read(&headers)?;
     let query = params.q.unwrap_or_default();
     let default_take = state.config.gallery_page_size.max(1);
+    let take = params
+        .take
+        .unwrap_or(default_take)
+        .clamp(1, MAX_SEARCH_TAKE);
+    // `page` wins over `skip`, and either way the offset snaps to the start of
+    // a page. That makes "page N" one exact page, and it is what lets the
+    // page-size form send the current `skip`: at the new size, the page shown
+    // is the one holding the package that was first on screen.
+    let skip = match params.page {
+        Some(page) => (page.max(1) - 1).saturating_mul(take),
+        None => params.skip.unwrap_or(0).max(0),
+    };
+    let package_type = params.package_type.filter(|s| !s.is_empty());
     let request = SearchRequest {
         query: query.clone(),
-        skip: params.skip.unwrap_or(0).max(0),
-        take: params
-            .take
-            .unwrap_or(default_take)
-            .clamp(1, MAX_SEARCH_TAKE),
+        skip: skip - skip % take,
+        take,
         include_prerelease: params.prerelease.unwrap_or(true),
         include_semver2: true,
-        package_type: params.package_type.filter(|s| !s.is_empty()),
+        package_type: package_type.clone(),
     };
     let page = state.db.search(state.feed(), &request).await?;
     let urls = state.url_builder(&headers).with_hive(true);
     Ok(Html(ui::gallery_page(
         &urls,
         &page,
-        query.trim(),
-        request.skip,
-        request.take,
+        &ui::GalleryView {
+            query: query.trim(),
+            skip: request.skip,
+            take,
+            default_take,
+            prerelease: params.prerelease,
+            package_type: package_type.as_deref(),
+        },
     )))
 }
 

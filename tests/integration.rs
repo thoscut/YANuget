@@ -1111,6 +1111,8 @@ async fn gallery_page_size_is_configurable() {
         .unwrap();
     assert!(body.contains("class=\"pager\""));
     assert!(body.contains("of 2"));
+    // The configured size is the one selected, and stays on offer.
+    assert!(body.contains("<option value=\"1\" selected>"), "{body}");
 }
 
 #[tokio::test]
@@ -1153,6 +1155,63 @@ async fn gallery_paginates_results() {
     assert!(body.contains("class=\"pager\""));
     assert!(body.contains("of 3"));
     assert!(body.contains("skip=1")); // next page link
+}
+
+async fn get_text(server: &TestServer, path: &str) -> String {
+    server
+        .client
+        .get(server.url(path))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn gallery_pager_goes_to_a_page_and_snaps_to_page_starts() {
+    let server = spawn_with(|c| c.gallery_page_size = 2).await;
+    for id in ["Pp.A", "Pp.B", "Pp.C", "Pp.D", "Pp.E"] {
+        push_multipart(&server, API_KEY, build_nupkg(id, "1.0.0", b"x")).await;
+    }
+
+    // "Go to page" names a page, and the page is named in the title.
+    let body = get_text(&server, "/packages?page=2").await;
+    assert!(body.contains("3\u{2013}4 of 5"), "{body}");
+    assert!(
+        body.contains("page 2 of 3 \u{2014} YANuget</title>"),
+        "{body}"
+    );
+
+    // `page` wins over `skip`.
+    let body = get_text(&server, "/packages?page=3&skip=0").await;
+    assert!(body.contains("5\u{2013}5 of 5"), "{body}");
+
+    // Any offset snaps to the start of its page. That is what the page-size
+    // form relies on: it sends the `skip` on screen with the new `take`.
+    let body = get_text(&server, "/packages?skip=3").await;
+    assert!(body.contains("3\u{2013}4 of 5"), "{body}");
+    let body = get_text(&server, "/packages?skip=3&take=4").await;
+    assert!(body.contains("1\u{2013}4 of 5"), "{body}");
+
+    // With everything on one page, the page size is still on offer, so a
+    // larger choice can be undone.
+    let body = get_text(&server, "/packages?take=20").await;
+    assert!(body.contains("<select id=\"pg-take\""), "{body}");
+    assert!(!body.contains("pg-page"), "{body}");
+
+    // The search text survives the round trip through the forms.
+    let body = get_text(&server, "/packages?q=pp&page=3").await;
+    assert!(body.contains("5\u{2013}5 of 5"), "{body}");
+    assert!(
+        body.contains("<input type=\"hidden\" name=\"q\" value=\"pp\">"),
+        "{body}"
+    );
+
+    // An offset past the end is still reported as such.
+    let body = get_text(&server, "/packages?skip=99").await;
+    assert!(body.contains("nothing on this page"), "{body}");
 }
 
 #[tokio::test]

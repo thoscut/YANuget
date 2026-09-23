@@ -19,17 +19,17 @@ const STYLE: &str = "\
 --bg:#0d1117;--card:#161b22;--border:#30363d;--fg:#e6edf3;--muted:#9aa4af;\
 --accent:#58a6ff;--accent2:#1f6feb;--accent2h:#2d76f0;--onaccent:#fff;\
 --code:#010409;--warn:#d29922;--subtle:#21262d;--subtleh:#30363d;\
---ok:#3fb950;--danger:#b62324;--dangerfg:#ff7b72}\
+--ok:#3fb950;--danger:#b62324;--dangerfg:#ff7b72;--ctl:#656c76}\
 @media(prefers-color-scheme:light){:root{\
 --bg:#f6f8fa;--card:#fff;--border:#d0d7de;--fg:#1f2328;--muted:#59636e;\
 --accent:#0969da;--accent2:#0969da;--accent2h:#0a5fc2;--onaccent:#fff;\
 --code:#f6f8fa;--warn:#9a6700;--subtle:#eaeef2;--subtleh:#dde3ea;\
---ok:#1a7f37;--danger:#cf222e;--dangerfg:#cf222e}}\
+--ok:#1a7f37;--danger:#cf222e;--dangerfg:#cf222e;--ctl:#818b98}}\
 *{box-sizing:border-box}\
 body{margin:0;background:var(--bg);color:var(--fg);\
 font:15px/1.55 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif}\
 a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}\
-a:focus-visible,button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline-offset:2px}\
+a:focus-visible,button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid var(--accent);outline-offset:2px}\
 .vh{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);border:0}\
 .skip{position:absolute;left:-999px;top:0;background:var(--accent2);color:var(--onaccent);padding:8px 12px;border-radius:0 0 6px 0;z-index:10}\
 .skip:focus{left:0}\
@@ -103,6 +103,15 @@ img.picon{width:32px;height:32px;object-fit:contain;vertical-align:-6px;margin-r
 .pager{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:18px 0;flex-wrap:wrap}\
 .btn{border:1px solid var(--border);border-radius:6px;padding:8px 14px;color:var(--fg)}\
 .btn[aria-disabled=true]{opacity:.4;pointer-events:none}\
+.pager .btn{min-height:44px;display:inline-flex;align-items:center;gap:6px}\
+.pager-go{flex:1 0 100%;display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:12px}\
+.pager-go form{display:flex;align-items:center;gap:8px;margin:0}\
+.pager-go label{color:var(--muted);font-size:14px}\
+.pager-go input,.pager-go select{min-height:44px;padding:0 10px;border:1px solid var(--ctl);border-radius:6px;\
+background:var(--bg);color:var(--fg);font-size:15px}\
+.pager-go input{width:6em}\
+.pager-go button{padding:0 14px;background:var(--subtle);border-color:var(--border);color:var(--fg)}\
+.pager-go button:hover{background:var(--subtleh)}\
 .badge.ok{color:var(--ok);border-color:var(--ok)}\
 .atbl{width:100%;border-collapse:collapse}\
 .atbl th,.atbl td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--border);font-size:14px;vertical-align:middle}\
@@ -217,7 +226,7 @@ fn csp_hash(content: &str) -> String {
 ///
 /// `active` marks the current footer nav item (`"stats"`, `"settings"`, or `""`).
 fn layout(urls: &UrlBuilder, title: &str, query: &str, active: &str, body: &str) -> String {
-    layout_with_chrome(urls, title, query, active, body, Chrome::Feed)
+    layout_with_chrome(urls, title, query, active, body, Chrome::Feed, "")
 }
 
 /// Which navigation a page can offer.
@@ -235,6 +244,8 @@ enum Chrome {
     Root,
 }
 
+/// `search_hidden` is extra hidden inputs for the header's search form: the
+/// gallery uses it to keep a chosen page size across a new search.
 fn layout_with_chrome(
     urls: &UrlBuilder,
     title: &str,
@@ -242,6 +253,7 @@ fn layout_with_chrome(
     active: &str,
     body: &str,
     chrome: Chrome,
+    search_hidden: &str,
 ) -> String {
     let cur = |name: &str| {
         if name == active {
@@ -276,7 +288,7 @@ fn layout_with_chrome(
 <form class=\"search\" action=\"{packages}\" method=\"get\" role=\"search\">\
 <label for=\"q\" class=\"vh\">Search packages</label>\
 <input id=\"q\" type=\"search\" name=\"q\" placeholder=\"Search packages\u{2026}\" value=\"{q}\" autocomplete=\"off\">\
-<button type=\"submit\">Search</button></form>\
+{search_hidden}<button type=\"submit\">Search</button></form>\
 </div></header>\
 <main id=\"main\" tabindex=\"-1\"><div class=\"wrap\">{body}</div></main>\
 <footer><div class=\"wrap\"><nav aria-label=\"Site\">Served by YANuget \u{2014} \
@@ -347,14 +359,79 @@ pub fn error_page(urls: &UrlBuilder, status: axum::http::StatusCode) -> String {
     layout(urls, &format!("{heading} \u{2014} YANuget"), "", "", &body)
 }
 
-/// The gallery / search-results page. `skip`/`take` drive pagination.
+/// What the gallery was asked to show: the search, the page, and the filters
+/// that every paging link and form has to carry.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GalleryView<'a> {
+    pub query: &'a str,
+    pub skip: i64,
+    pub take: i64,
+    /// The configured page size (`gallery_page_size`).
+    pub default_take: i64,
+    pub prerelease: Option<bool>,
+    pub package_type: Option<&'a str>,
+}
+
+impl GalleryView<'_> {
+    /// The gallery URL of the page starting at `skip`, escaped for an
+    /// attribute, carrying the search, the page size and the filters.
+    fn href(&self, urls: &UrlBuilder, skip: i64) -> String {
+        // `take` has to be carried, or paging silently changes the page size
+        // back to the default: `?take=5` showed "1–5 of N", and Next then
+        // returned twenty items while the counter still claimed five. And
+        // `&` is `&amp;` inside an HTML attribute — a bare one is only
+        // tolerated because no entity name follows it here.
+        let mut href = format!(
+            "{}?q={}&amp;skip={skip}&amp;take={}",
+            escape_html(&urls.app("/packages")),
+            enc_path(self.query),
+            self.take
+        );
+        if let Some(pre) = self.prerelease {
+            href.push_str(&format!("&amp;prerelease={pre}"));
+        }
+        if let Some(ty) = self.package_type {
+            href.push_str(&format!("&amp;packageType={}", enc_path(ty)));
+        }
+        href
+    }
+
+    /// Hidden inputs carrying the search and the filters into a GET form. They
+    /// have no ids: the header's search box already owns `id="q"`.
+    fn hidden_fields(&self) -> String {
+        let mut out = format!(
+            "<input type=\"hidden\" name=\"q\" value=\"{}\">",
+            escape_html(self.query)
+        );
+        if let Some(pre) = self.prerelease {
+            out.push_str(&format!(
+                "<input type=\"hidden\" name=\"prerelease\" value=\"{pre}\">"
+            ));
+        }
+        if let Some(ty) = self.package_type {
+            out.push_str(&format!(
+                "<input type=\"hidden\" name=\"packageType\" value=\"{}\">",
+                escape_html(ty)
+            ));
+        }
+        out
+    }
+}
+
+/// The gallery / search-results page.
 pub fn gallery_page(
     urls: &UrlBuilder,
     page: &crate::database::SearchPage,
-    query: &str,
-    skip: i64,
-    take: i64,
+    view: &GalleryView,
 ) -> String {
+    let view = GalleryView {
+        skip: view.skip.max(0),
+        take: view.take.max(1),
+        ..*view
+    };
+    let query = view.query;
+    let pages = (page.total_hits + view.take - 1) / view.take;
+    let current = view.skip / view.take + 1;
     let body = if page.groups.is_empty() {
         let browse_all = escape_html(&urls.app("/packages"));
         if !query.trim().is_empty() {
@@ -371,7 +448,8 @@ pub fn gallery_page(
             // thousands of packages that their feed was empty.
             format!(
                 "<div class=\"empty\"><p>There is nothing on this page.</p>\
-                 <p><a href=\"{browse_all}\">Back to the first page</a></p></div>"
+                 <p><a href=\"{first}\">Back to the first page</a></p></div>",
+                first = view.href(urls, 0),
             )
         } else {
             first_run_panel(urls)
@@ -422,22 +500,33 @@ pub fn gallery_page(
         }
         cards.push_str(&pager(
             urls,
-            query,
-            skip,
-            take,
+            &view,
             page.groups.len() as i64,
             page.total_hits,
         ));
         cards
     };
-    let title = if query.trim().is_empty() {
-        "YANuget".to_string()
-    } else {
-        // Otherwise every search result page shares one <title>, so tabs,
-        // bookmarks and history entries for different queries look identical.
-        format!("Search: \u{201c}{query}\u{201d} \u{2014} YANuget")
+    // Searches and later pages get titles of their own. Otherwise every search,
+    // and every page of one, shares one <title>, so tabs, bookmarks and history
+    // entries look identical.
+    let search = (!query.trim().is_empty()).then(|| format!("Search: \u{201c}{query}\u{201d}"));
+    let later_page = current > 1 && !page.groups.is_empty();
+    let title = match (search, later_page) {
+        (None, false) => "YANuget".to_string(),
+        (None, true) => format!("Packages, page {current} of {pages} \u{2014} YANuget"),
+        (Some(s), false) => format!("{s} \u{2014} YANuget"),
+        (Some(s), true) => format!("{s}, page {current} of {pages} \u{2014} YANuget"),
     };
-    layout(urls, &title, query, "", &body)
+    // A new search starts on page one, but keeps a page size someone chose.
+    let search_hidden = if view.take != view.default_take.max(1) {
+        format!(
+            "<input type=\"hidden\" name=\"take\" value=\"{}\">",
+            view.take
+        )
+    } else {
+        String::new()
+    };
+    layout_with_chrome(urls, &title, query, "", &body, Chrome::Feed, &search_hidden)
 }
 
 /// What an empty feed shows instead of "no packages": the three commands that
@@ -488,42 +577,97 @@ fn first_run_panel(urls: &UrlBuilder) -> String {
     )
 }
 
-/// Previous/next pagination control for the gallery.
-fn pager(urls: &UrlBuilder, query: &str, skip: i64, take: i64, shown: i64, total: i64) -> String {
-    let take = take.max(1);
-    let skip = skip.max(0);
-    // Only render when there is more than one page worth of results.
-    if total <= take && skip == 0 {
+/// The page sizes the pager offers: a fixed ladder, plus the configured default
+/// and the size in use, so the select always shows the real size. There is no
+/// "all": `take` is capped at 1000.
+fn page_sizes(take: i64, default_take: i64) -> Vec<i64> {
+    let mut sizes = vec![20, 50, 100, take, default_take.max(1)];
+    sizes.sort_unstable();
+    sizes.dedup();
+    sizes
+}
+
+/// Pagination for the gallery: previous/next links around the range shown,
+/// and two small forms, one to go to a page and one to change the page size.
+///
+/// Both are plain GET forms, so they work without JavaScript and need nothing
+/// the CSP would have to allow. "Go to page" sends `page`. The page-size form
+/// sends the current `skip`, which the handler snaps to the start of the page
+/// holding it at the new size, so the first package on screen stays there.
+fn pager(urls: &UrlBuilder, view: &GalleryView, shown: i64, total: i64) -> String {
+    let (skip, take) = (view.skip, view.take);
+    let sizes = page_sizes(take, view.default_take);
+    // Paging needs a second page. A page size is worth offering whenever it
+    // would change what is shown: without that, choosing 100 on a feed of 60
+    // left no way back to 20 a page.
+    let paged = total > take || skip > 0;
+    let sizable = total > sizes[0];
+    if !paged && !sizable {
         return String::new();
     }
-    let q = enc_path(query);
-    let base = urls.app("/packages");
-    let prev = (skip - take).max(0);
-    let has_prev = skip > 0;
-    let has_next = skip + shown < total;
-    let next = skip + take;
-    let from = if shown == 0 { 0 } else { skip + 1 };
-    let to = skip + shown;
-    let link = |target: i64, enabled: bool, label: &str| {
-        if enabled {
-            // `take` has to be carried, or paging silently changes the page size
-            // back to the default: `?take=5` showed "1–5 of N", and Next then
-            // returned twenty items while the counter still claimed five. And
-            // `&` is `&amp;` inside an HTML attribute — a bare one is only
-            // tolerated because no entity name follows it here.
-            format!(
-                "<a class=\"btn\" href=\"{base}?q={q}&amp;skip={target}&amp;take={take}\">{label}</a>"
-            )
-        } else {
-            format!("<span class=\"btn\" aria-disabled=\"true\">{label}</span>")
-        }
-    };
-    format!(
-        "<nav class=\"pager\" aria-label=\"Pagination\">{prev_l}\
-         <span class=\"muted\">{from}\u{2013}{to} of {total}</span>{next_l}</nav>",
-        prev_l = link(prev, has_prev, "\u{2190} Previous"),
-        next_l = link(next, has_next, "Next \u{2192}"),
-    )
+    let hidden = view.hidden_fields();
+    let action = escape_html(&urls.app("/packages"));
+    let mut out = String::from("<nav class=\"pager\" aria-label=\"Pagination\">");
+    if paged {
+        let link = |target: i64, enabled: bool, label: &str| {
+            if enabled {
+                format!(
+                    "<a class=\"btn\" href=\"{}\">{label}</a>",
+                    view.href(urls, target)
+                )
+            } else {
+                // A link without an href, still announced as one, and disabled.
+                format!("<a class=\"btn\" role=\"link\" aria-disabled=\"true\">{label}</a>")
+            }
+        };
+        let from = if shown == 0 { 0 } else { skip + 1 };
+        out.push_str(&format!(
+            "{prev}<span class=\"muted\">{from}\u{2013}{to} of {total}</span>{next}",
+            prev = link(
+                (skip - take).max(0),
+                skip > 0,
+                "<span aria-hidden=\"true\">\u{2190}</span> Previous"
+            ),
+            next = link(
+                skip + take,
+                skip + shown < total,
+                "Next <span aria-hidden=\"true\">\u{2192}</span>"
+            ),
+            to = skip + shown,
+        ));
+    }
+    out.push_str("<div class=\"pager-go\">");
+    if paged {
+        let pages = (total + take - 1) / take;
+        let current = skip / take + 1;
+        out.push_str(&format!(
+            "<form method=\"get\" action=\"{action}\">{hidden}\
+             <input type=\"hidden\" name=\"take\" value=\"{take}\">\
+             <label for=\"pg-page\">Page</label>\
+             <input id=\"pg-page\" name=\"page\" type=\"number\" inputmode=\"numeric\" min=\"1\" \
+             max=\"{pages}\" value=\"{current}\" required aria-describedby=\"pg-of\">\
+             <span id=\"pg-of\" class=\"muted\">of {pages}</span>\
+             <button type=\"submit\">Go<span class=\"vh\"> to page</span></button></form>"
+        ));
+    }
+    if sizable {
+        let options: String = sizes
+            .iter()
+            .map(|n| {
+                let sel = if *n == take { " selected" } else { "" };
+                format!("<option value=\"{n}\"{sel}>{n}</option>")
+            })
+            .collect();
+        out.push_str(&format!(
+            "<form method=\"get\" action=\"{action}\">{hidden}\
+             <input type=\"hidden\" name=\"skip\" value=\"{skip}\">\
+             <label for=\"pg-take\">Per page</label>\
+             <select id=\"pg-take\" name=\"take\">{options}</select>\
+             <button type=\"submit\">Apply<span class=\"vh\"> page size</span></button></form>"
+        ));
+    }
+    out.push_str("</div></nav>");
+    out
 }
 
 /// The statistics page: feed-wide totals, the most-downloaded packages, and the
@@ -923,7 +1067,15 @@ pub fn feeds_index_page(feeds: &[(String, String)]) -> String {
          <p class=\"muted\">This server hosts several NuGet feeds. Pick one:</p>\
          <div class=\"card\">{list}</div>"
     );
-    layout_with_chrome(&urls, "Feeds \u{2014} YANuget", "", "", &body, Chrome::Root)
+    layout_with_chrome(
+        &urls,
+        "Feeds \u{2014} YANuget",
+        "",
+        "",
+        &body,
+        Chrome::Root,
+        "",
+    )
 }
 
 /// Replace any `user:password@` in a URL with `***@`.
@@ -1520,20 +1672,31 @@ mod tests {
         }
     }
 
+    /// A gallery request on a server whose configured page size is 20.
+    fn view(query: &str, skip: i64, take: i64) -> GalleryView<'_> {
+        GalleryView {
+            query,
+            skip,
+            take,
+            default_take: 20,
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn gallery_lists_cards_and_paginates() {
         let urls = UrlBuilder::new("https://host");
         // Two of three results shown -> pager with a Next link.
         let mut page = page_of(&["Pkg.A", "Pkg.B"]);
         page.total_hits = 3;
-        let html = gallery_page(&urls, &page, "", 0, 2);
+        let html = gallery_page(&urls, &page, &view("", 0, 2));
         assert!(html.contains("Pkg.A"));
         assert!(html.contains("/packages/pkg.b"));
         assert!(html.contains("class=\"pager\""));
         assert!(html.contains("skip=2")); // next page
 
         // Empty result for a query offers a "clear search" link.
-        let empty = gallery_page(&urls, &page_of(&[]), "zzz", 0, 20);
+        let empty = gallery_page(&urls, &page_of(&[]), &view("zzz", 0, 20));
         assert!(empty.contains("Clear search"));
     }
 
@@ -1597,7 +1760,7 @@ mod tests {
             }],
             total_hits: 1,
         };
-        let html = gallery_page(&urls, &page, "", 0, 20);
+        let html = gallery_page(&urls, &page, &view("", 0, 20));
         assert!(html.contains("1.9.0"), "{html}");
     }
 
@@ -1606,13 +1769,13 @@ mod tests {
         let urls = UrlBuilder::new("https://host");
         let mut page = page_of(&["A"]);
         page.total_hits = 1;
-        let html = gallery_page(&urls, &page, "", 0, 20);
+        let html = gallery_page(&urls, &page, &view("", 0, 20));
         assert!(html.contains("<h1"), "no h1 on the landing page: {html}");
         // "1 package", not "1 package(s)".
         assert!(html.contains("1 package<"), "{html}");
         assert!(html.contains("<title>YANuget</title>"), "{html}");
 
-        let searched = gallery_page(&urls, &page, "logging", 0, 20);
+        let searched = gallery_page(&urls, &page, &view("logging", 0, 20));
         assert!(searched.contains("<title>Search:"), "{searched}");
         assert!(searched.contains("logging"), "{searched}");
     }
@@ -1624,7 +1787,7 @@ mod tests {
         let urls = UrlBuilder::new("https://host");
         let mut page = page_of(&[]);
         page.total_hits = 5000;
-        let html = gallery_page(&urls, &page, "", 99_999, 20);
+        let html = gallery_page(&urls, &page, &view("", 99_999, 20));
         assert!(!html.contains("Your feed is live"), "{html}");
         assert!(html.contains("nothing on this page"), "{html}");
         assert!(html.contains("Back to the first page"), "{html}");
@@ -1635,7 +1798,7 @@ mod tests {
         let urls = UrlBuilder::new("https://host");
         let mut page = page_of(&["A", "B"]);
         page.total_hits = 40;
-        let html = gallery_page(&urls, &page, "", 0, 5);
+        let html = gallery_page(&urls, &page, &view("", 0, 5));
         // Carrying `take` is what keeps the "1-5 of 40" counter honest on the
         // next page.
         assert!(html.contains("skip=5&amp;take=5"), "{html}");
@@ -1644,11 +1807,137 @@ mod tests {
     }
 
     #[test]
+    fn the_pager_offers_a_page_to_go_to_and_a_page_size() {
+        let urls = UrlBuilder::new("https://host");
+        let mut page = page_of(&["A", "B", "C", "D", "E"]);
+        page.total_hits = 42;
+        // The third page at five a page, on a server whose default is seven.
+        let html = gallery_page(
+            &urls,
+            &page,
+            &GalleryView {
+                query: "a\"b<c",
+                skip: 10,
+                take: 5,
+                default_take: 7,
+                ..Default::default()
+            },
+        );
+        assert!(html.contains("11\u{2013}15 of 42"), "{html}");
+        // One pager, holding two plain GET forms back to the gallery.
+        assert_eq!(html.matches("class=\"pager\"").count(), 1, "{html}");
+        let form = "<form method=\"get\" action=\"/packages\">";
+        assert_eq!(html.matches(form).count(), 2, "{html}");
+        assert!(
+            html.contains("max=\"9\" value=\"3\" required aria-describedby=\"pg-of\""),
+            "{html}"
+        );
+        assert!(
+            html.contains("<span id=\"pg-of\" class=\"muted\">of 9</span>"),
+            "{html}"
+        );
+        // The size form sends the offset on screen, for the server to snap.
+        assert!(html.contains("name=\"skip\" value=\"10\""), "{html}");
+        // The size in use and the configured default both stay on offer.
+        for n in [5, 7, 20, 50, 100] {
+            assert!(
+                html.contains(&format!("<option value=\"{n}\"")),
+                "{n}: {html}"
+            );
+        }
+        assert!(html.contains("<option value=\"5\" selected>"), "{html}");
+        // The search text rides along in both forms, escaped, and without an
+        // id: the header's search box owns `id="q"`.
+        let q = format!(
+            "<input type=\"hidden\" name=\"q\" value=\"{}\">",
+            escape_html("a\"b<c")
+        );
+        assert_eq!(html.matches(q.as_str()).count(), 2, "{html}");
+        assert!(!html.contains("a\"b<c"), "{html}");
+        // A later page is named in the title.
+        assert!(
+            html.contains(
+                "<title>Search: \u{201c}a&quot;b&lt;c\u{201d}, page 3 of 9 \u{2014} YANuget</title>"
+            ),
+            "{html}"
+        );
+        // A new search from the header keeps the chosen page size.
+        assert!(
+            html.contains(
+                "<input type=\"hidden\" name=\"take\" value=\"5\"><button type=\"submit\">Search"
+            ),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn the_page_size_stays_on_offer_when_everything_fits() {
+        // After choosing 100 on a feed of 60, there has to be a way back.
+        let urls = UrlBuilder::new("https://host");
+        let mut page = page_of(&["A", "B"]);
+        page.total_hits = 60;
+        let html = gallery_page(&urls, &page, &view("", 0, 100));
+        assert!(html.contains("<select id=\"pg-take\""), "{html}");
+        // With one page there is nothing to page through.
+        assert!(!html.contains("pg-page"), "{html}");
+        assert!(!html.contains("Previous"), "{html}");
+
+        // A list shorter than the smallest page size needs no pager at all.
+        page.total_hits = 2;
+        let html = gallery_page(&urls, &page, &view("", 0, 20));
+        assert!(!html.contains("class=\"pager\""), "{html}");
+    }
+
+    #[test]
+    fn paging_carries_the_filters_and_names_later_pages() {
+        let urls = UrlBuilder::new("https://host");
+        let mut page = page_of(&["A", "B"]);
+        page.total_hits = 6;
+        let html = gallery_page(
+            &urls,
+            &page,
+            &GalleryView {
+                skip: 2,
+                take: 2,
+                default_take: 20,
+                prerelease: Some(false),
+                package_type: Some("Dependency"),
+                ..Default::default()
+            },
+        );
+        assert!(
+            html.contains("skip=4&amp;take=2&amp;prerelease=false&amp;packageType=Dependency"),
+            "{html}"
+        );
+        assert_eq!(
+            html.matches("<input type=\"hidden\" name=\"packageType\" value=\"Dependency\">")
+                .count(),
+            2,
+            "{html}"
+        );
+        assert!(
+            html.contains("<title>Packages, page 2 of 3 \u{2014} YANuget</title>"),
+            "{html}"
+        );
+
+        // On the first page Previous stays a link to assistive technology,
+        // announced as disabled; the arrows are decoration.
+        let first = gallery_page(&urls, &page, &view("", 0, 2));
+        assert!(
+            first.contains(
+                "<a class=\"btn\" role=\"link\" aria-disabled=\"true\">\
+                 <span aria-hidden=\"true\">\u{2190}</span> Previous</a>"
+            ),
+            "{first}"
+        );
+    }
+
+    #[test]
     fn an_empty_feed_shows_the_commands_that_fill_it() {
         // The first page anyone sees. It has to carry *this* server's service
         // index, not a placeholder host, or it is just decoration.
         let urls = UrlBuilder::new("https://nuget.example.com");
-        let html = gallery_page(&urls, &page_of(&[]), "", 0, 20);
+        let html = gallery_page(&urls, &page_of(&[]), &view("", 0, 20));
         assert!(html.contains("Your feed is live"), "{html}");
         assert!(
             html.contains("dotnet nuget add source https://nuget.example.com/v3/index.json"),
@@ -1666,7 +1955,7 @@ mod tests {
 
         // A search that finds nothing is a different situation and must not be
         // answered with onboarding instructions.
-        let no_match = gallery_page(&urls, &page_of(&[]), "zzz", 0, 20);
+        let no_match = gallery_page(&urls, &page_of(&[]), &view("zzz", 0, 20));
         assert!(!no_match.contains("Your feed is live"), "{no_match}");
     }
 
@@ -1695,7 +1984,7 @@ mod tests {
         // An empty gallery page (no package-provided links) must reference no
         // external assets: all CSS/JS is inline and the favicon is a data URI.
         let urls = UrlBuilder::new("https://host");
-        let html = gallery_page(&urls, &page_of(&[]), "", 0, 20);
+        let html = gallery_page(&urls, &page_of(&[]), &view("", 0, 20));
         for needle in [
             "googleapis",
             "gstatic",

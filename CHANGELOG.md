@@ -12,6 +12,17 @@ expected to change incompatibly at any version.
 
 ## [Unreleased]
 
+### Added
+
+- The gallery pager can go to a page by number and change how many packages a
+  page shows: 20, 50, 100, or the configured `gallery_page_size`. Both are plain
+  GET forms, so they work without JavaScript. After a size change the page shown
+  is the one that holds the package that was first on screen, because `page`
+  wins over `skip` and any offset now snaps to the start of its page. Later
+  pages carry their number in the page title, the size choice stays on offer
+  when everything fits on one page, and paging keeps `prerelease` and
+  `packageType` filters as well as the search.
+
 ### Changed
 
 - `base64` 0.22 → 0.23, `toml` 0.8 → 1.1 and `tower-http` 0.6 → 0.7. All three
