@@ -44,6 +44,10 @@ expected to change incompatibly at any version.
 
 ### Fixed
 
+- Form controls rendered in the browser's own font (Arial on Windows) and
+  with borders of 1.4–1.6:1 against the page. They now use the page font and
+  a `--ctl` border token (3:1 or more in both themes); the dark theme's button
+  hover colour was darkened to keep white text readable.
 - A search paged past its last page said "No packages match", although it had
   matches. It now says there is nothing on that page and links to the last page
   and the first, keeping the search and the page size.

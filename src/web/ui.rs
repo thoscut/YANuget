@@ -17,7 +17,7 @@ use crate::nuget::UrlBuilder;
 const STYLE: &str = "\
 :root{color-scheme:dark light;\
 --bg:#0d1117;--card:#161b22;--border:#30363d;--fg:#e6edf3;--muted:#9aa4af;\
---accent:#58a6ff;--accent2:#1f6feb;--accent2h:#2d76f0;--onaccent:#fff;\
+--accent:#58a6ff;--accent2:#1f6feb;--accent2h:#1a64d6;--onaccent:#fff;\
 --code:#010409;--warn:#d29922;--subtle:#21262d;--subtleh:#30363d;\
 --ok:#3fb950;--danger:#b62324;--dangerfg:#ff7b72;--ctl:#656c76}\
 @media(prefers-color-scheme:light){:root{\
@@ -26,6 +26,7 @@ const STYLE: &str = "\
 --code:#f6f8fa;--warn:#9a6700;--subtle:#eaeef2;--subtleh:#dde3ea;\
 --ok:#1a7f37;--danger:#cf222e;--dangerfg:#cf222e;--ctl:#818b98}}\
 *{box-sizing:border-box}\
+button,input,select{font-family:inherit}\
 body{margin:0;background:var(--bg);color:var(--fg);\
 font:15px/1.55 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif}\
 a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}\
@@ -39,7 +40,7 @@ header .wrap{display:flex;align-items:center;gap:16px}\
 .logo{font-weight:700;font-size:20px;color:var(--fg)}\
 .logo span{color:var(--accent)}\
 form.search{flex:1;display:flex;gap:8px}\
-input[type=search]{flex:1;padding:9px 12px;border-radius:6px;border:1px solid var(--border);\
+input[type=search]{flex:1;padding:9px 12px;border-radius:6px;border:1px solid var(--ctl);\
 background:var(--bg);color:var(--fg);font-size:15px;min-height:44px}\
 input[type=search]:focus{border-color:var(--accent)}\
 button{padding:9px 16px;border-radius:6px;border:1px solid var(--accent2);\
@@ -2008,6 +2009,24 @@ mod tests {
             !rules.contains('#'),
             "hardcoded colour outside the variable block: {rules}"
         );
+    }
+
+    #[test]
+    fn form_controls_use_the_page_font_and_a_visible_border() {
+        // Browsers give form controls a font of their own (Arial on Windows),
+        // and the card border token is only ~1.4:1 against the page, too faint
+        // to show where a field is. Controls use `--ctl`, set in both themes.
+        assert!(STYLE.contains("button,input,select{font-family:inherit}"));
+        assert!(STYLE.contains("input[type=search]{flex:1;padding:9px 12px;border-radius:6px;border:1px solid var(--ctl)"));
+        let (dark, light) = STYLE
+            .split_once("prefers-color-scheme:light")
+            .expect("a light block");
+        assert!(dark.contains("--ctl:#"), "{dark}");
+        let light_vars = light
+            .split_once("*{box-sizing:border-box}")
+            .expect("variables before rules")
+            .0;
+        assert!(light_vars.contains("--ctl:#"), "{light_vars}");
     }
 
     #[test]
