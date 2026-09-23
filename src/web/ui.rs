@@ -464,11 +464,19 @@ pub fn gallery_page(
             // thousands of packages that their feed was empty. It is checked
             // before the search case, which said a search with four matches
             // had none.
+            // With a single page, the last page is the first: one link, not two
+            // that lead to the same place.
+            let last = if pages > 1 {
+                format!(
+                    "<p><a href=\"{}\">Go to the last page ({pages})</a></p>",
+                    view.href(urls, (pages - 1) * view.take)
+                )
+            } else {
+                String::new()
+            };
             format!(
                 "<div class=\"empty\"><h1 class=\"title\">There is nothing on this page</h1>\
-                 <p><a href=\"{last}\">Go to the last page ({pages})</a></p>\
-                 <p><a href=\"{first}\">Back to the first page</a></p></div>",
-                last = view.href(urls, (pages - 1) * view.take),
+                 {last}<p><a href=\"{first}\">Back to the first page</a></p></div>",
                 first = view.href(urls, 0),
             )
         } else if !query.trim().is_empty() {
@@ -2031,6 +2039,11 @@ mod tests {
             html.contains("?q=git&amp;skip=0&amp;take=2\">Back to the first page</a>"),
             "{html}"
         );
+
+        // With one page of matches the last page is the first: one link.
+        let html = gallery_page(&urls, &page, &view("git", 100, 20));
+        assert!(!html.contains("Go to the last page"), "{html}");
+        assert_eq!(html.matches("Back to the first page").count(), 1, "{html}");
     }
 
     #[test]
