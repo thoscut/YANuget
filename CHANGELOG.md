@@ -27,6 +27,9 @@ expected to change incompatibly at any version.
   three places that genuinely must interpolate a name — `PRAGMA table_info` and
   `ALTER TABLE` in the migration, and the `IN (?…)` placeholder list — take
   `&'static str` or generated placeholders only, never caller data.
+- `yanuget migrate` exits non-zero when any version failed to migrate, not only
+  when nothing got through. A partial copy used to exit 0, so a script gating on
+  the exit code read it as finished. Re-running retries only the failures.
 
 ### Fixed
 

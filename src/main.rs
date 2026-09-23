@@ -395,10 +395,14 @@ async fn run_migrate(config_path: Option<&str>, args: MigrateArgs) -> anyhow::Re
     // Best-effort cleanup of the scratch directory.
     let _ = tokio::fs::remove_dir_all(&temp_dir).await;
 
-    // Surface a non-zero exit only when nothing at all got through.
-    if summary.failed > 0 && summary.imported == 0 && summary.skipped == 0 {
+    // Any failure is a non-zero exit, even when everything else got through.
+    // Scripts gate on it ("stop the old server once the copy is done"), and a
+    // partial copy that exits 0 reads as a finished one. A re-run is cheap: it
+    // skips what is already there and retries only what failed.
+    if summary.failed > 0 {
         anyhow::bail!(
-            "migration failed: {} error(s), nothing imported",
+            "migration incomplete: {} failed (listed above); re-run to retry them, \
+             versions already migrated are skipped",
             summary.failed
         );
     }

@@ -55,6 +55,11 @@ definitions — is read the same way the server reads it.
 - **It is idempotent and resumable.** Versions the target feed already holds are
   skipped, so re-running after an interruption picks up where it stopped. Use
   `--overwrite` only when you deliberately want to replace what is there.
+- **It exits non-zero if anything failed.** The failed versions are listed at
+  the end, and the exit status is non-zero even when every other version got
+  through, so a script can gate on it — for example before switching clients
+  over or stopping the old server. Re-run to retry the failures; what already
+  arrived is skipped.
 - **Run it against a stopped server, or a quiet one.** The command opens the
   same data directory and database as the server. That works, but the two
   processes do not share the server's in-process version locks, so a migration

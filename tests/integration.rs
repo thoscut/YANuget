@@ -1995,6 +1995,77 @@ async fn migrate_dry_run_reports_without_importing() {
     assert!(!target.db.exists(&feed.name, "dry.run", &v).await.unwrap());
 }
 
+/// Run `yanuget migrate` as the real binary, the way an operator or a script
+/// would, into a data directory under `dir`.
+async fn run_migrate_command(
+    dir: &std::path::Path,
+    source: &TestServer,
+    extra: &[&str],
+) -> std::process::Output {
+    let config = dir.join("yanuget.toml");
+    // A TOML literal string takes a Windows path's backslashes as they are.
+    std::fs::write(
+        &config,
+        format!(
+            "data_dir = '{}'\ntls_enabled = false\n",
+            dir.join("data").display()
+        ),
+    )
+    .unwrap();
+    tokio::process::Command::new(env!("CARGO_BIN_EXE_yanuget"))
+        .arg("--config")
+        .arg(&config)
+        .arg("migrate")
+        .arg("--source")
+        .arg(source.url("/v3/index.json"))
+        .args(extra)
+        .output()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn migrate_command_fails_when_any_version_failed() {
+    // A partial copy has to fail the command. Scripts gate on its exit code
+    // ("stop the old server once the copy is done"), and a real run that
+    // reported "139 imported, 0 skipped, 20 failed" exited 0.
+    let source = spawn().await;
+    let small = build_nupkg("Exit.Small", "1.0.0", b"x");
+    // Filler deflate cannot shrink much, so this package stays the larger one.
+    let filler: Vec<u8> = (0..64 * 1024u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+        .collect();
+    let large = build_nupkg("Exit.Large", "1.0.0", &filler);
+    let cap = (small.len() + large.len()) / 2;
+    assert!(small.len() < cap && cap < large.len());
+    for nupkg in [small, large] {
+        let resp = push_multipart(&source, API_KEY, nupkg).await;
+        assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+    }
+
+    // Over the size cap, the large package fails; the small one is imported.
+    let target = tempfile::tempdir().unwrap();
+    let cap = cap.to_string();
+    let partial =
+        run_migrate_command(target.path(), &source, &["--max-package-size-bytes", &cap]).await;
+    let stderr = String::from_utf8_lossy(&partial.stderr);
+    assert!(!partial.status.success(), "partial run exited 0: {stderr}");
+    assert!(stderr.contains("migration incomplete"), "{stderr}");
+
+    // Without the cap, a re-run retries only what failed, and succeeds.
+    let rerun = run_migrate_command(target.path(), &source, &[]).await;
+    let stdout = String::from_utf8_lossy(&rerun.stdout);
+    assert!(
+        rerun.status.success(),
+        "{stdout}{}",
+        String::from_utf8_lossy(&rerun.stderr)
+    );
+    assert!(
+        stdout.contains("1 imported, 1 skipped, 0 failed"),
+        "{stdout}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Hardening: forwarding-header trust, response headers, auth gaps, CSRF,
 // conditional downloads and cross-feed payload integrity.
