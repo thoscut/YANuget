@@ -28,6 +28,15 @@ expected to change incompatibly at any version.
   `ALTER TABLE` in the migration, and the `IN (?…)` placeholder list — take
   `&'static str` or generated placeholders only, never caller data.
 
+### Fixed
+
+- `yanuget migrate` found only the first 100 packages on a BaGetter source.
+  BaGetter reports the number of results on the current page as `totalHits`,
+  and discovery stopped once `skip` passed it. Discovery now pages until the
+  source returns an empty page, advances by the results actually received (a
+  source may return fewer than `take` asked for), and stops early only when a
+  page repeats ids it has already seen.
+
 ## [0.5.0] — 2026-08-11
 
 The first release with a changelog. Versions 0.1.0 to 0.4.0 predate it; what
