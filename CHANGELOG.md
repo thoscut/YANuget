@@ -44,6 +44,11 @@ expected to change incompatibly at any version.
 
 ### Fixed
 
+- The package page kept its version list out of reach. The sticky install card
+  (over 500 px tall) covered Info and Versions while scrolling, and on a phone
+  the list came only after the whole readme. The card no longer sticks, the
+  sidebar reads Install, Versions, Info, and the readme is a grid item of its
+  own that follows the sidebar on a narrow screen.
 - Form controls rendered in the browser's own font (Arial on Windows) and
   with borders of 1.4–1.6:1 against the page. They now use the page font and
   a `--ctl` border token (3:1 or more in both themes); the dark theme's button

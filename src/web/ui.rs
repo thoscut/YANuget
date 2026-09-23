@@ -62,7 +62,9 @@ padding:1px 10px;font-size:12px;color:var(--muted);margin:0 4px 4px 0}\
 .muted{color:var(--muted)}\
 .grid{display:grid;grid-template-columns:1fr 340px;gap:22px}\
 @media(max-width:760px){.grid{grid-template-columns:1fr}}\
-@media(min-width:761px){.side .install{position:sticky;top:20px}}\
+.detail{grid-template-columns:1fr 340px;grid-template-areas:\"main side\" \"readme side\";grid-template-rows:auto 1fr}\
+.detail>.content{grid-area:main}.detail>.side{grid-area:side}.detail>.readme-area{grid-area:readme;min-width:0}\
+@media(max-width:760px){.detail{grid-template-columns:1fr;grid-template-areas:\"main\" \"side\" \"readme\";grid-template-rows:auto}}\
 h1.title{font-size:26px;margin:0 0 2px;overflow-wrap:anywhere}\
 pre{background:var(--code);border:1px solid var(--border);border-radius:8px;padding:12px 14px;\
 overflow:auto;font-size:13px;margin:6px 0}\
@@ -1159,7 +1161,7 @@ pub fn detail_page(
          <a href=\"{packages}\">Packages</a> <span aria-hidden=\"true\">/</span> <span>{id}</span></nav>\
          <h1 class=\"title\">{icon}{id}</h1>\
          <div class=\"meta\">{version}{badges} \u{2022} {dl} downloads of this version \u{2022} published {pub}</div>\
-         <p>{desc}</p>{tags}{links}{deps}{symbols}{readme}",
+         <p>{desc}</p>{tags}{links}{deps}{symbols}",
         packages = escape_html(&urls.app("/packages")),
         icon = render_icon(urls, selected),
         version = escape_html(&version),
@@ -1175,19 +1177,30 @@ pub fn detail_page(
         } else {
             ""
         },
-        readme = render_readme(readme),
     );
 
+    // Versions right under Install: picking another version is the common
+    // next step, and Info repeats much of what the header already says.
     let side = format!(
         "<div class=\"card install\">{install}</div>\
-         <div class=\"card\"><h3 class=\"muted\">Info</h3>{info}</div>\
-         <div class=\"card\"><h3 class=\"muted\">Versions</h3>{versions}</div>",
+         <div class=\"card\"><h3 class=\"muted\">Versions</h3>{versions}</div>\
+         <div class=\"card\"><h3 class=\"muted\">Info</h3>{info}</div>",
         install = render_install(urls, selected, primary_client),
         info = render_info(selected),
     );
 
+    // The readme is a grid item of its own, placed after the sidebar on a
+    // narrow screen. Inside the main column it came first there, and a long
+    // readme pushed the version list out of reach.
+    let readme = render_readme(readme);
+    let readme = if readme.is_empty() {
+        readme
+    } else {
+        format!("<div class=\"readme-area\">{readme}</div>")
+    };
     let body = format!(
-        "<div class=\"grid\"><div class=\"content\">{main}</div><div class=\"side\">{side}</div></div>"
+        "<div class=\"grid detail\"><div class=\"content\">{main}</div>\
+         <div class=\"side\">{side}</div>{readme}</div>"
     );
     layout(
         urls,
@@ -1658,6 +1671,36 @@ mod tests {
         assert!(html.contains("badge pre"));
         assert!(html.contains("badge un"));
         assert!(html.contains("Debug symbols are available"));
+    }
+
+    #[test]
+    fn the_detail_page_keeps_the_versions_within_reach() {
+        // The sticky install card (over 500 px tall) covered Info and Versions
+        // while scrolling, and on a phone Versions came after the whole readme.
+        let urls = UrlBuilder::new("https://host");
+        let p = sample();
+        let html = detail_page(
+            &urls,
+            std::slice::from_ref(&p),
+            &p,
+            Some("A long readme."),
+            "choco",
+            false,
+        );
+        assert!(!STYLE.contains("sticky"));
+        let at = |needle: &str| {
+            html.find(needle)
+                .unwrap_or_else(|| panic!("{needle}: {html}"))
+        };
+        let (install, versions) = (at("class=\"card install\""), at(">Versions<"));
+        let (info, readme) = (at(">Info<"), at("<div class=\"readme-area\">"));
+        assert!(
+            install < versions && versions < info && info < readme,
+            "{html}"
+        );
+        // The readme is a grid item of its own, not part of the main column.
+        let content_end = at("<div class=\"side\">");
+        assert!(readme > content_end, "{html}");
     }
 
     fn page_of(ids: &[&str]) -> crate::database::SearchPage {
