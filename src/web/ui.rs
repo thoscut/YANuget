@@ -103,7 +103,10 @@ ol.steps{padding-left:44px}\
 .kv b{color:var(--muted);font-weight:500;min-width:120px;flex:0 0 auto}\
 .kv.wide b{flex:0 0 13em}\
 @media(max-width:480px){.kv div{flex-direction:column;gap:0}.kv b{min-width:0}.kv.wide b{flex:0 0 auto}}\
-.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:14px;margin:0 0 8px}\
+.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin:0 0 8px}\
+@media(max-width:480px){.stats{grid-template-columns:repeat(2,1fr)}}\
+.lists{display:grid;grid-template-columns:1fr 1fr;gap:22px;margin-top:14px}\
+@media(max-width:760px){.lists{grid-template-columns:1fr}}\
 .stat{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:16px 18px}\
 .stat .n{font-size:26px;font-weight:700}\
 .stat .l{color:var(--muted);font-size:13px}\
@@ -755,7 +758,7 @@ pub fn stats_page(
 
     let body = format!(
         "<h1 class=\"title\">Statistics</h1>{tiles}\
-         <div class=\"grid\">\
+         <div class=\"lists\">\
          <div class=\"card\"><h2 class=\"muted\">Most downloaded</h2>{top_list}</div>\
          <div class=\"card\"><h2 class=\"muted\">Recently published</h2>{recent_list}</div>\
          </div>"
@@ -2225,6 +2228,16 @@ mod tests {
         assert!(html.contains("1,234")); // grouped downloads
         assert!(html.contains("Top.Pkg"));
         assert!(html.contains("Recently published"));
+        // Six tiles in rows of three (two on a phone), not five and an orphan;
+        // the two lists share the width evenly, not the package page's
+        // `1fr 340px` split.
+        assert_eq!(html.matches("class=\"stat\"").count(), 6);
+        assert!(STYLE.contains(".stats{display:grid;grid-template-columns:repeat(3,1fr)"));
+        assert!(
+            html.contains("<div class=\"lists\"><div class=\"card\">"),
+            "{html}"
+        );
+        assert!(!html.contains("class=\"grid\""), "{html}");
     }
 
     /// The level of every heading in `html`, in document order.

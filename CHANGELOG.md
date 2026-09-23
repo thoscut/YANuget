@@ -44,6 +44,10 @@ expected to change incompatibly at any version.
 
 ### Fixed
 
+- The stats page set its six tiles in as many columns as fit (five and an
+  orphan on a desktop) and its two lists in the package page's `1fr 340px`
+  split. Tiles are now in rows of three (two on a phone) and the lists share
+  the width evenly.
 - Install commands wrapped after any hyphen, so `--version` could end one line
   as `--` and start the next as `version`. Each flag now stays on one line with
   its value; the URL still wraps, and the copied text is unchanged.
