@@ -2066,6 +2066,144 @@ async fn migrate_command_fails_when_any_version_failed() {
     );
 }
 
+/// A source feed holding one package, `Slow.Package` 1.0.0, whose `.nupkg` it
+/// sends in `chunks` pieces with `pause` between them: steady, but slow.
+/// Returns the service-index URL.
+async fn slow_upstream(chunks: usize, pause: std::time::Duration) -> String {
+    use axum::body::{Body, Bytes};
+    use axum::extract::Query;
+    use axum::routing::get;
+    use axum::{Json, Router};
+    use futures::StreamExt;
+    use std::collections::HashMap;
+
+    let nupkg = build_nupkg("Slow.Package", "1.0.0", &[7u8; 16 * 1024]);
+    let listener = tokio::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .await
+        .unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let index = serde_json::json!({
+        "version": "3.0.0",
+        "resources": [
+            {"@id": format!("{base}/flat/"), "@type": "PackageBaseAddress/3.0.0"},
+            {"@id": format!("{base}/query"), "@type": "SearchQueryService"}
+        ]
+    });
+    let app = Router::new()
+        .route(
+            "/v3/index.json",
+            get(move || {
+                let index = index.clone();
+                async move { Json(index) }
+            }),
+        )
+        .route(
+            "/query",
+            get(|Query(q): Query<HashMap<String, String>>| async move {
+                let first = q.get("skip").is_none_or(|s| s == "0");
+                let data = if first {
+                    serde_json::json!([{"id": "Slow.Package", "version": "1.0.0"}])
+                } else {
+                    serde_json::json!([])
+                };
+                Json(serde_json::json!({"totalHits": 1, "data": data}))
+            }),
+        )
+        .route(
+            "/flat/slow.package/index.json",
+            get(|| async { Json(serde_json::json!({"versions": ["1.0.0"]})) }),
+        )
+        .route(
+            "/flat/slow.package/1.0.0/slow.package.1.0.0.nupkg",
+            get(move || {
+                let nupkg = nupkg.clone();
+                async move {
+                    let size = nupkg.len().div_ceil(chunks);
+                    let pieces: Vec<Bytes> =
+                        nupkg.chunks(size).map(Bytes::copy_from_slice).collect();
+                    let body = futures::stream::iter(pieces).then(move |piece| async move {
+                        tokio::time::sleep(pause).await;
+                        Ok::<_, std::io::Error>(piece)
+                    });
+                    axum::response::Response::builder()
+                        .header("content-length", nupkg.len())
+                        .body(Body::from_stream(body))
+                        .unwrap()
+                }
+            }),
+        );
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("{base}/v3/index.json")
+}
+
+#[tokio::test]
+async fn migrate_downloads_packages_that_take_longer_than_the_timeout() {
+    // A whole-transfer deadline of `timeout_secs` failed every package larger
+    // than the source could send in that time: at ~2 MiB/s and the default
+    // 60 s, anything past ~120 MB. Eight pieces 300 ms apart take 2.4 s against
+    // a 1 s timeout, while no single pause comes near it.
+    let upstream = slow_upstream(8, std::time::Duration::from_millis(300)).await;
+    let target = migrate_target().await;
+    let feeds = target.config.resolved_feeds().unwrap();
+    let source = MirrorConfig {
+        enabled: true,
+        upstream,
+        timeout_secs: 1,
+        allow_private_upstream: true,
+        ..Default::default()
+    };
+    let summary = yanuget::migrate::run(
+        &target.storage,
+        &target.db,
+        &feeds[0],
+        &target.temp_dir,
+        source,
+        MigrateOptions {
+            quiet: true,
+            ..Default::default()
+        },
+        indicatif::ProgressDrawTarget::hidden(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        (summary.imported, summary.failed),
+        (1, 0),
+        "{:?}",
+        summary.failures
+    );
+}
+
+#[tokio::test]
+async fn read_through_mirror_still_gives_up_on_a_slow_download() {
+    // The read-through mirror is started by an anonymous request, so it keeps
+    // its total deadline: an upstream that trickles must not hold the fetch.
+    let upstream = slow_upstream(8, std::time::Duration::from_millis(300)).await;
+    let target = migrate_target().await;
+    let client = yanuget::mirror::MirrorClient::from_config(&MirrorConfig {
+        enabled: true,
+        upstream,
+        timeout_secs: 1,
+        allow_private_upstream: true,
+        ..Default::default()
+    })
+    .unwrap();
+    let mirrored = yanuget::mirror::ensure_package(
+        &client,
+        &target.storage,
+        &target.db,
+        "default",
+        &target.temp_dir,
+        "Slow.Package",
+        &yanuget::mirror::MirrorOptions::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(mirrored, 0);
+}
+
 // ---------------------------------------------------------------------------
 // Hardening: forwarding-header trust, response headers, auth gaps, CSRF,
 // conditional downloads and cross-feed payload integrity.

@@ -40,7 +40,7 @@ A live display shows progress, ETA and transfer rate while it runs.
 | `--source-username` / `--source-password` | *(none)* | HTTP Basic credentials for the source. |
 | `--source-token <token>` | *(none)* | Bearer token for the source. |
 | `--source-header "Name: Value"` | *(none)* | Extra request header; repeatable. |
-| `--timeout-secs <n>` | `60` | Per-request timeout against the source. |
+| `--timeout-secs <n>` | `60` | How long the source may take to connect, or stay silent while answering. Listing requests must also finish within it; a package download may take longer, as long as data keeps arriving. |
 | `--concurrency <n>` | `4` | Packages downloaded and indexed at once. |
 | `--skip-prerelease` | off | Import only stable versions. |
 | `--overwrite` | off | Replace versions the target feed already has. |

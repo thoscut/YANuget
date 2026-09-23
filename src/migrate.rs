@@ -136,11 +136,16 @@ pub async fn run(
     let concurrency = opts.concurrency.max(1);
     let skip_existing = matches!(opts.overwrite, OverwriteMode::Disabled);
 
-    let client = MirrorClient::from_config(&source).ok_or_else(|| {
+    let mut client = MirrorClient::from_config(&source).ok_or_else(|| {
         Error::Other(anyhow::anyhow!(
             "could not build a source client (mirror config disabled?)"
         ))
     })?;
+    // A migration copies packages of any size, so a download is bounded by how
+    // long the source goes silent, not by how long it takes. A deadline on the
+    // whole transfer failed everything the source could not send within
+    // `timeout_secs`: at ~2 MiB/s and the default 60 s, anything past ~120 MB.
+    client.set_download_deadline(None);
 
     if !opts.quiet {
         println!(

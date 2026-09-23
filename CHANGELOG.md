@@ -39,6 +39,13 @@ expected to change incompatibly at any version.
   source returns an empty page, advances by the results actually received (a
   source may return fewer than `take` asked for), and stops early only when a
   page repeats ids it has already seen.
+- `yanuget migrate` failed every package the source could not send within
+  `--timeout-secs`, because the timeout covered the whole download: at ~2 MiB/s
+  and the default 60 s, anything past ~120 MB. The failure read "error decoding
+  response body". A migration download is now bounded only by how long the
+  source goes silent (connect and read timeouts). Listing requests keep a total
+  deadline, and so do read-through mirror downloads, which an anonymous request
+  can start.
 
 ## [0.5.0] — 2026-08-11
 

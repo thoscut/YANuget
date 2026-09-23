@@ -55,7 +55,9 @@ struct MigrateArgs {
     /// Extra source request header as "Name: Value"; may be repeated.
     #[arg(long)]
     source_header: Vec<String>,
-    /// Per-request timeout to the source, in seconds.
+    /// Timeout, in seconds, for connecting to the source and for any silence
+    /// while it answers. Listing requests must also finish within it; package
+    /// downloads may take as long as they need while data keeps arriving.
     #[arg(long, default_value_t = 60)]
     timeout_secs: u64,
     /// Number of packages downloaded and indexed concurrently.

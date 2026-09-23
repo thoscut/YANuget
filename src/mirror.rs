@@ -36,6 +36,12 @@ pub struct MirrorClient {
     max_package_size_bytes: Option<u64>,
     /// Cap on versions fetched for one read-through miss.
     max_versions_per_package: Option<usize>,
+    /// Deadline for one metadata request (service index, search or catalog
+    /// page, version list), from `timeout_secs`.
+    timeout: std::time::Duration,
+    /// Deadline for one whole `.nupkg` download. `None` leaves only the read
+    /// timeout, which bounds how long the upstream may go silent.
+    download_deadline: Option<std::time::Duration>,
     resources: OnceCell<MirrorResources>,
 }
 
@@ -73,8 +79,14 @@ impl MirrorClient {
         if !config.enabled {
             return None;
         }
+        // Connecting and every read are bounded on the client. A read timeout
+        // restarts with each chunk received, so it limits how long the upstream
+        // may go silent, not how long a transfer may take; each request adds a
+        // total deadline of its own on top (`timeout`, `download_deadline`).
+        let timeout = std::time::Duration::from_secs(config.timeout_secs.max(1));
         let mut builder = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(config.timeout_secs.max(1)))
+            .connect_timeout(timeout)
+            .read_timeout(timeout)
             .user_agent(concat!("yanuget/", env!("CARGO_PKG_VERSION")))
             .default_headers(auth_headers(&config.auth));
         // Upstream credentials ride on every request as default headers. reqwest
@@ -121,8 +133,23 @@ impl MirrorClient {
             allow_private_upstream: config.allow_private_upstream,
             max_package_size_bytes: config.max_package_size_bytes,
             max_versions_per_package: config.max_versions_per_package,
+            timeout,
+            download_deadline: Some(timeout),
             resources: OnceCell::new(),
         })
+    }
+
+    /// Replace the deadline on one whole `.nupkg` download. `None` removes it:
+    /// the upstream may then take as long as it needs, provided it never goes
+    /// silent for longer than the read timeout.
+    ///
+    /// The read-through mirror keeps its deadline, because an anonymous request
+    /// starts that fetch and an upstream that trickles bytes must not hold it
+    /// open. `migrate` removes it: an operator copying a feed wants its large
+    /// packages, and a deadline on the whole transfer fails every package the
+    /// source cannot send within `timeout_secs`.
+    pub fn set_download_deadline(&mut self, deadline: Option<std::time::Duration>) {
+        self.download_deadline = deadline;
     }
 
     /// Reject an upstream-supplied resource URL that we should not fetch.
@@ -244,6 +271,7 @@ impl MirrorClient {
                 let index: serde_json::Value = self
                     .client
                     .get(&self.upstream)
+                    .timeout(self.timeout)
                     .send()
                     .await
                     .map_err(mirror_err)?
@@ -290,7 +318,13 @@ impl MirrorClient {
     pub async fn upstream_versions(&self, lower_id: &str) -> Result<Vec<String>> {
         let base = &self.resources().await?.package_base;
         let url = format!("{base}{lower_id}/index.json");
-        let resp = self.client.get(&url).send().await.map_err(mirror_err)?;
+        let resp = self
+            .client
+            .get(&url)
+            .timeout(self.timeout)
+            .send()
+            .await
+            .map_err(mirror_err)?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(Vec::new());
         }
@@ -319,9 +353,11 @@ impl MirrorClient {
     ) -> Result<streaming::StreamSummary> {
         let base = &self.resources().await?.package_base;
         let url = format!("{base}{lower_id}/{version}/{lower_id}.{version}.nupkg");
-        let resp = self
-            .client
-            .get(&url)
+        let mut request = self.client.get(&url);
+        if let Some(deadline) = self.download_deadline {
+            request = request.timeout(deadline);
+        }
+        let resp = request
             .send()
             .await
             .map_err(mirror_err)?
@@ -414,6 +450,7 @@ impl MirrorClient {
             let doc: serde_json::Value = self
                 .client
                 .get(&url)
+                .timeout(self.timeout)
                 .send()
                 .await
                 .map_err(mirror_err)?
@@ -461,6 +498,7 @@ impl MirrorClient {
         let index: serde_json::Value = self
             .client
             .get(catalog)
+            .timeout(self.timeout)
             .send()
             .await
             .map_err(mirror_err)?
@@ -485,6 +523,7 @@ impl MirrorClient {
             let page: serde_json::Value = match self
                 .client
                 .get(&page_url)
+                .timeout(self.timeout)
                 .send()
                 .await
                 .and_then(|r| r.error_for_status())
