@@ -329,7 +329,7 @@ pub fn error_page(urls: &UrlBuilder, status: axum::http::StatusCode) -> String {
         ),
         StatusCode::BAD_REQUEST => (
             "That request did not make sense",
-            "Check the package id and version in the address bar.",
+            "Check the address for a typo.",
         ),
         StatusCode::TOO_MANY_REQUESTS => (
             "Too many requests",
@@ -434,22 +434,26 @@ pub fn gallery_page(
     let current = view.skip / view.take + 1;
     let body = if page.groups.is_empty() {
         let browse_all = escape_html(&urls.app("/packages"));
-        if !query.trim().is_empty() {
-            format!(
-                "<div class=\"empty\"><p>No packages match \u{201c}{}\u{201d}.</p>\
-                 <p><a href=\"{browse_all}\">Clear search and browse all packages</a></p></div>",
-                escape_html(query),
-            )
-        } else if page.total_hits > 0 {
-            // Empty page, non-empty feed: `skip` is past the end. That happens
+        if page.total_hits > 0 {
+            // Empty page, matches exist: `skip` is past the end. That happens
             // from a bookmarked link, a hand-edited URL, or a `skip` that was
             // valid until a delete or a retention sweep shortened the list.
             // Answering it with the onboarding panel told an operator with
-            // thousands of packages that their feed was empty.
+            // thousands of packages that their feed was empty. It is checked
+            // before the search case, which said a search with four matches
+            // had none.
             format!(
-                "<div class=\"empty\"><p>There is nothing on this page.</p>\
+                "<div class=\"empty\"><h1 class=\"title\">There is nothing on this page</h1>\
+                 <p><a href=\"{last}\">Go to the last page ({pages})</a></p>\
                  <p><a href=\"{first}\">Back to the first page</a></p></div>",
+                last = view.href(urls, (pages - 1) * view.take),
                 first = view.href(urls, 0),
+            )
+        } else if !query.trim().is_empty() {
+            format!(
+                "<div class=\"empty\"><h1 class=\"title\">No packages match \u{201c}{}\u{201d}</h1>\
+                 <p><a href=\"{browse_all}\">Clear search and browse all packages</a></p></div>",
+                escape_html(query),
             )
         } else {
             first_run_panel(urls)
@@ -1791,6 +1795,33 @@ mod tests {
         assert!(!html.contains("Your feed is live"), "{html}");
         assert!(html.contains("nothing on this page"), "{html}");
         assert!(html.contains("Back to the first page"), "{html}");
+        assert!(
+            html.contains("skip=4980&amp;take=20\">Go to the last page (250)</a>"),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn a_search_past_its_last_page_is_not_a_search_without_matches() {
+        // `?q=git&skip=100` on a feed where git has four matches said "No
+        // packages match". The way back keeps the search and the page size.
+        let urls = UrlBuilder::new("https://host");
+        let mut page = page_of(&[]);
+        page.total_hits = 4;
+        let html = gallery_page(&urls, &page, &view("git", 100, 2));
+        assert!(!html.contains("No packages match"), "{html}");
+        assert!(
+            html.contains("<h1 class=\"title\">There is nothing on this page</h1>"),
+            "{html}"
+        );
+        assert!(
+            html.contains("?q=git&amp;skip=2&amp;take=2\">Go to the last page (2)</a>"),
+            "{html}"
+        );
+        assert!(
+            html.contains("?q=git&amp;skip=0&amp;take=2\">Back to the first page</a>"),
+            "{html}"
+        );
     }
 
     #[test]

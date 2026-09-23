@@ -1215,6 +1215,44 @@ async fn gallery_pager_goes_to_a_page_and_snaps_to_page_starts() {
 }
 
 #[tokio::test]
+async fn gallery_reads_its_query_string_leniently() {
+    // The gallery's addresses are typed and edited by hand. An empty or
+    // mistyped value falls back to its default; each of these was a 400.
+    let server = spawn_with(|c| c.gallery_page_size = 2).await;
+    for id in ["Ln.A", "Ln.B", "Ln.C"] {
+        push_multipart(&server, API_KEY, build_nupkg(id, "1.0.0", b"x")).await;
+    }
+    for query in [
+        "skip=",
+        "take=",
+        "take=abc",
+        "page=",
+        "page=two",
+        "skip=-5",
+        "prerelease=maybe",
+    ] {
+        let resp = server
+            .client
+            .get(server.url(&format!("/packages?{query}")))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK, "?{query}");
+        let body = resp.text().await.unwrap();
+        assert!(body.contains("1\u{2013}2 of 3"), "?{query}: {body}");
+    }
+
+    // A search past its last page is not a search without matches, and the
+    // way back keeps the search and the page size.
+    let body = get_text(&server, "/packages?q=ln&skip=100").await;
+    assert!(!body.contains("No packages match"), "{body}");
+    assert!(
+        body.contains("?q=ln&amp;skip=2&amp;take=2\">Go to the last page (2)</a>"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
 async fn web_ui_can_be_disabled() {
     let server = spawn_with(|c| c.enable_web_ui = false).await;
     push_multipart(&server, API_KEY, build_nupkg("Hidden.Pkg", "1.0.0", b"x")).await;

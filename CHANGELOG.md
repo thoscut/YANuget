@@ -44,6 +44,13 @@ expected to change incompatibly at any version.
 
 ### Fixed
 
+- A search paged past its last page said "No packages match", although it had
+  matches. It now says there is nothing on that page and links to the last page
+  and the first, keeping the search and the page size.
+- The gallery answered an empty or mistyped `?skip=`, `?take=`, `?page=` or
+  `?prerelease=` with a 400 page. Its query string is now read leniently: a value
+  that does not parse means the default. The 400 page's advice now reads "Check
+  the address for a typo."
 - `yanuget migrate` found only the first 100 packages on a BaGetter source.
   BaGetter reports the number of results on the current page as `totalHits`,
   and discovery stopped once `skip` passed it. Discovery now pages until the
