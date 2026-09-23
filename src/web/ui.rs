@@ -76,6 +76,7 @@ code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}\
 .install h3{margin:14px 0 4px;font-size:14px;color:var(--muted)}\
 .install .primary h3{color:var(--accent)}\
 .install pre{white-space:pre-wrap;overflow-wrap:break-word}\
+.nw{white-space:nowrap}\
 .snip{display:flex;flex-direction:column;align-items:flex-end}\
 .snip .copy{padding:6px 12px;font-size:12px;min-height:32px;margin-bottom:-4px;\
 background:var(--subtle);border:1px solid var(--border);color:var(--fg)}\
@@ -577,7 +578,7 @@ fn first_run_panel(urls: &UrlBuilder) -> String {
             "<li><h2>{label}</h2><div class=\"snip\">\
              <button type=\"button\" class=\"copy\" aria-label=\"Copy command\">Copy</button>\
              <pre><code>{cmd}</code></pre></div></li>",
-            cmd = escape_html(&cmd),
+            cmd = command_html(&cmd),
         ));
     }
 
@@ -1272,10 +1273,45 @@ fn render_install(urls: &UrlBuilder, p: &Package, primary_client: &str) -> Strin
             "<div{cls}><h3>{label}</h3><div class=\"snip\">\
              <button type=\"button\" class=\"copy\" aria-label=\"Copy command\">Copy</button>\
              <pre><code>{cmd}</code></pre></div></div>",
-            cmd = escape_html(&cmd),
+            cmd = command_html(&cmd),
         ));
     }
     out
+}
+
+/// A command for a copyable snippet, as HTML: every token escaped exactly
+/// once, and each flag kept on one line with the value after it.
+///
+/// Snippets wrap (`pre-wrap`) to fit the sidebar, and a browser may break a
+/// line after any hyphen, so `--version` came out as `--` / `version`, and
+/// `2.0.0-beta` split in two. A `.nw` span holds a flag and its value together.
+/// A URL stays breakable, being the one token too long for the sidebar. The
+/// text is unchanged, tokens are rejoined with the spaces they were split on,
+/// and spans add no whitespace, so the copy button (`innerText`) still puts
+/// exactly the command on the clipboard.
+fn command_html(cmd: &str) -> String {
+    let tokens: Vec<&str> = cmd.split(' ').collect();
+    let mut parts = Vec::with_capacity(tokens.len());
+    let mut i = 0;
+    while i < tokens.len() {
+        let token = tokens[i];
+        if token.starts_with('-') {
+            let mut kept = token.to_string();
+            if let Some(value) = tokens
+                .get(i + 1)
+                .filter(|v| !v.is_empty() && !v.starts_with('-') && !v.contains("://"))
+            {
+                kept.push(' ');
+                kept.push_str(value);
+                i += 1;
+            }
+            parts.push(format!("<span class=\"nw\">{}</span>", escape_html(&kept)));
+        } else {
+            parts.push(escape_html(token));
+        }
+        i += 1;
+    }
+    parts.join(" ")
 }
 
 fn render_info(p: &Package) -> String {
@@ -1614,13 +1650,76 @@ mod tests {
         assert_eq!(human_size(25 * 1024 * 1024 * 1024), "25.0 GB");
     }
 
+    /// What a browser's `innerText` gives for `html`: the text with the tags
+    /// dropped and the five escapes undone. It is what the copy button puts
+    /// on the clipboard.
+    fn text_of(html: &str) -> String {
+        let mut text = String::new();
+        let mut in_tag = false;
+        for c in html.chars() {
+            match c {
+                '<' => in_tag = true,
+                '>' if in_tag => in_tag = false,
+                _ if !in_tag => text.push(c),
+                _ => {}
+            }
+        }
+        text.replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&#39;", "'")
+            .replace("&amp;", "&")
+    }
+
+    #[test]
+    fn install_commands_keep_flags_whole_and_copy_unchanged() {
+        // `pre-wrap` let a browser break after any hyphen: `--version` split
+        // into `--` and `version` at the end of a line.
+        let urls = UrlBuilder::new("https://host.test/a&b");
+        let mut p = sample();
+        p.version = crate::version::NuGetVersion::parse("2.0.0-beta").unwrap();
+        let html = render_install(&urls, &p, "choco");
+        assert!(
+            html.contains("<span class=\"nw\">--version 2.0.0-beta</span>"),
+            "{html}"
+        );
+        assert!(
+            html.contains("<span class=\"nw\">-Version 2.0.0-beta</span>"),
+            "{html}"
+        );
+        // The URL is left free to wrap, and is escaped once.
+        assert!(
+            html.contains(
+                "<span class=\"nw\">--source</span> https://host.test/a&amp;b/v3/index.json"
+            ),
+            "{html}"
+        );
+        // Each snippet's text is exactly the command, so the clipboard is too.
+        let idx = "https://host.test/a&b/v3/index.json";
+        for expected in [
+            format!("choco install Contoso.Utils --version 2.0.0-beta --source {idx}"),
+            format!("dotnet add package Contoso.Utils --version 2.0.0-beta --source {idx}"),
+            format!("nuget install Contoso.Utils -Version 2.0.0-beta -Source {idx}"),
+        ] {
+            let found = html
+                .split("<code>")
+                .skip(1)
+                .map(|s| text_of(s.split("</code>").next().unwrap()))
+                .any(|t| t == expected);
+            assert!(found, "no snippet reads {expected:?}: {html}");
+        }
+        // The helper keeps a lone flag, and the value after it, intact.
+        assert_eq!(text_of(&command_html("a -n b --x")), "a -n b --x");
+        assert_eq!(text_of(&command_html("a  b")), "a  b");
+    }
+
     #[test]
     fn install_snippet_orders_primary_first() {
         let urls = UrlBuilder::new("https://nuget.example.com");
         let p = sample();
         let choco_first = render_install(&urls, &p, "choco");
         assert!(choco_first.find("Chocolatey").unwrap() < choco_first.find("dotnet CLI").unwrap());
-        assert!(choco_first.contains("choco install Contoso.Utils --version 1.0.0"));
+        assert!(text_of(&choco_first).contains("choco install Contoso.Utils --version 1.0.0"));
         let dotnet_first = render_install(&urls, &p, "dotnet");
         assert!(
             dotnet_first.find("dotnet CLI").unwrap() < dotnet_first.find("Chocolatey").unwrap()
@@ -2034,7 +2133,8 @@ mod tests {
         );
         assert!(html.contains("dotnet nuget push"), "{html}");
         assert!(
-            html.contains("dotnet restore --source https://nuget.example.com/v3/index.json"),
+            text_of(&html)
+                .contains("dotnet restore --source https://nuget.example.com/v3/index.json"),
             "{html}"
         );
         // Each command gets a copy button, which reads `innerText` — so the

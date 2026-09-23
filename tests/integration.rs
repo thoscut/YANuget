@@ -866,7 +866,11 @@ async fn gallery_lists_and_details_packages() {
         .unwrap();
     assert!(detail.status().is_success());
     let body = detail.text().await.unwrap();
-    assert!(body.contains("choco install Web.Ui.Pkg --version 1.2.3"));
+    // Each flag sits on one line with its value (`.nw`); the text is unchanged.
+    assert!(
+        body.contains("choco install Web.Ui.Pkg <span class=\"nw\">--version 1.2.3</span>"),
+        "{body}"
+    );
     assert!(body.contains("Newtonsoft.Json")); // dependency rendered
                                                // Accessibility + UX affordances.
     assert!(body.contains("Skip to content"));

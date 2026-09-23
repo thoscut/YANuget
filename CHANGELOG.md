@@ -44,6 +44,9 @@ expected to change incompatibly at any version.
 
 ### Fixed
 
+- Install commands wrapped after any hyphen, so `--version` could end one line
+  as `--` and start the next as `version`. Each flag now stays on one line with
+  its value; the URL still wraps, and the copied text is unchanged.
 - The stats, settings, package and first-run pages went from `<h1>` straight to
   `<h3>`; every section heading is now an `<h2>`, and the package page's client
   labels sit under a new "Install" heading. Counts of one read "1 download" and
