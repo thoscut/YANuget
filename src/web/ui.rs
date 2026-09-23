@@ -105,7 +105,8 @@ ol.steps{padding-left:44px}\
 @media(max-width:480px){.kv div{flex-direction:column;gap:0}.kv b{min-width:0}.kv.wide b{flex:0 0 auto}}\
 .stats{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin:0 0 8px}\
 @media(max-width:480px){.stats{grid-template-columns:repeat(2,1fr)}}\
-.lists{display:grid;grid-template-columns:1fr 1fr;gap:22px;margin-top:14px}\
+.lists{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:14px}\
+.lists>.card{margin:0}\
 @media(max-width:760px){.lists{grid-template-columns:1fr}}\
 .stat{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:16px 18px}\
 .stat .n{font-size:26px;font-weight:700}\
