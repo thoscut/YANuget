@@ -44,6 +44,11 @@ expected to change incompatibly at any version.
 
 ### Fixed
 
+- The Copy buttons showed on feeds served over plain HTTP, and without
+  JavaScript, where they could not copy anything (browsers withhold the
+  clipboard API outside a secure context). They now appear only where they
+  work, each names its command for screen readers, and a copy is announced
+  through a status region.
 - The stats page set its six tiles in as many columns as fit (five and an
   orphan on a desktop) and its two lists in the package page's `1fr 340px`
   split. Tiles are now in rows of three (two on a phone) and the lists share

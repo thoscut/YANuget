@@ -189,8 +189,12 @@ pub fn safe_href(url: &str) -> Option<&str> {
 }
 
 /// Tiny inline script giving the install-command "Copy" buttons their
-/// behaviour. It degrades gracefully: without JS the `<pre>` stays selectable
-/// and the button simply does nothing.
+/// behaviour. The buttons are rendered `hidden` and shown only when the
+/// clipboard API exists: without JavaScript, or on a feed served over plain
+/// HTTP (where browsers withhold `navigator.clipboard`), a visible button did
+/// nothing. The `<pre>` stays selectable either way. A copy is announced
+/// through the page's one `role="status"` region, because the button's own
+/// "Copied" text is hidden behind its `aria-label`.
 ///
 /// Kept separate from its `<script>` wrapper because the CSP hash below must be
 /// taken over exactly this text — the element's content, not the tags.
@@ -198,11 +202,15 @@ pub fn safe_href(url: &str) -> Option<&str> {
 /// to be an inline `onsubmit=` attribute, which the CSP below cannot whitelist
 /// by hash — so the prompt is delegated from here off a `data-confirm`
 /// attribute instead, keeping the guard rail and the policy both intact.
-const COPY_SCRIPT_BODY: &str = "document.addEventListener('click',function(e){\
+const COPY_SCRIPT_BODY: &str = "if(navigator.clipboard)\
+document.querySelectorAll('.copy').forEach(function(b){b.hidden=false});\
+document.addEventListener('click',function(e){\
 var b=e.target.closest('.copy');if(!b)return;\
 var c=b.parentNode.querySelector('code');if(!c||!navigator.clipboard)return;\
 navigator.clipboard.writeText(c.innerText).then(function(){\
-var o=b.textContent;b.textContent='Copied';setTimeout(function(){b.textContent=o},1200)})});\
+var s=document.getElementById('copied');if(s)s.textContent='Copied to the clipboard';\
+var o=b.textContent;b.textContent='Copied';\
+setTimeout(function(){b.textContent=o;if(s)s.textContent=''},1200)})});\
 document.addEventListener('submit',function(e){\
 var m=e.target.getAttribute&&e.target.getAttribute('data-confirm');\
 if(m&&!confirm(m))e.preventDefault()});";
@@ -308,6 +316,7 @@ fn layout_with_chrome(
 <a href=\"{idx}\">v3 service index</a> \u{2022} <a href=\"{docs}\">Docs</a> \u{2022} \
 <a href=\"{stats}\"{cs}>Stats</a> \u{2022} \
 <a href=\"{settings}\"{cg}>Settings</a></nav></div></footer>\
+<div id=\"copied\" class=\"vh\" role=\"status\"></div>\
 <script>{COPY_SCRIPT_BODY}</script></body></html>",
         title = escape_html(title),
         q = escape_html(query),
@@ -579,8 +588,10 @@ fn first_run_panel(urls: &UrlBuilder) -> String {
     for (label, cmd) in steps {
         snippets.push_str(&format!(
             "<li><h2>{label}</h2><div class=\"snip\">\
-             <button type=\"button\" class=\"copy\" aria-label=\"Copy command\">Copy</button>\
+             <button type=\"button\" class=\"copy\" aria-label=\"Copy the command to {what}\" \
+             hidden>Copy</button>\
              <pre><code>{cmd}</code></pre></div></li>",
+            what = label.to_lowercase(),
             cmd = command_html(&cmd),
         ));
     }
@@ -1274,7 +1285,8 @@ fn render_install(urls: &UrlBuilder, p: &Package, primary_client: &str) -> Strin
         let cls = if i == 0 { " class=\"primary\"" } else { "" };
         out.push_str(&format!(
             "<div{cls}><h3>{label}</h3><div class=\"snip\">\
-             <button type=\"button\" class=\"copy\" aria-label=\"Copy command\">Copy</button>\
+             <button type=\"button\" class=\"copy\" aria-label=\"Copy the {label} command\" \
+             hidden>Copy</button>\
              <pre><code>{cmd}</code></pre></div></div>",
             cmd = command_html(&cmd),
         ));
@@ -1714,6 +1726,43 @@ mod tests {
         // The helper keeps a lone flag, and the value after it, intact.
         assert_eq!(text_of(&command_html("a -n b --x")), "a -n b --x");
         assert_eq!(text_of(&command_html("a  b")), "a  b");
+    }
+
+    #[test]
+    fn copy_buttons_show_only_where_they_can_copy() {
+        // `navigator.clipboard` exists only in a secure context, so on a feed
+        // served over plain HTTP (and without JavaScript) a visible Copy button
+        // did nothing. Buttons start hidden and the script shows them when the
+        // API is there.
+        let urls = UrlBuilder::new("http://feed.example");
+        let p = sample();
+        let html = detail_page(&urls, std::slice::from_ref(&p), &p, None, "choco", false);
+        for label in ["Chocolatey", "dotnet CLI", "nuget.exe"] {
+            let button = format!(
+                "<button type=\"button\" class=\"copy\" aria-label=\"Copy the {label} command\" \
+                 hidden>Copy</button>"
+            );
+            assert!(html.contains(&button), "{label}: {html}");
+        }
+        assert!(COPY_SCRIPT_BODY.starts_with(
+            "if(navigator.clipboard)document.querySelectorAll('.copy')\
+             .forEach(function(b){b.hidden=false});"
+        ));
+        // One status region announces a copy; the button's "Copied" is hidden
+        // behind its aria-label.
+        assert_eq!(
+            html.matches("<div id=\"copied\" class=\"vh\" role=\"status\"></div>")
+                .count(),
+            1,
+            "{html}"
+        );
+        assert!(COPY_SCRIPT_BODY.contains("getElementById('copied')"));
+
+        let first_run = gallery_page(&urls, &page_of(&[]), &view("", 0, 20));
+        assert!(
+            first_run.contains("aria-label=\"Copy the command to push a package\" hidden>"),
+            "{first_run}"
+        );
     }
 
     #[test]
