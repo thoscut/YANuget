@@ -55,7 +55,9 @@ struct MigrateArgs {
     /// Extra source request header as "Name: Value"; may be repeated.
     #[arg(long)]
     source_header: Vec<String>,
-    /// Per-request timeout to the source, in seconds.
+    /// Timeout, in seconds, for connecting to the source and for any silence
+    /// while it answers. Listing requests must also finish within it; package
+    /// downloads may take as long as they need while data keeps arriving.
     #[arg(long, default_value_t = 60)]
     timeout_secs: u64,
     /// Number of packages downloaded and indexed concurrently.
@@ -395,10 +397,14 @@ async fn run_migrate(config_path: Option<&str>, args: MigrateArgs) -> anyhow::Re
     // Best-effort cleanup of the scratch directory.
     let _ = tokio::fs::remove_dir_all(&temp_dir).await;
 
-    // Surface a non-zero exit only when nothing at all got through.
-    if summary.failed > 0 && summary.imported == 0 && summary.skipped == 0 {
+    // Any failure is a non-zero exit, even when everything else got through.
+    // Scripts gate on it ("stop the old server once the copy is done"), and a
+    // partial copy that exits 0 reads as a finished one. A re-run is cheap: it
+    // skips what is already there and retries only what failed.
+    if summary.failed > 0 {
         anyhow::bail!(
-            "migration failed: {} error(s), nothing imported",
+            "migration incomplete: {} failed (listed above); re-run to retry them, \
+             versions already migrated are skipped",
             summary.failed
         );
     }

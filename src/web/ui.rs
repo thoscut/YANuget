@@ -17,19 +17,21 @@ use crate::nuget::UrlBuilder;
 const STYLE: &str = "\
 :root{color-scheme:dark light;\
 --bg:#0d1117;--card:#161b22;--border:#30363d;--fg:#e6edf3;--muted:#9aa4af;\
---accent:#58a6ff;--accent2:#1f6feb;--accent2h:#2d76f0;--onaccent:#fff;\
+--accent:#58a6ff;--accent2:#1f6feb;--accent2h:#1a64d6;--onaccent:#fff;\
 --code:#010409;--warn:#d29922;--subtle:#21262d;--subtleh:#30363d;\
---ok:#3fb950;--danger:#b62324;--dangerfg:#ff7b72}\
+--ok:#3fb950;--danger:#b62324;--dangerfg:#ff7b72;--ctl:#656c76}\
 @media(prefers-color-scheme:light){:root{\
 --bg:#f6f8fa;--card:#fff;--border:#d0d7de;--fg:#1f2328;--muted:#59636e;\
 --accent:#0969da;--accent2:#0969da;--accent2h:#0a5fc2;--onaccent:#fff;\
 --code:#f6f8fa;--warn:#9a6700;--subtle:#eaeef2;--subtleh:#dde3ea;\
---ok:#1a7f37;--danger:#cf222e;--dangerfg:#cf222e}}\
+--ok:#1a7f37;--danger:#cf222e;--dangerfg:#cf222e;--ctl:#818b98}}\
 *{box-sizing:border-box}\
+button,input,select{font-family:inherit}\
 body{margin:0;background:var(--bg);color:var(--fg);\
 font:15px/1.55 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif}\
 a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}\
-a:focus-visible,button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline-offset:2px}\
+main p a,footer a{text-decoration:underline;text-underline-offset:.15em}\
+a:focus-visible,button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid var(--accent);outline-offset:2px}\
 .vh{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);border:0}\
 .skip{position:absolute;left:-999px;top:0;background:var(--accent2);color:var(--onaccent);padding:8px 12px;border-radius:0 0 6px 0;z-index:10}\
 .skip:focus{left:0}\
@@ -39,7 +41,7 @@ header .wrap{display:flex;align-items:center;gap:16px}\
 .logo{font-weight:700;font-size:20px;color:var(--fg)}\
 .logo span{color:var(--accent)}\
 form.search{flex:1;display:flex;gap:8px}\
-input[type=search]{flex:1;padding:9px 12px;border-radius:6px;border:1px solid var(--border);\
+input[type=search]{flex:1;padding:9px 12px;border-radius:6px;border:1px solid var(--ctl);\
 background:var(--bg);color:var(--fg);font-size:15px;min-height:44px}\
 input[type=search]:focus{border-color:var(--accent)}\
 button{padding:9px 16px;border-radius:6px;border:1px solid var(--accent2);\
@@ -50,6 +52,9 @@ main{padding:26px 0 60px}\
 .card{background:var(--card);border:1px solid var(--border);border-radius:10px;\
 padding:18px 20px;margin:0 0 14px}\
 .card h2{margin:0 0 4px;font-size:18px;overflow-wrap:anywhere}\
+h2.muted{font-size:17px;margin:18px 0 8px}\
+.card>h2.muted:first-child{margin-top:0}\
+@media(max-width:560px){.wrap{padding:0 16px}.card{padding:14px 16px}}\
 .meta{color:var(--muted);font-size:13px;margin:2px 0}\
 .crumbs{font-size:13px;color:var(--muted);margin:0 0 6px}\
 .tags{margin-top:8px;list-style:none;padding:0;display:flex;flex-wrap:wrap}\
@@ -61,14 +66,17 @@ padding:1px 10px;font-size:12px;color:var(--muted);margin:0 4px 4px 0}\
 .muted{color:var(--muted)}\
 .grid{display:grid;grid-template-columns:1fr 340px;gap:22px}\
 @media(max-width:760px){.grid{grid-template-columns:1fr}}\
-@media(min-width:761px){.side .install{position:sticky;top:20px}}\
+.detail{grid-template-columns:1fr 340px;grid-template-areas:\"main side\" \"readme side\";grid-template-rows:auto 1fr}\
+.detail>.content{grid-area:main}.detail>.side{grid-area:side}.detail>.readme-area{grid-area:readme;min-width:0}\
+@media(max-width:760px){.detail{grid-template-columns:1fr;grid-template-areas:\"main\" \"side\" \"readme\";grid-template-rows:auto}}\
 h1.title{font-size:26px;margin:0 0 2px;overflow-wrap:anywhere}\
 pre{background:var(--code);border:1px solid var(--border);border-radius:8px;padding:12px 14px;\
 overflow:auto;font-size:13px;margin:6px 0}\
 code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}\
-.install h3{margin:14px 0 4px;font-size:13px;text-transform:uppercase;letter-spacing:.4px;color:var(--muted)}\
+.install h3{margin:14px 0 4px;font-size:14px;color:var(--muted)}\
 .install .primary h3{color:var(--accent)}\
 .install pre{white-space:pre-wrap;overflow-wrap:break-word}\
+.nw{white-space:nowrap}\
 .snip{display:flex;flex-direction:column;align-items:flex-end}\
 .snip .copy{padding:6px 12px;font-size:12px;min-height:32px;margin-bottom:-4px;\
 background:var(--subtle);border:1px solid var(--border);color:var(--fg)}\
@@ -87,13 +95,19 @@ img.picon{width:32px;height:32px;object-fit:contain;vertical-align:-6px;margin-r
 .hero{text-align:center;padding:30px 0 4px}\
 .hero h1{font-size:30px;margin:0 0 8px;letter-spacing:-.4px}\
 .hero p{margin:0 auto;max-width:46ch;color:var(--muted)}\
-.steps h3{margin:16px 0 4px;font-size:13px;text-transform:uppercase;letter-spacing:.4px;color:var(--muted)}\
-.steps h3:first-child{margin-top:0}\
+ol.steps{padding-left:44px}\
+.steps h2{margin:16px 0 4px;font-size:14px;color:var(--muted)}\
+.steps li:first-child h2{margin-top:0}\
 .steps pre{white-space:pre-wrap;overflow-wrap:break-word}\
 .kv{font-size:13px}.kv div{display:flex;gap:10px;padding:3px 0;border-bottom:1px solid var(--border)}\
 .kv b{color:var(--muted);font-weight:500;min-width:120px;flex:0 0 auto}\
-@media(max-width:480px){.kv div{flex-direction:column;gap:0}.kv b{min-width:0}}\
-.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:14px;margin:0 0 8px}\
+.kv.wide b{flex:0 0 13em}\
+@media(max-width:480px){.kv div{flex-direction:column;gap:0}.kv b{min-width:0}.kv.wide b{flex:0 0 auto}}\
+.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin:0 0 8px}\
+@media(max-width:480px){.stats{grid-template-columns:repeat(2,1fr)}}\
+.lists{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:14px}\
+.lists>.card{margin:0}\
+@media(max-width:760px){.lists{grid-template-columns:1fr}}\
 .stat{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:16px 18px}\
 .stat .n{font-size:26px;font-weight:700}\
 .stat .l{color:var(--muted);font-size:13px}\
@@ -103,6 +117,15 @@ img.picon{width:32px;height:32px;object-fit:contain;vertical-align:-6px;margin-r
 .pager{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:18px 0;flex-wrap:wrap}\
 .btn{border:1px solid var(--border);border-radius:6px;padding:8px 14px;color:var(--fg)}\
 .btn[aria-disabled=true]{opacity:.4;pointer-events:none}\
+.pager .btn{min-height:44px;display:inline-flex;align-items:center;gap:6px}\
+.pager-go{flex:1 0 100%;display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:12px}\
+.pager-go form{display:flex;align-items:center;gap:8px;margin:0}\
+.pager-go label{color:var(--muted);font-size:14px}\
+.pager-go input,.pager-go select{min-height:44px;padding:0 10px;border:1px solid var(--ctl);border-radius:6px;\
+background:var(--bg);color:var(--fg);font-size:15px}\
+.pager-go input{width:6em}\
+.pager-go button{padding:0 14px;background:var(--subtle);border-color:var(--border);color:var(--fg)}\
+.pager-go button:hover{background:var(--subtleh)}\
 .badge.ok{color:var(--ok);border-color:var(--ok)}\
 .atbl{width:100%;border-collapse:collapse}\
 .atbl th,.atbl td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--border);font-size:14px;vertical-align:middle}\
@@ -167,8 +190,12 @@ pub fn safe_href(url: &str) -> Option<&str> {
 }
 
 /// Tiny inline script giving the install-command "Copy" buttons their
-/// behaviour. It degrades gracefully: without JS the `<pre>` stays selectable
-/// and the button simply does nothing.
+/// behaviour. The buttons are rendered `hidden` and shown only when the
+/// clipboard API exists: without JavaScript, or on a feed served over plain
+/// HTTP (where browsers withhold `navigator.clipboard`), a visible button did
+/// nothing. The `<pre>` stays selectable either way. A copy is announced
+/// through the page's one `role="status"` region, because the button's own
+/// "Copied" text is hidden behind its `aria-label`.
 ///
 /// Kept separate from its `<script>` wrapper because the CSP hash below must be
 /// taken over exactly this text — the element's content, not the tags.
@@ -176,11 +203,15 @@ pub fn safe_href(url: &str) -> Option<&str> {
 /// to be an inline `onsubmit=` attribute, which the CSP below cannot whitelist
 /// by hash — so the prompt is delegated from here off a `data-confirm`
 /// attribute instead, keeping the guard rail and the policy both intact.
-const COPY_SCRIPT_BODY: &str = "document.addEventListener('click',function(e){\
+const COPY_SCRIPT_BODY: &str = "if(navigator.clipboard)\
+document.querySelectorAll('.copy').forEach(function(b){b.hidden=false});\
+document.addEventListener('click',function(e){\
 var b=e.target.closest('.copy');if(!b)return;\
 var c=b.parentNode.querySelector('code');if(!c||!navigator.clipboard)return;\
 navigator.clipboard.writeText(c.innerText).then(function(){\
-var o=b.textContent;b.textContent='Copied';setTimeout(function(){b.textContent=o},1200)})});\
+var s=document.getElementById('copied');if(s)s.textContent='Copied to the clipboard';\
+var o=b.textContent;b.textContent='Copied';\
+setTimeout(function(){b.textContent=o;if(s)s.textContent=''},1200)})});\
 document.addEventListener('submit',function(e){\
 var m=e.target.getAttribute&&e.target.getAttribute('data-confirm');\
 if(m&&!confirm(m))e.preventDefault()});";
@@ -217,7 +248,7 @@ fn csp_hash(content: &str) -> String {
 ///
 /// `active` marks the current footer nav item (`"stats"`, `"settings"`, or `""`).
 fn layout(urls: &UrlBuilder, title: &str, query: &str, active: &str, body: &str) -> String {
-    layout_with_chrome(urls, title, query, active, body, Chrome::Feed)
+    layout_with_chrome(urls, title, query, active, body, Chrome::Feed, "")
 }
 
 /// Which navigation a page can offer.
@@ -235,6 +266,8 @@ enum Chrome {
     Root,
 }
 
+/// `search_hidden` is extra hidden inputs for the header's search form: the
+/// gallery uses it to keep a chosen page size across a new search.
 fn layout_with_chrome(
     urls: &UrlBuilder,
     title: &str,
@@ -242,6 +275,7 @@ fn layout_with_chrome(
     active: &str,
     body: &str,
     chrome: Chrome,
+    search_hidden: &str,
 ) -> String {
     let cur = |name: &str| {
         if name == active {
@@ -276,13 +310,14 @@ fn layout_with_chrome(
 <form class=\"search\" action=\"{packages}\" method=\"get\" role=\"search\">\
 <label for=\"q\" class=\"vh\">Search packages</label>\
 <input id=\"q\" type=\"search\" name=\"q\" placeholder=\"Search packages\u{2026}\" value=\"{q}\" autocomplete=\"off\">\
-<button type=\"submit\">Search</button></form>\
+{search_hidden}<button type=\"submit\">Search</button></form>\
 </div></header>\
 <main id=\"main\" tabindex=\"-1\"><div class=\"wrap\">{body}</div></main>\
 <footer><div class=\"wrap\"><nav aria-label=\"Site\">Served by YANuget \u{2014} \
 <a href=\"{idx}\">v3 service index</a> \u{2022} <a href=\"{docs}\">Docs</a> \u{2022} \
 <a href=\"{stats}\"{cs}>Stats</a> \u{2022} \
 <a href=\"{settings}\"{cg}>Settings</a></nav></div></footer>\
+<div id=\"copied\" class=\"vh\" role=\"status\"></div>\
 <script>{COPY_SCRIPT_BODY}</script></body></html>",
         title = escape_html(title),
         q = escape_html(query),
@@ -317,7 +352,7 @@ pub fn error_page(urls: &UrlBuilder, status: axum::http::StatusCode) -> String {
         ),
         StatusCode::BAD_REQUEST => (
             "That request did not make sense",
-            "Check the package id and version in the address bar.",
+            "Check the address for a typo.",
         ),
         StatusCode::TOO_MANY_REQUESTS => (
             "Too many requests",
@@ -347,31 +382,109 @@ pub fn error_page(urls: &UrlBuilder, status: axum::http::StatusCode) -> String {
     layout(urls, &format!("{heading} \u{2014} YANuget"), "", "", &body)
 }
 
-/// The gallery / search-results page. `skip`/`take` drive pagination.
+/// What the gallery was asked to show: the search, the page, and the filters
+/// that every paging link and form has to carry.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GalleryView<'a> {
+    pub query: &'a str,
+    pub skip: i64,
+    pub take: i64,
+    /// The configured page size (`gallery_page_size`).
+    pub default_take: i64,
+    pub prerelease: Option<bool>,
+    pub package_type: Option<&'a str>,
+}
+
+impl GalleryView<'_> {
+    /// The gallery URL of the page starting at `skip`, escaped for an
+    /// attribute, carrying the search, the page size and the filters.
+    fn href(&self, urls: &UrlBuilder, skip: i64) -> String {
+        // `take` has to be carried, or paging silently changes the page size
+        // back to the default: `?take=5` showed "1–5 of N", and Next then
+        // returned twenty items while the counter still claimed five. And
+        // `&` is `&amp;` inside an HTML attribute — a bare one is only
+        // tolerated because no entity name follows it here.
+        let mut href = format!(
+            "{}?q={}&amp;skip={skip}&amp;take={}",
+            escape_html(&urls.app("/packages")),
+            enc_path(self.query),
+            self.take
+        );
+        if let Some(pre) = self.prerelease {
+            href.push_str(&format!("&amp;prerelease={pre}"));
+        }
+        if let Some(ty) = self.package_type {
+            href.push_str(&format!("&amp;packageType={}", enc_path(ty)));
+        }
+        href
+    }
+
+    /// Hidden inputs carrying the search and the filters into a GET form. They
+    /// have no ids: the header's search box already owns `id="q"`.
+    fn hidden_fields(&self) -> String {
+        let mut out = format!(
+            "<input type=\"hidden\" name=\"q\" value=\"{}\">",
+            escape_html(self.query)
+        );
+        if let Some(pre) = self.prerelease {
+            out.push_str(&format!(
+                "<input type=\"hidden\" name=\"prerelease\" value=\"{pre}\">"
+            ));
+        }
+        if let Some(ty) = self.package_type {
+            out.push_str(&format!(
+                "<input type=\"hidden\" name=\"packageType\" value=\"{}\">",
+                escape_html(ty)
+            ));
+        }
+        out
+    }
+}
+
+/// The gallery / search-results page.
 pub fn gallery_page(
     urls: &UrlBuilder,
     page: &crate::database::SearchPage,
-    query: &str,
-    skip: i64,
-    take: i64,
+    view: &GalleryView,
 ) -> String {
+    let view = GalleryView {
+        skip: view.skip.max(0),
+        take: view.take.max(1),
+        ..*view
+    };
+    let query = view.query;
+    let pages = (page.total_hits + view.take - 1) / view.take;
+    let current = view.skip / view.take + 1;
     let body = if page.groups.is_empty() {
         let browse_all = escape_html(&urls.app("/packages"));
-        if !query.trim().is_empty() {
-            format!(
-                "<div class=\"empty\"><p>No packages match \u{201c}{}\u{201d}.</p>\
-                 <p><a href=\"{browse_all}\">Clear search and browse all packages</a></p></div>",
-                escape_html(query),
-            )
-        } else if page.total_hits > 0 {
-            // Empty page, non-empty feed: `skip` is past the end. That happens
+        if page.total_hits > 0 {
+            // Empty page, matches exist: `skip` is past the end. That happens
             // from a bookmarked link, a hand-edited URL, or a `skip` that was
             // valid until a delete or a retention sweep shortened the list.
             // Answering it with the onboarding panel told an operator with
-            // thousands of packages that their feed was empty.
+            // thousands of packages that their feed was empty. It is checked
+            // before the search case, which said a search with four matches
+            // had none.
+            // With a single page, the last page is the first: one link, not two
+            // that lead to the same place.
+            let last = if pages > 1 {
+                format!(
+                    "<p><a href=\"{}\">Go to the last page ({pages})</a></p>",
+                    view.href(urls, (pages - 1) * view.take)
+                )
+            } else {
+                String::new()
+            };
             format!(
-                "<div class=\"empty\"><p>There is nothing on this page.</p>\
-                 <p><a href=\"{browse_all}\">Back to the first page</a></p></div>"
+                "<div class=\"empty\"><h1 class=\"title\">There is nothing on this page</h1>\
+                 {last}<p><a href=\"{first}\">Back to the first page</a></p></div>",
+                first = view.href(urls, 0),
+            )
+        } else if !query.trim().is_empty() {
+            format!(
+                "<div class=\"empty\"><h1 class=\"title\">No packages match \u{201c}{}\u{201d}</h1>\
+                 <p><a href=\"{browse_all}\">Clear search and browse all packages</a></p></div>",
+                escape_html(query),
             )
         } else {
             first_run_panel(urls)
@@ -412,32 +525,46 @@ pub fn gallery_page(
             cards.push_str(&format!(
                 "<div class=\"card\"><h2><a href=\"{url}\">{id}</a> \
                  <span class=\"muted\">{ver}</span>{pre}</h2>\
-                 <div class=\"meta\">{dl} downloads, all versions{authors}</div>\
+                 <div class=\"meta\">{nv} version{vs}, {dl} download{ds}{authors}</div>\
                  <p>{desc}</p>{tags}</div>",
                 ver = escape_html(&p.normalized_version()),
+                nv = group.packages.len(),
+                vs = plural(group.packages.len() as i64),
                 dl = group_digits(group.total_downloads() as i64),
+                ds = plural(group.total_downloads() as i64),
                 desc = escape_html(&truncate(&p.description, 240)),
                 tags = render_tags(&p.tags),
             ));
         }
         cards.push_str(&pager(
             urls,
-            query,
-            skip,
-            take,
+            &view,
             page.groups.len() as i64,
             page.total_hits,
         ));
         cards
     };
-    let title = if query.trim().is_empty() {
-        "YANuget".to_string()
-    } else {
-        // Otherwise every search result page shares one <title>, so tabs,
-        // bookmarks and history entries for different queries look identical.
-        format!("Search: \u{201c}{query}\u{201d} \u{2014} YANuget")
+    // Searches and later pages get titles of their own. Otherwise every search,
+    // and every page of one, shares one <title>, so tabs, bookmarks and history
+    // entries look identical.
+    let search = (!query.trim().is_empty()).then(|| format!("Search: \u{201c}{query}\u{201d}"));
+    let later_page = current > 1 && !page.groups.is_empty();
+    let title = match (search, later_page) {
+        (None, false) => "YANuget".to_string(),
+        (None, true) => format!("Packages, page {current} of {pages} \u{2014} YANuget"),
+        (Some(s), false) => format!("{s} \u{2014} YANuget"),
+        (Some(s), true) => format!("{s}, page {current} of {pages} \u{2014} YANuget"),
     };
-    layout(urls, &title, query, "", &body)
+    // A new search starts on page one, but keeps a page size someone chose.
+    let search_hidden = if view.take != view.default_take.max(1) {
+        format!(
+            "<input type=\"hidden\" name=\"take\" value=\"{}\">",
+            view.take
+        )
+    } else {
+        String::new()
+    };
+    layout_with_chrome(urls, &title, query, "", &body, Chrome::Feed, &search_hidden)
 }
 
 /// What an empty feed shows instead of "no packages": the three commands that
@@ -453,34 +580,35 @@ fn first_run_panel(urls: &UrlBuilder) -> String {
     let idx = urls.service_index();
     let steps = [
         (
-            "1 \u{2014} Add this feed",
+            "Add this feed",
             format!("dotnet nuget add source {idx} -n yanuget"),
         ),
         (
-            "2 \u{2014} Push a package",
+            "Push a package",
             "dotnet nuget push MyPackage.1.0.0.nupkg --source yanuget --api-key <your-api-key>"
                 .to_string(),
         ),
-        (
-            "3 \u{2014} Restore from it",
-            format!("dotnet restore --source {idx}"),
-        ),
+        ("Restore from it", format!("dotnet restore --source {idx}")),
     ];
 
+    // A real ordered list: these are steps, so the numbers are the list's own
+    // rather than text in each heading.
     let mut snippets = String::new();
     for (label, cmd) in steps {
         snippets.push_str(&format!(
-            "<h3>{label}</h3><div class=\"snip\">\
-             <button type=\"button\" class=\"copy\" aria-label=\"Copy command\">Copy</button>\
-             <pre><code>{cmd}</code></pre></div>",
-            cmd = escape_html(&cmd),
+            "<li><h2>{label}</h2><div class=\"snip\">\
+             <button type=\"button\" class=\"copy\" aria-label=\"Copy the command to {what}\" \
+             hidden>Copy</button>\
+             <pre><code>{cmd}</code></pre></div></li>",
+            what = label.to_lowercase(),
+            cmd = command_html(&cmd),
         ));
     }
 
     format!(
         "<div class=\"hero\"><h1>Your feed is live</h1>\
          <p>Nothing published to it yet. Three commands change that.</p></div>\
-         <div class=\"card steps\">{snippets}</div>\
+         <ol class=\"card steps\">{snippets}</ol>\
          <p class=\"muted\">Using Chocolatey, <code>nuget.exe</code> or Visual Studio? \
          The same service-index URL works for all of them \u{2014} see \
          <a href=\"{docs}\">the documentation</a>.</p>",
@@ -488,42 +616,97 @@ fn first_run_panel(urls: &UrlBuilder) -> String {
     )
 }
 
-/// Previous/next pagination control for the gallery.
-fn pager(urls: &UrlBuilder, query: &str, skip: i64, take: i64, shown: i64, total: i64) -> String {
-    let take = take.max(1);
-    let skip = skip.max(0);
-    // Only render when there is more than one page worth of results.
-    if total <= take && skip == 0 {
+/// The page sizes the pager offers: a fixed ladder, plus the configured default
+/// and the size in use, so the select always shows the real size. There is no
+/// "all": `take` is capped at 1000.
+fn page_sizes(take: i64, default_take: i64) -> Vec<i64> {
+    let mut sizes = vec![20, 50, 100, take, default_take.max(1)];
+    sizes.sort_unstable();
+    sizes.dedup();
+    sizes
+}
+
+/// Pagination for the gallery: previous/next links around the range shown,
+/// and two small forms, one to go to a page and one to change the page size.
+///
+/// Both are plain GET forms, so they work without JavaScript and need nothing
+/// the CSP would have to allow. "Go to page" sends `page`. The page-size form
+/// sends the current `skip`, which the handler snaps to the start of the page
+/// holding it at the new size, so the first package on screen stays there.
+fn pager(urls: &UrlBuilder, view: &GalleryView, shown: i64, total: i64) -> String {
+    let (skip, take) = (view.skip, view.take);
+    let sizes = page_sizes(take, view.default_take);
+    // Paging needs a second page. A page size is worth offering whenever it
+    // would change what is shown: without that, choosing 100 on a feed of 60
+    // left no way back to 20 a page.
+    let paged = total > take || skip > 0;
+    let sizable = total > sizes[0];
+    if !paged && !sizable {
         return String::new();
     }
-    let q = enc_path(query);
-    let base = urls.app("/packages");
-    let prev = (skip - take).max(0);
-    let has_prev = skip > 0;
-    let has_next = skip + shown < total;
-    let next = skip + take;
-    let from = if shown == 0 { 0 } else { skip + 1 };
-    let to = skip + shown;
-    let link = |target: i64, enabled: bool, label: &str| {
-        if enabled {
-            // `take` has to be carried, or paging silently changes the page size
-            // back to the default: `?take=5` showed "1–5 of N", and Next then
-            // returned twenty items while the counter still claimed five. And
-            // `&` is `&amp;` inside an HTML attribute — a bare one is only
-            // tolerated because no entity name follows it here.
-            format!(
-                "<a class=\"btn\" href=\"{base}?q={q}&amp;skip={target}&amp;take={take}\">{label}</a>"
-            )
-        } else {
-            format!("<span class=\"btn\" aria-disabled=\"true\">{label}</span>")
-        }
-    };
-    format!(
-        "<nav class=\"pager\" aria-label=\"Pagination\">{prev_l}\
-         <span class=\"muted\">{from}\u{2013}{to} of {total}</span>{next_l}</nav>",
-        prev_l = link(prev, has_prev, "\u{2190} Previous"),
-        next_l = link(next, has_next, "Next \u{2192}"),
-    )
+    let hidden = view.hidden_fields();
+    let action = escape_html(&urls.app("/packages"));
+    let mut out = String::from("<nav class=\"pager\" aria-label=\"Pagination\">");
+    if paged {
+        let link = |target: i64, enabled: bool, label: &str| {
+            if enabled {
+                format!(
+                    "<a class=\"btn\" href=\"{}\">{label}</a>",
+                    view.href(urls, target)
+                )
+            } else {
+                // A link without an href, still announced as one, and disabled.
+                format!("<a class=\"btn\" role=\"link\" aria-disabled=\"true\">{label}</a>")
+            }
+        };
+        let from = if shown == 0 { 0 } else { skip + 1 };
+        out.push_str(&format!(
+            "{prev}<span class=\"muted\">{from}\u{2013}{to} of {total}</span>{next}",
+            prev = link(
+                (skip - take).max(0),
+                skip > 0,
+                "<span aria-hidden=\"true\">\u{2190}</span> Previous"
+            ),
+            next = link(
+                skip + take,
+                skip + shown < total,
+                "Next <span aria-hidden=\"true\">\u{2192}</span>"
+            ),
+            to = skip + shown,
+        ));
+    }
+    out.push_str("<div class=\"pager-go\">");
+    if paged {
+        let pages = (total + take - 1) / take;
+        let current = skip / take + 1;
+        out.push_str(&format!(
+            "<form method=\"get\" action=\"{action}\">{hidden}\
+             <input type=\"hidden\" name=\"take\" value=\"{take}\">\
+             <label for=\"pg-page\">Page</label>\
+             <input id=\"pg-page\" name=\"page\" type=\"number\" inputmode=\"numeric\" min=\"1\" \
+             max=\"{pages}\" value=\"{current}\" required aria-describedby=\"pg-of\">\
+             <span id=\"pg-of\" class=\"muted\">of {pages}</span>\
+             <button type=\"submit\">Go<span class=\"vh\"> to page</span></button></form>"
+        ));
+    }
+    if sizable {
+        let options: String = sizes
+            .iter()
+            .map(|n| {
+                let sel = if *n == take { " selected" } else { "" };
+                format!("<option value=\"{n}\"{sel}>{n}</option>")
+            })
+            .collect();
+        out.push_str(&format!(
+            "<form method=\"get\" action=\"{action}\">{hidden}\
+             <input type=\"hidden\" name=\"skip\" value=\"{skip}\">\
+             <label for=\"pg-take\">Per page</label>\
+             <select id=\"pg-take\" name=\"take\">{options}</select>\
+             <button type=\"submit\">Apply<span class=\"vh\"> page size</span></button></form>"
+        ));
+    }
+    out.push_str("</div></nav>");
+    out
 }
 
 /// The statistics page: feed-wide totals, the most-downloaded packages, and the
@@ -560,10 +743,11 @@ pub fn stats_page(
             let p = g.latest();
             out.push_str(&format!(
                 "<li><a href=\"{href}\">{id}</a>\
-                 <span class=\"muted\">{dl} downloads</span></li>",
+                 <span class=\"muted\">{dl} download{ds}</span></li>",
                 href = escape_html(&urls.app(&format!("/packages/{}", enc_path(&p.lower_id())))),
                 id = escape_html(&p.id),
                 dl = group_digits(g.total_downloads() as i64),
+                ds = plural(g.total_downloads() as i64),
             ));
         }
         out.push_str("</ul>");
@@ -594,9 +778,9 @@ pub fn stats_page(
 
     let body = format!(
         "<h1 class=\"title\">Statistics</h1>{tiles}\
-         <div class=\"grid\">\
-         <div class=\"card\"><h3 class=\"muted\">Most downloaded</h3>{top_list}</div>\
-         <div class=\"card\"><h3 class=\"muted\">Recently published</h3>{recent_list}</div>\
+         <div class=\"lists\">\
+         <div class=\"card\"><h2 class=\"muted\">Most downloaded</h2>{top_list}</div>\
+         <div class=\"card\"><h2 class=\"muted\">Recently published</h2>{recent_list}</div>\
          </div>"
     );
     layout(urls, "Statistics \u{2014} YANuget", "", "stats", &body)
@@ -654,7 +838,7 @@ pub fn settings_page(urls: &UrlBuilder, config: &Config, feed: &super::FeedConte
         "Unlist (restorable)"
     };
 
-    let mut server = String::from("<div class=\"kv\">");
+    let mut server = String::from("<div class=\"kv wide\">");
     server.push_str(&kv("Feed", &feed.name));
     server.push_str(&kv("Push / delete auth", auth));
     server.push_str(&kv("Download auth", read_auth));
@@ -674,7 +858,7 @@ pub fn settings_page(urls: &UrlBuilder, config: &Config, feed: &super::FeedConte
     server.push_str("</div>");
 
     // Upstream mirroring + license policy (per feed).
-    let mut policy = String::from("<div class=\"kv\">");
+    let mut policy = String::from("<div class=\"kv wide\">");
     match &feed.mirror {
         Some(m) => {
             policy.push_str(&kv("Upstream mirror", "Enabled"));
@@ -701,7 +885,7 @@ pub fn settings_page(urls: &UrlBuilder, config: &Config, feed: &super::FeedConte
     policy.push_str("</div>");
 
     let r = &feed.retention;
-    let mut retention = String::from("<div class=\"kv\">");
+    let mut retention = String::from("<div class=\"kv wide\">");
     retention.push_str(&kv("Retention", on_off(r.enabled)));
     if r.enabled {
         retention.push_str(&kv("Prune after each push", yes_no(r.prune_on_push)));
@@ -728,7 +912,7 @@ pub fn settings_page(urls: &UrlBuilder, config: &Config, feed: &super::FeedConte
 
     let admin = if feed.admin.is_enabled() {
         format!(
-            "<div class=\"card\"><h3 class=\"muted\">Administration</h3>\
+            "<div class=\"card\"><h2 class=\"muted\">Administration</h2>\
              <p>Manage package versions (approve / promote / disable / delete) in the \
              <a href=\"{}\">admin area</a>. Sign in with the admin key.</p></div>",
             escape_html(&urls.app("/admin"))
@@ -741,10 +925,10 @@ pub fn settings_page(urls: &UrlBuilder, config: &Config, feed: &super::FeedConte
         "<h1 class=\"title\">Settings</h1>\
          <p class=\"muted\">Read-only overview of this feed's policy. \
          Secrets and storage paths are not shown.</p>\
-         <div class=\"card\"><h3 class=\"muted\">Server</h3>{server}</div>\
-         <div class=\"card\"><h3 class=\"muted\">Mirror &amp; policy</h3>{policy}</div>\
-         <div class=\"card\"><h3 class=\"muted\">Retention</h3>{retention}</div>\
-         <div class=\"card\"><h3 class=\"muted\">Endpoints</h3><div class=\"kv\">\
+         <div class=\"card\"><h2 class=\"muted\">Server</h2>{server}</div>\
+         <div class=\"card\"><h2 class=\"muted\">Mirror &amp; policy</h2>{policy}</div>\
+         <div class=\"card\"><h2 class=\"muted\">Retention</h2>{retention}</div>\
+         <div class=\"card\"><h2 class=\"muted\">Endpoints</h2><div class=\"kv wide\">\
          {svc}{sym}</div></div>{admin}",
         svc = kv_html(
             "Service index",
@@ -923,7 +1107,15 @@ pub fn feeds_index_page(feeds: &[(String, String)]) -> String {
          <p class=\"muted\">This server hosts several NuGet feeds. Pick one:</p>\
          <div class=\"card\">{list}</div>"
     );
-    layout_with_chrome(&urls, "Feeds \u{2014} YANuget", "", "", &body, Chrome::Root)
+    layout_with_chrome(
+        &urls,
+        "Feeds \u{2014} YANuget",
+        "",
+        "",
+        &body,
+        Chrome::Root,
+        "",
+    )
 }
 
 /// Replace any `user:password@` in a URL with `***@`.
@@ -987,12 +1179,13 @@ pub fn detail_page(
         let sel = if v == version { " class=\"sel\"" } else { "" };
         versions.push_str(&format!(
             "<li><span><a{sel} href=\"{href}\">{dv}</a>{badges}</span>\
-             <span class=\"muted\">{dls} downloads</span></li>",
+             <span class=\"muted\">{dls} download{ds}</span></li>",
             href =
                 escape_html(&urls.app(&format!("/packages/{}/{}", enc_path(&lower), enc_path(&v)))),
             dv = escape_html(&v),
             badges = status_badges(p),
             dls = group_digits(p.downloads as i64),
+            ds = plural(p.downloads as i64),
         ));
     }
     versions.push_str("</ul>");
@@ -1001,13 +1194,14 @@ pub fn detail_page(
         "<nav class=\"crumbs\" aria-label=\"Breadcrumb\">\
          <a href=\"{packages}\">Packages</a> <span aria-hidden=\"true\">/</span> <span>{id}</span></nav>\
          <h1 class=\"title\">{icon}{id}</h1>\
-         <div class=\"meta\">{version}{badges} \u{2022} {dl} downloads of this version \u{2022} published {pub}</div>\
-         <p>{desc}</p>{tags}{links}{deps}{symbols}{readme}",
+         <div class=\"meta\">{version}{badges} \u{2022} {dl} download{ds} of this version \u{2022} published {pub}</div>\
+         <p>{desc}</p>{tags}{links}{deps}{symbols}",
         packages = escape_html(&urls.app("/packages")),
         icon = render_icon(urls, selected),
         version = escape_html(&version),
         badges = status_badges(selected),
         dl = group_digits(selected.downloads as i64),
+        ds = plural(selected.downloads as i64),
         pub = escape_html(&selected.published.format("%Y-%m-%d").to_string()),
         desc = escape_html(&selected.description),
         tags = render_tags(&selected.tags),
@@ -1018,19 +1212,33 @@ pub fn detail_page(
         } else {
             ""
         },
-        readme = render_readme(readme),
     );
 
+    // Versions right under Install: picking another version is the common
+    // next step, and Info repeats much of what the header already says.
+    // The section headings are all `<h2>`, one level under the package name,
+    // and the client labels inside Install are `<h3>` under it. A heading that
+    // jumps a level reads, to a screen reader user, like a missing section.
     let side = format!(
-        "<div class=\"card install\">{install}</div>\
-         <div class=\"card\"><h3 class=\"muted\">Info</h3>{info}</div>\
-         <div class=\"card\"><h3 class=\"muted\">Versions</h3>{versions}</div>",
+        "<div class=\"card install\"><h2 class=\"muted\">Install</h2>{install}</div>\
+         <div class=\"card\"><h2 class=\"muted\">Versions</h2>{versions}</div>\
+         <div class=\"card\"><h2 class=\"muted\">Info</h2>{info}</div>",
         install = render_install(urls, selected, primary_client),
         info = render_info(selected),
     );
 
+    // The readme is a grid item of its own, placed after the sidebar on a
+    // narrow screen. Inside the main column it came first there, and a long
+    // readme pushed the version list out of reach.
+    let readme = render_readme(readme);
+    let readme = if readme.is_empty() {
+        readme
+    } else {
+        format!("<div class=\"readme-area\">{readme}</div>")
+    };
     let body = format!(
-        "<div class=\"grid\"><div class=\"content\">{main}</div><div class=\"side\">{side}</div></div>"
+        "<div class=\"grid detail\"><div class=\"content\">{main}</div>\
+         <div class=\"side\">{side}</div>{readme}</div>"
     );
     layout(
         urls,
@@ -1086,12 +1294,48 @@ fn render_install(urls: &UrlBuilder, p: &Package, primary_client: &str) -> Strin
         let cls = if i == 0 { " class=\"primary\"" } else { "" };
         out.push_str(&format!(
             "<div{cls}><h3>{label}</h3><div class=\"snip\">\
-             <button type=\"button\" class=\"copy\" aria-label=\"Copy command\">Copy</button>\
+             <button type=\"button\" class=\"copy\" aria-label=\"Copy the {label} command\" \
+             hidden>Copy</button>\
              <pre><code>{cmd}</code></pre></div></div>",
-            cmd = escape_html(&cmd),
+            cmd = command_html(&cmd),
         ));
     }
     out
+}
+
+/// A command for a copyable snippet, as HTML: every token escaped exactly
+/// once, and each flag kept on one line with the value after it.
+///
+/// Snippets wrap (`pre-wrap`) to fit the sidebar, and a browser may break a
+/// line after any hyphen, so `--version` came out as `--` / `version`, and
+/// `2.0.0-beta` split in two. A `.nw` span holds a flag and its value together.
+/// A URL stays breakable, being the one token too long for the sidebar. The
+/// text is unchanged, tokens are rejoined with the spaces they were split on,
+/// and spans add no whitespace, so the copy button (`innerText`) still puts
+/// exactly the command on the clipboard.
+fn command_html(cmd: &str) -> String {
+    let tokens: Vec<&str> = cmd.split(' ').collect();
+    let mut parts = Vec::with_capacity(tokens.len());
+    let mut i = 0;
+    while i < tokens.len() {
+        let token = tokens[i];
+        if token.starts_with('-') {
+            let mut kept = token.to_string();
+            if let Some(value) = tokens
+                .get(i + 1)
+                .filter(|v| !v.is_empty() && !v.starts_with('-') && !v.contains("://"))
+            {
+                kept.push(' ');
+                kept.push_str(value);
+                i += 1;
+            }
+            parts.push(format!("<span class=\"nw\">{}</span>", escape_html(&kept)));
+        } else {
+            parts.push(escape_html(token));
+        }
+        i += 1;
+    }
+    parts.join(" ")
 }
 
 fn render_info(p: &Package) -> String {
@@ -1152,7 +1396,7 @@ fn render_dependencies(urls: &UrlBuilder, p: &Package) -> String {
     if p.dependencies.is_empty() {
         return String::new();
     }
-    let mut out = String::from("<h3 class=\"muted\">Dependencies</h3>");
+    let mut out = String::from("<h2 class=\"muted\">Dependencies</h2>");
     for group in &p.dependencies {
         let tfm = group
             .target_framework
@@ -1219,7 +1463,7 @@ fn render_readme(readme: Option<&str>) -> String {
                 ""
             };
             format!(
-                "<h3 class=\"muted\">Readme</h3><div class=\"card readme\">{}</div>{notice}",
+                "<h2 class=\"muted\">Readme</h2><div class=\"card readme\">{}</div>{notice}",
                 escape_html(shown)
             )
         }
@@ -1430,13 +1674,113 @@ mod tests {
         assert_eq!(human_size(25 * 1024 * 1024 * 1024), "25.0 GB");
     }
 
+    /// What a browser's `innerText` gives for `html`: the text with the tags
+    /// dropped and the five escapes undone. It is what the copy button puts
+    /// on the clipboard.
+    fn text_of(html: &str) -> String {
+        let mut text = String::new();
+        let mut in_tag = false;
+        for c in html.chars() {
+            match c {
+                '<' => in_tag = true,
+                '>' if in_tag => in_tag = false,
+                _ if !in_tag => text.push(c),
+                _ => {}
+            }
+        }
+        text.replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&#39;", "'")
+            .replace("&amp;", "&")
+    }
+
+    #[test]
+    fn install_commands_keep_flags_whole_and_copy_unchanged() {
+        // `pre-wrap` let a browser break after any hyphen: `--version` split
+        // into `--` and `version` at the end of a line.
+        let urls = UrlBuilder::new("https://host.test/a&b");
+        let mut p = sample();
+        p.version = crate::version::NuGetVersion::parse("2.0.0-beta").unwrap();
+        let html = render_install(&urls, &p, "choco");
+        assert!(
+            html.contains("<span class=\"nw\">--version 2.0.0-beta</span>"),
+            "{html}"
+        );
+        assert!(
+            html.contains("<span class=\"nw\">-Version 2.0.0-beta</span>"),
+            "{html}"
+        );
+        // The URL is left free to wrap, and is escaped once.
+        assert!(
+            html.contains(
+                "<span class=\"nw\">--source</span> https://host.test/a&amp;b/v3/index.json"
+            ),
+            "{html}"
+        );
+        // Each snippet's text is exactly the command, so the clipboard is too.
+        let idx = "https://host.test/a&b/v3/index.json";
+        for expected in [
+            format!("choco install Contoso.Utils --version 2.0.0-beta --source {idx}"),
+            format!("dotnet add package Contoso.Utils --version 2.0.0-beta --source {idx}"),
+            format!("nuget install Contoso.Utils -Version 2.0.0-beta -Source {idx}"),
+        ] {
+            let found = html
+                .split("<code>")
+                .skip(1)
+                .map(|s| text_of(s.split("</code>").next().unwrap()))
+                .any(|t| t == expected);
+            assert!(found, "no snippet reads {expected:?}: {html}");
+        }
+        // The helper keeps a lone flag, and the value after it, intact.
+        assert_eq!(text_of(&command_html("a -n b --x")), "a -n b --x");
+        assert_eq!(text_of(&command_html("a  b")), "a  b");
+    }
+
+    #[test]
+    fn copy_buttons_show_only_where_they_can_copy() {
+        // `navigator.clipboard` exists only in a secure context, so on a feed
+        // served over plain HTTP (and without JavaScript) a visible Copy button
+        // did nothing. Buttons start hidden and the script shows them when the
+        // API is there.
+        let urls = UrlBuilder::new("http://feed.example");
+        let p = sample();
+        let html = detail_page(&urls, std::slice::from_ref(&p), &p, None, "choco", false);
+        for label in ["Chocolatey", "dotnet CLI", "nuget.exe"] {
+            let button = format!(
+                "<button type=\"button\" class=\"copy\" aria-label=\"Copy the {label} command\" \
+                 hidden>Copy</button>"
+            );
+            assert!(html.contains(&button), "{label}: {html}");
+        }
+        assert!(COPY_SCRIPT_BODY.starts_with(
+            "if(navigator.clipboard)document.querySelectorAll('.copy')\
+             .forEach(function(b){b.hidden=false});"
+        ));
+        // One status region announces a copy; the button's "Copied" is hidden
+        // behind its aria-label.
+        assert_eq!(
+            html.matches("<div id=\"copied\" class=\"vh\" role=\"status\"></div>")
+                .count(),
+            1,
+            "{html}"
+        );
+        assert!(COPY_SCRIPT_BODY.contains("getElementById('copied')"));
+
+        let first_run = gallery_page(&urls, &page_of(&[]), &view("", 0, 20));
+        assert!(
+            first_run.contains("aria-label=\"Copy the command to push a package\" hidden>"),
+            "{first_run}"
+        );
+    }
+
     #[test]
     fn install_snippet_orders_primary_first() {
         let urls = UrlBuilder::new("https://nuget.example.com");
         let p = sample();
         let choco_first = render_install(&urls, &p, "choco");
         assert!(choco_first.find("Chocolatey").unwrap() < choco_first.find("dotnet CLI").unwrap());
-        assert!(choco_first.contains("choco install Contoso.Utils --version 1.0.0"));
+        assert!(text_of(&choco_first).contains("choco install Contoso.Utils --version 1.0.0"));
         let dotnet_first = render_install(&urls, &p, "dotnet");
         assert!(
             dotnet_first.find("dotnet CLI").unwrap() < dotnet_first.find("Chocolatey").unwrap()
@@ -1503,6 +1847,36 @@ mod tests {
         assert!(html.contains("Debug symbols are available"));
     }
 
+    #[test]
+    fn the_detail_page_keeps_the_versions_within_reach() {
+        // The sticky install card (over 500 px tall) covered Info and Versions
+        // while scrolling, and on a phone Versions came after the whole readme.
+        let urls = UrlBuilder::new("https://host");
+        let p = sample();
+        let html = detail_page(
+            &urls,
+            std::slice::from_ref(&p),
+            &p,
+            Some("A long readme."),
+            "choco",
+            false,
+        );
+        assert!(!STYLE.contains("sticky"));
+        let at = |needle: &str| {
+            html.find(needle)
+                .unwrap_or_else(|| panic!("{needle}: {html}"))
+        };
+        let (install, versions) = (at("class=\"card install\""), at(">Versions<"));
+        let (info, readme) = (at(">Info<"), at("<div class=\"readme-area\">"));
+        assert!(
+            install < versions && versions < info && info < readme,
+            "{html}"
+        );
+        // The readme is a grid item of its own, not part of the main column.
+        let content_end = at("<div class=\"side\">");
+        assert!(readme > content_end, "{html}");
+    }
+
     fn page_of(ids: &[&str]) -> crate::database::SearchPage {
         let groups = ids
             .iter()
@@ -1520,20 +1894,31 @@ mod tests {
         }
     }
 
+    /// A gallery request on a server whose configured page size is 20.
+    fn view(query: &str, skip: i64, take: i64) -> GalleryView<'_> {
+        GalleryView {
+            query,
+            skip,
+            take,
+            default_take: 20,
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn gallery_lists_cards_and_paginates() {
         let urls = UrlBuilder::new("https://host");
         // Two of three results shown -> pager with a Next link.
         let mut page = page_of(&["Pkg.A", "Pkg.B"]);
         page.total_hits = 3;
-        let html = gallery_page(&urls, &page, "", 0, 2);
+        let html = gallery_page(&urls, &page, &view("", 0, 2));
         assert!(html.contains("Pkg.A"));
         assert!(html.contains("/packages/pkg.b"));
         assert!(html.contains("class=\"pager\""));
         assert!(html.contains("skip=2")); // next page
 
         // Empty result for a query offers a "clear search" link.
-        let empty = gallery_page(&urls, &page_of(&[]), "zzz", 0, 20);
+        let empty = gallery_page(&urls, &page_of(&[]), &view("zzz", 0, 20));
         assert!(empty.contains("Clear search"));
     }
 
@@ -1597,7 +1982,7 @@ mod tests {
             }],
             total_hits: 1,
         };
-        let html = gallery_page(&urls, &page, "", 0, 20);
+        let html = gallery_page(&urls, &page, &view("", 0, 20));
         assert!(html.contains("1.9.0"), "{html}");
     }
 
@@ -1606,13 +1991,13 @@ mod tests {
         let urls = UrlBuilder::new("https://host");
         let mut page = page_of(&["A"]);
         page.total_hits = 1;
-        let html = gallery_page(&urls, &page, "", 0, 20);
+        let html = gallery_page(&urls, &page, &view("", 0, 20));
         assert!(html.contains("<h1"), "no h1 on the landing page: {html}");
         // "1 package", not "1 package(s)".
         assert!(html.contains("1 package<"), "{html}");
         assert!(html.contains("<title>YANuget</title>"), "{html}");
 
-        let searched = gallery_page(&urls, &page, "logging", 0, 20);
+        let searched = gallery_page(&urls, &page, &view("logging", 0, 20));
         assert!(searched.contains("<title>Search:"), "{searched}");
         assert!(searched.contains("logging"), "{searched}");
     }
@@ -1624,10 +2009,42 @@ mod tests {
         let urls = UrlBuilder::new("https://host");
         let mut page = page_of(&[]);
         page.total_hits = 5000;
-        let html = gallery_page(&urls, &page, "", 99_999, 20);
+        let html = gallery_page(&urls, &page, &view("", 99_999, 20));
         assert!(!html.contains("Your feed is live"), "{html}");
         assert!(html.contains("nothing on this page"), "{html}");
         assert!(html.contains("Back to the first page"), "{html}");
+        assert!(
+            html.contains("skip=4980&amp;take=20\">Go to the last page (250)</a>"),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn a_search_past_its_last_page_is_not_a_search_without_matches() {
+        // `?q=git&skip=100` on a feed where git has four matches said "No
+        // packages match". The way back keeps the search and the page size.
+        let urls = UrlBuilder::new("https://host");
+        let mut page = page_of(&[]);
+        page.total_hits = 4;
+        let html = gallery_page(&urls, &page, &view("git", 100, 2));
+        assert!(!html.contains("No packages match"), "{html}");
+        assert!(
+            html.contains("<h1 class=\"title\">There is nothing on this page</h1>"),
+            "{html}"
+        );
+        assert!(
+            html.contains("?q=git&amp;skip=2&amp;take=2\">Go to the last page (2)</a>"),
+            "{html}"
+        );
+        assert!(
+            html.contains("?q=git&amp;skip=0&amp;take=2\">Back to the first page</a>"),
+            "{html}"
+        );
+
+        // With one page of matches the last page is the first: one link.
+        let html = gallery_page(&urls, &page, &view("git", 100, 20));
+        assert!(!html.contains("Go to the last page"), "{html}");
+        assert_eq!(html.matches("Back to the first page").count(), 1, "{html}");
     }
 
     #[test]
@@ -1635,7 +2052,7 @@ mod tests {
         let urls = UrlBuilder::new("https://host");
         let mut page = page_of(&["A", "B"]);
         page.total_hits = 40;
-        let html = gallery_page(&urls, &page, "", 0, 5);
+        let html = gallery_page(&urls, &page, &view("", 0, 5));
         // Carrying `take` is what keeps the "1-5 of 40" counter honest on the
         // next page.
         assert!(html.contains("skip=5&amp;take=5"), "{html}");
@@ -1644,11 +2061,137 @@ mod tests {
     }
 
     #[test]
+    fn the_pager_offers_a_page_to_go_to_and_a_page_size() {
+        let urls = UrlBuilder::new("https://host");
+        let mut page = page_of(&["A", "B", "C", "D", "E"]);
+        page.total_hits = 42;
+        // The third page at five a page, on a server whose default is seven.
+        let html = gallery_page(
+            &urls,
+            &page,
+            &GalleryView {
+                query: "a\"b<c",
+                skip: 10,
+                take: 5,
+                default_take: 7,
+                ..Default::default()
+            },
+        );
+        assert!(html.contains("11\u{2013}15 of 42"), "{html}");
+        // One pager, holding two plain GET forms back to the gallery.
+        assert_eq!(html.matches("class=\"pager\"").count(), 1, "{html}");
+        let form = "<form method=\"get\" action=\"/packages\">";
+        assert_eq!(html.matches(form).count(), 2, "{html}");
+        assert!(
+            html.contains("max=\"9\" value=\"3\" required aria-describedby=\"pg-of\""),
+            "{html}"
+        );
+        assert!(
+            html.contains("<span id=\"pg-of\" class=\"muted\">of 9</span>"),
+            "{html}"
+        );
+        // The size form sends the offset on screen, for the server to snap.
+        assert!(html.contains("name=\"skip\" value=\"10\""), "{html}");
+        // The size in use and the configured default both stay on offer.
+        for n in [5, 7, 20, 50, 100] {
+            assert!(
+                html.contains(&format!("<option value=\"{n}\"")),
+                "{n}: {html}"
+            );
+        }
+        assert!(html.contains("<option value=\"5\" selected>"), "{html}");
+        // The search text rides along in both forms, escaped, and without an
+        // id: the header's search box owns `id="q"`.
+        let q = format!(
+            "<input type=\"hidden\" name=\"q\" value=\"{}\">",
+            escape_html("a\"b<c")
+        );
+        assert_eq!(html.matches(q.as_str()).count(), 2, "{html}");
+        assert!(!html.contains("a\"b<c"), "{html}");
+        // A later page is named in the title.
+        assert!(
+            html.contains(
+                "<title>Search: \u{201c}a&quot;b&lt;c\u{201d}, page 3 of 9 \u{2014} YANuget</title>"
+            ),
+            "{html}"
+        );
+        // A new search from the header keeps the chosen page size.
+        assert!(
+            html.contains(
+                "<input type=\"hidden\" name=\"take\" value=\"5\"><button type=\"submit\">Search"
+            ),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn the_page_size_stays_on_offer_when_everything_fits() {
+        // After choosing 100 on a feed of 60, there has to be a way back.
+        let urls = UrlBuilder::new("https://host");
+        let mut page = page_of(&["A", "B"]);
+        page.total_hits = 60;
+        let html = gallery_page(&urls, &page, &view("", 0, 100));
+        assert!(html.contains("<select id=\"pg-take\""), "{html}");
+        // With one page there is nothing to page through.
+        assert!(!html.contains("pg-page"), "{html}");
+        assert!(!html.contains("Previous"), "{html}");
+
+        // A list shorter than the smallest page size needs no pager at all.
+        page.total_hits = 2;
+        let html = gallery_page(&urls, &page, &view("", 0, 20));
+        assert!(!html.contains("class=\"pager\""), "{html}");
+    }
+
+    #[test]
+    fn paging_carries_the_filters_and_names_later_pages() {
+        let urls = UrlBuilder::new("https://host");
+        let mut page = page_of(&["A", "B"]);
+        page.total_hits = 6;
+        let html = gallery_page(
+            &urls,
+            &page,
+            &GalleryView {
+                skip: 2,
+                take: 2,
+                default_take: 20,
+                prerelease: Some(false),
+                package_type: Some("Dependency"),
+                ..Default::default()
+            },
+        );
+        assert!(
+            html.contains("skip=4&amp;take=2&amp;prerelease=false&amp;packageType=Dependency"),
+            "{html}"
+        );
+        assert_eq!(
+            html.matches("<input type=\"hidden\" name=\"packageType\" value=\"Dependency\">")
+                .count(),
+            2,
+            "{html}"
+        );
+        assert!(
+            html.contains("<title>Packages, page 2 of 3 \u{2014} YANuget</title>"),
+            "{html}"
+        );
+
+        // On the first page Previous stays a link to assistive technology,
+        // announced as disabled; the arrows are decoration.
+        let first = gallery_page(&urls, &page, &view("", 0, 2));
+        assert!(
+            first.contains(
+                "<a class=\"btn\" role=\"link\" aria-disabled=\"true\">\
+                 <span aria-hidden=\"true\">\u{2190}</span> Previous</a>"
+            ),
+            "{first}"
+        );
+    }
+
+    #[test]
     fn an_empty_feed_shows_the_commands_that_fill_it() {
         // The first page anyone sees. It has to carry *this* server's service
         // index, not a placeholder host, or it is just decoration.
         let urls = UrlBuilder::new("https://nuget.example.com");
-        let html = gallery_page(&urls, &page_of(&[]), "", 0, 20);
+        let html = gallery_page(&urls, &page_of(&[]), &view("", 0, 20));
         assert!(html.contains("Your feed is live"), "{html}");
         assert!(
             html.contains("dotnet nuget add source https://nuget.example.com/v3/index.json"),
@@ -1656,7 +2199,8 @@ mod tests {
         );
         assert!(html.contains("dotnet nuget push"), "{html}");
         assert!(
-            html.contains("dotnet restore --source https://nuget.example.com/v3/index.json"),
+            text_of(&html)
+                .contains("dotnet restore --source https://nuget.example.com/v3/index.json"),
             "{html}"
         );
         // Each command gets a copy button, which reads `innerText` — so the
@@ -1666,7 +2210,7 @@ mod tests {
 
         // A search that finds nothing is a different situation and must not be
         // answered with onboarding instructions.
-        let no_match = gallery_page(&urls, &page_of(&[]), "zzz", 0, 20);
+        let no_match = gallery_page(&urls, &page_of(&[]), &view("zzz", 0, 20));
         assert!(!no_match.contains("Your feed is live"), "{no_match}");
     }
 
@@ -1691,11 +2235,29 @@ mod tests {
     }
 
     #[test]
+    fn form_controls_use_the_page_font_and_a_visible_border() {
+        // Browsers give form controls a font of their own (Arial on Windows),
+        // and the card border token is only ~1.4:1 against the page, too faint
+        // to show where a field is. Controls use `--ctl`, set in both themes.
+        assert!(STYLE.contains("button,input,select{font-family:inherit}"));
+        assert!(STYLE.contains("input[type=search]{flex:1;padding:9px 12px;border-radius:6px;border:1px solid var(--ctl)"));
+        let (dark, light) = STYLE
+            .split_once("prefers-color-scheme:light")
+            .expect("a light block");
+        assert!(dark.contains("--ctl:#"), "{dark}");
+        let light_vars = light
+            .split_once("*{box-sizing:border-box}")
+            .expect("variables before rules")
+            .0;
+        assert!(light_vars.contains("--ctl:#"), "{light_vars}");
+    }
+
+    #[test]
     fn gallery_chrome_loads_no_external_assets() {
         // An empty gallery page (no package-provided links) must reference no
         // external assets: all CSS/JS is inline and the favicon is a data URI.
         let urls = UrlBuilder::new("https://host");
-        let html = gallery_page(&urls, &page_of(&[]), "", 0, 20);
+        let html = gallery_page(&urls, &page_of(&[]), &view("", 0, 20));
         for needle in [
             "googleapis",
             "gstatic",
@@ -1729,6 +2291,116 @@ mod tests {
         assert!(html.contains("1,234")); // grouped downloads
         assert!(html.contains("Top.Pkg"));
         assert!(html.contains("Recently published"));
+        // Six tiles in rows of three (two on a phone), not five and an orphan;
+        // the two lists share the width evenly, not the package page's
+        // `1fr 340px` split.
+        assert_eq!(html.matches("class=\"stat\"").count(), 6);
+        assert!(STYLE.contains(".stats{display:grid;grid-template-columns:repeat(3,1fr)"));
+        assert!(
+            html.contains("<div class=\"lists\"><div class=\"card\">"),
+            "{html}"
+        );
+        assert!(!html.contains("class=\"grid\""), "{html}");
+    }
+
+    /// The level of every heading in `html`, in document order.
+    fn heading_levels(html: &str) -> Vec<u8> {
+        let bytes = html.as_bytes();
+        (0..bytes.len().saturating_sub(3))
+            .filter(|&i| {
+                bytes[i] == b'<'
+                    && bytes[i + 1] == b'h'
+                    && (b'1'..=b'6').contains(&bytes[i + 2])
+                    && matches!(bytes[i + 3], b'>' | b' ')
+            })
+            .map(|i| bytes[i + 2] - b'0')
+            .collect()
+    }
+
+    #[test]
+    fn every_page_outlines_without_skipping_a_heading_level() {
+        // The stats, settings, package and first-run pages went from `<h1>`
+        // straight to `<h3>`, which a screen reader presents as a section
+        // missing its heading.
+        let urls = UrlBuilder::new("https://host");
+        let mut p = sample();
+        p.dependencies = vec![crate::models::DependencyGroup {
+            target_framework: Some("net8.0".into()),
+            dependencies: vec![],
+        }];
+        let stats = crate::database::DatabaseStats {
+            package_count: 1,
+            version_count: 1,
+            listed_count: 1,
+            total_downloads: 1,
+            total_size: 1,
+            symbol_count: 0,
+        };
+        let pages = [
+            (
+                "detail",
+                detail_page(
+                    &urls,
+                    std::slice::from_ref(&p),
+                    &p,
+                    Some("docs"),
+                    "choco",
+                    false,
+                ),
+            ),
+            (
+                "stats",
+                stats_page(&urls, &stats, &page_of(&["A"]), &[sample()]),
+            ),
+            (
+                "settings",
+                settings_page(&urls, &Config::default(), &feed_ctx(None, Some("adm"))),
+            ),
+            (
+                "first run",
+                gallery_page(&urls, &page_of(&[]), &view("", 0, 20)),
+            ),
+            (
+                "gallery",
+                gallery_page(&urls, &page_of(&["A", "B"]), &view("", 0, 20)),
+            ),
+        ];
+        for (name, html) in pages {
+            let levels = heading_levels(&html);
+            assert_eq!(levels.first(), Some(&1), "{name}: {levels:?}");
+            for pair in levels.windows(2) {
+                assert!(pair[1] <= pair[0] + 1, "{name} skips a level: {levels:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn counts_of_one_are_singular_and_steps_are_a_list() {
+        let urls = UrlBuilder::new("https://host");
+        let mut p = sample();
+        p.downloads = 1;
+        let html = detail_page(&urls, std::slice::from_ref(&p), &p, None, "choco", false);
+        assert!(html.contains("1 download of this version"), "{html}");
+        assert!(
+            html.contains("<span class=\"muted\">1 download</span>"),
+            "{html}"
+        );
+        assert!(!html.contains("1 downloads"), "{html}");
+
+        let mut page = page_of(&["A"]);
+        page.groups[0].packages[0].downloads = 1;
+        let html = gallery_page(&urls, &page, &view("", 0, 20));
+        assert!(html.contains("1 version, 1 download"), "{html}");
+
+        // The first-run steps are numbered by an ordered list, not by text in
+        // each heading, and no label is set in capitals.
+        let html = gallery_page(&urls, &page_of(&[]), &view("", 0, 20));
+        assert!(
+            html.contains("<ol class=\"card steps\"><li><h2>Add this feed</h2>"),
+            "{html}"
+        );
+        assert!(!STYLE.contains(".install h3{margin:14px 0 4px;font-size:13px;text-transform"));
+        assert!(!STYLE.contains(".steps h3"));
     }
 
     fn feed_ctx(api: Option<&str>, admin: Option<&str>) -> super::super::FeedContext {

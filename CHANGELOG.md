@@ -12,6 +12,17 @@ expected to change incompatibly at any version.
 
 ## [Unreleased]
 
+### Added
+
+- The gallery pager can go to a page by number and change how many packages a
+  page shows: 20, 50, 100, or the configured `gallery_page_size`. Both are plain
+  GET forms, so they work without JavaScript. After a size change the page shown
+  is the one that holds the package that was first on screen, because `page`
+  wins over `skip` and any offset now snaps to the start of its page. Later
+  pages carry their number in the page title, the size choice stays on offer
+  when everything fits on one page, and paging keeps `prerelease` and
+  `packageType` filters as well as the search.
+
 ### Changed
 
 - `base64` 0.22 → 0.23, `toml` 0.8 → 1.1 and `tower-http` 0.6 → 0.7. All three
@@ -27,6 +38,61 @@ expected to change incompatibly at any version.
   three places that genuinely must interpolate a name — `PRAGMA table_info` and
   `ALTER TABLE` in the migration, and the `IN (?…)` placeholder list — take
   `&'static str` or generated placeholders only, never caller data.
+- `yanuget migrate` exits non-zero when any version failed to migrate, not only
+  when nothing got through. A partial copy used to exit 0, so a script gating on
+  the exit code read it as finished. Re-running retries only the failures.
+
+### Fixed
+
+- The Copy buttons showed on feeds served over plain HTTP, and without
+  JavaScript, where they could not copy anything (browsers withhold the
+  clipboard API outside a secure context). They now appear only where they
+  work, each names its command for screen readers, and a copy is announced
+  through a status region.
+- The stats page set its six tiles in as many columns as fit (five and an
+  orphan on a desktop) and its two lists in the package page's `1fr 340px`
+  split. Tiles are now in rows of three (two on a phone) and the lists share
+  the width evenly.
+- Install commands wrapped after any hyphen, so `--version` could end one line
+  as `--` and start the next as `version`. Each flag now stays on one line with
+  its value; the URL still wraps, and the copied text is unchanged.
+- The stats, settings, package and first-run pages went from `<h1>` straight to
+  `<h3>`; every section heading is now an `<h2>`, and the package page's client
+  labels sit under a new "Install" heading. Counts of one read "1 download" and
+  "1 version". Links in running text and the footer are underlined, not told
+  apart by colour alone. The install and first-run labels are no longer set in
+  capitals, the first-run steps are an ordered list, the settings labels get a
+  wider column, and a phone gets a little more width for content. Gallery
+  cards now show how many versions a package has.
+- The package page kept its version list out of reach. The sticky install card
+  (over 500 px tall) covered Info and Versions while scrolling, and on a phone
+  the list came only after the whole readme. The card no longer sticks, the
+  sidebar reads Install, Versions, Info, and the readme is a grid item of its
+  own that follows the sidebar on a narrow screen.
+- Form controls rendered in the browser's own font (Arial on Windows) and
+  with borders of 1.4–1.6:1 against the page. They now use the page font and
+  a `--ctl` border token (3:1 or more in both themes); the dark theme's button
+  hover colour was darkened to keep white text readable.
+- A search paged past its last page said "No packages match", although it had
+  matches. It now says there is nothing on that page and links to the last page
+  and the first, keeping the search and the page size.
+- The gallery answered an empty or mistyped `?skip=`, `?take=`, `?page=` or
+  `?prerelease=` with a 400 page. Its query string is now read leniently: a value
+  that does not parse means the default. The 400 page's advice now reads "Check
+  the address for a typo."
+- `yanuget migrate` found only the first 100 packages on a BaGetter source.
+  BaGetter reports the number of results on the current page as `totalHits`,
+  and discovery stopped once `skip` passed it. Discovery now pages until the
+  source returns an empty page, advances by the results actually received (a
+  source may return fewer than `take` asked for), and stops early only when a
+  page repeats ids it has already seen.
+- `yanuget migrate` failed every package the source could not send within
+  `--timeout-secs`, because the timeout covered the whole download: at ~2 MiB/s
+  and the default 60 s, anything past ~120 MB. The failure read "error decoding
+  response body". A migration download is now bounded only by how long the
+  source goes silent (connect and read timeouts). Listing requests keep a total
+  deadline, and so do read-through mirror downloads, which an anonymous request
+  can start.
 
 ## [0.5.0] — 2026-08-11
 

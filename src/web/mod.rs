@@ -1394,33 +1394,75 @@ async fn download_symbol(
 // Web gallery (HTML)
 // ---------------------------------------------------------------------------
 
+/// The gallery's query string: a search, plus the pager's `page`.
+///
+/// Every value is taken as text and parsed with [`lenient`]. These are
+/// addresses people bookmark and edit, so an empty or mistyped `?take=` shows
+/// the default rather than a 400, which is what a typed field answered.
+#[derive(Debug, Deserialize)]
+struct GalleryParams {
+    #[serde(default)]
+    q: Option<String>,
+    #[serde(default)]
+    skip: Option<String>,
+    #[serde(default)]
+    take: Option<String>,
+    /// A 1-based page number, from the pager's "go to page" form.
+    #[serde(default)]
+    page: Option<String>,
+    #[serde(default)]
+    prerelease: Option<String>,
+    #[serde(rename = "packageType", default)]
+    package_type: Option<String>,
+}
+
+/// Parse an optional query value, treating an empty or malformed one as absent.
+fn lenient<T: std::str::FromStr>(value: Option<&str>) -> Option<T> {
+    value.and_then(|v| v.trim().parse().ok())
+}
+
 async fn gallery(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(params): Query<SearchParams>,
+    Query(params): Query<GalleryParams>,
 ) -> Result<Html<String>> {
     state.require_read(&headers)?;
     let query = params.q.unwrap_or_default();
     let default_take = state.config.gallery_page_size.max(1);
+    let take = lenient(params.take.as_deref())
+        .unwrap_or(default_take)
+        .clamp(1, MAX_SEARCH_TAKE);
+    // `page` wins over `skip`, and either way the offset snaps to the start of
+    // a page. That makes "page N" one exact page, and it is what lets the
+    // page-size form send the current `skip`: at the new size, the page shown
+    // is the one holding the package that was first on screen.
+    let skip = match lenient::<i64>(params.page.as_deref()) {
+        Some(page) => (page.max(1) - 1).saturating_mul(take),
+        None => lenient(params.skip.as_deref()).unwrap_or(0).max(0),
+    };
+    let prerelease = lenient::<bool>(params.prerelease.as_deref());
+    let package_type = params.package_type.filter(|s| !s.is_empty());
     let request = SearchRequest {
         query: query.clone(),
-        skip: params.skip.unwrap_or(0).max(0),
-        take: params
-            .take
-            .unwrap_or(default_take)
-            .clamp(1, MAX_SEARCH_TAKE),
-        include_prerelease: params.prerelease.unwrap_or(true),
+        skip: skip - skip % take,
+        take,
+        include_prerelease: prerelease.unwrap_or(true),
         include_semver2: true,
-        package_type: params.package_type.filter(|s| !s.is_empty()),
+        package_type: package_type.clone(),
     };
     let page = state.db.search(state.feed(), &request).await?;
     let urls = state.url_builder(&headers).with_hive(true);
     Ok(Html(ui::gallery_page(
         &urls,
         &page,
-        query.trim(),
-        request.skip,
-        request.take,
+        &ui::GalleryView {
+            query: query.trim(),
+            skip: request.skip,
+            take,
+            default_take,
+            prerelease,
+            package_type: package_type.as_deref(),
+        },
     )))
 }
 

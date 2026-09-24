@@ -36,6 +36,12 @@ pub struct MirrorClient {
     max_package_size_bytes: Option<u64>,
     /// Cap on versions fetched for one read-through miss.
     max_versions_per_package: Option<usize>,
+    /// Deadline for one metadata request (service index, search or catalog
+    /// page, version list), from `timeout_secs`.
+    timeout: std::time::Duration,
+    /// Deadline for one whole `.nupkg` download. `None` leaves only the read
+    /// timeout, which bounds how long the upstream may go silent.
+    download_deadline: Option<std::time::Duration>,
     resources: OnceCell<MirrorResources>,
 }
 
@@ -73,8 +79,14 @@ impl MirrorClient {
         if !config.enabled {
             return None;
         }
+        // Connecting and every read are bounded on the client. A read timeout
+        // restarts with each chunk received, so it limits how long the upstream
+        // may go silent, not how long a transfer may take; each request adds a
+        // total deadline of its own on top (`timeout`, `download_deadline`).
+        let timeout = std::time::Duration::from_secs(config.timeout_secs.max(1));
         let mut builder = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(config.timeout_secs.max(1)))
+            .connect_timeout(timeout)
+            .read_timeout(timeout)
             .user_agent(concat!("yanuget/", env!("CARGO_PKG_VERSION")))
             .default_headers(auth_headers(&config.auth));
         // Upstream credentials ride on every request as default headers. reqwest
@@ -121,8 +133,23 @@ impl MirrorClient {
             allow_private_upstream: config.allow_private_upstream,
             max_package_size_bytes: config.max_package_size_bytes,
             max_versions_per_package: config.max_versions_per_package,
+            timeout,
+            download_deadline: Some(timeout),
             resources: OnceCell::new(),
         })
+    }
+
+    /// Replace the deadline on one whole `.nupkg` download. `None` removes it:
+    /// the upstream may then take as long as it needs, provided it never goes
+    /// silent for longer than the read timeout.
+    ///
+    /// The read-through mirror keeps its deadline, because an anonymous request
+    /// starts that fetch and an upstream that trickles bytes must not hold it
+    /// open. `migrate` removes it: an operator copying a feed wants its large
+    /// packages, and a deadline on the whole transfer fails every package the
+    /// source cannot send within `timeout_secs`.
+    pub fn set_download_deadline(&mut self, deadline: Option<std::time::Duration>) {
+        self.download_deadline = deadline;
     }
 
     /// Reject an upstream-supplied resource URL that we should not fetch.
@@ -244,6 +271,7 @@ impl MirrorClient {
                 let index: serde_json::Value = self
                     .client
                     .get(&self.upstream)
+                    .timeout(self.timeout)
                     .send()
                     .await
                     .map_err(mirror_err)?
@@ -290,7 +318,13 @@ impl MirrorClient {
     pub async fn upstream_versions(&self, lower_id: &str) -> Result<Vec<String>> {
         let base = &self.resources().await?.package_base;
         let url = format!("{base}{lower_id}/index.json");
-        let resp = self.client.get(&url).send().await.map_err(mirror_err)?;
+        let resp = self
+            .client
+            .get(&url)
+            .timeout(self.timeout)
+            .send()
+            .await
+            .map_err(mirror_err)?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(Vec::new());
         }
@@ -319,9 +353,11 @@ impl MirrorClient {
     ) -> Result<streaming::StreamSummary> {
         let base = &self.resources().await?.package_base;
         let url = format!("{base}{lower_id}/{version}/{lower_id}.{version}.nupkg");
-        let resp = self
-            .client
-            .get(&url)
+        let mut request = self.client.get(&url);
+        if let Some(deadline) = self.download_deadline {
+            request = request.timeout(deadline);
+        }
+        let resp = request
             .send()
             .await
             .map_err(mirror_err)?
@@ -391,11 +427,22 @@ impl MirrorClient {
 
     /// Page through the upstream `SearchQueryService` with an empty query,
     /// collecting every package id.
+    ///
+    /// Only an empty page ends the walk. `totalHits` cannot be trusted to:
+    /// BaGetter reports the number of results on the *current page* there, so
+    /// stopping once `skip >= totalHits` ended every BaGetter migration after
+    /// its first page. A short page cannot either, because a server may return
+    /// fewer results than `take` asked for, so `skip` advances by what the page
+    /// actually held. The one extra request for the empty page at the end is
+    /// the price of not depending on either.
     async fn enumerate_via_search(&self, search: &str) -> Result<Vec<String>> {
-        const PAGE: i64 = 100;
+        const PAGE: usize = 100;
+        // Safety valve: 50,000 pages is five million ids at a full page each,
+        // far past any real feed, and stops a source that never runs dry.
+        const MAX_PAGES: usize = 50_000;
         let mut ids = DedupIds::new();
-        let mut skip: i64 = 0;
-        loop {
+        let mut skip: usize = 0;
+        for _ in 0..MAX_PAGES {
             let sep = if search.contains('?') { '&' } else { '?' };
             let url = format!(
                 "{search}{sep}q=&skip={skip}&take={PAGE}&prerelease=true&semVerLevel=2.0.0"
@@ -403,6 +450,7 @@ impl MirrorClient {
             let doc: serde_json::Value = self
                 .client
                 .get(&url)
+                .timeout(self.timeout)
                 .send()
                 .await
                 .map_err(mirror_err)?
@@ -417,26 +465,30 @@ impl MirrorClient {
                 .and_then(|d| d.as_array())
                 .map(|a| a.len())
                 .unwrap_or(0);
+            if page_len == 0 {
+                return Ok(ids.into_vec());
+            }
+            let known = ids.len();
             for id in page_ids(&doc) {
                 ids.push(&id);
             }
-
-            skip += PAGE;
-            // A short page means we have reached the end.
-            if page_len < PAGE as usize {
-                break;
+            // A page of nothing but ids already seen means the source is not
+            // honouring `skip` — it would answer every later page the same way.
+            if ids.len() == known {
+                tracing::warn!(
+                    upstream = %self.upstream,
+                    skip,
+                    "search page repeated earlier results; stopping enumeration"
+                );
+                return Ok(ids.into_vec());
             }
-            // Stop once we've paged past the upstream's reported total.
-            if let Some(total) = doc.get("totalHits").and_then(|t| t.as_i64()) {
-                if skip >= total {
-                    break;
-                }
-            }
-            // Safety valve against an upstream that never returns a short page.
-            if skip > 5_000_000 {
-                break;
-            }
+            skip += page_len;
         }
+        tracing::warn!(
+            upstream = %self.upstream,
+            pages = MAX_PAGES,
+            "search enumeration hit its page limit; the id list may be incomplete"
+        );
         Ok(ids.into_vec())
     }
 
@@ -446,6 +498,7 @@ impl MirrorClient {
         let index: serde_json::Value = self
             .client
             .get(catalog)
+            .timeout(self.timeout)
             .send()
             .await
             .map_err(mirror_err)?
@@ -470,6 +523,7 @@ impl MirrorClient {
             let page: serde_json::Value = match self
                 .client
                 .get(&page_url)
+                .timeout(self.timeout)
                 .send()
                 .await
                 .and_then(|r| r.error_for_status())
@@ -527,6 +581,10 @@ impl DedupIds {
         if self.seen.insert(id.to_lowercase()) {
             self.ids.push(id.to_string());
         }
+    }
+
+    fn len(&self) -> usize {
+        self.ids.len()
     }
 
     fn into_vec(self) -> Vec<String> {
@@ -919,5 +977,128 @@ mod tests {
             ..Default::default()
         };
         assert!(MirrorClient::from_config(&enabled).is_some());
+    }
+
+    /// How a fake upstream's search service pages.
+    #[derive(Clone, Copy, Debug)]
+    enum Quirk {
+        /// Reports the real total in `totalHits`, as nuget.org and YANuget do.
+        Honest,
+        /// BaGetter: `totalHits` is the number of results on the current page.
+        PageSizedTotalHits,
+        /// Returns at most this many results, whatever `take` asked for.
+        CapsTake(usize),
+        /// Ignores `skip`: every request gets the first page again.
+        IgnoresSkip,
+    }
+
+    /// Serve a service index and a search service over `total` package ids
+    /// (`Pkg.000`, `Pkg.001`, …). Returns the service-index URL and a count of
+    /// the search requests made.
+    async fn fake_search_upstream(
+        total: usize,
+        quirk: Quirk,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use axum::extract::Query;
+        use axum::routing::get;
+        use axum::{Json, Router};
+        use std::collections::HashMap;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let index = serde_json::json!({
+            "version": "3.0.0",
+            "resources": [
+                {"@id": format!("{base}/flat/"), "@type": "PackageBaseAddress/3.0.0"},
+                {"@id": format!("{base}/query"), "@type": "SearchQueryService"}
+            ]
+        });
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counter = requests.clone();
+        let app = Router::new()
+            .route(
+                "/v3/index.json",
+                get(move || {
+                    let index = index.clone();
+                    async move { Json(index) }
+                }),
+            )
+            .route(
+                "/query",
+                get(move |Query(q): Query<HashMap<String, String>>| {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    let arg = |k: &str| q.get(k).and_then(|v| v.parse::<usize>().ok());
+                    let mut skip = arg("skip").unwrap_or(0);
+                    let mut take = arg("take").unwrap_or(20);
+                    match quirk {
+                        Quirk::CapsTake(cap) => take = take.min(cap),
+                        Quirk::IgnoresSkip => skip = 0,
+                        Quirk::Honest | Quirk::PageSizedTotalHits => {}
+                    }
+                    let data: Vec<serde_json::Value> = (skip..total.min(skip + take))
+                        .map(|i| serde_json::json!({"id": format!("Pkg.{i:03}"), "version": "1.0.0"}))
+                        .collect();
+                    let total_hits = match quirk {
+                        Quirk::PageSizedTotalHits => data.len(),
+                        _ => total,
+                    };
+                    async move { Json(serde_json::json!({"totalHits": total_hits, "data": data})) }
+                }),
+            );
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("{base}/v3/index.json"), requests)
+    }
+
+    async fn enumerate(upstream: String) -> Vec<String> {
+        let client = MirrorClient::from_config(&MirrorConfig {
+            enabled: true,
+            upstream,
+            // The fake upstream is on loopback.
+            allow_private_upstream: true,
+            ..Default::default()
+        })
+        .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            client.enumerate_package_ids(),
+        )
+        .await
+        .expect("enumeration must terminate")
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn search_enumeration_reaches_every_page_whatever_totalhits_says() {
+        // BaGetter's `totalHits` counts only the results on the page it
+        // returns, so a walk that stops once `skip >= totalHits` ends after page
+        // one: a real migration off BaGetter found 100 of its 164 package ids.
+        for quirk in [Quirk::Honest, Quirk::PageSizedTotalHits] {
+            let (upstream, _) = fake_search_upstream(250, quirk).await;
+            let ids = enumerate(upstream).await;
+            assert_eq!(ids.len(), 250, "{quirk:?}");
+            assert_eq!(ids[249], "Pkg.249", "{quirk:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn search_enumeration_survives_a_server_that_caps_take() {
+        // A server may return fewer results than `take` asked for. A short page
+        // is then not the end, and `skip` has to advance by what arrived.
+        let (upstream, _) = fake_search_upstream(250, Quirk::CapsTake(30)).await;
+        assert_eq!(enumerate(upstream).await.len(), 250);
+    }
+
+    #[tokio::test]
+    async fn search_enumeration_stops_when_the_server_ignores_skip() {
+        // With nothing but an empty page to stop on, a server that answers
+        // every request with its first page would be asked again until the
+        // safety valve. A page that adds no new id ends the walk instead.
+        let (upstream, requests) = fake_search_upstream(250, Quirk::IgnoresSkip).await;
+        assert_eq!(enumerate(upstream).await.len(), 100);
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 }

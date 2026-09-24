@@ -40,7 +40,7 @@ A live display shows progress, ETA and transfer rate while it runs.
 | `--source-username` / `--source-password` | *(none)* | HTTP Basic credentials for the source. |
 | `--source-token <token>` | *(none)* | Bearer token for the source. |
 | `--source-header "Name: Value"` | *(none)* | Extra request header; repeatable. |
-| `--timeout-secs <n>` | `60` | Per-request timeout against the source. |
+| `--timeout-secs <n>` | `60` | How long the source may take to connect, or stay silent while answering. Listing requests must also finish within it; a package download may take longer, as long as data keeps arriving. |
 | `--concurrency <n>` | `4` | Packages downloaded and indexed at once. |
 | `--skip-prerelease` | off | Import only stable versions. |
 | `--overwrite` | off | Replace versions the target feed already has. |
@@ -55,6 +55,11 @@ definitions — is read the same way the server reads it.
 - **It is idempotent and resumable.** Versions the target feed already holds are
   skipped, so re-running after an interruption picks up where it stopped. Use
   `--overwrite` only when you deliberately want to replace what is there.
+- **It exits non-zero if anything failed.** The failed versions are listed at
+  the end, and the exit status is non-zero even when every other version got
+  through, so a script can gate on it — for example before switching clients
+  over or stopping the old server. Re-run to retry the failures; what already
+  arrived is skipped.
 - **Run it against a stopped server, or a quiet one.** The command opens the
   same data directory and database as the server. That works, but the two
   processes do not share the server's in-process version locks, so a migration
