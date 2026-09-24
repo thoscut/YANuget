@@ -22,6 +22,7 @@ on:
       - "scripts/media/**"
       - "scripts/capture-media.sh"
       - "docs/**"
+      - "overrides/**"
       - "mkdocs.yml"
 
 permissions:

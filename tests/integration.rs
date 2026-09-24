@@ -904,9 +904,9 @@ async fn stats_page_aggregates_the_feed() {
     assert!(resp.status().is_success());
     let body = resp.text().await.unwrap();
     assert!(body.contains("Statistics"));
-    // 2 distinct packages, 3 versions.
-    assert!(body.contains(">2</div><div class=\"l\">Packages"));
-    assert!(body.contains(">3</div><div class=\"l\">Versions"));
+    // 2 distinct packages, 3 versions, each value under its caption.
+    assert!(body.contains("<div class=\"l\">Packages</div><div class=\"n\">2</div>"));
+    assert!(body.contains("<div class=\"l\">Versions</div><div class=\"n\">3</div>"));
     // Both lists reference the published packages.
     assert!(body.contains("Most downloaded"));
     assert!(body.contains("Recently published"));
@@ -945,6 +945,162 @@ fn no_redirect() -> reqwest::Client {
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .unwrap()
+}
+
+#[tokio::test]
+async fn admin_selection_disables_then_deletes_a_whole_package() {
+    let server = spawn_admin().await;
+    for v in ["1.0.0", "2.0.0"] {
+        push_multipart(&server, API_KEY, build_nupkg("Bulk.Pkg", v, b"data")).await;
+    }
+    let index = "/v3/package/bulk.pkg/index.json";
+
+    // Nothing ticked: back to the page, nothing changed.
+    let resp = admin_bulk(&server, "", "bulk.pkg", ADMIN_KEY, "op=disable").await;
+    assert_eq!(resp.status(), reqwest::StatusCode::SEE_OTHER);
+    assert_eq!(resp.headers()["location"], "/admin/packages/bulk.pkg");
+    assert!(status_of(&server, index).await.is_success());
+
+    // Both versions disabled in one go: the package is withheld.
+    let resp = admin_bulk(
+        &server,
+        "",
+        "bulk.pkg",
+        ADMIN_KEY,
+        "op=disable&v=1.0.0&v=2.0.0",
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::SEE_OTHER);
+    assert_eq!(
+        status_of(&server, index).await,
+        reqwest::StatusCode::NOT_FOUND
+    );
+
+    // A version the feed does not hold refuses the whole request.
+    let resp = admin_bulk(
+        &server,
+        "",
+        "bulk.pkg",
+        ADMIN_KEY,
+        "op=delete&v=1.0.0&v=9.9.9",
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+
+    // Delete both: the package is gone, and the admin lands on the list.
+    let resp = admin_bulk(
+        &server,
+        "",
+        "bulk.pkg",
+        ADMIN_KEY,
+        "op=delete&v=1.0.0&v=2.0.0",
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::SEE_OTHER);
+    assert_eq!(resp.headers()["location"], "/admin");
+    let gone = server
+        .client
+        .get(server.url("/admin/packages/bulk.pkg"))
+        .basic_auth("admin", Some(ADMIN_KEY))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(gone.status(), reqwest::StatusCode::NOT_FOUND);
+
+    // The selection form is as guarded as the rest: no CSRF token, no change.
+    let resp = no_redirect()
+        .post(server.url("/admin/packages/bulk.pkg"))
+        .basic_auth("admin", Some(ADMIN_KEY))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body("op=delete&v=1.0.0")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn the_gallery_sorts_by_downloads_name_and_last_update() {
+    let server = spawn().await;
+    // Pushed oldest first; only Zulu gets a download.
+    for id in ["Zulu.Pkg", "Mike.Pkg", "Alpha.Pkg"] {
+        push_multipart(&server, API_KEY, build_nupkg(id, "1.0.0", b"x")).await;
+    }
+    let dl = server
+        .client
+        .get(server.url("/v3/package/zulu.pkg/1.0.0/zulu.pkg.1.0.0.nupkg"))
+        .send()
+        .await
+        .unwrap();
+    assert!(dl.status().is_success());
+
+    let order = |html: &str| {
+        let mut ids: Vec<(usize, &str)> = ["Alpha.Pkg", "Mike.Pkg", "Zulu.Pkg"]
+            .into_iter()
+            .map(|id| (html.find(&format!(">{id}</a>")).expect(id), id))
+            .collect();
+        ids.sort();
+        ids.into_iter().map(|(_, id)| id).collect::<Vec<_>>()
+    };
+    let server = &server;
+    let page = |query: &'static str| async move {
+        server
+            .client
+            .get(server.url(&format!("/packages{query}")))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap()
+    };
+    // Downloads first, ties by name.
+    assert_eq!(
+        order(&page("").await),
+        ["Zulu.Pkg", "Alpha.Pkg", "Mike.Pkg"]
+    );
+    assert_eq!(
+        order(&page("?sort=name").await),
+        ["Alpha.Pkg", "Mike.Pkg", "Zulu.Pkg"]
+    );
+    assert_eq!(
+        order(&page("?sort=updated").await),
+        ["Alpha.Pkg", "Mike.Pkg", "Zulu.Pkg"]
+    );
+    // An order the gallery does not know is the default one, not an error.
+    assert_eq!(
+        order(&page("?sort=sideways").await),
+        ["Zulu.Pkg", "Alpha.Pkg", "Mike.Pkg"]
+    );
+}
+
+#[tokio::test]
+async fn the_gallery_font_is_served_once_for_every_feed_and_cached() {
+    let server = spawn_feeds(|c| c.feeds = vec![feed("stable"), feed("dev")]).await;
+    let html = server
+        .client
+        .get(server.url("/stable"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let url = html
+        .split("<link rel=\"preload\" href=\"")
+        .nth(1)
+        .and_then(|s| s.split('"').next())
+        .expect("the page preloads its font")
+        .to_string();
+    assert!(url.starts_with("/_assets/"), "{url}");
+    let resp = server.client.get(server.url(&url)).send().await.unwrap();
+    assert!(resp.status().is_success());
+    assert_eq!(resp.headers()["content-type"], "font/woff2");
+    assert!(resp.headers()["cache-control"]
+        .to_str()
+        .unwrap()
+        .contains("immutable"));
+    assert!(resp.bytes().await.unwrap().starts_with(b"wOF2"));
 }
 
 #[tokio::test]
@@ -1634,12 +1790,7 @@ async fn spawn_feeds(customize: impl FnOnce(&mut Config)) -> TestServer {
     let feeds_meta = Arc::new(
         feeds
             .iter()
-            .map(|f| FeedMeta {
-                name: f.name.clone(),
-                prefix: f.prefix.clone(),
-                requires_approval: f.requires_approval,
-                license_policy: f.license_policy.clone(),
-            })
+            .map(FeedMeta::from_resolved)
             .collect::<Vec<_>>(),
     );
     let mut states = Vec::new();
@@ -1873,6 +2024,183 @@ async fn promotion_moves_a_version_into_the_next_ring() {
         .await
         .unwrap()
         .status()
+        .is_success());
+}
+
+/// POST the admin page's selection form for `id` under `prefix`.
+async fn admin_bulk(
+    server: &TestServer,
+    prefix: &str,
+    id: &str,
+    key: &str,
+    fields: &str,
+) -> reqwest::Response {
+    no_redirect()
+        .post(server.url(&format!("{prefix}/admin/packages/{id}")))
+        .basic_auth("admin", Some(key))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(format!("{}&{fields}", admin_body(key)))
+        .send()
+        .await
+        .unwrap()
+}
+
+async fn status_of(server: &TestServer, path: &str) -> reqwest::StatusCode {
+    server
+        .client
+        .get(server.url(path))
+        .send()
+        .await
+        .unwrap()
+        .status()
+}
+
+#[tokio::test]
+async fn admin_can_move_and_copy_versions_into_a_feed_it_administers() {
+    let server = spawn_feeds(|c| {
+        c.api_key = Some(API_KEY.into());
+        c.admin_api_key = Some(ADMIN_KEY.into());
+        c.feeds = vec![feed("dev"), feed("stable")];
+    })
+    .await;
+    for v in ["1.0.0", "2.0.0"] {
+        push_to(
+            &server,
+            "/dev/api/v2/package",
+            API_KEY,
+            build_nupkg("Mv.Pkg", v, b"x"),
+        )
+        .await;
+    }
+
+    // Both feeds share the admin key, so the page offers the other one.
+    let page = server
+        .client
+        .get(server.url("/dev/admin/packages/mv.pkg"))
+        .basic_auth("admin", Some(ADMIN_KEY))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        page.contains("<option value=\"stable\">stable</option>"),
+        "{page}"
+    );
+    assert!(!page.contains("<option value=\"dev\">"), "{page}");
+
+    // Move 1.0.0: it leaves dev and arrives in stable.
+    let resp = admin_bulk(
+        &server,
+        "/dev",
+        "mv.pkg",
+        ADMIN_KEY,
+        "op=move&target=stable&v=1.0.0",
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::SEE_OTHER);
+    let flat = |feed: &str| format!("/{feed}/v3/package/mv.pkg/1.0.0/mv.pkg.1.0.0.nupkg");
+    assert!(status_of(&server, &flat("stable")).await.is_success());
+    assert_eq!(
+        status_of(&server, &flat("dev")).await,
+        reqwest::StatusCode::NOT_FOUND
+    );
+
+    // Copy 2.0.0: it is in both afterwards.
+    let resp = admin_bulk(
+        &server,
+        "/dev",
+        "mv.pkg",
+        ADMIN_KEY,
+        "op=copy&target=stable&v=2.0.0",
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::SEE_OTHER);
+    for feed in ["dev", "stable"] {
+        assert!(
+            status_of(
+                &server,
+                &format!("/{feed}/v3/package/mv.pkg/2.0.0/mv.pkg.2.0.0.nupkg")
+            )
+            .await
+            .is_success(),
+            "{feed}"
+        );
+    }
+
+    // Moving the last version out sends the admin back to the package list.
+    let resp = admin_bulk(
+        &server,
+        "/dev",
+        "mv.pkg",
+        ADMIN_KEY,
+        "op=move&target=stable&v=2.0.0",
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::SEE_OTHER);
+    assert_eq!(resp.headers()["location"], "/dev/admin");
+    // The files stayed: stable serves both versions.
+    let versions: serde_json::Value = server
+        .client
+        .get(server.url("/stable/v3/package/mv.pkg/index.json"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(versions["versions"], serde_json::json!(["1.0.0", "2.0.0"]));
+}
+
+#[tokio::test]
+async fn moving_into_a_feed_takes_that_feeds_admin_key() {
+    let server = spawn_feeds(|c| {
+        c.api_key = Some(API_KEY.into());
+        let mut dev = feed("dev");
+        dev.admin_api_key = Some("dev-admin".into());
+        let mut stable = feed("stable");
+        stable.admin_api_key = Some("stable-admin".into());
+        c.feeds = vec![dev, stable];
+    })
+    .await;
+    push_to(
+        &server,
+        "/dev/api/v2/package",
+        API_KEY,
+        build_nupkg("Guard.Pkg", "1.0.0", b"x"),
+    )
+    .await;
+
+    // dev's key is no key to stable: the page does not offer it...
+    let page = server
+        .client
+        .get(server.url("/dev/admin/packages/guard.pkg"))
+        .basic_auth("admin", Some("dev-admin"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(!page.contains("value=\"move\""), "{page}");
+
+    // ...and a hand-made request is refused, leaving both feeds as they were.
+    let resp = admin_bulk(
+        &server,
+        "/dev",
+        "guard.pkg",
+        "dev-admin",
+        "op=move&target=stable&v=1.0.0",
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(
+        status_of(&server, "/stable/v3/package/guard.pkg/index.json").await,
+        reqwest::StatusCode::NOT_FOUND
+    );
+    assert!(status_of(&server, "/dev/v3/package/guard.pkg/index.json")
+        .await
         .is_success());
 }
 

@@ -120,12 +120,7 @@ async fn run_server(config_path: Option<&str>) -> anyhow::Result<()> {
     let feeds_meta = Arc::new(
         feeds
             .iter()
-            .map(|f| FeedMeta {
-                name: f.name.clone(),
-                prefix: f.prefix.clone(),
-                requires_approval: f.requires_approval,
-                license_policy: f.license_policy.clone(),
-            })
+            .map(FeedMeta::from_resolved)
             .collect::<Vec<_>>(),
     );
 

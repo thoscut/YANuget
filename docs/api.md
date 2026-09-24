@@ -217,7 +217,7 @@ debugger falls through to the next symbol source.
 
 ```
 GET /                                  # searchable package list
-GET /packages?q=&skip=&take=           # same, as a search page
+GET /packages?q=&skip=&take=&sort=     # same, as a search page
 GET /packages/{id}                     # detail for the newest version
 GET /packages/{id}/{version}           # detail for a specific version
 GET /packages/{id}/{version}/icon      # the package's embedded icon
@@ -226,7 +226,11 @@ GET /settings                          # read-only policy overview
 ```
 
 Human-facing HTML (not part of the NuGet protocol). The header has a search box
-(submitting to `/packages?q=`). The detail page shows versions, dependencies,
+(submitting to `/packages?q=`). The list is sorted by `sort`: `downloads` (the
+default, the same ranking `/v3/search` gives clients), `name` (A to Z) or
+`updated` (the package whose newest version was published last comes first); an
+unknown value falls back to the default. Paging, the page-size form and a new
+search keep the chosen order. The detail page shows versions, dependencies,
 links, readme, symbol availability, and the install command for Chocolatey /
 `dotnet` / `nuget.exe` (ordered by `primary_client`). `/stats` shows feed totals
 (packages, versions, downloads, storage, symbol files) plus the most-downloaded
@@ -246,6 +250,15 @@ response also carries its own `Content-Security-Policy: default-src 'none'`.
 Requires `enable_web_ui` (on by default); when disabled, `/` serves a minimal
 info page and `/packages/*` return `404`.
 
+```
+GET /_assets/fonts/atkinson-hyperlegible-next-2.001-latin-wght.woff2
+```
+
+The gallery's one font, embedded in the binary and served from the root (not
+per feed), with a one-year immutable cache. Its name carries the font's version,
+so a different font arrives under a different URL. The gallery's policy allows
+fonts from this origin only (`font-src 'self'`).
+
 ## Admin area (HTTP Basic auth)
 
 Mounted only when `admin_api_key` is set; protected by HTTP Basic auth (any
@@ -255,6 +268,7 @@ from the browser.
 ```
 GET  /admin                                       # dashboard: all package ids
 GET  /admin/packages/{id}                          # versions + actions
+POST /admin/packages/{id}                          # one action on several versions
 POST /admin/packages/{id}/{version}/disable        # withhold a version
 POST /admin/packages/{id}/{version}/enable         # restore a disabled version
 POST /admin/packages/{id}/{version}/delete         # remove from this feed
@@ -277,6 +291,32 @@ it, the shared payload, sidecars and indexed symbols are hard-deleted too.
 the version to be a member of the current feed. The POST actions return
 `303 See Other` back to the package page; without credentials they return `401`
 with a `WWW-Authenticate: Basic` challenge.
+
+`POST /admin/packages/{id}` applies one action to every version it names — how a
+whole package is disabled, deleted or moved. The form fields are `op` (`enable`,
+`disable`, `approve`, `delete`, `copy` or `move`), one `v` per version, and for
+`copy`/`move` a `target` feed:
+
+```
+curl -u admin:$ADMIN_KEY -X POST -H "X-CSRF-Token: $TOKEN" \
+     -d "op=move&target=stable&v=1.0.0&v=1.1.0" \
+     https://host/dev/admin/packages/foo
+```
+
+Every named version is checked before anything changes, so one this feed does
+not hold (`404`) or a target whose license policy refuses one (`403`) leaves the
+feed as it was. `copy` adds the versions to the target, as `promote` does;
+`move` also removes them from this feed and keeps each one's listed and enabled
+state. The files are never touched by either, since the target holds them
+afterwards. The target applies its own approval gate and license policy, as for
+a push. With no version named, the request changes nothing and redirects back.
+
+Copying or moving **into** a feed takes that feed's admin key: the request must
+carry credentials that are valid for the target as well, unless the target is
+this feed's `promotes_to`, which the configuration already trusts this feed's
+admin to fill. Otherwise it returns `400`. Feeds that share one admin key (the
+global `admin_api_key`) can therefore hand versions to each other; feeds with
+keys of their own cannot, without both.
 
 ### CSRF
 

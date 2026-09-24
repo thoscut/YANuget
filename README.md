@@ -184,7 +184,7 @@ YANuget implements the NuGet v3 protocol. Full reference in
 | Web gallery | `GET /` and `GET /packages/{id}[/{version}]` |
 | Package icon | `GET /packages/{id}/{version}/icon` |
 | Documentation | `GET /docs` (embedded, offline) |
-| Admin (Basic auth) | `GET /admin`, `POST /admin/packages/{id}/{version}/{disable\|enable\|delete}` |
+| Admin (Basic auth) | `GET /admin`, `POST /admin/packages/{id}/{version}/{disable\|enable\|delete}`, `POST /admin/packages/{id}` (several versions: disable, delete, copy or move to another feed) |
 | Health | `GET /health` (readiness), `GET /health/live` (liveness) |
 
 ---
@@ -293,7 +293,8 @@ symbols. Native (Windows) PDBs are stored but cannot be indexed.
 A self-contained, dependency-free HTML gallery (no external assets, works
 offline) lives at `/`:
 
-* a searchable package list (search box in the header),
+* a searchable package list (search box in the header), sortable by downloads,
+  name or last update,
 * a per-package detail page with versions, dependencies, links, readme and the
   install command for Chocolatey / `dotnet` / `nuget.exe`,
 * a package's embedded icon, served from the feed itself — the bytes are
@@ -304,8 +305,10 @@ offline) lives at `/`:
 * a read-only settings overview (`/settings`) that never exposes secrets,
 * a configurable page size (`gallery_page_size`, default 20) with pagination.
 
-The gallery loads **no external resources** — all CSS and JavaScript are inlined
-and the favicon is an inline data URI, so it works on an air-gapped network.
+The gallery loads **no external resources** — all CSS and JavaScript are inlined,
+the favicon is an inline data URI, and its one font (Atkinson Hyperlegible Next,
+drawn to keep `l`, `1` and `I` apart) is embedded in the binary and served by the
+server itself, so it works on an air-gapped network.
 
 Disable the gallery (and the docs below) with `enable_web_ui = false`.
 
@@ -335,12 +338,16 @@ instead), as does an install from crates.io. The Markdown sources live in
 ## Admin moderation
 
 When `admin_api_key` is set, an `/admin` area (HTTP Basic auth) lets an operator
-**disable**, **re-enable** or **delete** individual package versions from the
-browser. A *disabled* version is withheld from clients entirely — hidden from
-search/registration/versions **and** not downloadable — which is stronger than
-NuGet's *unlist* (an unlisted version stays downloadable for restore). Delete is
-a hard delete (payload, sidecars and symbols). The area is only mounted when an
-admin key is configured.
+**disable**, **re-enable** or **delete** package versions from the browser — one
+at a time, or every ticked version at once, which is how a whole package goes.
+A package's gallery page links straight to it. A *disabled* version is withheld
+from clients entirely — hidden from search/registration/versions **and** not
+downloadable — which is stronger than NuGet's *unlist* (an unlisted version
+stays downloadable for restore). Delete is a hard delete (payload, sidecars and
+symbols) once no feed holds the version any more. With several feeds, ticked
+versions can also be **copied** or **moved** to another feed the same admin
+credentials cover; the files stay where they are. The area is only mounted when
+an admin key is configured, and the settings page says how to turn it on.
 
 ## Package retention
 
@@ -482,3 +489,7 @@ Releases are cut from tags; the process is in [RELEASING.md](RELEASING.md).
 ## License
 
 [MIT](LICENSE).
+
+The gallery embeds the font Atkinson Hyperlegible Next, © 2020-2024 The
+Atkinson Hyperlegible Next Project Authors, under the SIL Open Font License 1.1
+([`src/web/fonts/OFL.txt`](src/web/fonts/OFL.txt)).
