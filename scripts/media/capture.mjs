@@ -104,7 +104,7 @@ console.log("reels:");
   await page.waitForLoadState("networkidle");
   await reel.shoot(page, 1500);
 
-  await page.click(".card h2 a");
+  await page.click(".pkg h2 a");
   await page.waitForLoadState("networkidle");
   await reel.shoot(page, 1800);
 

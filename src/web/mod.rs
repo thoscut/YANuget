@@ -5,6 +5,7 @@
 //! single unconfigured feed is served at the root, preserving the original
 //! single-feed URLs.
 
+mod assets;
 mod docs;
 mod files;
 mod ui;
@@ -30,7 +31,7 @@ use crate::auth::{AdminAuth, ApiKeyAuth, ReadAuth};
 use crate::config::{
     Config, LicensePolicyConfig, OverwriteMode, RateLimitConfig, ResolvedFeed, RetentionConfig,
 };
-use crate::database::{Membership, PackageDatabase, SearchRequest};
+use crate::database::{Membership, PackageDatabase, SearchRequest, SearchSort};
 use crate::error::{Error, Result};
 use crate::indexing::{self, IndexOptions};
 use crate::mirror::{self, MirrorClient, MirrorOptions};
@@ -100,7 +101,8 @@ impl FeedContext {
     }
 }
 
-/// Lightweight, cross-feed metadata so a handler can resolve a promotion target.
+/// Lightweight, cross-feed metadata so a handler can resolve a promotion, copy
+/// or move target.
 #[derive(Debug, Clone)]
 pub struct FeedMeta {
     pub name: String,
@@ -109,6 +111,22 @@ pub struct FeedMeta {
     /// The target feed's own license policy, so a promotion into it is held to
     /// the same rule a direct push would be.
     pub license_policy: LicensePolicyConfig,
+    /// The target feed's own admin key. Copying or moving a version into a
+    /// feed takes that feed's admin credentials, not just this one's.
+    pub admin: AdminAuth,
+}
+
+impl FeedMeta {
+    /// The cross-feed view of one resolved feed.
+    pub fn from_resolved(feed: &ResolvedFeed) -> Self {
+        Self {
+            name: feed.name.clone(),
+            prefix: feed.prefix.clone(),
+            requires_approval: feed.requires_approval,
+            license_policy: feed.license_policy.clone(),
+            admin: AdminAuth::new(feed.admin_api_key.clone()),
+        }
+    }
 }
 
 /// Shared application state for one feed, cheaply cloneable (everything behind
@@ -243,7 +261,7 @@ impl AppState {
 /// their `/{name}` prefix with a feed index at the root.
 pub fn build_app(states: Vec<AppState>) -> Router {
     let layers = GlobalLayers::from_states(&states);
-    let mut top = health_routes(&states);
+    let mut top = health_routes(&states).merge(assets::routes());
 
     if states.len() == 1 && states[0].feed.prefix.is_empty() {
         top = top.merge(feed_routes(states.into_iter().next().expect("one state")));
@@ -277,7 +295,9 @@ pub fn build_app(states: Vec<AppState>) -> Router {
 pub fn router(state: AppState) -> Router {
     let states = std::slice::from_ref(&state);
     let layers = GlobalLayers::from_states(states);
-    let app = health_routes(states).merge(feed_routes(state));
+    let app = health_routes(states)
+        .merge(assets::routes())
+        .merge(feed_routes(state));
     apply_global_layers(app, layers)
 }
 
@@ -623,7 +643,10 @@ fn feed_routes(state: AppState) -> Router {
         if state.feed.admin.is_enabled() {
             ui = ui
                 .route("/admin", get(admin_dashboard))
-                .route("/admin/packages/{id}", get(admin_package))
+                .route(
+                    "/admin/packages/{id}",
+                    get(admin_package).merge(admin_post(admin_bulk)),
+                )
                 .route(
                     "/admin/packages/{id}/{version}/disable",
                     admin_post(admin_disable),
@@ -682,7 +705,11 @@ async fn html_errors(
     // `WWW-Authenticate` challenge on a 401, without which a browser never
     // prompts — and replace only the body and its content type.
     let (mut parts, _) = response.into_parts();
-    let page = ui::error_page(&state.url_builder(&headers), status);
+    let page = ui::error_page(
+        &state.url_builder(&headers),
+        status,
+        state.feed.admin.is_enabled(),
+    );
     parts.headers.remove(header::CONTENT_LENGTH);
     parts.headers.insert(
         header::CONTENT_TYPE,
@@ -1224,6 +1251,7 @@ async fn search(
         include_prerelease: params.prerelease.unwrap_or(false),
         include_semver2: is_semver2_level(params.semver_level.as_deref()),
         package_type: params.package_type.filter(|s| !s.is_empty()),
+        sort: Default::default(),
     };
     let page = state.db.search(state.feed(), &request).await?;
     // Link results into the hive matching the caller's semVerLevel, so a client
@@ -1414,6 +1442,9 @@ struct GalleryParams {
     prerelease: Option<String>,
     #[serde(rename = "packageType", default)]
     package_type: Option<String>,
+    /// `downloads` (the default), `name` or `updated`.
+    #[serde(default)]
+    sort: Option<String>,
 }
 
 /// Parse an optional query value, treating an empty or malformed one as absent.
@@ -1442,6 +1473,12 @@ async fn gallery(
     };
     let prerelease = lenient::<bool>(params.prerelease.as_deref());
     let package_type = params.package_type.filter(|s| !s.is_empty());
+    // An unknown order is the default one, like every other gallery value.
+    let sort = params
+        .sort
+        .as_deref()
+        .and_then(SearchSort::parse)
+        .unwrap_or_default();
     let request = SearchRequest {
         query: query.clone(),
         skip: skip - skip % take,
@@ -1449,6 +1486,7 @@ async fn gallery(
         include_prerelease: prerelease.unwrap_or(true),
         include_semver2: true,
         package_type: package_type.clone(),
+        sort,
     };
     let page = state.db.search(state.feed(), &request).await?;
     let urls = state.url_builder(&headers).with_hive(true);
@@ -1462,6 +1500,8 @@ async fn gallery(
             default_take,
             prerelease,
             package_type: package_type.as_deref(),
+            sort,
+            admin: state.feed.admin.is_enabled(),
         },
     )))
 }
@@ -1491,7 +1531,13 @@ async fn stats_page(State(state): State<AppState>, headers: HeaderMap) -> Result
         .await?;
     let recent = state.db.recent_packages(state.feed(), 10).await?;
     let urls = state.url_builder(&headers);
-    Ok(Html(ui::stats_page(&urls, &stats, &top, &recent)))
+    Ok(Html(ui::stats_page(
+        &urls,
+        &stats,
+        &top,
+        &recent,
+        state.feed.admin.is_enabled(),
+    )))
 }
 
 async fn package_detail(
@@ -1649,6 +1695,7 @@ async fn render_detail(
         readme.as_deref(),
         &state.config.primary_client,
         has_symbols,
+        state.feed.admin.is_enabled(),
     )))
 }
 
@@ -1716,6 +1763,16 @@ fn form_field(body: &str, name: &str) -> Option<String> {
     })
 }
 
+/// Every value of a repeated form field (`v=1.0.0&v=2.0.0`), in order.
+fn form_fields(body: &str, name: &str) -> Vec<String> {
+    body.split('&')
+        .filter_map(|pair| {
+            let (k, v) = pair.split_once('=')?;
+            (decode_form_value(k) == name).then(|| decode_form_value(v))
+        })
+        .collect()
+}
+
 fn decode_form_value(raw: &str) -> String {
     let plus_decoded = raw.replace('+', " ");
     percent_encoding::percent_decode_str(&plus_decoded)
@@ -1744,13 +1801,257 @@ async fn admin_package(
         return Err(Error::PackageNotFound);
     }
     let urls = state.url_builder(&headers);
+    let targets: Vec<String> = transfer_targets(&state, &headers)
+        .map(|m| m.name.clone())
+        .collect();
+    // The id as published, not as typed into the address.
+    let display_id = &versions[0].package.id;
     Ok(Html(ui::admin_package_page(
         &urls,
-        &id,
+        display_id,
         &versions,
         state.feed.promotes_to.as_deref(),
+        &targets,
         &state.feed.admin.csrf_token().unwrap_or_default(),
     )))
+}
+
+/// The feeds this request may copy or move versions into: every other feed
+/// whose own admin key the request also presents, and the promotion target,
+/// which the configuration already trusts this feed's admin to fill.
+///
+/// Holding one feed's admin key must not be a way to write into another:
+/// without the target's key, a `dev` admin could move anything into `stable`.
+fn transfer_targets<'a>(
+    state: &'a AppState,
+    headers: &'a HeaderMap,
+) -> impl Iterator<Item = &'a FeedMeta> + 'a {
+    state.feeds.iter().filter(move |m| {
+        m.name != state.feed.name
+            && (m.admin.check_headers(headers)
+                || state.feed.promotes_to.as_deref() == Some(m.name.as_str()))
+    })
+}
+
+/// Whether [`transfer_version`] leaves the version in this feed too.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Transfer {
+    /// Add it to the target and keep it here (what a promotion does).
+    Copy,
+    /// Add it to the target and take it out of here.
+    Move,
+}
+
+/// Copy or move one version of this feed into `target`.
+///
+/// The target's license policy and approval gate apply, exactly as for a push
+/// into it. A copy arrives active, as a promotion always has; a move keeps
+/// the listed and enabled state it had here, since it is the same version,
+/// elsewhere. A version the target already holds keeps its state there. Its
+/// files are never touched: the target holds them afterwards either way.
+async fn transfer_version(
+    state: &AppState,
+    target: &FeedMeta,
+    id: &str,
+    v: &NuGetVersion,
+    mode: Transfer,
+) -> Result<()> {
+    // You can only hand on what *this* feed holds — not any globally-known
+    // version that happens to live in some other feed. Checked again under
+    // the lock below; this first look keeps such a version from being judged
+    // against the target's policy at all.
+    if !state.db.exists(state.feed(), id, v).await? {
+        return Err(Error::PackageNotFound);
+    }
+    let package = state
+        .db
+        .get_package_data(id, v)
+        .await?
+        .ok_or(Error::PackageNotFound)?;
+
+    // The target feed's own license policy, not this one's. A promotion is how
+    // a version enters that feed, so it has to clear the same rule a direct
+    // push would: otherwise `dev` with no policy is a way around `stable`'s
+    // `action = "block"`.
+    let outcome = crate::policy::evaluate_license(&target.license_policy, &package);
+    if !outcome.allowed {
+        return Err(Error::PolicyViolation(format!(
+            "{} rejects this package: {}",
+            target.name,
+            outcome.violation.unwrap_or_else(|| "license policy".into())
+        )));
+    }
+
+    // Under the same lock as a push or a purge of this version, so the checks
+    // below and the membership changes after them see one consistent state.
+    // Without it a retention sweep that drops the last membership in between
+    // deletes the shared data, and the insert then leaves a membership
+    // pointing at a package row that no longer exists — invisible to every
+    // query (they all inner-join) yet enough to make a later push conflict.
+    let _guard = crate::locks::lock_version(id, &v.normalized()).await;
+    let Some(here) = state.db.get_membership(state.feed(), id, v).await? else {
+        return Err(Error::PackageNotFound);
+    };
+    if !state.db.package_data_exists(id, v).await? {
+        return Err(Error::PackageNotFound);
+    }
+    let mut membership = Membership {
+        pending: target.requires_approval,
+        flagged: outcome.violation.is_some(),
+        flag_reason: outcome.violation,
+        ..Membership::active(&target.name, &package)
+    };
+    if mode == Transfer::Move {
+        membership.listed = here.listed;
+        membership.enabled = here.enabled;
+    }
+    match state.db.add_membership(&membership).await {
+        Ok(()) | Err(Error::PackageAlreadyExists) => {}
+        Err(e) => return Err(e),
+    }
+    if mode == Transfer::Move {
+        state.db.remove_membership(state.feed(), id, v).await?;
+    }
+    Ok(())
+}
+
+/// What the admin page's selection form asks for.
+#[derive(Clone, Copy)]
+enum BulkOp {
+    Enable,
+    Disable,
+    Approve,
+    Delete,
+    Copy,
+    Move,
+}
+
+impl BulkOp {
+    fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "enable" => Self::Enable,
+            "disable" => Self::Disable,
+            "approve" => Self::Approve,
+            "delete" => Self::Delete,
+            "copy" => Self::Copy,
+            "move" => Self::Move,
+            _ => return None,
+        })
+    }
+}
+
+/// Apply one action to every version ticked on the admin page — the way a
+/// whole package is disabled, deleted, or moved to another feed.
+///
+/// Every version is checked before anything changes, so a typo'd version or
+/// a target that refuses the package leaves the feed as it was rather than
+/// half done. Nothing selected sends the admin back to the page unchanged.
+async fn admin_bulk(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    body: String,
+) -> Result<Response> {
+    require_admin_action(&state, &headers, &body)?;
+    let back = Redirect::to(&admin_package_url(&state.feed.prefix, &id)).into_response();
+    let op = form_field(&body, "op")
+        .as_deref()
+        .and_then(BulkOp::parse)
+        .ok_or_else(|| Error::BadRequest("unknown or missing action".into()))?;
+    let versions = form_fields(&body, "v")
+        .iter()
+        .map(|v| parse_version(v))
+        .collect::<Result<Vec<_>>>()?;
+    if versions.is_empty() {
+        return Ok(back);
+    }
+    for v in &versions {
+        if !state.db.exists(state.feed(), &id, v).await? {
+            return Err(Error::PackageNotFound);
+        }
+    }
+
+    match op {
+        BulkOp::Enable | BulkOp::Disable => {
+            let enabled = matches!(op, BulkOp::Enable);
+            for v in &versions {
+                state.db.set_enabled(state.feed(), &id, v, enabled).await?;
+            }
+        }
+        BulkOp::Approve => {
+            for v in &versions {
+                state.db.approve_membership(state.feed(), &id, v).await?;
+            }
+        }
+        BulkOp::Delete => {
+            for v in &versions {
+                retention::purge_version(
+                    state.storage.as_ref(),
+                    state.db.as_ref(),
+                    state.feed(),
+                    &id,
+                    v,
+                )
+                .await?;
+            }
+        }
+        BulkOp::Copy | BulkOp::Move => {
+            let name = form_field(&body, "target").unwrap_or_default();
+            let target = transfer_targets(&state, &headers)
+                .find(|m| m.name == name)
+                .ok_or_else(|| {
+                    Error::BadRequest(format!(
+                        "{name:?} is not a feed these credentials may add versions to"
+                    ))
+                })?;
+            // Refuse the lot up front if the target's policy refuses any of
+            // it, rather than moving half a package.
+            for v in &versions {
+                let package = state
+                    .db
+                    .get_package_data(&id, v)
+                    .await?
+                    .ok_or(Error::PackageNotFound)?;
+                let outcome = crate::policy::evaluate_license(&target.license_policy, &package);
+                if !outcome.allowed {
+                    return Err(Error::PolicyViolation(format!(
+                        "{} rejects {} {}: {}",
+                        target.name,
+                        package.id,
+                        v.normalized(),
+                        outcome.violation.unwrap_or_else(|| "license policy".into())
+                    )));
+                }
+            }
+            let mode = if matches!(op, BulkOp::Move) {
+                Transfer::Move
+            } else {
+                Transfer::Copy
+            };
+            for v in &versions {
+                transfer_version(&state, target, &id, v, mode).await?;
+            }
+            tracing::info!(
+                from = %state.feed(),
+                to = %target.name,
+                %id,
+                count = versions.len(),
+                moved = mode == Transfer::Move,
+                "transferred versions"
+            );
+        }
+    }
+
+    // Back to the package if this feed still holds any of it, else the list.
+    if state
+        .db
+        .find_all_versions(state.feed(), &id)
+        .await?
+        .is_empty()
+    {
+        return Ok(Redirect::to(&format!("{}/admin", state.feed.prefix)).into_response());
+    }
+    Ok(back)
 }
 
 async fn admin_disable(
@@ -1814,56 +2115,13 @@ async fn admin_promote(
         ));
     };
     let v = parse_version(&version)?;
-    // You can only promote what *this* ring holds — not any globally-known
-    // version that happens to live in some other feed.
-    if !state.db.exists(state.feed(), &id, &v).await? {
-        return Err(Error::PackageNotFound);
-    }
-    let package = state
-        .db
-        .get_package_data(&id, &v)
-        .await?
-        .ok_or(Error::PackageNotFound)?;
-    // The target must be a known feed; gate the promoted membership if it does.
+    // The target must be a known feed; the copy clears its policy and gate.
     let target_meta = state
         .feeds
         .iter()
         .find(|m| &m.name == target)
         .ok_or_else(|| Error::BadRequest(format!("unknown promotion target {target:?}")))?;
-
-    // The target feed's own license policy, not this one's. A promotion is how
-    // a version enters that feed, so it has to clear the same rule a direct
-    // push would: otherwise `dev` with no policy is a way around `stable`'s
-    // `action = "block"`, and whoever holds `dev`'s admin key effectively has
-    // write access to `stable`.
-    let outcome = crate::policy::evaluate_license(&target_meta.license_policy, &package);
-    if !outcome.allowed {
-        return Err(Error::PolicyViolation(format!(
-            "{target} rejects this package: {}",
-            outcome.violation.unwrap_or_else(|| "license policy".into())
-        )));
-    }
-
-    let membership = Membership {
-        pending: target_meta.requires_approval,
-        flagged: outcome.violation.is_some(),
-        flag_reason: outcome.violation,
-        ..Membership::active(target, &package)
-    };
-    // Under the same lock as a push or a purge of this version, so the
-    // existence check above and the membership below see one consistent state.
-    // Without it a retention sweep that drops the last membership in between
-    // deletes the shared data, and this insert then leaves a membership
-    // pointing at a package row that no longer exists — invisible to every
-    // query (they all inner-join) yet enough to make a later push conflict.
-    let _guard = crate::locks::lock_version(&id, &v.normalized()).await;
-    if !state.db.package_data_exists(&id, &v).await? {
-        return Err(Error::PackageNotFound);
-    }
-    match state.db.add_membership(&membership).await {
-        Ok(()) | Err(Error::PackageAlreadyExists) => {}
-        Err(e) => return Err(e),
-    }
+    transfer_version(&state, target_meta, &id, &v, Transfer::Copy).await?;
     tracing::info!(from = %state.feed(), to = %target, %id, version = %v.normalized(), "promoted version");
     Ok(Redirect::to(&admin_package_url(&state.feed.prefix, &id)).into_response())
 }

@@ -9,142 +9,232 @@
 //! the `choco install` command (configurable via `primary_client`).
 
 use crate::config::Config;
+use crate::database::SearchSort;
 use crate::models::{Package, PackageType};
 use crate::nuget::UrlBuilder;
 
-/// Minimal, dependency-free styling, inlined so the UI needs no static assets
-/// and works fully offline.
-const STYLE: &str = "\
+/// Where the embedded gallery font is served from, as a literal so the
+/// stylesheet below can be one compile-time constant (its CSP hash depends on
+/// it). The name carries the font's version: the file is cached as immutable,
+/// so a different font has to arrive under a different URL.
+macro_rules! font_url {
+    () => {
+        "/_assets/fonts/atkinson-hyperlegible-next-2.001-latin-wght.woff2"
+    };
+}
+pub(super) const FONT_URL: &str = font_url!();
+
+/// The gallery's styling, inlined so a page needs nothing but itself and the
+/// one font file this server also serves. It works fully offline.
+///
+/// The look is a warehouse's: pages sit on a grey floor, the package page is a
+/// shipping label (die-cut corners, heavy carbon rules, one cell per field),
+/// and the one colour is floor-marking yellow, spent on the action that
+/// matters on a page and on the highlighter a hovered link gets. The typeface,
+/// Atkinson Hyperlegible Next, was drawn to keep `l`, `1` and `I` (and `0` and
+/// `O`) apart, which is most of what reading a package id or a version asks.
+const STYLE: &str = concat!(
+    "@font-face{font-family:'Atkinson Hyperlegible Next';font-style:normal;font-weight:200 800;\
+font-display:swap;src:url(",
+    font_url!(),
+    ") format('woff2');\
+unicode-range:U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+0304,U+0308,\
+U+0329,U+2000-206F,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD}\
 :root{color-scheme:dark light;\
---bg:#0d1117;--card:#161b22;--border:#30363d;--fg:#e6edf3;--muted:#9aa4af;\
---accent:#58a6ff;--accent2:#1f6feb;--accent2h:#1a64d6;--onaccent:#fff;\
---code:#010409;--warn:#d29922;--subtle:#21262d;--subtleh:#30363d;\
---ok:#3fb950;--danger:#b62324;--dangerfg:#ff7b72;--ctl:#656c76}\
+--floor:#131920;--stock:#1b232c;--ink:#e6eaee;--pencil:#9ca8b4;--rule:#2e3945;--code:#0e1318;\
+--hivis:#ffd100;--onhivis:#16191d;--focus:#ffd100;--ctl:#6b7885;\
+--warn:#e0a526;--ok:#4cc06a;--danger:#e5484d;--ondanger:#16191d;--dangerfg:#ff8a85}\
 @media(prefers-color-scheme:light){:root{\
---bg:#f6f8fa;--card:#fff;--border:#d0d7de;--fg:#1f2328;--muted:#59636e;\
---accent:#0969da;--accent2:#0969da;--accent2h:#0a5fc2;--onaccent:#fff;\
---code:#f6f8fa;--warn:#9a6700;--subtle:#eaeef2;--subtleh:#dde3ea;\
---ok:#1a7f37;--danger:#cf222e;--dangerfg:#cf222e;--ctl:#818b98}}\
+--floor:#e6e9ec;--stock:#fff;--ink:#16191d;--pencil:#56606b;--rule:#c5cbd2;--code:#f2f4f6;\
+--hivis:#ffd100;--onhivis:#16191d;--focus:#16191d;--ctl:#7a8591;\
+--warn:#8a5a00;--ok:#1b7a3a;--danger:#c0262d;--ondanger:#fff;--dangerfg:#c0262d}}\
 *{box-sizing:border-box}\
+html{-webkit-text-size-adjust:100%;text-size-adjust:100%}\
 button,input,select{font-family:inherit}\
-body{margin:0;background:var(--bg);color:var(--fg);\
-font:15px/1.55 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif}\
-a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}\
-main p a,footer a{text-decoration:underline;text-underline-offset:.15em}\
-a:focus-visible,button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid var(--accent);outline-offset:2px}\
+body{margin:0;background:var(--floor);color:var(--ink);\
+font:16px/1.55 'Atkinson Hyperlegible Next',system-ui,-apple-system,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;\
+font-variant-numeric:tabular-nums}\
+a{color:inherit;text-decoration:underline;text-decoration-thickness:1px;text-underline-offset:.2em}\
+a:hover{background:var(--hivis);color:var(--onhivis);text-decoration:none;\
+-webkit-box-decoration-break:clone;box-decoration-break:clone}\
+a:focus-visible,button:focus-visible,input:focus-visible,select:focus-visible{outline:3px solid var(--focus);outline-offset:2px}\
 .vh{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);border:0}\
-.skip{position:absolute;left:-999px;top:0;background:var(--accent2);color:var(--onaccent);padding:8px 12px;border-radius:0 0 6px 0;z-index:10}\
+.skip{position:absolute;left:-999px;top:0;z-index:10;padding:10px 14px;background:var(--hivis);color:var(--onhivis);font-weight:700}\
 .skip:focus{left:0}\
-header{background:var(--card);border-bottom:1px solid var(--border);padding:14px 0}\
-.wrap{max-width:980px;margin:0 auto;padding:0 20px}\
-header .wrap{display:flex;align-items:center;gap:16px}\
-.logo{font-weight:700;font-size:20px;color:var(--fg)}\
-.logo span{color:var(--accent)}\
-form.search{flex:1;display:flex;gap:8px}\
-input[type=search]{flex:1;padding:9px 12px;border-radius:6px;border:1px solid var(--ctl);\
-background:var(--bg);color:var(--fg);font-size:15px;min-height:44px}\
-input[type=search]:focus{border-color:var(--accent)}\
-button{padding:9px 16px;border-radius:6px;border:1px solid var(--accent2);\
-background:var(--accent2);color:var(--onaccent);font-size:15px;cursor:pointer;min-height:44px}\
-button:hover{background:var(--accent2h)}\
-@media(max-width:560px){header .wrap{flex-wrap:wrap}form.search{flex:1 0 100%}}\
-main{padding:26px 0 60px}\
-.card{background:var(--card);border:1px solid var(--border);border-radius:10px;\
-padding:18px 20px;margin:0 0 14px}\
-.card h2{margin:0 0 4px;font-size:18px;overflow-wrap:anywhere}\
-h2.muted{font-size:17px;margin:18px 0 8px}\
-.card>h2.muted:first-child{margin-top:0}\
-@media(max-width:560px){.wrap{padding:0 16px}.card{padding:14px 16px}}\
-.meta{color:var(--muted);font-size:13px;margin:2px 0}\
-.crumbs{font-size:13px;color:var(--muted);margin:0 0 6px}\
-.tags{margin-top:8px;list-style:none;padding:0;display:flex;flex-wrap:wrap}\
-.tag{display:inline-block;background:var(--subtle);border:1px solid var(--border);border-radius:20px;\
-padding:1px 10px;font-size:12px;color:var(--muted);margin:0 4px 4px 0}\
-.badge{display:inline-block;font-size:11px;padding:0 7px;border-radius:20px;border:1px solid var(--border);vertical-align:middle}\
-.badge.pre{color:var(--warn);border-color:var(--warn)}\
-.badge.un{color:var(--muted)}\
-.muted{color:var(--muted)}\
-.grid{display:grid;grid-template-columns:1fr 340px;gap:22px}\
-@media(max-width:760px){.grid{grid-template-columns:1fr}}\
-.detail{grid-template-columns:1fr 340px;grid-template-areas:\"main side\" \"readme side\";grid-template-rows:auto 1fr}\
-.detail>.content{grid-area:main}.detail>.side{grid-area:side}.detail>.readme-area{grid-area:readme;min-width:0}\
-@media(max-width:760px){.detail{grid-template-columns:1fr;grid-template-areas:\"main\" \"side\" \"readme\";grid-template-rows:auto}}\
-h1.title{font-size:26px;margin:0 0 2px;overflow-wrap:anywhere}\
-pre{background:var(--code);border:1px solid var(--border);border-radius:8px;padding:12px 14px;\
-overflow:auto;font-size:13px;margin:6px 0}\
-code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}\
-.install h3{margin:14px 0 4px;font-size:14px;color:var(--muted)}\
-.install .primary h3{color:var(--accent)}\
-.install pre{white-space:pre-wrap;overflow-wrap:break-word}\
+header{background:var(--stock);border-bottom:3px solid var(--ink)}\
+.wrap{max-width:1120px;margin:0 auto;padding:0 24px}\
+header .wrap{display:flex;flex-wrap:wrap;align-items:center;gap:12px 28px;padding-top:12px;padding-bottom:12px}\
+.logo{display:inline-flex;align-items:center;gap:10px;font-size:21px;font-weight:800;letter-spacing:-.01em;text-decoration:none}\
+.logo:hover{background:none;color:inherit}\
+.logo .box{fill:none;stroke:currentColor;stroke-width:3}.logo .tape{fill:var(--hivis)}\
+form.search{flex:1 1 300px;display:flex;gap:8px}\
+input[type=search]{flex:1;min-width:0;padding:9px 14px;border-radius:6px;border:2px solid var(--ctl);\
+background:var(--floor);color:var(--ink);font-size:16px;min-height:44px}\
+input[type=search]:focus{border-color:var(--ink)}\
+button{padding:9px 18px;border-radius:6px;border:2px solid var(--ink);background:var(--ink);color:var(--stock);\
+font-size:16px;font-weight:700;cursor:pointer;min-height:44px}\
+button:hover{background:var(--hivis);color:var(--onhivis)}\
+nav.site{display:flex;flex-wrap:wrap;gap:4px 20px;font-size:15px}\
+nav.site a{padding:8px 0 5px;border-bottom:3px solid transparent;text-decoration:none}\
+nav.site a:hover{background:none;color:inherit;border-bottom-color:var(--hivis)}\
+nav.site a[aria-current=page]{font-weight:700;border-bottom-color:var(--ink)}\
+@media(max-width:760px){form.search{order:3;flex-basis:100%}nav.site{margin-left:auto}}\
+@media(max-width:560px){.wrap{padding:0 16px}header .wrap{gap:8px 16px}nav.site{gap:4px 14px}}\
+main{padding:32px 0 72px}main:focus{outline:none}\
+h1,h2,h3{line-height:1.2}\
+h1.title{margin:0 0 6px;font-size:30px;font-weight:800;letter-spacing:-.01em;overflow-wrap:anywhere}\
+h2{margin:0 0 10px;font-size:19px;font-weight:750}\
+.card{margin:0 0 36px}\
+.meta,.muted{color:var(--pencil)}.meta{font-size:14px}\
+.crumbs{margin:0 0 12px;font-size:14px;color:var(--pencil)}\
+.bar{display:flex;flex-wrap:wrap;align-items:flex-end;justify-content:space-between;gap:12px 24px;margin:0 0 16px}\
+.bar h1{margin:0}\
+.sort{display:flex;flex-wrap:wrap;align-items:center;gap:8px 12px;font-size:15px;color:var(--pencil)}\
+.seg{display:inline-flex;border:2px solid var(--ink);border-radius:6px;overflow:hidden;background:var(--stock);color:var(--ink)}\
+.seg a{display:inline-flex;align-items:center;min-height:40px;padding:0 14px;font-weight:700;text-decoration:none}\
+.seg a+a{border-left:2px solid var(--ink)}\
+.seg a[aria-current]{background:var(--ink);color:var(--stock)}\
+.seg a:focus-visible{outline-offset:-6px}\
+.manifest{list-style:none;margin:0;padding:0;border-top:2px solid var(--ink)}\
+.pkg{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:2px 40px;padding:18px 0 20px;border-bottom:1px solid var(--rule)}\
+.pkg>*{grid-column:1}\
+.pkg h2{margin:0;font-size:20px;overflow-wrap:anywhere}\
+.pkg h2 a{text-decoration:none}\
+.pkg .ver{font-weight:500;color:var(--pencil)}\
+.pkg p{margin:4px 0 0;max-width:75ch}\
+.pkg .figs{grid-column:2;grid-row:1/span 3;text-align:right;font-size:14px;line-height:1.6;color:var(--pencil)}\
+@media(max-width:640px){.pkg{grid-template-columns:minmax(0,1fr)}.pkg .figs{grid-column:1;grid-row:auto;margin-top:6px;text-align:left}}\
+.tags{display:flex;flex-wrap:wrap;gap:6px;margin:12px 0 0;padding:0;list-style:none}\
+.tag{padding:0 8px;border:1px solid var(--rule);border-radius:4px;background:var(--stock);color:var(--pencil);font-size:13px;line-height:20px}\
+.badge{display:inline-block;margin-left:2px;padding:0 6px;border:1.5px solid currentColor;border-radius:4px;\
+color:var(--pencil);font-size:12px;font-weight:700;line-height:18px;vertical-align:.15em;white-space:nowrap}\
+.badge.pre{color:var(--warn);border-style:dashed}\
+.badge.ok{color:var(--ok)}\
+.grid{display:grid;grid-template-columns:minmax(0,1fr) 340px;gap:0 40px}\
+.detail{grid-template-areas:\"main side\" \"readme side\";grid-template-rows:auto 1fr}\
+.detail>.content{grid-area:main;min-width:0}.detail>.side{grid-area:side;min-width:0}.detail>.readme-area{grid-area:readme;min-width:0}\
+@media(max-width:880px){.detail{grid-template-columns:minmax(0,1fr);grid-template-areas:\"main\" \"side\" \"readme\";grid-template-rows:auto}\
+.detail>.side{margin-top:36px}}\
+.label{margin:0 0 22px;background:var(--stock);border:3px solid var(--ink);border-radius:14px;overflow:hidden}\
+.label-head{display:flex;align-items:center;gap:16px;padding:20px 24px 18px}\
+.label h1{flex:1 1 0;min-width:0;margin:0;font-size:40px;line-height:1.08;letter-spacing:-.02em}\
+.label .manage{flex:0 0 auto;font-size:15px;font-weight:700}\
+img.picon{flex:0 0 auto;width:48px;height:48px;object-fit:contain;border-radius:8px}\
+.fields{display:flex;flex-wrap:wrap;margin:0 0 0 -2px}\
+.fields>div{flex:1 1 9.5rem;min-width:0;padding:10px 16px 12px;border-left:2px solid var(--ink);border-top:2px solid var(--ink)}\
+.fields dt{font-size:13px;color:var(--pencil)}\
+.fields dd{margin:0;font-size:17px;font-weight:700;overflow-wrap:anywhere}\
+.fields .wide{flex-basis:100%}\
+@media(max-width:560px){.label-head{flex-wrap:wrap;gap:10px 14px;padding:16px 16px 14px}.label h1{font-size:28px}\
+.label .manage{flex-basis:100%}img.picon{width:36px;height:36px}.fields>div{padding:8px 12px 10px}}\
+.lede{max-width:65ch;margin:0 0 14px;font-size:18px;line-height:1.5}\
+.links{display:flex;flex-wrap:wrap;gap:4px 20px;margin:16px 0 0}\
+.links a[rel~=nofollow]::after{content:\" \u{2197}\";font-size:.8em}\
+.content h2,.readme-area>h2{margin:32px 0 10px}\
+.tfm{margin:16px 0 4px;font-size:15px;font-weight:700}\
+table.deps{width:100%;border-collapse:collapse;border-top:2px solid var(--ink);font-size:15px}\
+table.deps td{padding:8px 12px 8px 0;border-bottom:1px solid var(--rule);vertical-align:top;overflow-wrap:anywhere}\
+table.deps td+td{padding-right:0;text-align:right;white-space:nowrap}\
+.install>div,ol.steps>li{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:end;column-gap:12px}\
+.install>div+div{margin-top:20px}\
+.install h3{margin:0;padding-bottom:2px;font-size:15px}\
+.snip{display:contents}.snip pre{grid-column:1/-1}\
+pre{margin:8px 0 0;padding:12px 14px;overflow:auto;background:var(--code);border:1px solid var(--rule);border-radius:6px;font-size:14px;line-height:1.55}\
+code{font-family:'Cascadia Mono','Cascadia Code',Consolas,ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.93em}\
+pre code{font-size:inherit}\
+.install pre,.steps pre{white-space:pre-wrap;overflow-wrap:break-word}\
+.install .primary pre{background:var(--stock);border:2px solid var(--ink)}\
 .nw{white-space:nowrap}\
-.snip{display:flex;flex-direction:column;align-items:flex-end}\
-.snip .copy{padding:6px 12px;font-size:12px;min-height:32px;margin-bottom:-4px;\
-background:var(--subtle);border:1px solid var(--border);color:var(--fg)}\
-.snip .copy:hover{background:var(--subtleh)}\
-.snip pre{width:100%}\
-.versions{list-style:none;margin:0;padding:0;max-height:340px;overflow:auto}\
-.versions li{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:5px 0;border-bottom:1px solid var(--border)}\
-.versions a{min-height:40px;display:inline-flex;align-items:center}\
-.versions a.sel{font-weight:700}\
-table.deps{width:100%;border-collapse:collapse;font-size:13px}\
-table.deps td{padding:3px 8px 3px 0}\
-.readme{white-space:pre-wrap;word-wrap:break-word;overflow-wrap:anywhere}\
-img.picon{width:32px;height:32px;object-fit:contain;vertical-align:-6px;margin-right:10px;border-radius:6px;background:var(--subtle)}\
-.links a[rel~=nofollow]::after{content:\" \u{2197}\";color:var(--muted);font-size:11px}\
-.empty{text-align:center;color:var(--muted);padding:60px 0}\
-.hero{text-align:center;padding:30px 0 4px}\
-.hero h1{font-size:30px;margin:0 0 8px;letter-spacing:-.4px}\
-.hero p{margin:0 auto;max-width:46ch;color:var(--muted)}\
-ol.steps{padding-left:44px}\
-.steps h2{margin:16px 0 4px;font-size:14px;color:var(--muted)}\
-.steps li:first-child h2{margin-top:0}\
-.steps pre{white-space:pre-wrap;overflow-wrap:break-word}\
-.kv{font-size:13px}.kv div{display:flex;gap:10px;padding:3px 0;border-bottom:1px solid var(--border)}\
-.kv b{color:var(--muted);font-weight:500;min-width:120px;flex:0 0 auto}\
-.kv.wide b{flex:0 0 13em}\
-@media(max-width:480px){.kv div{flex-direction:column;gap:0}.kv b{min-width:0}.kv.wide b{flex:0 0 auto}}\
-.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin:0 0 8px}\
-@media(max-width:480px){.stats{grid-template-columns:repeat(2,1fr)}}\
-.lists{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:14px}\
+.copy{min-height:36px;padding:0 14px;background:var(--stock);color:var(--ink);font-size:14px}\
+.primary .copy{background:var(--hivis);color:var(--onhivis)}\
+.versions{list-style:none;margin:0;padding:0;max-height:360px;overflow:auto;border-top:2px solid var(--ink)}\
+.versions li{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:0 2px 0 14px;border-bottom:1px solid var(--rule);font-size:15px}\
+.versions li.sel{background:var(--stock);box-shadow:inset 6px 0 0 var(--hivis)}\
+.versions a{display:inline-flex;align-items:center;min-height:42px;font-weight:600;text-decoration:none}\
+.versions a[aria-current]{font-weight:800}\
+.readme{padding:22px 26px;background:var(--stock);border:1px solid var(--rule);border-radius:6px;\
+font-size:15px;line-height:1.6;white-space:pre-wrap;overflow-wrap:anywhere}\
+@media(max-width:560px){.readme{padding:16px}}\
+.kv{border-top:2px solid var(--ink);font-size:15px}\
+.kv div{display:flex;gap:16px;padding:9px 0;border-bottom:1px solid var(--rule)}\
+.kv b{flex:0 0 14em;color:var(--pencil);font-weight:500}\
+.kv a,.kv code{overflow-wrap:anywhere}\
+@media(max-width:560px){.kv div{flex-direction:column;gap:0}.kv b{flex:0 0 auto}}\
+.stats{display:grid;grid-template-columns:repeat(3,1fr);margin:0 0 40px;background:var(--stock);\
+border:3px solid var(--ink);border-radius:14px;overflow:hidden}\
+.stat{min-width:0;margin:-2px 0 0 -2px;padding:12px 20px 16px;border-left:2px solid var(--ink);border-top:2px solid var(--ink)}\
+.stat .l{font-size:14px;color:var(--pencil)}\
+.stat .n{font-size:30px;font-weight:800;line-height:1.15;overflow-wrap:anywhere}\
+@media(max-width:560px){.stats{grid-template-columns:repeat(2,1fr)}.stat{padding:10px 14px 12px}.stat .n{font-size:24px}}\
+.lists{display:grid;grid-template-columns:1fr 1fr;gap:0 40px}\
 .lists>.card{margin:0}\
-@media(max-width:760px){.lists{grid-template-columns:1fr}}\
-.stat{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:16px 18px}\
-.stat .n{font-size:26px;font-weight:700}\
-.stat .l{color:var(--muted);font-size:13px}\
-.rank{list-style:none;margin:0;padding:0}\
-.rank li{display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;padding:6px 0;border-bottom:1px solid var(--border)}\
-.rank li>a{overflow-wrap:anywhere}\
-.pager{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:18px 0;flex-wrap:wrap}\
-.btn{border:1px solid var(--border);border-radius:6px;padding:8px 14px;color:var(--fg)}\
-.btn[aria-disabled=true]{opacity:.4;pointer-events:none}\
-.pager .btn{min-height:44px;display:inline-flex;align-items:center;gap:6px}\
+@media(max-width:760px){.lists{grid-template-columns:1fr;gap:28px}}\
+.rank{list-style:none;margin:0;padding:0;border-top:2px solid var(--ink)}\
+.rank li{display:flex;flex-wrap:wrap;justify-content:space-between;gap:2px 12px;padding:9px 0;border-bottom:1px solid var(--rule)}\
+.rank li>a,.rank .id{font-weight:600;text-decoration:none;overflow-wrap:anywhere}\
+.pager{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:12px;margin:24px 0 0}\
+.btn{display:inline-flex;align-items:center;gap:6px;min-height:44px;padding:0 16px;background:var(--stock);\
+border:2px solid var(--ink);border-radius:6px;font-weight:700;text-decoration:none}\
+.btn[aria-disabled=true]{opacity:.35;pointer-events:none}\
 .pager-go{flex:1 0 100%;display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:12px}\
 .pager-go form{display:flex;align-items:center;gap:8px;margin:0}\
-.pager-go label{color:var(--muted);font-size:14px}\
-.pager-go input,.pager-go select{min-height:44px;padding:0 10px;border:1px solid var(--ctl);border-radius:6px;\
-background:var(--bg);color:var(--fg);font-size:15px}\
+.pager-go label{font-size:15px;color:var(--pencil)}\
+select,.pager-go input{min-height:44px;padding:0 10px;border:2px solid var(--ctl);border-radius:6px;\
+background:var(--stock);color:var(--ink);font-size:16px}\
 .pager-go input{width:6em}\
-.pager-go button{padding:0 14px;background:var(--subtle);border-color:var(--border);color:var(--fg)}\
-.pager-go button:hover{background:var(--subtleh)}\
-.badge.ok{color:var(--ok);border-color:var(--ok)}\
-.atbl{width:100%;border-collapse:collapse}\
-.atbl th,.atbl td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--border);font-size:14px;vertical-align:middle}\
-.atbl th{color:var(--muted);font-weight:500;font-size:12px;text-transform:uppercase;letter-spacing:.4px}\
-.actions{display:flex;gap:8px;flex-wrap:wrap}\
+.pager-go button,.actions button,.bulk button{padding:0 14px;background:var(--stock);color:var(--ink)}\
+.pager-go button:hover,.actions button:hover,.bulk button:hover{background:var(--hivis);color:var(--onhivis)}\
+.hero{max-width:62ch;margin:0 0 28px}\
+.hero h1{margin:0 0 8px;font-size:40px;font-weight:800;line-height:1.08;letter-spacing:-.02em}\
+.hero p{margin:0;font-size:18px;color:var(--pencil)}\
+ol.steps{max-width:860px;margin:0 0 28px;padding:0;list-style:none;counter-reset:step}\
+ol.steps>li{position:relative;grid-template-rows:40px auto;padding:0 0 26px 58px;counter-increment:step}\
+ol.steps>li::before{content:counter(step);position:absolute;left:0;top:0;display:grid;place-items:center;\
+width:40px;height:40px;border-radius:6px;background:var(--hivis);color:var(--onhivis);font-size:20px;font-weight:800}\
+.steps h2{align-self:center;margin:0;font-size:18px}\
+.empty{max-width:62ch;padding:16px 0 40px}\
+.empty h1.title{font-size:36px}\
+.scroll{overflow-x:auto}\
+.atbl{width:100%;border-collapse:collapse;border-top:2px solid var(--ink)}\
+.atbl th,.atbl td{padding:10px 14px 10px 0;border-bottom:1px solid var(--rule);text-align:left;font-size:15px;vertical-align:middle}\
+.atbl th{color:var(--pencil);font-size:14px;font-weight:600}\
+.atbl .pick{width:2.75em;padding-left:6px}\
+input[type=checkbox]{width:20px;height:20px;margin:0;accent-color:var(--ink)}\
+.actions{display:flex;flex-wrap:wrap;gap:6px}\
 .actions form{margin:0}\
-.actions button{padding:8px 14px;font-size:13px;min-height:40px;background:var(--subtle);border:1px solid var(--border);color:var(--fg)}\
-.actions button:hover{background:var(--subtleh)}\
-.actions button.danger{border-color:var(--danger);color:var(--dangerfg)}\
-.actions button.danger:hover{background:var(--danger);color:var(--onaccent)}\
-footer{border-top:1px solid var(--border);color:var(--muted);font-size:13px;padding:18px 0}\
-footer a[aria-current=page]{color:var(--fg);font-weight:600}\
-";
+.actions button,.bulk button{min-height:38px;font-size:14px;white-space:nowrap}\
+button.danger{background:var(--stock);border-color:var(--danger);color:var(--dangerfg)}\
+button.danger:hover{background:var(--danger);border-color:var(--danger);color:var(--ondanger)}\
+.bulk{display:flex;flex-wrap:wrap;align-items:center;gap:10px 12px;margin:18px 0 0;padding:14px 16px;\
+background:var(--stock);border:2px solid var(--ink);border-radius:10px}\
+.bulk [role=status]{flex-basis:100%;color:var(--dangerfg);font-weight:700}.bulk [role=status]:empty{display:none}\
+.bulk .to{display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding-left:12px;border-left:1px solid var(--rule)}\
+.bulk select{min-height:38px;font-size:15px}\
+@media(max-width:640px){.atbl,.atbl tbody{display:block}\
+.atbl thead tr{display:flex;align-items:center;padding:8px 0;border-bottom:1px solid var(--rule)}\
+.atbl thead th{padding:0 0 0 6px;border:0}.atbl thead th:not(.pick){display:none}\
+.atbl tbody tr{display:grid;grid-template-columns:2.75em minmax(0,1fr) auto auto;align-items:center;gap:10px 10px;\
+padding:12px 0;border-bottom:1px solid var(--rule)}\
+.atbl td{padding:0;border:0}.atbl td:last-child{grid-column:2/-1}\
+.bulk .to{flex-basis:100%;padding-left:0;border-left:0}.bulk .danger{margin-left:0}}\
+.bulk .danger{margin-left:auto}\
+footer{padding:20px 0 32px;border-top:1px solid var(--rule);color:var(--pencil);font-size:14px}\
+footer .wrap{display:flex;flex-wrap:wrap;justify-content:space-between;gap:6px 24px}\
+"
+);
 
-/// The inline SVG favicon, as a data URI so the page loads no external asset.
+/// The inline SVG favicon, as a data URI so the page loads no external asset:
+/// the header's taped box, filled.
 const FAVICON: &str = "data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'\
-%20viewBox='0%200%2032%2032'%3E%3Crect%20width='32'%20height='32'%20rx='6'%20fill='%23512bd4'/%3E\
-%3Ctext%20x='16'%20y='22'%20font-size='15'%20font-family='sans-serif'%20font-weight='700'\
-%20fill='white'%20text-anchor='middle'%3EYN%3C/text%3E%3C/svg%3E";
+%20viewBox='0%200%2032%2032'%3E%3Crect%20width='32'%20height='32'%20rx='6'%20fill='%2316191d'/%3E\
+%3Crect%20x='12'%20width='8'%20height='32'%20fill='%23ffd100'/%3E%3C/svg%3E";
+
+/// The header's mark: a box, taped shut. Coloured by the stylesheet (`.box`,
+/// `.tape`), since the CSP allows no inline `style`.
+const LOGO_MARK: &str =
+    "<svg width=\"26\" height=\"26\" viewBox=\"0 0 26 26\" aria-hidden=\"true\" \
+focusable=\"false\"><rect class=\"tape\" x=\"10\" y=\"1.5\" width=\"6\" height=\"23\"/>\
+<rect class=\"box\" x=\"1.5\" y=\"1.5\" width=\"23\" height=\"23\" rx=\"4\"/></svg>";
 
 /// The form field (and header) carrying the admin CSRF token.
 pub const CSRF_FIELD: &str = "_csrf";
@@ -202,9 +292,16 @@ pub fn safe_href(url: &str) -> Option<&str> {
 /// It also carries the admin area's destructive-action confirmation. That used
 /// to be an inline `onsubmit=` attribute, which the CSP below cannot whitelist
 /// by hash — so the prompt is delegated from here off a `data-confirm`
-/// attribute instead, keeping the guard rail and the policy both intact.
+/// attribute instead, keeping the guard rail and the policy both intact. The
+/// attribute is read off the button that submitted first, because the admin
+/// page's selection form has a Delete button beside harmless ones.
+///
+/// The rest is the admin selection: a "select every version" box (hidden
+/// without JavaScript, where it could do nothing), and a note instead of a
+/// round trip when an action is chosen with nothing selected.
 const COPY_SCRIPT_BODY: &str = "if(navigator.clipboard)\
 document.querySelectorAll('.copy').forEach(function(b){b.hidden=false});\
+document.querySelectorAll('.all').forEach(function(a){a.hidden=false});\
 document.addEventListener('click',function(e){\
 var b=e.target.closest('.copy');if(!b)return;\
 var c=b.parentNode.querySelector('code');if(!c||!navigator.clipboard)return;\
@@ -212,8 +309,14 @@ navigator.clipboard.writeText(c.innerText).then(function(){\
 var s=document.getElementById('copied');if(s)s.textContent='Copied to the clipboard';\
 var o=b.textContent;b.textContent='Copied';\
 setTimeout(function(){b.textContent=o;if(s)s.textContent=''},1200)})});\
+document.addEventListener('change',function(e){\
+var a=e.target;if(!a.classList||!a.classList.contains('all'))return;\
+document.querySelectorAll('input[name=v]').forEach(function(c){c.checked=a.checked})});\
 document.addEventListener('submit',function(e){\
-var m=e.target.getAttribute&&e.target.getAttribute('data-confirm');\
+var f=e.target,s=e.submitter;\
+if(f.id==='bulk'&&!document.querySelector('input[name=v]:checked')){e.preventDefault();\
+var n=document.getElementById('bulk-note');if(n)n.textContent='Select at least one version first.';return}\
+var m=(s&&s.getAttribute('data-confirm'))||(f.getAttribute&&f.getAttribute('data-confirm'));\
 if(m&&!confirm(m))e.preventDefault()});";
 
 /// The `Content-Security-Policy` served with every gallery/admin page.
@@ -223,11 +326,12 @@ if(m&&!confirm(m))e.preventDefault()});";
 /// this policy is the backstop that keeps an escaping bug from becoming script
 /// execution. `default-src 'none'` denies everything not listed, and the only
 /// inline style/script permitted are the two the server itself emits, pinned by
-/// SHA-256 — an injected `<script>` has a different hash and will not run.
+/// SHA-256 — an injected `<script>` has a different hash and will not run. The
+/// one font comes from this origin, like everything else.
 pub static CSP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     format!(
-        "default-src 'none'; img-src 'self' data:; style-src '{style}'; script-src '{script}'; \
-         base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
+        "default-src 'none'; img-src 'self' data:; font-src 'self'; style-src '{style}'; \
+         script-src '{script}'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
         style = csp_hash(STYLE),
         script = csp_hash(COPY_SCRIPT_BODY),
     )
@@ -244,11 +348,21 @@ fn csp_hash(content: &str) -> String {
     )
 }
 
+/// The running server's version, shown in every page's footer.
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// What the shared chrome needs to know about the page it wraps.
+#[derive(Clone, Copy, Default)]
+struct Nav<'a> {
+    /// The current header item (`"stats"`, `"settings"`, `"admin"`, or `""`).
+    active: &'a str,
+    /// Whether this feed has an admin area to link to.
+    admin: bool,
+}
+
 /// Wrap a page body in the shared layout (head, header bar, footer).
-///
-/// `active` marks the current footer nav item (`"stats"`, `"settings"`, or `""`).
-fn layout(urls: &UrlBuilder, title: &str, query: &str, active: &str, body: &str) -> String {
-    layout_with_chrome(urls, title, query, active, body, Chrome::Feed, "")
+fn layout(urls: &UrlBuilder, title: &str, nav: Nav, body: &str) -> String {
+    layout_with_chrome(urls, title, "", nav, body, Chrome::Feed, "")
 }
 
 /// Which navigation a page can offer.
@@ -267,68 +381,69 @@ enum Chrome {
 }
 
 /// `search_hidden` is extra hidden inputs for the header's search form: the
-/// gallery uses it to keep a chosen page size across a new search.
+/// gallery uses it to keep a chosen page size and order across a new search.
 fn layout_with_chrome(
     urls: &UrlBuilder,
     title: &str,
     query: &str,
-    active: &str,
+    nav: Nav,
     body: &str,
     chrome: Chrome,
     search_hidden: &str,
 ) -> String {
-    let cur = |name: &str| {
-        if name == active {
-            " aria-current=\"page\""
-        } else {
-            ""
-        }
-    };
-    if chrome == Chrome::Root {
-        return format!(
-            "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
-<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
-<link rel=\"icon\" href=\"{FAVICON}\">\
-<title>{title}</title><style>{STYLE}</style></head><body>\
-<a class=\"skip\" href=\"#main\">Skip to content</a>\
-<header><div class=\"wrap\">\
-<a class=\"logo\" href=\"/\">YA<span>NuGet</span></a></div></header>\
-<main id=\"main\" tabindex=\"-1\"><div class=\"wrap\">{body}</div></main>\
-<footer><div class=\"wrap\">Served by YANuget</div></footer>\
-<script>{COPY_SCRIPT_BODY}</script></body></html>",
-            title = escape_html(title),
-        );
-    }
-    format!(
+    let head = format!(
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
 <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
 <link rel=\"icon\" href=\"{FAVICON}\">\
+<link rel=\"preload\" href=\"{FONT_URL}\" as=\"font\" type=\"font/woff2\" crossorigin>\
 <title>{title}</title><style>{STYLE}</style></head><body>\
-<a class=\"skip\" href=\"#main\">Skip to content</a>\
-<header><div class=\"wrap\">\
-<a class=\"logo\" href=\"{home}\">YA<span>NuGet</span></a>\
+<a class=\"skip\" href=\"#main\">Skip to content</a>",
+        title = escape_html(title),
+    );
+    if chrome == Chrome::Root {
+        return format!(
+            "{head}<header><div class=\"wrap\">\
+<a class=\"logo\" href=\"/\">{LOGO_MARK}YANuget</a></div></header>\
+<main id=\"main\" tabindex=\"-1\"><div class=\"wrap\">{body}</div></main>\
+<footer><div class=\"wrap\"><span>Served by YANuget {VERSION}</span></div></footer>\
+<script>{COPY_SCRIPT_BODY}</script></body></html>"
+        );
+    }
+    let item = |name: &str, path: &str, label: &str| {
+        let current = if name == nav.active {
+            " aria-current=\"page\""
+        } else {
+            ""
+        };
+        format!(
+            "<a href=\"{}\"{current}>{label}</a>",
+            escape_html(&urls.app(path))
+        )
+    };
+    let mut links = item("stats", "/stats", "Stats");
+    links.push_str(&item("settings", "/settings", "Settings"));
+    links.push_str(&item("docs", "/docs/", "Docs"));
+    if nav.admin {
+        links.push_str(&item("admin", "/admin", "Admin"));
+    }
+    format!(
+        "{head}<header><div class=\"wrap\">\
+<a class=\"logo\" href=\"{home}\">{LOGO_MARK}YANuget</a>\
 <form class=\"search\" action=\"{packages}\" method=\"get\" role=\"search\">\
 <label for=\"q\" class=\"vh\">Search packages</label>\
 <input id=\"q\" type=\"search\" name=\"q\" placeholder=\"Search packages\u{2026}\" value=\"{q}\" autocomplete=\"off\">\
 {search_hidden}<button type=\"submit\">Search</button></form>\
+<nav class=\"site\" aria-label=\"Site\">{links}</nav>\
 </div></header>\
 <main id=\"main\" tabindex=\"-1\"><div class=\"wrap\">{body}</div></main>\
-<footer><div class=\"wrap\"><nav aria-label=\"Site\">Served by YANuget \u{2014} \
-<a href=\"{idx}\">v3 service index</a> \u{2022} <a href=\"{docs}\">Docs</a> \u{2022} \
-<a href=\"{stats}\"{cs}>Stats</a> \u{2022} \
-<a href=\"{settings}\"{cg}>Settings</a></nav></div></footer>\
+<footer><div class=\"wrap\"><span>Served by YANuget {VERSION}</span>\
+<span>Package source: <a href=\"{idx}\">{idx}</a></span></div></footer>\
 <div id=\"copied\" class=\"vh\" role=\"status\"></div>\
 <script>{COPY_SCRIPT_BODY}</script></body></html>",
-        title = escape_html(title),
         q = escape_html(query),
         home = escape_html(&urls.app("/")),
         packages = escape_html(&urls.app("/packages")),
         idx = escape_html(&urls.service_index()),
-        docs = escape_html(&urls.app("/docs/")),
-        stats = escape_html(&urls.app("/stats")),
-        settings = escape_html(&urls.app("/settings")),
-        cs = cur("stats"),
-        cg = cur("settings"),
     )
 }
 
@@ -339,7 +454,7 @@ fn layout_with_chrome(
 /// deliberately not parsed through: a 5xx message is generic on purpose (the
 /// underlying I/O, SQL or upstream detail goes to the log), and re-rendering an
 /// error string into HTML is a needless place to get escaping wrong.
-pub fn error_page(urls: &UrlBuilder, status: axum::http::StatusCode) -> String {
+pub fn error_page(urls: &UrlBuilder, status: axum::http::StatusCode, admin: bool) -> String {
     use axum::http::StatusCode;
     let (heading, detail) = match status {
         StatusCode::NOT_FOUND => (
@@ -379,11 +494,19 @@ pub fn error_page(urls: &UrlBuilder, status: axum::http::StatusCode) -> String {
         home = escape_html(&urls.app("/")),
         code = status.as_u16(),
     );
-    layout(urls, &format!("{heading} \u{2014} YANuget"), "", "", &body)
+    layout(
+        urls,
+        &format!("{heading} \u{2014} YANuget"),
+        Nav {
+            admin,
+            ..Nav::default()
+        },
+        &body,
+    )
 }
 
-/// What the gallery was asked to show: the search, the page, and the filters
-/// that every paging link and form has to carry.
+/// What the gallery was asked to show: the search, the page, the order, and the
+/// filters that every paging link and form has to carry.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct GalleryView<'a> {
     pub query: &'a str,
@@ -393,12 +516,22 @@ pub struct GalleryView<'a> {
     pub default_take: i64,
     pub prerelease: Option<bool>,
     pub package_type: Option<&'a str>,
+    pub sort: SearchSort,
+    /// Whether this feed has an admin area, for the header's link to it.
+    pub admin: bool,
 }
 
 impl GalleryView<'_> {
     /// The gallery URL of the page starting at `skip`, escaped for an
-    /// attribute, carrying the search, the page size and the filters.
+    /// attribute, carrying the search, the page size, the order and the
+    /// filters.
     fn href(&self, urls: &UrlBuilder, skip: i64) -> String {
+        self.href_sorted(urls, skip, self.sort)
+    }
+
+    /// [`Self::href`] in another order. The default order is left out of the
+    /// URL, so the addresses people already bookmarked keep meaning the same.
+    fn href_sorted(&self, urls: &UrlBuilder, skip: i64, sort: SearchSort) -> String {
         // `take` has to be carried, or paging silently changes the page size
         // back to the default: `?take=5` showed "1–5 of N", and Next then
         // returned twenty items while the counter still claimed five. And
@@ -416,11 +549,14 @@ impl GalleryView<'_> {
         if let Some(ty) = self.package_type {
             href.push_str(&format!("&amp;packageType={}", enc_path(ty)));
         }
+        if sort != SearchSort::default() {
+            href.push_str(&format!("&amp;sort={}", sort.as_str()));
+        }
         href
     }
 
-    /// Hidden inputs carrying the search and the filters into a GET form. They
-    /// have no ids: the header's search box already owns `id="q"`.
+    /// Hidden inputs carrying the search, the order and the filters into a GET
+    /// form. They have no ids: the header's search box already owns `id="q"`.
     fn hidden_fields(&self) -> String {
         let mut out = format!(
             "<input type=\"hidden\" name=\"q\" value=\"{}\">",
@@ -437,8 +573,46 @@ impl GalleryView<'_> {
                 escape_html(ty)
             ));
         }
+        out.push_str(&sort_field(self.sort));
         out
     }
+}
+
+/// A hidden `sort` input, or nothing for the default order.
+fn sort_field(sort: SearchSort) -> String {
+    if sort == SearchSort::default() {
+        String::new()
+    } else {
+        format!(
+            "<input type=\"hidden\" name=\"sort\" value=\"{}\">",
+            sort.as_str()
+        )
+    }
+}
+
+/// The orders the gallery offers, as links: one click, no form, and each one
+/// starts again from the first page, since page three of another order is a
+/// different set of packages.
+fn sort_links(urls: &UrlBuilder, view: &GalleryView) -> String {
+    let mut links = String::new();
+    for (sort, label) in [
+        (SearchSort::Downloads, "Downloads"),
+        (SearchSort::Name, "Name"),
+        (SearchSort::Updated, "Recently updated"),
+    ] {
+        let current = if sort == view.sort {
+            " aria-current=\"true\""
+        } else {
+            ""
+        };
+        links.push_str(&format!(
+            "<a href=\"{}\"{current}>{label}</a>",
+            view.href_sorted(urls, 0, sort)
+        ));
+    }
+    format!(
+        "<nav class=\"sort\" aria-label=\"Sort order\">Sort by <span class=\"seg\">{links}</span></nav>"
+    )
 }
 
 /// The gallery / search-results page.
@@ -490,7 +664,7 @@ pub fn gallery_page(
             first_run_panel(urls)
         }
     } else {
-        let mut cards = String::new();
+        let mut rows = String::new();
         // A real `<h1>`, not a muted paragraph: this is the landing page, and
         // without one a screen reader announces no page heading at all — while
         // the *empty* state did have one, so the structure changed with the
@@ -505,7 +679,15 @@ pub fn gallery_page(
                 escape_html(query)
             )
         };
-        cards.push_str(&format!("<h1 class=\"title\">{heading}</h1>"));
+        // One package has no order to choose.
+        let sort = if page.total_hits > 1 {
+            sort_links(urls, &view)
+        } else {
+            String::new()
+        };
+        rows.push_str(&format!(
+            "<div class=\"bar\"><h1 class=\"title\">{heading}</h1>{sort}</div><ul class=\"manifest\">"
+        ));
         for group in &page.groups {
             // The newest *stable* version, matching what a NuGet client
             // searching this feed is offered.
@@ -517,32 +699,37 @@ pub fn gallery_page(
             } else {
                 ""
             };
+            let desc = if p.description.trim().is_empty() {
+                String::new()
+            } else {
+                format!("<p>{}</p>", escape_html(&truncate(&p.description, 240)))
+            };
             let authors = if p.authors.is_empty() {
                 String::new()
             } else {
-                format!(" \u{2022} by {}", escape_html(&p.authors.join(", ")))
+                format!("<div>by {}</div>", escape_html(&p.authors.join(", ")))
             };
-            cards.push_str(&format!(
-                "<div class=\"card\"><h2><a href=\"{url}\">{id}</a> \
-                 <span class=\"muted\">{ver}</span>{pre}</h2>\
-                 <div class=\"meta\">{nv} version{vs}, {dl} download{ds}{authors}</div>\
-                 <p>{desc}</p>{tags}</div>",
+            rows.push_str(&format!(
+                "<li class=\"pkg\"><h2><a href=\"{url}\">{id}</a> \
+                 <span class=\"ver\">{ver}</span>{pre}</h2>{desc}\
+                 <div class=\"figs\"><div>{nv} version{vs}, {dl} download{ds}</div>{authors}</div>\
+                 {tags}</li>",
                 ver = escape_html(&p.normalized_version()),
                 nv = group.packages.len(),
                 vs = plural(group.packages.len() as i64),
                 dl = group_digits(group.total_downloads() as i64),
                 ds = plural(group.total_downloads() as i64),
-                desc = escape_html(&truncate(&p.description, 240)),
                 tags = render_tags(&p.tags),
             ));
         }
-        cards.push_str(&pager(
+        rows.push_str("</ul>");
+        rows.push_str(&pager(
             urls,
             &view,
             page.groups.len() as i64,
             page.total_hits,
         ));
-        cards
+        rows
     };
     // Searches and later pages get titles of their own. Otherwise every search,
     // and every page of one, shares one <title>, so tabs, bookmarks and history
@@ -555,8 +742,9 @@ pub fn gallery_page(
         (Some(s), false) => format!("{s} \u{2014} YANuget"),
         (Some(s), true) => format!("{s}, page {current} of {pages} \u{2014} YANuget"),
     };
-    // A new search starts on page one, but keeps a page size someone chose.
-    let search_hidden = if view.take != view.default_take.max(1) {
+    // A new search starts on page one, but keeps a page size and an order
+    // someone chose.
+    let mut search_hidden = if view.take != view.default_take.max(1) {
         format!(
             "<input type=\"hidden\" name=\"take\" value=\"{}\">",
             view.take
@@ -564,7 +752,19 @@ pub fn gallery_page(
     } else {
         String::new()
     };
-    layout_with_chrome(urls, &title, query, "", &body, Chrome::Feed, &search_hidden)
+    search_hidden.push_str(&sort_field(view.sort));
+    layout_with_chrome(
+        urls,
+        &title,
+        query,
+        Nav {
+            admin: view.admin,
+            ..Nav::default()
+        },
+        &body,
+        Chrome::Feed,
+        &search_hidden,
+    )
 }
 
 /// What an empty feed shows instead of "no packages": the three commands that
@@ -592,7 +792,9 @@ fn first_run_panel(urls: &UrlBuilder) -> String {
     ];
 
     // A real ordered list: these are steps, so the numbers are the list's own
-    // rather than text in each heading.
+    // rather than text in each heading. The stylesheet draws the numbers
+    // itself, and a list without markers stops being announced as a list in
+    // Safari unless it says so.
     let mut snippets = String::new();
     for (label, cmd) in steps {
         snippets.push_str(&format!(
@@ -608,7 +810,7 @@ fn first_run_panel(urls: &UrlBuilder) -> String {
     format!(
         "<div class=\"hero\"><h1>Your feed is live</h1>\
          <p>Nothing published to it yet. Three commands change that.</p></div>\
-         <ol class=\"card steps\">{snippets}</ol>\
+         <ol class=\"card steps\" role=\"list\">{snippets}</ol>\
          <p class=\"muted\">Using Chocolatey, <code>nuget.exe</code> or Visual Studio? \
          The same service-index URL works for all of them \u{2014} see \
          <a href=\"{docs}\">the documentation</a>.</p>",
@@ -716,6 +918,7 @@ pub fn stats_page(
     stats: &crate::database::DatabaseStats,
     top: &crate::database::SearchPage,
     recent: &[Package],
+    admin: bool,
 ) -> String {
     let cards = [
         (stats.package_count.to_string(), "Packages"),
@@ -725,12 +928,13 @@ pub fn stats_page(
         (stats.symbol_count.to_string(), "Symbol files"),
         (stats.listed_count.to_string(), "Listed versions"),
     ];
+    // The same ruled cells as the package label: a caption over each value.
     let mut tiles = String::from("<div class=\"stats\">");
     for (n, l) in cards {
         tiles.push_str(&format!(
-            "<div class=\"stat\"><div class=\"n\">{}</div><div class=\"l\">{}</div></div>",
+            "<div class=\"stat\"><div class=\"l\">{}</div><div class=\"n\">{}</div></div>",
+            l,
             escape_html(&n),
-            l
         ));
     }
     tiles.push_str("</div>");
@@ -740,12 +944,15 @@ pub fn stats_page(
     } else {
         let mut out = String::from("<ul class=\"rank\">");
         for g in &top.groups {
-            let p = g.latest();
+            // The version a client would be offered, as in the gallery.
+            let p = g.headline();
             out.push_str(&format!(
-                "<li><a href=\"{href}\">{id}</a>\
+                "<li><span><a class=\"id\" href=\"{href}\">{id}</a> \
+                 <span class=\"muted\">{ver}</span></span>\
                  <span class=\"muted\">{dl} download{ds}</span></li>",
                 href = escape_html(&urls.app(&format!("/packages/{}", enc_path(&p.lower_id())))),
                 id = escape_html(&p.id),
+                ver = escape_html(&p.normalized_version()),
                 dl = group_digits(g.total_downloads() as i64),
                 ds = plural(g.total_downloads() as i64),
             ));
@@ -760,7 +967,8 @@ pub fn stats_page(
         let mut out = String::from("<ul class=\"rank\">");
         for p in recent {
             out.push_str(&format!(
-                "<li><a href=\"{href}\">{id} {dv}</a>\
+                "<li><span><a class=\"id\" href=\"{href}\">{id}</a> \
+                 <span class=\"muted\">{dv}</span></span>\
                  <span class=\"muted\">{when}</span></li>",
                 href = escape_html(&urls.app(&format!(
                     "/packages/{}/{}",
@@ -779,11 +987,19 @@ pub fn stats_page(
     let body = format!(
         "<h1 class=\"title\">Statistics</h1>{tiles}\
          <div class=\"lists\">\
-         <div class=\"card\"><h2 class=\"muted\">Most downloaded</h2>{top_list}</div>\
-         <div class=\"card\"><h2 class=\"muted\">Recently published</h2>{recent_list}</div>\
+         <div class=\"card\"><h2>Most downloaded</h2>{top_list}</div>\
+         <div class=\"card\"><h2>Recently published</h2>{recent_list}</div>\
          </div>"
     );
-    layout(urls, "Statistics \u{2014} YANuget", "", "stats", &body)
+    layout(
+        urls,
+        "Statistics \u{2014} YANuget",
+        Nav {
+            active: "stats",
+            admin,
+        },
+        &body,
+    )
 }
 
 /// Group a non-negative integer into thousands with `,` separators.
@@ -839,6 +1055,7 @@ pub fn settings_page(urls: &UrlBuilder, config: &Config, feed: &super::FeedConte
     };
 
     let mut server = String::from("<div class=\"kv wide\">");
+    server.push_str(&kv("YANuget version", VERSION));
     server.push_str(&kv("Feed", &feed.name));
     server.push_str(&kv("Push / delete auth", auth));
     server.push_str(&kv("Download auth", read_auth));
@@ -910,25 +1127,31 @@ pub fn settings_page(urls: &UrlBuilder, config: &Config, feed: &super::FeedConte
     }
     retention.push_str("</div>");
 
+    // Said even when the admin area is off: otherwise nothing on any page
+    // tells an operator that disabling, deleting and moving versions exist.
     let admin = if feed.admin.is_enabled() {
         format!(
-            "<div class=\"card\"><h2 class=\"muted\">Administration</h2>\
-             <p>Manage package versions (approve / promote / disable / delete) in the \
+            "<div class=\"card\"><h2>Administration</h2>\
+             <p>Approve, disable, delete and move package versions between feeds in the \
              <a href=\"{}\">admin area</a>. Sign in with the admin key.</p></div>",
             escape_html(&urls.app("/admin"))
         )
     } else {
-        String::new()
+        "<div class=\"card\"><h2>Administration</h2>\
+         <p>Administration is turned off for this feed. Set <code>admin_api_key</code> \
+         (or <code>YANUGET_ADMIN_API_KEY</code>) to approve, disable, delete and move \
+         package versions from the gallery.</p></div>"
+            .to_string()
     };
 
     let body = format!(
         "<h1 class=\"title\">Settings</h1>\
          <p class=\"muted\">Read-only overview of this feed's policy. \
          Secrets and storage paths are not shown.</p>\
-         <div class=\"card\"><h2 class=\"muted\">Server</h2>{server}</div>\
-         <div class=\"card\"><h2 class=\"muted\">Mirror &amp; policy</h2>{policy}</div>\
-         <div class=\"card\"><h2 class=\"muted\">Retention</h2>{retention}</div>\
-         <div class=\"card\"><h2 class=\"muted\">Endpoints</h2><div class=\"kv wide\">\
+         <div class=\"card\"><h2>Server</h2>{server}</div>\
+         <div class=\"card\"><h2>Mirror &amp; policy</h2>{policy}</div>\
+         <div class=\"card\"><h2>Retention</h2>{retention}</div>\
+         <div class=\"card\"><h2>Endpoints</h2><div class=\"kv wide\">\
          {svc}{sym}</div></div>{admin}",
         svc = kv_html(
             "Service index",
@@ -946,8 +1169,22 @@ pub fn settings_page(urls: &UrlBuilder, config: &Config, feed: &super::FeedConte
             String::new()
         },
     );
-    layout(urls, "Settings \u{2014} YANuget", "", "settings", &body)
+    layout(
+        urls,
+        "Settings \u{2014} YANuget",
+        Nav {
+            active: "settings",
+            admin: feed.admin.is_enabled(),
+        },
+        &body,
+    )
 }
+
+/// The admin area's place in the header: current, and present.
+const ADMIN_NAV: Nav<'static> = Nav {
+    active: "admin",
+    admin: true,
+};
 
 /// The admin dashboard: every package id, linking to its management page.
 pub fn admin_dashboard_page(urls: &UrlBuilder, ids: &[String]) -> String {
@@ -968,30 +1205,42 @@ pub fn admin_dashboard_page(urls: &UrlBuilder, ids: &[String]) -> String {
         list.push_str("</ul>");
         format!(
             "<h1 class=\"title\">Admin</h1>\
-             <p class=\"muted\">Select a package to disable, enable or delete its versions.</p>\
+             <p class=\"muted\">Pick a package to approve, disable, delete or move its \
+             versions.</p>\
              <div class=\"card\">{list}</div>"
         )
     };
-    layout(urls, "Admin \u{2014} YANuget", "", "", &body)
+    layout(urls, "Admin \u{2014} YANuget", ADMIN_NAV, &body)
 }
 
 /// The per-package admin page: every version (incl. disabled, pending and
-/// flagged) with moderation actions. `promote_target`, when set, names the next
-/// release ring an admin can promote a version into.
+/// flagged) with moderation actions.
+///
+/// Each row has its own buttons for the common one-version case. Below the
+/// table, one form acts on every ticked version at once — which is also how a
+/// whole package is disabled, deleted or moved: tick them all. The boxes sit
+/// in the table but belong to that form through their `form` attribute,
+/// because a form cannot wrap the rows' own forms.
+///
+/// `promote_target`, when set, names the next release ring. `transfer_targets`
+/// are the other feeds this admin may copy or move versions into; with none,
+/// the page offers neither.
 pub fn admin_package_page(
     urls: &UrlBuilder,
     id: &str,
     versions: &[crate::database::FeedVersion],
     promote_target: Option<&str>,
+    transfer_targets: &[String],
     csrf_token: &str,
 ) -> String {
     let mut ordered: Vec<&crate::database::FeedVersion> = versions.iter().collect();
     ordered.sort_by(|a, b| b.package.version.cmp(&a.package.version));
 
+    let lower = id.to_lowercase();
     let action = |v: &str, op: &str| {
         escape_html(&urls.app(&format!(
             "/admin/packages/{}/{}/{}",
-            enc_path(&id.to_lowercase()),
+            enc_path(&lower),
             enc_path(v),
             op
         )))
@@ -1005,9 +1254,10 @@ pub fn admin_package_page(
     );
 
     let mut rows = String::new();
-    for fv in ordered {
+    for fv in &ordered {
         let p = &fv.package;
         let v = p.normalized_version();
+        let dv = escape_html(&v);
         let mut status = if fv.pending {
             "<span class=\"badge pre\">pending</span>".to_string()
         } else if !p.enabled {
@@ -1061,31 +1311,75 @@ pub fn admin_package_page(
             _ => String::new(),
         };
         rows.push_str(&format!(
-            "<tr><td>{pre}{dv}{reason}</td><td>{status}</td><td class=\"muted\">{dl}</td>\
+            "<tr><td class=\"pick\"><input type=\"checkbox\" name=\"v\" value=\"{dv}\" \
+             form=\"bulk\" aria-label=\"Select {dv}\"></td>\
+             <td>{pre}<span class=\"nw\">{dv}</span>{reason}</td><td>{status}</td>\
+             <td class=\"muted\">{dl}</td>\
              <td><div class=\"actions\">{actions}</div></td></tr>",
             pre = if p.is_prerelease() {
                 "<span class=\"badge pre\">pre</span> "
             } else {
                 ""
             },
-            dv = escape_html(&v),
             dl = group_digits(p.downloads as i64),
         ));
     }
 
+    // The selection form. "Enable" comes first on purpose: pressing Enter in a
+    // form submits it with its first button, and that must never be Delete.
+    let approve = if ordered.iter().any(|fv| fv.pending) {
+        "<button type=\"submit\" name=\"op\" value=\"approve\">Approve</button>"
+    } else {
+        ""
+    };
+    let transfer = if transfer_targets.is_empty() {
+        String::new()
+    } else {
+        let options: String = transfer_targets
+            .iter()
+            .map(|t| format!("<option value=\"{t}\">{t}</option>", t = escape_html(t)))
+            .collect();
+        format!(
+            "<span class=\"to\"><label for=\"bulk-target\">Feed</label>\
+             <select id=\"bulk-target\" name=\"target\">{options}</select>\
+             <button type=\"submit\" name=\"op\" value=\"copy\">Copy to feed</button>\
+             <button type=\"submit\" name=\"op\" value=\"move\">Move to feed</button></span>"
+        )
+    };
+    let bulk = format!(
+        "<form id=\"bulk\" class=\"bulk\" method=\"post\" action=\"{act}\" \
+         aria-labelledby=\"bulk-l\">{csrf}\
+         <span id=\"bulk-l\"><b>With the selected versions</b></span>\
+         <button type=\"submit\" name=\"op\" value=\"enable\">Enable</button>\
+         <button type=\"submit\" name=\"op\" value=\"disable\">Disable</button>{approve}{transfer}\
+         <button type=\"submit\" name=\"op\" value=\"delete\" class=\"danger\" \
+         data-confirm=\"{confirm}\">Delete</button>\
+         <span id=\"bulk-note\" role=\"status\"></span></form>",
+        act = escape_html(&urls.app(&format!("/admin/packages/{}", enc_path(&lower)))),
+        confirm = escape_html(&format!(
+            "Remove the selected versions of {id} from this feed? \
+             Versions no other feed holds are deleted for good."
+        )),
+    );
+
     let body = format!(
         "<nav class=\"crumbs\" aria-label=\"Breadcrumb\">\
-         <a href=\"{admin}\">Admin</a> <span aria-hidden=\"true\">/</span> <span>{id}</span></nav>\
-         <h1 class=\"title\">{id}</h1>\
+         <a href=\"{admin}\">Admin</a> <span aria-hidden=\"true\">/</span> <span>{eid}</span></nav>\
+         <div class=\"bar\"><h1 class=\"title\">{eid}</h1>\
+         <a href=\"{gallery}\">Open in the gallery</a></div>\
          <p class=\"muted\">Disabled and pending versions are hidden from clients and not \
-         downloadable. Delete removes this feed's membership.</p>\
-         <div class=\"card\"><table class=\"atbl\">\
-         <thead><tr><th>Version</th><th>Status</th><th>Downloads</th><th>Actions</th></tr></thead>\
-         <tbody>{rows}</tbody></table></div>",
+         downloadable. Delete removes this feed's membership; moving keeps the files, since \
+         the other feed then holds them.</p>\
+         <div class=\"card\"><div class=\"scroll\"><table class=\"atbl\">\
+         <thead><tr><th class=\"pick\"><input type=\"checkbox\" class=\"all\" \
+         aria-label=\"Select every version\" hidden></th>\
+         <th>Version</th><th>Status</th><th>Downloads</th><th>Actions</th></tr></thead>\
+         <tbody>{rows}</tbody></table></div>{bulk}</div>",
         admin = escape_html(&urls.app("/admin")),
-        id = escape_html(id),
+        gallery = escape_html(&urls.app(&format!("/packages/{}", enc_path(&lower)))),
+        eid = escape_html(id),
     );
-    layout(urls, &format!("Admin \u{2014} {id}"), "", "", &body)
+    layout(urls, &format!("Admin \u{2014} {id}"), ADMIN_NAV, &body)
 }
 
 /// The root feed index, shown when more than one feed is hosted. Each entry is
@@ -1111,7 +1405,7 @@ pub fn feeds_index_page(feeds: &[(String, String)]) -> String {
         &urls,
         "Feeds \u{2014} YANuget",
         "",
-        "",
+        Nav::default(),
         &body,
         Chrome::Root,
         "",
@@ -1158,6 +1452,9 @@ fn opt_count(n: Option<usize>) -> String {
 }
 
 /// The package detail page for one selected version.
+///
+/// `admin` is whether this feed has an admin area: the label then links to the
+/// page that disables, deletes or moves this package's versions.
 pub fn detail_page(
     urls: &UrlBuilder,
     packages: &[Package],
@@ -1165,6 +1462,7 @@ pub fn detail_page(
     readme: Option<&str>,
     primary_client: &str,
     has_symbols: bool,
+    admin: bool,
 ) -> String {
     let id = escape_html(&selected.id);
     let version = selected.normalized_version();
@@ -1176,9 +1474,13 @@ pub fn detail_page(
     ordered.sort_by(|a, b| b.version.cmp(&a.version));
     for p in ordered {
         let v = p.normalized_version();
-        let sel = if v == version { " class=\"sel\"" } else { "" };
+        let (li, current) = if v == version {
+            (" class=\"sel\"", " aria-current=\"page\"")
+        } else {
+            ("", "")
+        };
         versions.push_str(&format!(
-            "<li><span><a{sel} href=\"{href}\">{dv}</a>{badges}</span>\
+            "<li{li}><span><a href=\"{href}\"{current}>{dv}</a>{badges}</span>\
              <span class=\"muted\">{dls} download{ds}</span></li>",
             href =
                 escape_html(&urls.app(&format!("/packages/{}/{}", enc_path(&lower), enc_path(&v)))),
@@ -1190,41 +1492,54 @@ pub fn detail_page(
     }
     versions.push_str("</ul>");
 
+    let manage = if admin {
+        format!(
+            "<a class=\"manage\" href=\"{}\">Manage versions</a>",
+            escape_html(&urls.app(&format!("/admin/packages/{}", enc_path(&lower))))
+        )
+    } else {
+        String::new()
+    };
+    let desc = if selected.description.trim().is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<p class=\"lede\">{}</p>",
+            escape_html(&selected.description)
+        )
+    };
+    // The label: the id, then one ruled cell per fact about this version. A
+    // long id may break after any of its dots, which is where it reads best.
     let main = format!(
         "<nav class=\"crumbs\" aria-label=\"Breadcrumb\">\
          <a href=\"{packages}\">Packages</a> <span aria-hidden=\"true\">/</span> <span>{id}</span></nav>\
-         <h1 class=\"title\">{icon}{id}</h1>\
-         <div class=\"meta\">{version}{badges} \u{2022} {dl} download{ds} of this version \u{2022} published {pub}</div>\
-         <p>{desc}</p>{tags}{links}{deps}{symbols}",
+         <section class=\"label\" aria-labelledby=\"pkg\"><div class=\"label-head\">{icon}\
+         <h1 class=\"title\" id=\"pkg\">{id_breaks}</h1>{manage}</div>\
+         <dl class=\"fields\">{fields}</dl></section>\
+         {desc}{tags}{links}{deps}{symbols}",
         packages = escape_html(&urls.app("/packages")),
         icon = render_icon(urls, selected),
-        version = escape_html(&version),
-        badges = status_badges(selected),
-        dl = group_digits(selected.downloads as i64),
-        ds = plural(selected.downloads as i64),
-        pub = escape_html(&selected.published.format("%Y-%m-%d").to_string()),
-        desc = escape_html(&selected.description),
+        id_breaks = id.replace('.', ".<wbr>"),
+        fields = render_fields(selected),
         tags = render_tags(&selected.tags),
         links = render_links(selected),
         deps = render_dependencies(urls, selected),
         symbols = if has_symbols {
-            "<p class=\"muted\">\u{1f50e} Debug symbols are available for this package.</p>"
+            "<p class=\"muted\">Debug symbols are available for this package.</p>"
         } else {
             ""
         },
     );
 
     // Versions right under Install: picking another version is the common
-    // next step, and Info repeats much of what the header already says.
-    // The section headings are all `<h2>`, one level under the package name,
-    // and the client labels inside Install are `<h3>` under it. A heading that
-    // jumps a level reads, to a screen reader user, like a missing section.
+    // next step. The section headings are all `<h2>`, one level under the
+    // package name, and the client labels inside Install are `<h3>` under it.
+    // A heading that jumps a level reads, to a screen reader user, like a
+    // missing section.
     let side = format!(
-        "<div class=\"card install\"><h2 class=\"muted\">Install</h2>{install}</div>\
-         <div class=\"card\"><h2 class=\"muted\">Versions</h2>{versions}</div>\
-         <div class=\"card\"><h2 class=\"muted\">Info</h2>{info}</div>",
+        "<div class=\"card install\"><h2>Install</h2>{install}</div>\
+         <div class=\"card\"><h2>Versions</h2>{versions}</div>",
         install = render_install(urls, selected, primary_client),
-        info = render_info(selected),
     );
 
     // The readme is a grid item of its own, placed after the sidebar on a
@@ -1243,8 +1558,10 @@ pub fn detail_page(
     layout(
         urls,
         &format!("{} {} \u{2014} YANuget", selected.id, version),
-        "",
-        "",
+        Nav {
+            admin,
+            ..Nav::default()
+        },
         &body,
     )
 }
@@ -1338,32 +1655,39 @@ fn command_html(cmd: &str) -> String {
     parts.join(" ")
 }
 
-fn render_info(p: &Package) -> String {
-    let mut rows = String::from("<div class=\"kv\">");
-    rows.push_str(&format!(
-        "<div><b>Version</b>{}</div>",
-        escape_html(&p.normalized_version())
+/// The label's cells: what this one version is. The download count is this
+/// version's own, like everything else on the label; the gallery shows the
+/// total across versions.
+fn render_fields(p: &Package) -> String {
+    let field = |term: &str, value: &str| format!("<div><dt>{term}</dt><dd>{value}</dd></div>");
+    let mut out = field(
+        "Version",
+        &format!(
+            "{}{}",
+            escape_html(&p.normalized_version()),
+            status_badges(p)
+        ),
+    );
+    out.push_str(&field(
+        "Published",
+        &escape_html(&p.published.format("%Y-%m-%d").to_string()),
     ));
+    out.push_str(&field("Size", &escape_html(&human_size(p.package_size))));
+    out.push_str(&field("Downloads", &group_digits(p.downloads as i64)));
+    if let Some(lic) = p.license_expression.as_deref().or(p.license_url.as_deref()) {
+        out.push_str(&field("License", &escape_html(lic)));
+    }
+    let types = package_type_names(&p.package_types);
+    if !types.is_empty() {
+        out.push_str(&field("Type", &escape_html(&types)));
+    }
     if !p.authors.is_empty() {
-        rows.push_str(&format!(
-            "<div><b>Authors</b>{}</div>",
+        out.push_str(&format!(
+            "<div class=\"wide\"><dt>Authors</dt><dd>{}</dd></div>",
             escape_html(&p.authors.join(", "))
         ));
     }
-    if let Some(lic) = p.license_expression.as_deref().or(p.license_url.as_deref()) {
-        rows.push_str(&format!("<div><b>License</b>{}</div>", escape_html(lic)));
-    }
-    rows.push_str(&format!(
-        "<div><b>Size</b>{}</div>",
-        escape_html(&human_size(p.package_size))
-    ));
-    rows.push_str(&format!("<div><b>Downloads</b>{}</div>", p.downloads));
-    let types = package_type_names(&p.package_types);
-    if !types.is_empty() {
-        rows.push_str(&format!("<div><b>Type</b>{}</div>", escape_html(&types)));
-    }
-    rows.push_str("</div>");
-    rows
+    out
 }
 
 fn render_links(p: &Package) -> String {
@@ -1388,7 +1712,7 @@ fn render_links(p: &Package) -> String {
     if links.is_empty() {
         String::new()
     } else {
-        format!("<p class=\"links\">{}</p>", links.join(" \u{2022} "))
+        format!("<p class=\"links\">{}</p>", links.join(" "))
     }
 }
 
@@ -1396,13 +1720,15 @@ fn render_dependencies(urls: &UrlBuilder, p: &Package) -> String {
     if p.dependencies.is_empty() {
         return String::new();
     }
-    let mut out = String::from("<h2 class=\"muted\">Dependencies</h2>");
+    // Each target framework is a heading of its own under Dependencies, so a
+    // screen reader can jump between them as a sighted reader scans for one.
+    let mut out = String::from("<h2>Dependencies</h2>");
     for group in &p.dependencies {
         let tfm = group
             .target_framework
             .as_deref()
             .unwrap_or("All frameworks");
-        out.push_str(&format!("<p class=\"meta\">{}</p>", escape_html(tfm)));
+        out.push_str(&format!("<h3 class=\"tfm\">{}</h3>", escape_html(tfm)));
         if group.dependencies.is_empty() {
             out.push_str("<p class=\"muted\">No dependencies</p>");
             continue;
@@ -1463,7 +1789,7 @@ fn render_readme(readme: Option<&str>) -> String {
                 ""
             };
             format!(
-                "<h2 class=\"muted\">Readme</h2><div class=\"card readme\">{}</div>{notice}",
+                "<h2>Readme</h2><div class=\"card readme\">{}</div>{notice}",
                 escape_html(shown)
             )
         }
@@ -1745,7 +2071,15 @@ mod tests {
         // API is there.
         let urls = UrlBuilder::new("http://feed.example");
         let p = sample();
-        let html = detail_page(&urls, std::slice::from_ref(&p), &p, None, "choco", false);
+        let html = detail_page(
+            &urls,
+            std::slice::from_ref(&p),
+            &p,
+            None,
+            "choco",
+            false,
+            false,
+        );
         for label in ["Chocolatey", "dotnet CLI", "nuget.exe"] {
             let button = format!(
                 "<button type=\"button\" class=\"copy\" aria-label=\"Copy the {label} command\" \
@@ -1792,7 +2126,15 @@ mod tests {
         let urls = UrlBuilder::new("https://host");
         let mut p = sample();
         p.description = "<img src=x onerror=alert(1)>".into();
-        let html = detail_page(&urls, std::slice::from_ref(&p), &p, None, "choco", false);
+        let html = detail_page(
+            &urls,
+            std::slice::from_ref(&p),
+            &p,
+            None,
+            "choco",
+            false,
+            false,
+        );
         assert!(!html.contains("<img src=x"));
         assert!(html.contains("&lt;img src=x"));
     }
@@ -1841,7 +2183,15 @@ mod tests {
         let mut p = sample();
         p.version = crate::version::NuGetVersion::parse("2.0.0-rc.1").unwrap();
         p.listed = false;
-        let html = detail_page(&urls, std::slice::from_ref(&p), &p, None, "choco", true);
+        let html = detail_page(
+            &urls,
+            std::slice::from_ref(&p),
+            &p,
+            None,
+            "choco",
+            true,
+            false,
+        );
         assert!(html.contains("badge pre"));
         assert!(html.contains("badge un"));
         assert!(html.contains("Debug symbols are available"));
@@ -1851,6 +2201,7 @@ mod tests {
     fn the_detail_page_keeps_the_versions_within_reach() {
         // The sticky install card (over 500 px tall) covered Info and Versions
         // while scrolling, and on a phone Versions came after the whole readme.
+        // Info has since moved into the label at the top of the page.
         let urls = UrlBuilder::new("https://host");
         let p = sample();
         let html = detail_page(
@@ -1860,18 +2211,20 @@ mod tests {
             Some("A long readme."),
             "choco",
             false,
+            false,
         );
         assert!(!STYLE.contains("sticky"));
         let at = |needle: &str| {
             html.find(needle)
                 .unwrap_or_else(|| panic!("{needle}: {html}"))
         };
-        let (install, versions) = (at("class=\"card install\""), at(">Versions<"));
-        let (info, readme) = (at(">Info<"), at("<div class=\"readme-area\">"));
+        let (label, install) = (at("<section class=\"label\""), at("class=\"card install\""));
+        let (versions, readme) = (at(">Versions<"), at("<div class=\"readme-area\">"));
         assert!(
-            install < versions && versions < info && info < readme,
+            label < install && install < versions && versions < readme,
             "{html}"
         );
+        assert!(!html.contains(">Info<"), "{html}");
         // The readme is a grid item of its own, not part of the main column.
         let content_end = at("<div class=\"side\">");
         assert!(readme > content_end, "{html}");
@@ -2240,7 +2593,12 @@ mod tests {
         // and the card border token is only ~1.4:1 against the page, too faint
         // to show where a field is. Controls use `--ctl`, set in both themes.
         assert!(STYLE.contains("button,input,select{font-family:inherit}"));
-        assert!(STYLE.contains("input[type=search]{flex:1;padding:9px 12px;border-radius:6px;border:1px solid var(--ctl)"));
+        assert!(STYLE.contains(
+            "input[type=search]{flex:1;min-width:0;padding:9px 14px;border-radius:6px;border:2px solid var(--ctl)"
+        ));
+        assert!(STYLE.contains(
+            "select,.pager-go input{min-height:44px;padding:0 10px;border:2px solid var(--ctl)"
+        ));
         let (dark, light) = STYLE
             .split_once("prefers-color-scheme:light")
             .expect("a light block");
@@ -2273,6 +2631,160 @@ mod tests {
         // The offline building blocks are present.
         assert!(html.contains("<style>"));
         assert!(html.contains("rel=\"icon\" href=\"data:image/svg+xml,"));
+        // The one font is this server's own, and the policy allows only that.
+        assert!(FONT_URL.starts_with('/'), "{FONT_URL}");
+        assert!(STYLE.contains(&format!("src:url({FONT_URL})")));
+        assert!(html.contains(&format!("<link rel=\"preload\" href=\"{FONT_URL}\"")));
+        assert!(CSP.contains("font-src 'self';"), "{}", *CSP);
+    }
+
+    #[test]
+    fn the_gallery_sorts_by_a_link_and_every_page_keeps_the_order() {
+        let urls = UrlBuilder::new("https://host");
+        let mut page = page_of(&["A", "B"]);
+        page.total_hits = 6;
+        let by_name = GalleryView {
+            sort: SearchSort::Name,
+            ..view("", 2, 2)
+        };
+        let html = gallery_page(&urls, &page, &by_name);
+        // Three orders, the current one marked, each from the first page.
+        assert!(
+            html.contains(
+                "<a href=\"/packages?q=&amp;skip=0&amp;take=2&amp;sort=name\" \
+                 aria-current=\"true\">Name</a>"
+            ),
+            "{html}"
+        );
+        assert!(
+            html.contains("<a href=\"/packages?q=&amp;skip=0&amp;take=2\">Downloads</a>"),
+            "{html}"
+        );
+        assert!(
+            html.contains("sort=updated\">Recently updated</a>"),
+            "{html}"
+        );
+        // Paging, the pager's forms and a new search all keep the order.
+        assert!(html.contains("skip=4&amp;take=2&amp;sort=name"), "{html}");
+        assert_eq!(
+            html.matches("<input type=\"hidden\" name=\"sort\" value=\"name\">")
+                .count(),
+            3,
+            "{html}"
+        );
+
+        // The default order stays out of every URL, so old bookmarks and the
+        // addresses the tests above pin keep their meaning.
+        let html = gallery_page(&urls, &page, &view("", 2, 2));
+        assert!(!html.contains("name=\"sort\""), "{html}");
+        assert!(!html.contains("sort=downloads"), "{html}");
+
+        // A single package has nothing to sort.
+        let one = gallery_page(&urls, &page_of(&["A"]), &view("", 0, 20));
+        assert!(!one.contains("Sort by"), "{one}");
+    }
+
+    #[test]
+    fn the_chrome_names_the_version_and_links_the_admin_area_when_there_is_one() {
+        let urls = UrlBuilder::new("https://host");
+        let p = sample();
+        let plain = detail_page(
+            &urls,
+            std::slice::from_ref(&p),
+            &p,
+            None,
+            "choco",
+            false,
+            false,
+        );
+        assert!(
+            plain.contains(&format!("Served by YANuget {}", env!("CARGO_PKG_VERSION"))),
+            "{plain}"
+        );
+        assert!(!plain.contains("/admin"), "{plain}");
+
+        let managed = detail_page(
+            &urls,
+            std::slice::from_ref(&p),
+            &p,
+            None,
+            "choco",
+            false,
+            true,
+        );
+        assert!(
+            managed.contains("<a class=\"manage\" href=\"/admin/packages/contoso.utils\">"),
+            "{managed}"
+        );
+        assert!(
+            managed.contains("<a href=\"/admin\">Admin</a>"),
+            "{managed}"
+        );
+
+        let settings = settings_page(&urls, &Config::default(), &feed_ctx(None, None));
+        assert!(
+            settings.contains(&format!(
+                "<b>YANuget version</b>{}",
+                env!("CARGO_PKG_VERSION")
+            )),
+            "{settings}"
+        );
+        // With no admin key, the settings say how to get one.
+        assert!(settings.contains("admin_api_key"), "{settings}");
+    }
+
+    #[test]
+    fn the_admin_page_acts_on_the_selected_versions() {
+        let urls = UrlBuilder::new("https://host");
+        let mut beta = sample();
+        beta.version = crate::version::NuGetVersion::parse("2.0.0-beta").unwrap();
+        let versions = vec![
+            feed_version(sample(), false, false),
+            feed_version(beta, false, false),
+        ];
+        let html = admin_package_page(&urls, "Contoso.Utils", &versions, None, &[], "tok");
+        // One box per version, belonging to the form below the table.
+        for v in ["1.0.0", "2.0.0-beta"] {
+            assert!(
+                html.contains(&format!(
+                    "<input type=\"checkbox\" name=\"v\" value=\"{v}\" form=\"bulk\""
+                )),
+                "{v}: {html}"
+            );
+        }
+        assert!(
+            html.contains(
+                "<form id=\"bulk\" class=\"bulk\" method=\"post\" \
+                 action=\"/admin/packages/contoso.utils\""
+            ),
+            "{html}"
+        );
+        assert!(html.contains("<input type=\"hidden\" name=\"_csrf\" value=\"tok\">"));
+        // Enter submits with the first button, so that one must be harmless;
+        // Delete asks first.
+        let first = html.split("id=\"bulk\"").nth(1).unwrap();
+        let first = first.split("<button").nth(1).unwrap();
+        assert!(first.contains("value=\"enable\""), "{first}");
+        assert!(html.contains("value=\"delete\" class=\"danger\" data-confirm="));
+        // No other feed to hand versions to: no copy or move.
+        assert!(!html.contains("value=\"move\""), "{html}");
+
+        let html = admin_package_page(
+            &urls,
+            "Contoso.Utils",
+            &versions,
+            None,
+            &["stable".to_string()],
+            "tok",
+        );
+        assert!(
+            html.contains("<option value=\"stable\">stable</option>"),
+            "{html}"
+        );
+        assert!(html.contains("name=\"op\" value=\"copy\""), "{html}");
+        assert!(html.contains("name=\"op\" value=\"move\""), "{html}");
+        // The confirmation is read off the button that submitted.
+        assert!(COPY_SCRIPT_BODY.contains("e.submitter"));
     }
 
     #[test]
@@ -2286,7 +2798,7 @@ mod tests {
             total_size: 2048,
             symbol_count: 1,
         };
-        let html = stats_page(&urls, &stats, &page_of(&["Top.Pkg"]), &[sample()]);
+        let html = stats_page(&urls, &stats, &page_of(&["Top.Pkg"]), &[sample()], false);
         assert!(html.contains("Statistics"));
         assert!(html.contains("1,234")); // grouped downloads
         assert!(html.contains("Top.Pkg"));
@@ -2346,11 +2858,12 @@ mod tests {
                     Some("docs"),
                     "choco",
                     false,
+                    false,
                 ),
             ),
             (
                 "stats",
-                stats_page(&urls, &stats, &page_of(&["A"]), &[sample()]),
+                stats_page(&urls, &stats, &page_of(&["A"]), &[sample()], false),
             ),
             (
                 "settings",
@@ -2379,8 +2892,21 @@ mod tests {
         let urls = UrlBuilder::new("https://host");
         let mut p = sample();
         p.downloads = 1;
-        let html = detail_page(&urls, std::slice::from_ref(&p), &p, None, "choco", false);
-        assert!(html.contains("1 download of this version"), "{html}");
+        let html = detail_page(
+            &urls,
+            std::slice::from_ref(&p),
+            &p,
+            None,
+            "choco",
+            false,
+            false,
+        );
+        // The label's count is a bare number under its caption; the version
+        // list spells it out.
+        assert!(
+            html.contains("<div><dt>Downloads</dt><dd>1</dd></div>"),
+            "{html}"
+        );
         assert!(
             html.contains("<span class=\"muted\">1 download</span>"),
             "{html}"
@@ -2393,12 +2919,15 @@ mod tests {
         assert!(html.contains("1 version, 1 download"), "{html}");
 
         // The first-run steps are numbered by an ordered list, not by text in
-        // each heading, and no label is set in capitals.
+        // each heading, and no label is set in capitals. The stylesheet draws
+        // the numbers, so the list says it is one (Safari drops the role of a
+        // list without markers).
         let html = gallery_page(&urls, &page_of(&[]), &view("", 0, 20));
         assert!(
-            html.contains("<ol class=\"card steps\"><li><h2>Add this feed</h2>"),
+            html.contains("<ol class=\"card steps\" role=\"list\"><li><h2>Add this feed</h2>"),
             "{html}"
         );
+        assert!(STYLE.contains("counter-increment:step"));
         assert!(!STYLE.contains(".install h3{margin:14px 0 4px;font-size:13px;text-transform"));
         assert!(!STYLE.contains(".steps h3"));
     }
@@ -2456,7 +2985,7 @@ mod tests {
             feed_version(sample(), false, false),
             feed_version(disabled, false, false),
         ];
-        let pkg = admin_package_page(&urls, "Contoso.Utils", &versions, None, "tok");
+        let pkg = admin_package_page(&urls, "Contoso.Utils", &versions, None, &[], "tok");
         assert!(pkg.contains("/disable"));
         assert!(pkg.contains("/enable"));
         assert!(pkg.contains("/delete"));
@@ -2468,7 +2997,14 @@ mod tests {
     fn admin_page_shows_pending_and_promote() {
         let urls = UrlBuilder::new("https://host");
         let versions = vec![feed_version(sample(), true, true)];
-        let pkg = admin_package_page(&urls, "Contoso.Utils", &versions, Some("stable"), "tok");
+        let pkg = admin_package_page(
+            &urls,
+            "Contoso.Utils",
+            &versions,
+            Some("stable"),
+            &[],
+            "tok",
+        );
         assert!(pkg.contains("/approve"));
         assert!(pkg.contains("/promote"));
         assert!(pkg.contains("pending"));

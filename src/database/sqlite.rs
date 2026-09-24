@@ -29,7 +29,7 @@ use crate::version::NuGetVersion;
 
 use super::{
     DatabaseStats, FeedVersion, Membership, PackageDatabase, SearchGroup, SearchPage,
-    SearchRequest, SymbolKey, SymbolRef,
+    SearchRequest, SearchSort, SymbolKey, SymbolRef,
 };
 
 const SCHEMA: &str = r#"
@@ -690,24 +690,42 @@ impl PackageDatabase for SqliteDatabase {
             };
         }
 
-        let id_rows = sqlx::query(concat!(
-            "SELECT p.lower_id AS lower_id, SUM(fp.downloads) AS total \
-             FROM packages p JOIN feed_packages fp \
-               ON fp.lower_id = p.lower_id AND fp.normalized_version = p.normalized_version \
-             WHERE ",
-            filter!(),
-            " GROUP BY p.lower_id ORDER BY total DESC, p.lower_id ASC LIMIT ?7 OFFSET ?8"
-        ))
-        .bind(feed)
-        .bind(i64::from(request.include_prerelease))
-        .bind(i64::from(request.include_semver2))
-        .bind(&query)
-        .bind(&pattern)
-        .bind(&package_type)
-        .bind(request.take.max(0))
-        .bind(request.skip.max(0))
-        .fetch_all(&self.pool)
-        .await?;
+        // One statement per order, each still a compile-time constant. The id
+        // is the last key of every order, so a page boundary never falls
+        // between two packages that tie.
+        macro_rules! page_of_ids {
+            ($order:literal) => {
+                concat!(
+                    "SELECT p.lower_id AS lower_id, SUM(fp.downloads) AS total, \
+                     MAX(p.published) AS updated \
+                     FROM packages p JOIN feed_packages fp \
+                       ON fp.lower_id = p.lower_id AND fp.normalized_version = p.normalized_version \
+                     WHERE ",
+                    filter!(),
+                    " GROUP BY p.lower_id ORDER BY ",
+                    $order,
+                    " LIMIT ?7 OFFSET ?8"
+                )
+            };
+        }
+        // `published` is stored as RFC 3339 in UTC, so it orders as text.
+        let page_sql = match request.sort {
+            SearchSort::Downloads => page_of_ids!("total DESC, p.lower_id ASC"),
+            SearchSort::Name => page_of_ids!("p.lower_id ASC"),
+            SearchSort::Updated => page_of_ids!("updated DESC, p.lower_id ASC"),
+        };
+
+        let id_rows = sqlx::query(page_sql)
+            .bind(feed)
+            .bind(i64::from(request.include_prerelease))
+            .bind(i64::from(request.include_semver2))
+            .bind(&query)
+            .bind(&pattern)
+            .bind(&package_type)
+            .bind(request.take.max(0))
+            .bind(request.skip.max(0))
+            .fetch_all(&self.pool)
+            .await?;
 
         let ids: Vec<String> = id_rows
             .iter()

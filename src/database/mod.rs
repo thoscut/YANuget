@@ -37,6 +37,8 @@ pub struct SearchRequest {
     pub include_semver2: bool,
     /// Optional package-type filter (e.g. `DotnetTool`).
     pub package_type: Option<String>,
+    /// The order of the page's package ids.
+    pub sort: SearchSort,
 }
 
 impl Default for SearchRequest {
@@ -48,6 +50,44 @@ impl Default for SearchRequest {
             include_prerelease: true,
             include_semver2: true,
             package_type: None,
+            sort: SearchSort::default(),
+        }
+    }
+}
+
+/// The order search results come back in.
+///
+/// Only the gallery chooses one. `/v3/search` always asks for the default,
+/// which is the ranking NuGet clients have always been given here.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SearchSort {
+    /// Most downloads (across every matching version) first.
+    #[default]
+    Downloads,
+    /// By package id, A to Z.
+    Name,
+    /// The package whose newest matching version was published last, first.
+    Updated,
+}
+
+impl SearchSort {
+    /// Parse the gallery's `sort` value: `downloads`, `name` or `updated`,
+    /// case-insensitively.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "downloads" => Some(Self::Downloads),
+            "name" => Some(Self::Name),
+            "updated" => Some(Self::Updated),
+            _ => None,
+        }
+    }
+
+    /// The value [`Self::parse`] reads back.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Downloads => "downloads",
+            Self::Name => "name",
+            Self::Updated => "updated",
         }
     }
 }

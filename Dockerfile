@@ -28,6 +28,8 @@ RUN rm -rf src
 # looks exactly like a good one until someone opens /docs.
 ARG REQUIRE_DOCS=0
 COPY docs ./docs
+# The theme's `custom_dir` (the logo icon). Without it `mkdocs build` fails.
+COPY overrides ./overrides
 COPY mkdocs.yml requirements-docs.txt README.md ./
 RUN set -eu; \
     if apt-get update \

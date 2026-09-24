@@ -12,6 +12,52 @@ expected to change incompatibly at any version.
 
 ## [Unreleased]
 
+### Added
+
+- The gallery list can be sorted by downloads (still the default), name, or
+  most recently updated, from links above the list. Paging, the page-size form
+  and a new search keep the order; the default stays out of the URL, so existing
+  bookmarks mean what they meant.
+- The admin page acts on several versions at once: tick them (or all of them)
+  and enable, disable, approve, delete — or, with more than one feed, **copy**
+  or **move** them to another feed. A move keeps each version's listed and
+  enabled state and never touches its files, since the other feed then holds
+  them. Every version is checked before anything changes, and the target feed's
+  approval gate and license policy apply as for a push. Copying or moving into
+  a feed takes credentials valid for that feed too, except into this feed's
+  `promotes_to` target.
+- A package's gallery page links to its admin page ("Manage versions"), and the
+  header links to the admin area, whenever one is configured. Without one, the
+  settings page says which setting turns it on.
+- The server's version is shown in every page's footer and on the settings
+  page. The stats page's lists show each package's version.
+
+### Changed
+
+- The gallery has a design of its own instead of a copy of GitHub's colours: a
+  package page is laid out as a shipping label, lists as ruled manifests, and
+  its one accent colour is kept for the primary action. It follows the
+  browser's light or dark preference as before, and still loads nothing from
+  outside the server.
+- The gallery's typeface is Atkinson Hyperlegible Next (SIL Open Font License
+  1.1), embedded in the binary (34 KB) and served from
+  `/_assets/fonts/…woff2` with an immutable cache. The gallery's
+  Content-Security-Policy gained `font-src 'self'`.
+- The embedded documentation at `/docs` wears the same look: Material's
+  palette remapped onto the gallery's colours in `docs/stylesheets/extra.css`,
+  the gallery's font (loaded from the server, with the system fonts as the
+  fallback when the site is opened any other way), and the taped-box mark as
+  its logo and favicon. It follows the browser's light or dark preference, with
+  Material's switch to override it. The theme's `custom_dir` is the new
+  top-level `overrides/`, which the Dockerfile now copies into the docs build.
+- The README's screenshots and walkthrough GIFs are recaptured from the new
+  design, and `scripts/media/capture.mjs` clicks the gallery's new list markup
+  (`.pkg h2 a`) — with the old selector the capture, and so the media workflow,
+  would have failed.
+- A feed can no longer be named `_assets`: that is where the font is served.
+- `web::FeedMeta` carries the feed's admin key and has a
+  `FeedMeta::from_resolved` constructor.
+
 ## [0.5.1] — 2026-09-24
 
 ### Added

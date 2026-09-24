@@ -1,0 +1,261 @@
+/*
+ * The documentation site in the gallery's own look (see STYLE in
+ * src/web/ui.rs): a grey floor, carbon ink, one floor-marking yellow, and
+ * Atkinson Hyperlegible Next. Material's palette variables are remapped here
+ * rather than its rules rewritten, so a theme update keeps working.
+ *
+ * The font is the one the server already serves for the gallery, from its
+ * root. Where the site is opened some other way (`mkdocs serve`, a file on
+ * disk) that URL does not resolve and the system font stack takes over.
+ */
+
+@font-face {
+  font-family: "Atkinson Hyperlegible Next";
+  font-style: normal;
+  font-weight: 200 800;
+  font-display: swap;
+  src: url("/_assets/fonts/atkinson-hyperlegible-next-2.001-latin-wght.woff2") format("woff2");
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC,
+    U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215,
+    U+FEFF, U+FFFD;
+}
+
+:root {
+  --md-text-font: "Atkinson Hyperlegible Next";
+  --md-code-font: "Cascadia Mono", "Cascadia Code", Consolas;
+}
+
+[data-md-color-scheme="default"] {
+  --yn-floor: #e6e9ec;
+  --yn-stock: #fff;
+  --yn-ink: #16191d;
+  --yn-pencil: #56606b;
+  --yn-rule: #c5cbd2;
+  --yn-code: #f2f4f6;
+  --yn-hivis: #ffd100;
+  --yn-onhivis: #16191d;
+
+  --md-default-bg-color: var(--yn-floor);
+  --md-default-fg-color: var(--yn-ink);
+  --md-default-fg-color--light: var(--yn-pencil);
+  --md-default-fg-color--lighter: #8a939d;
+  --md-default-fg-color--lightest: var(--yn-rule);
+  --md-code-bg-color: var(--yn-code);
+  --md-code-fg-color: var(--yn-ink);
+  --md-typeset-color: var(--yn-ink);
+  --md-typeset-table-color: var(--yn-rule);
+}
+
+[data-md-color-scheme="slate"] {
+  --md-hue: 212;
+  --yn-floor: #131920;
+  --yn-stock: #1b232c;
+  --yn-ink: #e6eaee;
+  --yn-pencil: #9ca8b4;
+  --yn-rule: #2e3945;
+  --yn-code: #0e1318;
+  --yn-hivis: #ffd100;
+  --yn-onhivis: #16191d;
+
+  --md-default-bg-color: var(--yn-floor);
+  --md-default-fg-color: var(--yn-ink);
+  --md-default-fg-color--light: var(--yn-pencil);
+  --md-default-fg-color--lighter: #6b7885;
+  --md-default-fg-color--lightest: var(--yn-rule);
+  --md-code-bg-color: var(--yn-code);
+  --md-code-fg-color: var(--yn-ink);
+  --md-typeset-color: var(--yn-ink);
+  --md-typeset-table-color: var(--yn-rule);
+  --md-footer-bg-color: var(--yn-stock);
+  --md-footer-bg-color--dark: var(--yn-code);
+}
+
+/* `primary: custom` / `accent: custom`: the header is label stock with carbon
+   type, and the accent is carbon too — yellow is kept for highlights. */
+[data-md-color-primary="custom"] {
+  --md-primary-fg-color: var(--yn-stock);
+  --md-primary-fg-color--light: var(--yn-stock);
+  --md-primary-fg-color--dark: var(--yn-ink);
+  --md-primary-bg-color: var(--yn-ink);
+  --md-primary-bg-color--light: var(--yn-pencil);
+  --md-typeset-a-color: var(--yn-ink);
+}
+
+[data-md-color-accent="custom"] {
+  --md-accent-fg-color: var(--yn-ink);
+  --md-accent-fg-color--transparent: rgba(255, 209, 0, 0.35);
+  --md-accent-bg-color: var(--yn-hivis);
+  --md-accent-bg-color--light: rgba(255, 209, 0, 0.7);
+  --md-typeset-mark-color: rgba(255, 209, 0, 0.45);
+}
+
+body {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Header: a stock bar ruled off by carbon, like the gallery's. */
+.md-header,
+.md-header--shadow {
+  box-shadow: none;
+  border-bottom: 3px solid var(--yn-ink);
+}
+
+.md-header__topic:first-child {
+  font-weight: 800;
+  letter-spacing: -0.01em;
+}
+
+.md-header__button.md-logo svg {
+  width: 1.3rem;
+  height: 1.3rem;
+}
+
+.md-search__form {
+  border: 2px solid var(--yn-pencil);
+  border-radius: 6px;
+  background: var(--yn-floor);
+}
+
+.md-search__input {
+  color: var(--yn-ink);
+}
+
+.md-search__input::placeholder,
+.md-search__icon {
+  color: var(--yn-pencil);
+}
+
+/* Type: heavy headings in ink, not Material's light grey. */
+.md-typeset {
+  font-size: 0.8rem;
+  line-height: 1.65;
+}
+
+.md-typeset h1 {
+  margin-bottom: 1em;
+  color: var(--yn-ink);
+  font-weight: 800;
+  letter-spacing: -0.02em;
+}
+
+.md-typeset h2 {
+  font-weight: 750;
+  letter-spacing: -0.01em;
+}
+
+.md-typeset h3,
+.md-typeset h4 {
+  font-weight: 700;
+}
+
+/* Links: underlined in the text colour, and the highlighter on hover. */
+.md-typeset a {
+  color: inherit;
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 0.2em;
+}
+
+.md-typeset a:hover,
+.md-typeset a:focus-visible {
+  background: var(--yn-hivis);
+  color: var(--yn-onhivis);
+  text-decoration: none;
+  -webkit-box-decoration-break: clone;
+  box-decoration-break: clone;
+}
+
+.md-typeset .headerlink {
+  text-decoration: none;
+}
+
+.md-typeset .headerlink:hover,
+.md-typeset .headerlink:focus-visible {
+  background: none;
+  color: var(--yn-ink);
+}
+
+:focus-visible {
+  outline-color: var(--yn-ink);
+}
+
+[data-md-color-scheme="slate"] :focus-visible {
+  outline-color: var(--yn-hivis);
+}
+
+/* Navigation: the current page in bold with a yellow floor marking. */
+.md-nav__link--active,
+.md-nav__item .md-nav__link--active {
+  color: var(--yn-ink);
+  font-weight: 700;
+}
+
+.md-nav--primary .md-nav__link--active {
+  box-shadow: inset 4px 0 0 var(--yn-hivis);
+  padding-left: 0.5rem;
+}
+
+.md-nav__link:hover,
+.md-nav__link:focus {
+  color: var(--yn-ink);
+  text-decoration: underline;
+}
+
+/* Code: the gallery's command blocks. */
+.md-typeset pre > code,
+.md-typeset .highlight code {
+  border-radius: 6px;
+}
+
+.md-typeset pre {
+  border: 1px solid var(--yn-rule);
+  border-radius: 6px;
+}
+
+.md-typeset :not(pre) > code {
+  border: 1px solid var(--yn-rule);
+  border-radius: 4px;
+}
+
+/* Tables: a carbon rule on top, hairlines between rows, no card. */
+.md-typeset table:not([class]) {
+  border: 0;
+  border-top: 2px solid var(--yn-ink);
+  border-radius: 0;
+  box-shadow: none;
+  background: transparent;
+  font-size: 0.75rem;
+}
+
+.md-typeset table:not([class]) th {
+  background: transparent;
+  color: var(--yn-pencil);
+  font-weight: 600;
+}
+
+.md-typeset table:not([class]) td,
+.md-typeset table:not([class]) th {
+  border-top: 1px solid var(--yn-rule);
+}
+
+.md-typeset table:not([class]) tr:first-child td {
+  border-top: 0;
+}
+
+/* Admonitions keep their meaning colours, on label stock. */
+.md-typeset .admonition,
+.md-typeset details {
+  background: var(--yn-stock);
+  box-shadow: none;
+  border-radius: 6px;
+}
+
+.md-footer,
+.md-footer-meta {
+  background: var(--yn-ink);
+}
+
+[data-md-color-scheme="slate"] .md-footer,
+[data-md-color-scheme="slate"] .md-footer-meta {
+  background: var(--yn-stock);
+}
