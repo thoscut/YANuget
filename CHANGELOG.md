@@ -12,6 +12,8 @@ expected to change incompatibly at any version.
 
 ## [Unreleased]
 
+## [0.5.1] — 2026-09-24
+
 ### Added
 
 - The gallery pager can go to a page by number and change how many packages a
@@ -258,6 +260,7 @@ Beyond the defaults:
 - Symbol downloads require read authorisation and resolve to a package the
   requester is allowed to see.
 
-[Unreleased]: https://github.com/thoscut/yanuget/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/thoscut/yanuget/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/thoscut/yanuget/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/thoscut/yanuget/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/thoscut/yanuget/releases/tag/v0.4.0
