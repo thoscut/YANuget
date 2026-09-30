@@ -9,7 +9,7 @@
 //! the `choco install` command (configurable via `primary_client`).
 
 use crate::config::Config;
-use crate::database::SearchSort;
+use crate::database::{SearchSort, TagCount};
 use crate::models::{Package, PackageType};
 use crate::nuget::UrlBuilder;
 
@@ -106,6 +106,15 @@ h2{margin:0 0 10px;font-size:19px;font-weight:750}\
 @media(max-width:640px){.pkg{grid-template-columns:minmax(0,1fr)}.pkg .figs{grid-column:1;grid-row:auto;margin-top:6px;text-align:left}}\
 .tags{display:flex;flex-wrap:wrap;gap:6px;margin:12px 0 0;padding:0;list-style:none}\
 .tag{padding:0 8px;border:1px solid var(--rule);border-radius:4px;background:var(--stock);color:var(--pencil);font-size:13px;line-height:20px}\
+a.tag{text-decoration:none}a.tag:hover{border-color:var(--ink)}\
+.filter{display:flex;flex-wrap:wrap;gap:4px 20px;margin:-6px 0 16px;font-size:15px}\
+.popular{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin:0 0 18px;font-size:14px;color:var(--pencil)}\
+.popular>span{margin-right:6px}.popular .all{margin-left:6px}\
+.cloud{display:flex;flex-wrap:wrap;align-items:baseline;gap:8px 22px;max-width:960px;margin:20px 0 0;padding:0;list-style:none}\
+.cloud a{font-weight:600;line-height:1.2;text-decoration:none}\
+.cloud .n{margin-left:5px;color:var(--pencil);font-size:13px;font-weight:400}\
+.cloud .t1{font-size:15px}.cloud .t2{font-size:18px}.cloud .t3{font-size:22px;font-weight:700}\
+.cloud .t4{font-size:27px;font-weight:750}.cloud .t5{font-size:33px;font-weight:800;letter-spacing:-.01em}\
 .badge{display:inline-block;margin-left:2px;padding:0 6px;border:1.5px solid currentColor;border-radius:4px;\
 color:var(--pencil);font-size:12px;font-weight:700;line-height:18px;vertical-align:.15em;white-space:nowrap}\
 .badge.pre{color:var(--warn);border-style:dashed}\
@@ -118,7 +127,7 @@ color:var(--pencil);font-size:12px;font-weight:700;line-height:18px;vertical-ali
 .label{margin:0 0 22px;background:var(--stock);border:3px solid var(--ink);border-radius:14px;overflow:hidden}\
 .label-head{display:flex;align-items:center;gap:16px;padding:20px 24px 18px}\
 .label h1{flex:1 1 0;min-width:0;margin:0;font-size:40px;line-height:1.08;letter-spacing:-.02em}\
-.label .manage{flex:0 0 auto;font-size:15px;font-weight:700}\
+.label .acts{flex:0 0 auto;display:flex;flex-direction:column;align-items:flex-end;gap:2px;font-size:15px;font-weight:700}\
 img.picon{flex:0 0 auto;width:48px;height:48px;object-fit:contain;border-radius:8px}\
 .fields{display:flex;flex-wrap:wrap;margin:0 0 0 -2px}\
 .fields>div{flex:1 1 9.5rem;min-width:0;padding:10px 16px 12px;border-left:2px solid var(--ink);border-top:2px solid var(--ink)}\
@@ -126,7 +135,7 @@ img.picon{flex:0 0 auto;width:48px;height:48px;object-fit:contain;border-radius:
 .fields dd{margin:0;font-size:17px;font-weight:700;overflow-wrap:anywhere}\
 .fields .wide{flex-basis:100%}\
 @media(max-width:560px){.label-head{flex-wrap:wrap;gap:10px 14px;padding:16px 16px 14px}.label h1{font-size:28px}\
-.label .manage{flex-basis:100%}img.picon{width:36px;height:36px}.fields>div{padding:8px 12px 10px}}\
+.label .acts{flex-basis:100%;flex-direction:row;flex-wrap:wrap;gap:4px 18px}img.picon{width:36px;height:36px}.fields>div{padding:8px 12px 10px}}\
 .lede{max-width:65ch;margin:0 0 14px;font-size:18px;line-height:1.5}\
 .links{display:flex;flex-wrap:wrap;gap:4px 20px;margin:16px 0 0}\
 .links a[rel~=nofollow]::after{content:\" \u{2197}\";font-size:.8em}\
@@ -203,6 +212,7 @@ input[type=checkbox]{width:20px;height:20px;margin:0;accent-color:var(--ink)}\
 .actions{display:flex;flex-wrap:wrap;gap:6px}\
 .actions form{margin:0}\
 .actions button,.bulk button{min-height:38px;font-size:14px;white-space:nowrap}\
+.actions .btn{min-height:38px;padding:0 12px;font-size:14px}\
 button.danger{background:var(--stock);border-color:var(--danger);color:var(--dangerfg)}\
 button.danger:hover{background:var(--danger);border-color:var(--danger);color:var(--ondanger)}\
 .bulk{display:flex;flex-wrap:wrap;align-items:center;gap:10px 12px;margin:18px 0 0;padding:14px 16px;\
@@ -420,7 +430,8 @@ fn layout_with_chrome(
             escape_html(&urls.app(path))
         )
     };
-    let mut links = item("stats", "/stats", "Stats");
+    let mut links = item("tags", "/tags", "Tags");
+    links.push_str(&item("stats", "/stats", "Stats"));
     links.push_str(&item("settings", "/settings", "Settings"));
     links.push_str(&item("docs", "/docs/", "Docs"));
     if nav.admin {
@@ -517,6 +528,10 @@ pub struct GalleryView<'a> {
     pub prerelease: Option<bool>,
     pub package_type: Option<&'a str>,
     pub sort: SearchSort,
+    /// Only packages with this (lower-cased) tag.
+    pub tag: Option<&'a str>,
+    /// The feed's most used tags, offered above the list on the landing page.
+    pub popular: &'a [TagCount],
     /// Whether this feed has an admin area, for the header's link to it.
     pub admin: bool,
 }
@@ -549,6 +564,9 @@ impl GalleryView<'_> {
         if let Some(ty) = self.package_type {
             href.push_str(&format!("&amp;packageType={}", enc_path(ty)));
         }
+        if let Some(tag) = self.tag {
+            href.push_str(&format!("&amp;tag={}", enc_path(tag)));
+        }
         if sort != SearchSort::default() {
             href.push_str(&format!("&amp;sort={}", sort.as_str()));
         }
@@ -573,6 +591,7 @@ impl GalleryView<'_> {
                 escape_html(ty)
             ));
         }
+        out.push_str(&tag_field(self.tag));
         out.push_str(&sort_field(self.sort));
         out
     }
@@ -588,6 +607,26 @@ fn sort_field(sort: SearchSort) -> String {
             sort.as_str()
         )
     }
+}
+
+/// A hidden `tag` input, or nothing without a tag filter.
+fn tag_field(tag: Option<&str>) -> String {
+    match tag {
+        Some(tag) => format!(
+            "<input type=\"hidden\" name=\"tag\" value=\"{}\">",
+            escape_html(tag)
+        ),
+        None => String::new(),
+    }
+}
+
+/// The gallery filtered to one tag, from its first page.
+fn tag_href(urls: &UrlBuilder, tag: &str) -> String {
+    format!(
+        "{}?tag={}",
+        escape_html(&urls.app("/packages")),
+        enc_path(&tag.to_lowercase())
+    )
 }
 
 /// The orders the gallery offers, as links: one click, no form, and each one
@@ -615,6 +654,28 @@ fn sort_links(urls: &UrlBuilder, view: &GalleryView) -> String {
     )
 }
 
+/// The landing page's way in by tag: the most used tags, and the whole cloud.
+fn popular_tags(urls: &UrlBuilder, tags: &[TagCount]) -> String {
+    if tags.len() < 2 {
+        return String::new();
+    }
+    let links: String = tags
+        .iter()
+        .map(|t| {
+            format!(
+                "<a class=\"tag\" href=\"{}\">{}</a>",
+                tag_href(urls, &t.tag),
+                escape_html(&t.tag)
+            )
+        })
+        .collect();
+    format!(
+        "<nav class=\"popular\" aria-label=\"Popular tags\"><span>Popular tags</span>{links}\
+         <a class=\"all\" href=\"{}\">All tags</a></nav>",
+        escape_html(&urls.app("/tags"))
+    )
+}
+
 /// The gallery / search-results page.
 pub fn gallery_page(
     urls: &UrlBuilder,
@@ -627,8 +688,15 @@ pub fn gallery_page(
         ..*view
     };
     let query = view.query;
+    let searching = !query.trim().is_empty();
     let pages = (page.total_hits + view.take - 1) / view.take;
     let current = view.skip / view.take + 1;
+    // The same search and order without the tag: what "clear the tag" means.
+    let untagged = GalleryView { tag: None, ..view };
+    let tagged = view
+        .tag
+        .map(|t| format!(" tagged \u{201c}{}\u{201d}", escape_html(t)))
+        .unwrap_or_default();
     let body = if page.groups.is_empty() {
         let browse_all = escape_html(&urls.app("/packages"));
         if page.total_hits > 0 {
@@ -654,7 +722,23 @@ pub fn gallery_page(
                  {last}<p><a href=\"{first}\">Back to the first page</a></p></div>",
                 first = view.href(urls, 0),
             )
-        } else if !query.trim().is_empty() {
+        } else if view.tag.is_some() {
+            let heading = if searching {
+                format!(
+                    "No packages match \u{201c}{}\u{201d}{tagged}",
+                    escape_html(query)
+                )
+            } else {
+                format!("No packages{tagged}")
+            };
+            format!(
+                "<div class=\"empty\"><h1 class=\"title\">{heading}</h1>\
+                 <p><a href=\"{clear}\">Show them without the tag</a></p>\
+                 <p><a href=\"{all}\">See every tag</a></p></div>",
+                clear = untagged.href(urls, 0),
+                all = escape_html(&urls.app("/tags")),
+            )
+        } else if searching {
             format!(
                 "<div class=\"empty\"><h1 class=\"title\">No packages match \u{201c}{}\u{201d}</h1>\
                  <p><a href=\"{browse_all}\">Clear search and browse all packages</a></p></div>",
@@ -669,14 +753,18 @@ pub fn gallery_page(
         // without one a screen reader announces no page heading at all — while
         // the *empty* state did have one, so the structure changed with the
         // content.
-        let heading = if query.trim().is_empty() {
-            format!("{} package{}", page.total_hits, plural(page.total_hits))
-        } else {
+        let heading = if searching {
             format!(
-                "{} result{} for \u{201c}{}\u{201d}",
+                "{} result{} for \u{201c}{}\u{201d}{tagged}",
                 page.total_hits,
                 plural(page.total_hits),
                 escape_html(query)
+            )
+        } else {
+            format!(
+                "{} package{}{tagged}",
+                page.total_hits,
+                plural(page.total_hits)
             )
         };
         // One package has no order to choose.
@@ -685,8 +773,19 @@ pub fn gallery_page(
         } else {
             String::new()
         };
+        let filter = match view.tag {
+            Some(_) => format!(
+                "<p class=\"filter\"><a href=\"{}\">Clear the tag</a> \
+                 <a href=\"{}\">See every tag</a></p>",
+                untagged.href(urls, 0),
+                escape_html(&urls.app("/tags")),
+            ),
+            None => String::new(),
+        };
         rows.push_str(&format!(
-            "<div class=\"bar\"><h1 class=\"title\">{heading}</h1>{sort}</div><ul class=\"manifest\">"
+            "<div class=\"bar\"><h1 class=\"title\">{heading}</h1>{sort}</div>{filter}{popular}\
+             <ul class=\"manifest\">",
+            popular = popular_tags(urls, view.popular),
         ));
         for group in &page.groups {
             // The newest *stable* version, matching what a NuGet client
@@ -719,7 +818,7 @@ pub fn gallery_page(
                 vs = plural(group.packages.len() as i64),
                 dl = group_digits(group.total_downloads() as i64),
                 ds = plural(group.total_downloads() as i64),
-                tags = render_tags(&p.tags),
+                tags = render_tags(urls, &p.tags),
             ));
         }
         rows.push_str("</ul>");
@@ -731,10 +830,17 @@ pub fn gallery_page(
         ));
         rows
     };
-    // Searches and later pages get titles of their own. Otherwise every search,
-    // and every page of one, shares one <title>, so tabs, bookmarks and history
-    // entries look identical.
-    let search = (!query.trim().is_empty()).then(|| format!("Search: \u{201c}{query}\u{201d}"));
+    // Searches, tags and later pages get titles of their own. Otherwise every
+    // search, and every page of one, shares one <title>, so tabs, bookmarks and
+    // history entries look identical.
+    let search = match (searching, view.tag) {
+        (true, None) => Some(format!("Search: \u{201c}{query}\u{201d}")),
+        (true, Some(t)) => Some(format!(
+            "Search: \u{201c}{query}\u{201d}, tagged \u{201c}{t}\u{201d}"
+        )),
+        (false, Some(t)) => Some(format!("Tagged \u{201c}{t}\u{201d}")),
+        (false, None) => None,
+    };
     let later_page = current > 1 && !page.groups.is_empty();
     let title = match (search, later_page) {
         (None, false) => "YANuget".to_string(),
@@ -742,8 +848,8 @@ pub fn gallery_page(
         (Some(s), false) => format!("{s} \u{2014} YANuget"),
         (Some(s), true) => format!("{s}, page {current} of {pages} \u{2014} YANuget"),
     };
-    // A new search starts on page one, but keeps a page size and an order
-    // someone chose.
+    // A new search starts on page one, but keeps a page size, a tag and an
+    // order someone chose.
     let mut search_hidden = if view.take != view.default_take.max(1) {
         format!(
             "<input type=\"hidden\" name=\"take\" value=\"{}\">",
@@ -752,6 +858,7 @@ pub fn gallery_page(
     } else {
         String::new()
     };
+    search_hidden.push_str(&tag_field(view.tag));
     search_hidden.push_str(&sort_field(view.sort));
     layout_with_chrome(
         urls,
@@ -764,6 +871,72 @@ pub fn gallery_page(
         &body,
         Chrome::Feed,
         &search_hidden,
+    )
+}
+
+/// How many tags the tag page shows at most.
+pub const MAX_CLOUD_TAGS: i64 = 300;
+
+/// The tag cloud: every tag of the feed's visible packages, alphabetically,
+/// set larger the more packages carry it.
+///
+/// Size is never the only signal: each tag carries its count, so the page
+/// reads the same to a screen reader and to someone who cannot tell 18 px
+/// from 22 px. Five steps on a log scale, because a feed's tag counts are
+/// long-tailed — a linear scale makes one tag huge and every other one tiny.
+pub fn tags_page(urls: &UrlBuilder, tags: &[TagCount], admin: bool) -> String {
+    let body = if tags.is_empty() {
+        "<div class=\"empty\"><h1 class=\"title\">No tags yet</h1>\
+         <p>Packages get their tags from the <code>&lt;tags&gt;</code> element of their \
+         <code>.nuspec</code>.</p></div>"
+            .to_string()
+    } else {
+        let most = tags.iter().map(|t| t.packages).max().unwrap_or(1).max(1);
+        let step = |n: i64| -> usize {
+            if most <= 1 {
+                return 1;
+            }
+            let ratio = (n.max(1) as f64).ln() / (most as f64).ln();
+            1 + (ratio * 4.0).round().clamp(0.0, 4.0) as usize
+        };
+        let mut sorted: Vec<&TagCount> = tags.iter().collect();
+        sorted.sort_by(|a, b| a.tag.cmp(&b.tag));
+        let items: String = sorted
+            .iter()
+            .map(|t| {
+                format!(
+                    "<li><a class=\"t{step}\" href=\"{href}\">{tag}</a>\
+                     <span class=\"n\">{n}<span class=\"vh\"> package{s}</span></span></li>",
+                    step = step(t.packages),
+                    href = tag_href(urls, &t.tag),
+                    tag = escape_html(&t.tag),
+                    n = group_digits(t.packages),
+                    s = plural(t.packages),
+                )
+            })
+            .collect();
+        let capped = if tags.len() as i64 >= MAX_CLOUD_TAGS {
+            format!(" The {MAX_CLOUD_TAGS} most used are shown.")
+        } else {
+            String::new()
+        };
+        format!(
+            "<h1 class=\"title\">Tags</h1>\
+             <p class=\"muted\">{n} tag{s} on this feed's packages; the larger, the more \
+             packages carry it.{capped}</p>\
+             <ul class=\"cloud\">{items}</ul>",
+            n = tags.len(),
+            s = plural(tags.len() as i64),
+        )
+    };
+    layout(
+        urls,
+        "Tags \u{2014} YANuget",
+        Nav {
+            active: "tags",
+            admin,
+        },
+        &body,
     )
 }
 
@@ -1272,6 +1445,14 @@ pub fn admin_package_page(
         }
 
         let mut actions = String::new();
+        // Only what clients could fetch too: a disabled or pending version is
+        // withheld by the download endpoint, and a link to a 404 helps nobody.
+        if p.enabled && !fv.pending {
+            actions.push_str(&format!(
+                "<a class=\"btn\" href=\"{}\" aria-label=\"Download {dv}\">Download</a>",
+                escape_html(&urls.package_download(&lower, &v)),
+            ));
+        }
         if fv.pending {
             actions.push_str(&format!(
                 "<form method=\"post\" action=\"{}\">{csrf}<button type=\"submit\">Approve</button></form>",
@@ -1492,14 +1673,19 @@ pub fn detail_page(
     }
     versions.push_str("</ul>");
 
-    let manage = if admin {
-        format!(
-            "<a class=\"manage\" href=\"{}\">Manage versions</a>",
+    // The package file itself, from the same endpoint clients restore from —
+    // so read auth, ranges and caching behave exactly as they do for them.
+    let mut manage = format!(
+        "<a href=\"{}\">Download .nupkg</a>",
+        escape_html(&urls.package_download(&lower, &version))
+    );
+    if admin {
+        manage.push_str(&format!(
+            "<a href=\"{}\">Manage versions</a>",
             escape_html(&urls.app(&format!("/admin/packages/{}", enc_path(&lower))))
-        )
-    } else {
-        String::new()
-    };
+        ));
+    }
+    let manage = format!("<div class=\"acts\">{manage}</div>");
     let desc = if selected.description.trim().is_empty() {
         String::new()
     } else {
@@ -1521,7 +1707,7 @@ pub fn detail_page(
         icon = render_icon(urls, selected),
         id_breaks = id.replace('.', ".<wbr>"),
         fields = render_fields(selected),
-        tags = render_tags(&selected.tags),
+        tags = render_tags(urls, &selected.tags),
         links = render_links(selected),
         deps = render_dependencies(urls, selected),
         symbols = if has_symbols {
@@ -1815,7 +2001,8 @@ fn truncate_bytes(s: &str, max: usize) -> (&str, bool) {
 /// The most tags a package shows on a page.
 const MAX_RENDERED_TAGS: usize = 32;
 
-fn render_tags(tags: &[String]) -> String {
+/// A package's tags, each a link to the packages that share it.
+fn render_tags(urls: &UrlBuilder, tags: &[String]) -> String {
     if tags.is_empty() {
         return String::new();
     }
@@ -1823,7 +2010,11 @@ fn render_tags(tags: &[String]) -> String {
     // Tags are capped when a package is pushed; this bounds what rows stored
     // before that cap can put on a page.
     for t in tags.iter().take(MAX_RENDERED_TAGS) {
-        out.push_str(&format!("<span class=\"tag\">{}</span>", escape_html(t)));
+        out.push_str(&format!(
+            "<a class=\"tag\" href=\"{}\">{}</a>",
+            tag_href(urls, t),
+            escape_html(t)
+        ));
     }
     out.push_str("</div>");
     out
@@ -2718,9 +2909,19 @@ mod tests {
             true,
         );
         assert!(
-            managed.contains("<a class=\"manage\" href=\"/admin/packages/contoso.utils\">"),
+            managed.contains("<a href=\"/admin/packages/contoso.utils\">Manage versions</a>"),
             "{managed}"
         );
+        // The package file is linked for everyone, from the client endpoint.
+        for html in [&plain, &managed] {
+            assert!(
+                html.contains(
+                    "<a href=\"https://host/v3/package/contoso.utils/1.0.0/contoso.utils.1.0.0.nupkg\">\
+                     Download .nupkg</a>"
+                ),
+                "{html}"
+            );
+        }
         assert!(
             managed.contains("<a href=\"/admin\">Admin</a>"),
             "{managed}"
@@ -2736,6 +2937,111 @@ mod tests {
         );
         // With no admin key, the settings say how to get one.
         assert!(settings.contains("admin_api_key"), "{settings}");
+    }
+
+    #[test]
+    fn tags_link_to_a_filtered_gallery_that_every_page_keeps() {
+        let urls = UrlBuilder::new("https://host");
+        let mut page = page_of(&["A", "B"]);
+        page.groups[0].packages[0].tags = vec!["Logging".into(), "a&b<c".into()];
+        page.total_hits = 6;
+        // A row's tags link to the tag, lower-cased and escaped.
+        let html = gallery_page(&urls, &page, &view("", 0, 2));
+        assert!(
+            html.contains("<a class=\"tag\" href=\"/packages?tag=logging\">Logging</a>"),
+            "{html}"
+        );
+        assert!(
+            html.contains("<a class=\"tag\" href=\"/packages?tag=a%26b%3Cc\">a&amp;b&lt;c</a>"),
+            "{html}"
+        );
+
+        let tagged = GalleryView {
+            tag: Some("logging"),
+            ..view("", 2, 2)
+        };
+        let html = gallery_page(&urls, &page, &tagged);
+        assert!(
+            html.contains("<h1 class=\"title\">6 packages tagged \u{201c}logging\u{201d}</h1>"),
+            "{html}"
+        );
+        assert!(
+            html.contains(
+                "<title>Tagged \u{201c}logging\u{201d}, page 2 of 3 \u{2014} YANuget</title>"
+            ),
+            "{html}"
+        );
+        // Paging, the pager's forms and a new search all keep the tag…
+        assert!(html.contains("skip=4&amp;take=2&amp;tag=logging"), "{html}");
+        assert_eq!(
+            html.matches("<input type=\"hidden\" name=\"tag\" value=\"logging\">")
+                .count(),
+            3,
+            "{html}"
+        );
+        // …and clearing it keeps the rest.
+        assert!(
+            html.contains("<a href=\"/packages?q=&amp;skip=0&amp;take=2\">Clear the tag</a>"),
+            "{html}"
+        );
+
+        // A tag with no packages says so and offers the way back.
+        let none = gallery_page(&urls, &page_of(&[]), &tagged);
+        assert!(
+            none.contains("No packages tagged \u{201c}logging\u{201d}"),
+            "{none}"
+        );
+        assert!(!none.contains("Your feed is live"), "{none}");
+    }
+
+    #[test]
+    fn the_landing_page_offers_popular_tags_and_the_cloud_scales_with_use() {
+        let urls = UrlBuilder::new("https://host");
+        let counts = vec![
+            TagCount {
+                tag: "logging".into(),
+                packages: 40,
+            },
+            TagCount {
+                tag: "build".into(),
+                packages: 3,
+            },
+            TagCount {
+                tag: "zeta".into(),
+                packages: 1,
+            },
+        ];
+        let landing = gallery_page(
+            &urls,
+            &page_of(&["A", "B"]),
+            &GalleryView {
+                popular: &counts,
+                ..view("", 0, 20)
+            },
+        );
+        assert!(
+            landing.contains("<nav class=\"popular\" aria-label=\"Popular tags\">"),
+            "{landing}"
+        );
+        assert!(landing.contains("<a class=\"all\" href=\"/tags\">All tags</a>"));
+
+        let cloud = tags_page(&urls, &counts, false);
+        // Alphabetical, the most used largest, the least smallest, and every
+        // count written out rather than left to the size.
+        let at = |needle: &str| {
+            cloud
+                .find(needle)
+                .unwrap_or_else(|| panic!("{needle}: {cloud}"))
+        };
+        assert!(at(">build<") < at(">logging<") && at(">logging<") < at(">zeta<"));
+        assert!(cloud.contains("<a class=\"t5\" href=\"/packages?tag=logging\">logging</a>"));
+        assert!(cloud.contains("<a class=\"t1\" href=\"/packages?tag=zeta\">zeta</a>"));
+        assert!(cloud.contains("<span class=\"n\">40<span class=\"vh\"> packages</span></span>"));
+        assert!(cloud.contains("<span class=\"n\">1<span class=\"vh\"> package</span></span>"));
+        assert!(cloud.contains("<a href=\"/tags\" aria-current=\"page\">Tags</a>"));
+
+        let empty = tags_page(&urls, &[], false);
+        assert!(empty.contains("No tags yet"), "{empty}");
     }
 
     #[test]
@@ -2773,6 +3079,14 @@ mod tests {
         assert!(html.contains("value=\"delete\" class=\"danger\" data-confirm="));
         // No other feed to hand versions to: no copy or move.
         assert!(!html.contains("value=\"move\""), "{html}");
+        // Each servable version links to its package file.
+        assert!(
+            html.contains(
+                "<a class=\"btn\" href=\"https://host/v3/package/contoso.utils/2.0.0-beta/\
+                 contoso.utils.2.0.0-beta.nupkg\" aria-label=\"Download 2.0.0-beta\">Download</a>"
+            ),
+            "{html}"
+        );
 
         let html = admin_package_page(
             &urls,

@@ -294,7 +294,7 @@ A self-contained, dependency-free HTML gallery (no external assets, works
 offline) lives at `/`:
 
 * a searchable package list (search box in the header), sortable by downloads,
-  name or last update,
+  name or last update, and filterable by tag, with a tag cloud at `/tags`,
 * a per-package detail page with versions, dependencies, links, readme and the
   install command for Chocolatey / `dotnet` / `nuget.exe`,
 * a package's embedded icon, served from the feed itself — the bytes are

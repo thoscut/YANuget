@@ -31,6 +31,17 @@ expected to change incompatibly at any version.
   settings page says which setting turns it on.
 - The server's version is shown in every page's footer and on the settings
   page. The stats page's lists show each package's version.
+- The gallery filters by tag: every tag shown is a link to `/packages?tag=…`,
+  which narrows the list — and a search — to packages carrying it,
+  case-insensitively, and keeps the tag across paging, the page-size form and
+  a new search. `/tags` lists every tag of the feed's visible packages
+  alphabetically, set larger the more packages use it, with the count written
+  out; the landing page offers the twelve most used. Tags are indexed in a new
+  `package_tags` table, filled for existing databases once on startup.
+- A package page links its `.nupkg` ("Download .nupkg"), and the admin page
+  links each servable version's, both from the flat-container endpoint clients
+  restore from.
+- A feed can no longer be named `tags`.
 
 ### Changed
 

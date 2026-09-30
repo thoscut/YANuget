@@ -779,9 +779,9 @@ impl Config {
 /// Route path segments a feed may not shadow. A feed is mounted at `/{name}`,
 /// so a feed called `health` or `v3` would collide with (or mask) a real route.
 /// `_assets` is where the gallery's font is served, at the root.
-const RESERVED_FEED_NAMES: [&str; 11] = [
+const RESERVED_FEED_NAMES: [&str; 12] = [
     "health", "admin", "docs", "packages", "stats", "settings", "v3", "api", "download", "metrics",
-    "_assets",
+    "_assets", "tags",
 ];
 
 /// Validate a feed name: non-empty, made only of URL-path-safe characters (so it

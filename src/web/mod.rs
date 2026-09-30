@@ -663,6 +663,7 @@ fn feed_routes(state: AppState) -> Router {
             .route("/packages/{id}/{version}", get(package_detail_version))
             .route("/packages/{id}/{version}/icon", get(package_icon))
             .route("/stats", get(stats_page))
+            .route("/tags", get(tags_page))
             .route("/settings", get(settings_page))
             // Embedded, offline documentation site. `/docs` redirects to
             // `/docs/` so the site's relative links resolve.
@@ -1301,6 +1302,7 @@ async fn search(
         include_semver2: is_semver2_level(params.semver_level.as_deref()),
         package_type: params.package_type.filter(|s| !s.is_empty()),
         sort: Default::default(),
+        tag: None,
     };
     let page = state.db.search(state.feed(), &request).await?;
     // Link results into the hive matching the caller's semVerLevel, so a client
@@ -1504,6 +1506,20 @@ struct GalleryParams {
     /// `downloads` (the default), `name` or `updated`.
     #[serde(default)]
     sort: Option<String>,
+    /// Only packages with this tag.
+    #[serde(default)]
+    tag: Option<String>,
+}
+
+/// A `?tag=` value worth querying for: trimmed and lower-cased, or `None` for
+/// one no stored tag could equal (empty, too long, or with whitespace or
+/// control characters in it — tags are whitespace-separated when pushed).
+fn gallery_tag(raw: Option<&str>) -> Option<String> {
+    let tag = raw?.trim().to_lowercase();
+    let plausible = !tag.is_empty()
+        && tag.chars().count() <= crate::nuspec::MAX_TAG_CHARS
+        && !tag.chars().any(|c| c.is_whitespace() || c.is_control());
+    plausible.then_some(tag)
 }
 
 /// Parse an optional query value, treating an empty or malformed one as absent.
@@ -1538,6 +1554,7 @@ async fn gallery(
         .as_deref()
         .and_then(SearchSort::parse)
         .unwrap_or_default();
+    let tag = gallery_tag(params.tag.as_deref());
     let request = SearchRequest {
         query: query.clone(),
         skip: skip - skip % take,
@@ -1546,8 +1563,21 @@ async fn gallery(
         include_semver2: true,
         package_type: package_type.clone(),
         sort,
+        tag: tag.clone(),
     };
     let page = state.db.search(state.feed(), &request).await?;
+    // The landing page (no search, no filter, first page) offers a way in by
+    // tag; anywhere else it would be noise above results someone asked for.
+    let landing = query.trim().is_empty()
+        && tag.is_none()
+        && package_type.is_none()
+        && request.skip == 0
+        && !page.groups.is_empty();
+    let popular = if landing {
+        state.db.tag_counts(state.feed(), 12).await?
+    } else {
+        Vec::new()
+    };
     let urls = state.url_builder(&headers).with_hive(true);
     Ok(Html(ui::gallery_page(
         &urls,
@@ -1560,8 +1590,24 @@ async fn gallery(
             prerelease,
             package_type: package_type.as_deref(),
             sort,
+            tag: tag.as_deref(),
+            popular: &popular,
             admin: state.feed.admin.is_enabled(),
         },
+    )))
+}
+
+async fn tags_page(State(state): State<AppState>, headers: HeaderMap) -> Result<Html<String>> {
+    state.require_read(&headers)?;
+    let tags = state
+        .db
+        .tag_counts(state.feed(), ui::MAX_CLOUD_TAGS)
+        .await?;
+    let urls = state.url_builder(&headers);
+    Ok(Html(ui::tags_page(
+        &urls,
+        &tags,
+        state.feed.admin.is_enabled(),
     )))
 }
 

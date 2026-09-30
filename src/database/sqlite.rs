@@ -29,7 +29,7 @@ use crate::version::NuGetVersion;
 
 use super::{
     DatabaseStats, FeedVersion, Membership, PackageDatabase, SearchGroup, SearchPage,
-    SearchRequest, SearchSort, SymbolKey, SymbolRef,
+    SearchRequest, SearchSort, SymbolKey, SymbolRef, TagCount,
 };
 
 const SCHEMA: &str = r#"
@@ -105,7 +105,29 @@ CREATE TABLE IF NOT EXISTS symbols (
 );
 CREATE INDEX IF NOT EXISTS idx_symbols_owner
     ON symbols (lower_id, normalized_version);
+
+-- One row per (version, lower-cased tag): what the tag filter and the tag
+-- cloud read, as index lookups rather than a JSON scan of every package on
+-- every page view. `packages.tags` keeps the tags as pushed, for display.
+CREATE TABLE IF NOT EXISTS package_tags (
+    lower_id           TEXT NOT NULL,
+    normalized_version TEXT NOT NULL,
+    tag                TEXT NOT NULL,
+    PRIMARY KEY (lower_id, normalized_version, tag)
+);
+CREATE INDEX IF NOT EXISTS idx_package_tags_tag ON package_tags (tag, lower_id);
 "#;
+
+/// Fill `package_tags` for one version from its JSON tag array (`?3`),
+/// lower-cased. Tags are capped when a package is pushed; the `LIMIT`-like
+/// `key` and `substr` bounds apply the same caps to rows stored before that.
+macro_rules! insert_tags {
+    () => {
+        "INSERT OR IGNORE INTO package_tags (lower_id, normalized_version, tag) \
+         SELECT ?1, ?2, lower(substr(trim(je.value), 1, 64)) FROM json_each(?3) je \
+         WHERE trim(je.value) <> '' AND je.key < 64"
+    };
+}
 
 /// The feed-scoped projection: every `packages` column plus the membership's
 /// state aliased so it does not collide with the package's own template flags.
@@ -214,6 +236,22 @@ impl SqliteDatabase {
             .execute(&mut *tx)
             .await?;
             sqlx::query("PRAGMA user_version = 1")
+                .execute(&mut *tx)
+                .await?;
+        }
+        // Version 2: index the tags of every package stored before
+        // `package_tags` existed. Same transaction and `OR IGNORE`, so it is
+        // exactly-once and a no-op when re-run.
+        if schema_version < 2 {
+            sqlx::query(
+                "INSERT OR IGNORE INTO package_tags (lower_id, normalized_version, tag) \
+                 SELECT p.lower_id, p.normalized_version, lower(substr(trim(je.value), 1, 64)) \
+                 FROM packages p, json_each(p.tags) je \
+                 WHERE trim(je.value) <> '' AND je.key < 64",
+            )
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query("PRAGMA user_version = 2")
                 .execute(&mut *tx)
                 .await?;
         }
@@ -400,7 +438,16 @@ impl PackageDatabase for SqliteDatabase {
         .bind(json(&p.dependencies)?)
         .execute(&self.pool)
         .await?;
-        Ok(result.rows_affected() > 0)
+        let inserted = result.rows_affected() > 0;
+        if inserted {
+            sqlx::query(insert_tags!())
+                .bind(p.lower_id())
+                .bind(p.normalized_version())
+                .bind(json(&p.tags)?)
+                .execute(&self.pool)
+                .await?;
+        }
+        Ok(inserted)
     }
 
     async fn package_data_exists(&self, id: &str, version: &NuGetVersion) -> Result<bool> {
@@ -428,6 +475,11 @@ impl PackageDatabase for SqliteDatabase {
         let lower = id.to_lowercase();
         let normalized = version.normalized();
         sqlx::query("DELETE FROM feed_packages WHERE lower_id = ?1 AND normalized_version = ?2")
+            .bind(&lower)
+            .bind(&normalized)
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("DELETE FROM package_tags WHERE lower_id = ?1 AND normalized_version = ?2")
             .bind(&lower)
             .bind(&normalized)
             .execute(&self.pool)
@@ -672,6 +724,9 @@ impl PackageDatabase for SqliteDatabase {
         // declares the type. `json_each`/`json_extract` parse the stored JSON
         // so there is no quoting/escaping ambiguity.
         let package_type = request.package_type.as_deref().unwrap_or("").to_lowercase();
+        // An optional tag, matched exactly (case-insensitively) against the
+        // tag index: a package matches when any of its visible versions has it.
+        let tag = request.tag.as_deref().unwrap_or("").trim().to_lowercase();
 
         // Phase 1: pick the page of matching package ids, ranked by downloads.
         macro_rules! filter {
@@ -686,7 +741,11 @@ impl PackageDatabase for SqliteDatabase {
                       OR lower(IFNULL(p.title, '')) LIKE ?5 ESCAPE '\\') \
                  AND (?6 = '' OR EXISTS ( \
                       SELECT 1 FROM json_each(p.package_types) je \
-                      WHERE lower(json_extract(je.value, '$.name')) = ?6))"
+                      WHERE lower(json_extract(je.value, '$.name')) = ?6)) \
+                 AND (?7 = '' OR EXISTS ( \
+                      SELECT 1 FROM package_tags pt \
+                      WHERE pt.lower_id = p.lower_id \
+                        AND pt.normalized_version = p.normalized_version AND pt.tag = ?7))"
             };
         }
 
@@ -704,7 +763,7 @@ impl PackageDatabase for SqliteDatabase {
                     filter!(),
                     " GROUP BY p.lower_id ORDER BY ",
                     $order,
-                    " LIMIT ?7 OFFSET ?8"
+                    " LIMIT ?8 OFFSET ?9"
                 )
             };
         }
@@ -722,6 +781,7 @@ impl PackageDatabase for SqliteDatabase {
             .bind(&query)
             .bind(&pattern)
             .bind(&package_type)
+            .bind(&tag)
             .bind(request.take.max(0))
             .bind(request.skip.max(0))
             .fetch_all(&self.pool)
@@ -746,6 +806,7 @@ impl PackageDatabase for SqliteDatabase {
         .bind(&query)
         .bind(&pattern)
         .bind(&package_type)
+        .bind(&tag)
         .fetch_one(&self.pool)
         .await?;
 
@@ -883,6 +944,28 @@ impl PackageDatabase for SqliteDatabase {
         rows.iter()
             .map(|r| row_to_feed_package(r).map(|fv| fv.package))
             .collect()
+    }
+
+    async fn tag_counts(&self, feed: &str, limit: i64) -> Result<Vec<TagCount>> {
+        // The same visibility as search, so every tag listed leads somewhere.
+        let rows = sqlx::query(
+            "SELECT pt.tag AS tag, COUNT(DISTINCT pt.lower_id) AS packages \
+             FROM package_tags pt JOIN feed_packages fp \
+               ON fp.lower_id = pt.lower_id AND fp.normalized_version = pt.normalized_version \
+             WHERE fp.feed = ?1 AND fp.listed = 1 AND fp.enabled = 1 AND fp.pending = 0 \
+             GROUP BY pt.tag ORDER BY packages DESC, pt.tag ASC LIMIT ?2",
+        )
+        .bind(feed)
+        .bind(limit.max(0))
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .iter()
+            .map(|r| TagCount {
+                tag: r.get("tag"),
+                packages: r.get("packages"),
+            })
+            .collect())
     }
 
     async fn add_symbol(
@@ -1291,6 +1374,114 @@ mod tests {
         assert_eq!(listed.len(), 3);
         let with_unlisted = db.find_versions(FEED, "pkg", true).await.unwrap();
         assert_eq!(with_unlisted.len(), 4);
+    }
+
+    fn tagged(id: &str, version: &str, tags: &[&str]) -> Package {
+        let mut p = sample(id, version);
+        p.tags = tags.iter().map(|t| t.to_string()).collect();
+        p
+    }
+
+    #[tokio::test]
+    async fn the_tag_filter_and_counts_see_packages_not_versions() {
+        let db = SqliteDatabase::in_memory().await.unwrap();
+        db.add_to_feed(FEED, &tagged("Log.A", "1.0.0", &["Logging", "json"]))
+            .await
+            .unwrap();
+        db.add_to_feed(FEED, &tagged("Log.A", "1.1.0", &["logging"]))
+            .await
+            .unwrap();
+        db.add_to_feed(FEED, &tagged("Log.B", "2.0.0", &["LOGGING"]))
+            .await
+            .unwrap();
+        db.add_to_feed(FEED, &tagged("Other", "1.0.0", &["json"]))
+            .await
+            .unwrap();
+        // Another feed's tags are not this feed's.
+        db.add_to_feed("elsewhere", &tagged("Far", "1.0.0", &["logging", "far"]))
+            .await
+            .unwrap();
+
+        let by_tag = |tag: &str| SearchRequest {
+            tag: Some(tag.into()),
+            ..Default::default()
+        };
+        let page = db.search(FEED, &by_tag("Logging")).await.unwrap();
+        assert_eq!(page.total_hits, 2);
+        let ids: Vec<_> = page.groups.iter().map(|g| g.latest().id.clone()).collect();
+        assert!(ids.contains(&"Log.A".to_string()) && ids.contains(&"Log.B".to_string()));
+        assert_eq!(db.search(FEED, &by_tag("far")).await.unwrap().total_hits, 0);
+        // It narrows a search rather than replacing it.
+        let page = db
+            .search(
+                FEED,
+                &SearchRequest {
+                    query: "other".into(),
+                    tag: Some("json".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.total_hits, 1);
+
+        let counts = db.tag_counts(FEED, 10).await.unwrap();
+        assert_eq!(
+            counts,
+            vec![
+                TagCount {
+                    tag: "json".into(),
+                    packages: 2
+                },
+                TagCount {
+                    tag: "logging".into(),
+                    packages: 2
+                },
+            ]
+        );
+        assert_eq!(db.tag_counts(FEED, 1).await.unwrap().len(), 1);
+
+        // Deleting a version takes its tags with it.
+        let v = NuGetVersion::parse("2.0.0").unwrap();
+        db.delete_package_data("Log.B", &v).await.unwrap();
+        assert_eq!(
+            db.search(FEED, &by_tag("logging"))
+                .await
+                .unwrap()
+                .total_hits,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn tags_stored_before_the_index_are_indexed_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.db").to_string_lossy().into_owned();
+        {
+            let db = SqliteDatabase::connect(&path).await.unwrap();
+            db.add_to_feed(FEED, &tagged("Old.Pkg", "1.0.0", &["Legacy", "tools"]))
+                .await
+                .unwrap();
+            // As a database from before the tag index: no index rows, and the
+            // schema version it had then.
+            sqlx::query("DELETE FROM package_tags")
+                .execute(&db.pool)
+                .await
+                .unwrap();
+            sqlx::query("PRAGMA user_version = 1")
+                .execute(&db.pool)
+                .await
+                .unwrap();
+        }
+        let db = SqliteDatabase::connect(&path).await.unwrap();
+        let counts = db.tag_counts(FEED, 10).await.unwrap();
+        assert_eq!(counts.len(), 2, "{counts:?}");
+        assert!(counts.iter().any(|t| t.tag == "legacy"));
+        let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(version, 2);
     }
 
     #[tokio::test]

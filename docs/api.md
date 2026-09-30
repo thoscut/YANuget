@@ -217,7 +217,8 @@ debugger falls through to the next symbol source.
 
 ```
 GET /                                  # searchable package list
-GET /packages?q=&skip=&take=&sort=     # same, as a search page
+GET /packages?q=&skip=&take=&sort=&tag= # same, as a search page
+GET /tags                              # every tag, sized by how many packages use it
 GET /packages/{id}                     # detail for the newest version
 GET /packages/{id}/{version}           # detail for a specific version
 GET /packages/{id}/{version}/icon      # the package's embedded icon
@@ -229,8 +230,13 @@ Human-facing HTML (not part of the NuGet protocol). The header has a search box
 (submitting to `/packages?q=`). The list is sorted by `sort`: `downloads` (the
 default, the same ranking `/v3/search` gives clients), `name` (A to Z) or
 `updated` (the package whose newest version was published last comes first); an
-unknown value falls back to the default. Paging, the page-size form and a new
-search keep the chosen order. The detail page shows versions, dependencies,
+unknown value falls back to the default. `tag` narrows the list (and a search)
+to packages with that tag, case-insensitively; a value no tag could be — empty,
+over 64 characters, or containing whitespace — is ignored. Paging, the page-size
+form and a new search keep the chosen order and tag. Every tag shown links to
+its filtered list, and the landing page offers the most used ones. The detail
+page links the `.nupkg` itself (from the flat-container endpoint, so read auth,
+ranges and caching apply as for a client) and shows versions, dependencies,
 links, readme, symbol availability, and the install command for Chocolatey /
 `dotnet` / `nuget.exe` (ordered by `primary_client`). `/stats` shows feed totals
 (packages, versions, downloads, storage, symbol files) plus the most-downloaded

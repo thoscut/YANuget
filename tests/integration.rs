@@ -1075,6 +1075,38 @@ async fn the_gallery_sorts_by_downloads_name_and_last_update() {
 }
 
 #[tokio::test]
+async fn the_gallery_filters_by_tag_and_lists_every_tag() {
+    let server = spawn().await;
+    // Every test package is tagged `integration test`.
+    for id in ["Tag.One", "Tag.Two"] {
+        push_multipart(&server, API_KEY, build_nupkg(id, "1.0.0", b"x")).await;
+    }
+    let page = |q: &'static str| {
+        let url = server.url(q);
+        let client = server.client.clone();
+        async move { client.get(url).send().await.unwrap().text().await.unwrap() }
+    };
+    // Case does not matter; the heading names the tag.
+    let tagged = page("/packages?tag=INTEGRATION").await;
+    assert!(
+        tagged.contains("2 packages tagged \u{201c}integration\u{201d}"),
+        "{tagged}"
+    );
+    let none = page("/packages?tag=nothing-has-this").await;
+    assert!(none.contains("No packages tagged"), "{none}");
+    // A value no tag could be (it has a space) is no filter at all.
+    let all = page("/packages?tag=two%20words").await;
+    assert!(all.contains("2 packages<"), "{all}");
+
+    let cloud = page("/tags").await;
+    assert!(cloud.contains(">integration</a>"), "{cloud}");
+    assert!(cloud.contains("<span class=\"n\">2<span class=\"vh\"> packages</span></span>"));
+    // The landing page offers them too.
+    let landing = page("/").await;
+    assert!(landing.contains("aria-label=\"Popular tags\""), "{landing}");
+}
+
+#[tokio::test]
 async fn the_gallery_font_is_served_once_for_every_feed_and_cached() {
     let server = spawn_feeds(|c| c.feeds = vec![feed("stable"), feed("dev")]).await;
     let html = server

@@ -39,6 +39,17 @@ pub struct SearchRequest {
     pub package_type: Option<String>,
     /// The order of the page's package ids.
     pub sort: SearchSort,
+    /// Only packages carrying this tag (case-insensitive, exact).
+    pub tag: Option<String>,
+}
+
+/// How many packages of a feed carry one tag.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TagCount {
+    /// The tag, lower-cased.
+    pub tag: String,
+    /// Distinct package ids (not versions) with a visible version carrying it.
+    pub packages: i64,
 }
 
 impl Default for SearchRequest {
@@ -51,6 +62,7 @@ impl Default for SearchRequest {
             include_semver2: true,
             package_type: None,
             sort: SearchSort::default(),
+            tag: None,
         }
     }
 }
@@ -328,6 +340,10 @@ pub trait PackageDatabase: Send + Sync {
 
     /// The most recently published versions in `feed`, newest first.
     async fn recent_packages(&self, feed: &str, limit: i64) -> Result<Vec<Package>>;
+
+    /// The tags of `feed`'s visible (listed, enabled, approved) versions with
+    /// how many packages carry each, most used first, at most `limit`.
+    async fn tag_counts(&self, feed: &str, limit: i64) -> Result<Vec<TagCount>>;
 
     // --- symbols (global; keyed by SSQP signature) ---
 
