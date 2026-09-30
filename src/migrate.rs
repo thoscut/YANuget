@@ -546,7 +546,7 @@ impl Target<'_> {
                 }
             }
             // A concurrent run (or a non-overwriting policy) already has it.
-            Err(Error::PackageAlreadyExists)
+            Err(Error::PackageAlreadyExists | Error::VersionExists(_))
                 if self
                     .db
                     .exists(self.feed, &item.lower_id, &item.version)

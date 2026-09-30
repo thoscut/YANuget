@@ -1623,7 +1623,7 @@ impl MirrorTarget<'_> {
                 Fetched::Mirrored
             }
             // A concurrent fetch in another feed, or a push, got there first.
-            Err(Error::PackageAlreadyExists)
+            Err(Error::PackageAlreadyExists | Error::VersionExists(_))
                 if self
                     .db
                     .exists(feed, lower_id, version)

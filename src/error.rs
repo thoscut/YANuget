@@ -23,6 +23,12 @@ pub enum Error {
     #[error("package already exists")]
     PackageAlreadyExists,
 
+    /// A push named an id/version this feed cannot take, with why and what to
+    /// do instead. Same meaning as [`Error::PackageAlreadyExists`] to callers
+    /// that only need to know it is already there.
+    #[error("{0}")]
+    VersionExists(String),
+
     /// The uploaded package was malformed or could not be read.
     #[error("invalid package: {0}")]
     InvalidPackage(String),
@@ -91,7 +97,7 @@ impl Error {
     pub fn status(&self) -> StatusCode {
         match self {
             Error::PackageNotFound => StatusCode::NOT_FOUND,
-            Error::PackageAlreadyExists => StatusCode::CONFLICT,
+            Error::PackageAlreadyExists | Error::VersionExists(_) => StatusCode::CONFLICT,
             Error::InvalidPackage(_) => StatusCode::BAD_REQUEST,
             Error::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             Error::Unauthorized => StatusCode::UNAUTHORIZED,
@@ -131,8 +137,20 @@ impl IntoResponse for Error {
         // retries unauthenticated forever and `dotnet restore` fails outright —
         // even though the key it was given is correct.
         let challenge = matches!(self, Error::AdminUnauthorized | Error::Unauthorized);
+        let reason = status
+            .is_client_error()
+            .then(|| reason_phrase(&message))
+            .flatten();
         let body = Json(json!({ "error": message }));
         let mut response = (status, body).into_response();
+        // NuGet and Chocolatey print only the status line of a failed push —
+        // `409 (Conflict)` said nothing about why, or what to do. They print a
+        // server's own reason phrase in its place, as nuget.org uses it, so a
+        // client error carries its message there too (HTTP/1 only; HTTP/2 has
+        // no reason phrase). The JSON body is unchanged.
+        if let Some(reason) = reason {
+            response.extensions_mut().insert(reason);
+        }
         if challenge {
             let realm = if matches!(self, Error::AdminUnauthorized) {
                 "Basic realm=\"YANuget Admin\""
@@ -148,9 +166,54 @@ impl IntoResponse for Error {
     }
 }
 
+/// Longest reason phrase sent; clients print it on one line.
+const MAX_REASON: usize = 400;
+
+/// `message` as an HTTP/1 reason phrase: printable ASCII only (a CR or LF
+/// could otherwise end the status line early), anything else replaced, and
+/// cut to [`MAX_REASON`].
+fn reason_phrase(message: &str) -> Option<hyper::ext::ReasonPhrase> {
+    let mut text: String = message
+        .chars()
+        .map(|c| match c {
+            ' '..='~' => c,
+            '\u{2014}' | '\u{2013}' => '-',
+            '\u{201c}' | '\u{201d}' => '"',
+            '\u{2018}' | '\u{2019}' => '\'',
+            _ => '?',
+        })
+        .take(MAX_REASON)
+        .collect();
+    text = text.trim().to_string();
+    if text.is_empty() {
+        return None;
+    }
+    hyper::ext::ReasonPhrase::try_from(text).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_client_error_says_why_in_its_status_line() {
+        let response = Error::VersionExists("pkg 1.0.0 already exists".into()).into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let reason = response
+            .extensions()
+            .get::<hyper::ext::ReasonPhrase>()
+            .expect("a reason phrase");
+        assert_eq!(reason.as_bytes(), b"pkg 1.0.0 already exists");
+        // A server fault keeps its details to the log.
+        let fault = Error::Other(anyhow::anyhow!("/srv/secret/path")).into_response();
+        assert!(fault
+            .extensions()
+            .get::<hyper::ext::ReasonPhrase>()
+            .is_none());
+        // Nothing can end the status line early or smuggle a header.
+        let nasty = reason_phrase("a\r\nX-Evil: 1\u{2014}\u{e9}").unwrap();
+        assert_eq!(nasty.as_bytes(), b"a??X-Evil: 1-?");
+    }
 
     #[test]
     fn status_codes_map_as_expected() {

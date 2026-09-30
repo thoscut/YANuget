@@ -3,7 +3,7 @@
 //! version, and relisting it.
 
 use axum::extract::{FromRequest, Multipart, Path, Request, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use futures::StreamExt;
 
@@ -143,7 +143,7 @@ pub(super) async fn delete_package(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path((id, version)): Path<(String, String)>,
-) -> Result<StatusCode> {
+) -> Result<Response> {
     check_id(&id)?;
     if !state.feed.auth.check_headers(&headers) {
         return Err(Error::Unauthorized);
@@ -162,7 +162,7 @@ pub(super) async fn delete_package(
         )
         .await?;
         if removed {
-            Ok(StatusCode::NO_CONTENT)
+            Ok(StatusCode::NO_CONTENT.into_response())
         } else {
             Err(Error::PackageNotFound)
         }
@@ -172,11 +172,23 @@ pub(super) async fn delete_package(
             .db
             .set_listed(state.feed(), &id, &version, false)
             .await?;
-        if updated {
-            Ok(StatusCode::NO_CONTENT)
-        } else {
-            Err(Error::PackageNotFound)
+        if !updated {
+            return Err(Error::PackageNotFound);
         }
+        // The client reports "deleted successfully" either way, so say what
+        // actually happened: NuGet prints an `X-NuGet-Warning` as a warning.
+        // Without it, "deleted" read as gone — and the next push of a fixed
+        // build under the same version was refused with a bare 409.
+        let warning = format!(
+            "{id} {v} was unlisted, not deleted: it can still be downloaded, and pushing {v} \
+             again is refused. With hard_delete_enabled, a delete removes it for good.",
+            v = version.normalized()
+        );
+        let mut response = StatusCode::NO_CONTENT.into_response();
+        if let Ok(value) = HeaderValue::from_str(&warning) {
+            response.headers_mut().insert("x-nuget-warning", value);
+        }
+        Ok(response)
     }
 }
 

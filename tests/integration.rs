@@ -4560,6 +4560,49 @@ async fn a_refused_overwrite_leaves_the_version_in_its_feed() {
 }
 
 #[tokio::test]
+async fn a_delete_that_only_unlists_says_so_and_a_refused_push_says_why() {
+    // The default feed: a delete unlists, overwrites are off.
+    let server = spawn().await;
+    let nupkg = build_nupkg("Fixed.Pkg", "11.3.0", b"first build");
+    push_multipart(&server, API_KEY, nupkg).await;
+
+    let deleted = server
+        .client
+        .delete(server.url("/api/v2/package/Fixed.Pkg/11.3.0"))
+        .header("X-NuGet-ApiKey", API_KEY)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(deleted.status(), reqwest::StatusCode::NO_CONTENT);
+    let warning = deleted.headers()["x-nuget-warning"].to_str().unwrap();
+    assert!(warning.contains("was unlisted, not deleted"), "{warning}");
+
+    // The corrected build under the same version: refused, and the status
+    // line — all NuGet and Chocolatey print — says what and why.
+    let refused = push_multipart(
+        &server,
+        API_KEY,
+        build_nupkg("Fixed.Pkg", "11.3.0", b"fixed"),
+    )
+    .await;
+    assert_eq!(refused.status(), reqwest::StatusCode::CONFLICT);
+    let reason = refused
+        .extensions()
+        .get::<hyper::ext::ReasonPhrase>()
+        .map(|r| String::from_utf8_lossy(r.as_bytes()).into_owned())
+        .expect("a reason phrase");
+    assert!(
+        reason.starts_with("Fixed.Pkg 11.3.0 already exists in this feed (unlisted"),
+        "{reason}"
+    );
+    assert!(reason.contains("allow_overwrite = false"), "{reason}");
+    assert!(
+        reason.contains("Push it as a new version, such as 11.3.0."),
+        "{reason}"
+    );
+}
+
+#[tokio::test]
 async fn downloads_resume_safely_and_count_once() {
     let server = spawn().await;
     push_multipart(

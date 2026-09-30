@@ -233,6 +233,18 @@ lenient:
 - The web layer and the SQLite backend are split into modules by concern
   (`src/web/{protocol,publish,gallery,admin,…}.rs`, `src/web/ui/`,
   `src/database/sqlite/`), with no change in behaviour.
+- A refused request now says why in its status line, where NuGet and
+  Chocolatey print it: every client error's message is also sent as the HTTP/1
+  reason phrase (printable ASCII, capped). A push of an id/version the feed
+  already holds says what state it is in (unlisted, disabled, pending), which
+  setting refuses the overwrite, and what to do instead, e.g. `409
+  (octave.install 11.3.0 already exists in this feed (unlisted - which is all
+  a delete does while hard_delete_enabled is off - and still downloadable),
+  and overwriting is off (allow_overwrite = false). Push it as a new version,
+  such as 11.3.0.20260930. Or delete it for good first.)` instead of `409
+  (Conflict)`.
+- A `DELETE` that only unlists (without `hard_delete_enabled`) says so in an
+  `X-NuGet-Warning` header, since the client reports "deleted" either way.
 
 ### Removed
 
