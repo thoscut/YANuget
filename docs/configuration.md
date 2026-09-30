@@ -63,17 +63,32 @@ parallel, and behind corporate NAT or a CI egress gateway every developer shares
 one bucket. NuGet also treats `429` as terminal — it neither retries nor honours
 `Retry-After` — so being throttled mid-restore fails the build outright. The
 default is far above anything legitimate while still bounding online API-key
-guessing. The client IP is taken from `X-Forwarded-For` /
-`X-Real-IP` **when the connection peer is a trusted proxy** (see
-[Trusted proxies](#trusted-proxies)) and otherwise the peer address; requests
-with no determinable IP are not throttled. For very high read volume, raise the
-limit or disable it and rely on a reverse proxy.
+guessing. The client IP is the connection's peer address, unless that peer is
+a trusted proxy (see [Trusted proxies](#trusted-proxies)): then
+`X-Forwarded-For` is read **from the right**, skipping every hop that is itself
+a trusted proxy, and the first address nobody vouched for is the client. The
+leftmost entry is whatever the client sent — nginx's usual
+`$proxy_add_x_forwarded_for` keeps it — so it never chooses the bucket.
+`X-Real-IP` is used only when there is no `X-Forwarded-For`. IPv6 clients are
+counted per /64, since that is what one subscriber is routinely handed.
+Requests with no determinable IP are not throttled. For very high read
+volume, raise the limit or disable it and rely on a reverse proxy.
+
+Failed authentication has a separate, much smaller budget: a `401` to a
+request that carried a credential (`X-NuGet-ApiKey` or `Authorization`) counts
+against `max_failed_auth`, and once that is spent the client's credentialed
+requests are answered `429` until the window rolls over. A `401` to a request
+*without* credentials is the challenge a NuGet client waits for before it
+sends its key, and is not counted. YANuget also warns at startup about any
+push, read or admin key shorter than 32 characters: the limiter bounds online
+guessing, a long random key makes it pointless.
 
 | TOML key | Env var | Type | Default | Description |
 | --- | --- | --- | --- | --- |
 | `rate_limit.enabled` | `YANUGET_RATELIMIT_ENABLED` | bool | `true` | Master switch. |
 | `rate_limit.max_requests` | `YANUGET_RATELIMIT_MAX_REQUESTS` | int | `10000` | Max requests per IP per window (min 1). |
 | `rate_limit.window_secs` | `YANUGET_RATELIMIT_WINDOW_SECS` | int | `60` | Window length in seconds (min 1; `0` is refused at startup, since it would never limit anything). |
+| `rate_limit.max_failed_auth` | `YANUGET_RATELIMIT_MAX_FAILED_AUTH` | int | `30` | Failed authentications per IP per window before credentialed requests get `429`; `0` turns this budget off. |
 
 ## Trusted proxies
 

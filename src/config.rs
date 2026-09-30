@@ -464,6 +464,17 @@ pub struct RateLimitConfig {
     pub max_requests: u32,
     /// Window length in seconds.
     pub window_secs: u64,
+    /// Failed authentications per client per window: responses of `401` to
+    /// requests that carried a credential. Once spent, further credentialed
+    /// requests from that client get `429` until the window rolls over. `0`
+    /// turns this budget off.
+    ///
+    /// Much smaller than `max_requests`, because it only has to clear
+    /// mistakes: a restore that sends the right key never fails, and one that
+    /// sends the wrong key fails on its first request anyway. A `401` to a
+    /// request without credentials — the challenge a NuGet client waits for
+    /// before sending its key — is not counted.
+    pub max_failed_auth: u32,
 }
 
 impl Default for RateLimitConfig {
@@ -472,6 +483,7 @@ impl Default for RateLimitConfig {
             enabled: true,
             max_requests: 10_000,
             window_secs: 60,
+            max_failed_auth: 30,
         }
     }
 }
@@ -720,6 +732,10 @@ impl Config {
         }
         if let Some(v) = get("YANUGET_RATELIMIT_WINDOW_SECS")? {
             self.rate_limit.window_secs = parse_env_int("YANUGET_RATELIMIT_WINDOW_SECS", &v)?;
+        }
+        if let Some(v) = get("YANUGET_RATELIMIT_MAX_FAILED_AUTH")? {
+            self.rate_limit.max_failed_auth =
+                parse_env_int("YANUGET_RATELIMIT_MAX_FAILED_AUTH", &v)?;
         }
         if let Some(b) = bool_var("YANUGET_FILES_ENABLED")? {
             self.files.enabled = b;

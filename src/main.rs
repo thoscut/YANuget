@@ -103,6 +103,7 @@ async fn run_server(config_path: Option<&str>) -> anyhow::Result<()> {
                 "no API key configured — package push and delete are UNAUTHENTICATED for this feed"
             );
         }
+        warn_short_keys(feed);
     }
     if config.max_package_size_bytes.is_none() {
         tracing::info!("package size limit: unlimited (uploads stream to disk)");
@@ -220,6 +221,33 @@ async fn run_server(config_path: Option<&str>) -> anyhow::Result<()> {
         .await?;
     }
     Ok(())
+}
+
+/// Keys shorter than this are guessable online at the rate limiter's pace.
+const MIN_KEY_CHARS: usize = 32;
+
+/// Warn about each short key a feed accepts, naming its role but never the key.
+///
+/// The rate limiter bounds guessing, it does not prevent it: at the default
+/// failed-authentication budget a client still gets tens of thousands of
+/// guesses a day. A key of 32 random characters makes that irrelevant; a
+/// memorable word does not.
+fn warn_short_keys(feed: &yanuget::config::ResolvedFeed) {
+    let short = |k: &str| k.chars().count() < MIN_KEY_CHARS;
+    let roles = [
+        ("push", feed.api_keys.iter().any(|k| short(k))),
+        ("read", feed.read_api_key.as_deref().is_some_and(short)),
+        ("admin", feed.admin_api_key.as_deref().is_some_and(short)),
+    ];
+    for (role, is_short) in roles {
+        if is_short {
+            tracing::warn!(
+                feed = %feed.name,
+                role,
+                "a {role} key is shorter than {MIN_KEY_CHARS} characters; use a long random one"
+            );
+        }
+    }
 }
 
 /// The block printed on startup: where the server is, what it is serving, and

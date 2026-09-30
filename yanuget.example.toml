@@ -131,13 +131,17 @@ cors_allowed_origins = []
 # honours Retry-After — so being throttled mid-restore fails the build. The
 # default is far above anything legitimate while still bounding key guessing.
 #
-# The client IP is taken from X-Forwarded-For / X-Real-IP when the peer is a
-# trusted proxy (see trusted_proxies above) and otherwise the peer address.
+# The client IP is the peer address or, when the peer is a trusted proxy (see
+# trusted_proxies above), the rightmost X-Forwarded-For hop that is not itself
+# a trusted proxy. IPv6 clients are counted per /64.
 # ---------------------------------------------------------------------------
 [rate_limit]
 enabled = true                # YANUGET_RATELIMIT_ENABLED
 max_requests = 10000          # YANUGET_RATELIMIT_MAX_REQUESTS — per IP per window
 window_secs = 60              # YANUGET_RATELIMIT_WINDOW_SECS — at least 1
+# Failed authentications (401s to requests that carried a key) per IP per
+# window; once spent, that client's credentialed requests get 429. 0 = off.
+max_failed_auth = 30          # YANUGET_RATELIMIT_MAX_FAILED_AUTH
 
 # ---------------------------------------------------------------------------
 # Package retention — automatic pruning of old versions.

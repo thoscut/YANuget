@@ -203,7 +203,11 @@ impl AppState {
         let root = if let Some(base) = &self.config.base_url {
             base.clone()
         } else {
+            // Only a scheme a client can actually fetch from. Anything else
+            // would be pasted into every absolute URL handed out.
             let scheme = forwarded(headers, "x-forwarded-proto")
+                .map(|s| s.to_ascii_lowercase())
+                .filter(|s| s == "http" || s == "https")
                 .unwrap_or_else(|| self.config.scheme().to_string());
             let host = forwarded(headers, "x-forwarded-host")
                 .or_else(|| {
@@ -477,9 +481,15 @@ fn apply_global_layers(router: Router, layers: GlobalLayers) -> Router {
     // Added before HSTS so it stays inner: short-circuits abusive callers, and
     // its 429 response still flows out through the HSTS layer below.
     if let Some(cfg) = layers.rate_limit.filter(|c| c.enabled) {
-        let limiter = RateLimiter::new(cfg.max_requests, Duration::from_secs(cfg.window_secs));
+        let window = Duration::from_secs(cfg.window_secs);
+        let throttle = ratelimit::Throttle {
+            requests: RateLimiter::new(cfg.max_requests, window),
+            auth_failures: (cfg.max_failed_auth > 0)
+                .then(|| RateLimiter::new(cfg.max_failed_auth, window)),
+            trusted: layers.trusted_proxies.clone(),
+        };
         router = router.layer(axum::middleware::from_fn_with_state(
-            limiter,
+            throttle,
             ratelimit::enforce,
         ));
     }
