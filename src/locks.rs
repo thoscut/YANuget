@@ -67,6 +67,27 @@ pub fn try_lock_version(id: &str, normalized_version: &str) -> Option<OwnedMutex
     mutex_for(id, normalized_version).try_lock_owned().ok()
 }
 
+/// Acquire the lock for one symbol file, addressed by its SSQP `key` and file
+/// name. Symbols are stored globally, so two symbol pushes for *different*
+/// versions can still race for the same key; this serializes the check of who
+/// owns it with the write that claims it.
+pub async fn lock_symbol(key: &str, filename: &str) -> OwnedMutexGuard<()> {
+    // `:` cannot occur in a package id, so these never collide with versions.
+    let key = format!(
+        "symbol:{}/{}",
+        key.to_ascii_uppercase(),
+        filename.to_ascii_lowercase()
+    );
+    // The registry guard must be gone before the await (it is not `Send`).
+    let mutex = {
+        let mut reg = registry()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        acquire(&mut reg, key)
+    };
+    mutex.lock_owned().await
+}
+
 fn mutex_for(id: &str, normalized_version: &str) -> Arc<AsyncMutex<()>> {
     let key = format!(
         "{}/{}",

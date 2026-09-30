@@ -1213,20 +1213,17 @@ impl PackageDatabase for SqliteDatabase {
         filename: &str,
         id: &str,
         version: &NuGetVersion,
-    ) -> Result<()> {
-        sqlx::query(
-            // The `WHERE` is what keeps a symbol key attached to the package
-            // that first claimed it. Both halves of the key are chosen by the
-            // uploader, so without it any push credential could repoint another
-            // package's — or another feed's — symbols at itself. A package may
-            // still update its own key, which is what re-pushing a `.snupkg`
-            // does; a different package's attempt becomes a no-op here.
+    ) -> Result<bool> {
+        let result = sqlx::query(
+            // A claim, not an upsert: the first version to record a key keeps
+            // it. Both halves of the key are chosen by the uploader, so letting
+            // a later push repoint the row — even one for the same package id,
+            // from another feed or version — would let it take over what a
+            // debugger is served. The symbol pipeline decides what an existing
+            // claim means; this statement only reports whether it made one.
             r#"INSERT INTO symbols (ssqp_key, filename, lower_id, normalized_version)
                VALUES (?1, ?2, ?3, ?4)
-               ON CONFLICT(ssqp_key, filename) DO UPDATE SET
-                   lower_id = excluded.lower_id,
-                   normalized_version = excluded.normalized_version
-               WHERE symbols.lower_id = excluded.lower_id"#,
+               ON CONFLICT(ssqp_key, filename) DO NOTHING"#,
         )
         .bind(key.to_uppercase())
         .bind(filename.to_lowercase())
@@ -1234,6 +1231,15 @@ impl PackageDatabase for SqliteDatabase {
         .bind(version.normalized())
         .execute(&self.pool)
         .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    async fn delete_symbol(&self, key: &str, filename: &str) -> Result<()> {
+        sqlx::query("DELETE FROM symbols WHERE ssqp_key = ?1 AND filename = ?2")
+            .bind(key.to_uppercase())
+            .bind(filename.to_lowercase())
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -2039,9 +2045,17 @@ mod tests {
         db.add_to_feed(FEED, &sample("Sym", "1.0.0")).await.unwrap();
         let v = NuGetVersion::parse("1.0.0").unwrap();
 
-        db.add_symbol("ABCDEF01FFFFFFFF", "sym.pdb", "Sym", &v)
+        assert!(db
+            .add_symbol("ABCDEF01FFFFFFFF", "sym.pdb", "Sym", &v)
             .await
-            .unwrap();
+            .unwrap());
+        // A claim is made once: a second one, even for the same package from
+        // another version, neither succeeds nor moves the row.
+        let other = NuGetVersion::parse("2.0.0").unwrap();
+        assert!(!db
+            .add_symbol("abcdef01ffffffff", "SYM.pdb", "sym", &other)
+            .await
+            .unwrap());
         // Lookup is case-insensitive on the key.
         let found = db.find_symbol("abcdef01ffffffff", "sym.pdb").await.unwrap();
         let found = found.unwrap();
@@ -2059,6 +2073,12 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+
+        // A single mapping can be released, which makes the key claimable.
+        assert!(db.add_symbol("K", "a.pdb", "Sym", &v).await.unwrap());
+        db.delete_symbol("k", "A.pdb").await.unwrap();
+        assert!(db.find_symbol("K", "a.pdb").await.unwrap().is_none());
+        assert!(db.add_symbol("K", "a.pdb", "Sym", &other).await.unwrap());
     }
 
     #[tokio::test]

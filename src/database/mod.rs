@@ -448,15 +448,21 @@ pub trait PackageDatabase: Send + Sync {
 
     // --- symbols (global; keyed by SSQP signature) ---
 
-    /// Record a symbol-file mapping: its SSQP `key`/`filename` and the owning
-    /// package version (for cleanup on delete/retention).
+    /// Claim a symbol-file mapping: its SSQP `key`/`filename` and the owning
+    /// package version (for serving and for cleanup on delete/retention).
+    /// Returns `true` when this call created it. An existing mapping is never
+    /// changed — a key belongs to whichever version claimed it first — so
+    /// `false` means someone else holds it.
     async fn add_symbol(
         &self,
         key: &str,
         filename: &str,
         id: &str,
         version: &NuGetVersion,
-    ) -> Result<()>;
+    ) -> Result<bool>;
+
+    /// Remove one symbol-file mapping (undoing a claim whose push failed).
+    async fn delete_symbol(&self, key: &str, filename: &str) -> Result<()>;
 
     /// Resolve a symbol file by its SSQP key and filename, returning the owning
     /// package's lower-cased id and normalized version when present.

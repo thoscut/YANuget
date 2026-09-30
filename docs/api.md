@@ -223,6 +223,20 @@ Each PDB is extracted to disk rather than into memory; a PDB over 256 MiB, or
 PDBs totalling over 512 MiB, or more than 512 of them, refuse the push with a
 `400` (never a truncated PDB).
 
+As on nuget.org, every Portable PDB must belong to an assembly of the owning
+version's stored `.nupkg`: the `.dll` or `.exe` of the same name in the same
+folder (`lib/net8.0/Foo.pdb` → `lib/net8.0/Foo.dll`) must carry a CodeView
+debug entry with the PDB's id and a `PdbChecksum` entry matching the PDB's hash.
+Any compiler since Visual Studio 15.9 / the .NET Core 2.1 SDK writes both, so
+`dotnet pack --include-symbols -p:SymbolPackageFormat=snupkg` output passes
+unchanged; symbols for older assemblies, or for assemblies the package does not
+contain, are refused with a `400`. A symbol key is claimed once: the first
+version to store it owns it, a re-push of the same bytes is a no-op, and a push
+that would give the key to another package or replace its bytes is refused. The
+push is all-or-nothing — one refused PDB stores none of them — and it holds the
+owning version's lock, so it cannot interleave with a delete or overwrite of that
+version.
+
 ```
 GET /download/symbols/{file}/{key}/{file}
 ```

@@ -24,7 +24,8 @@ src/
 ├── policy.rs         Offline license allow/deny evaluation (pure)
 ├── mirror.rs         Upstream read-through mirroring (V3 feed → local feed)
 ├── migrate.rs        `yanuget migrate`: bulk import of a whole source server
-├── pdb.rs            Portable PDB parsing → SSQP symbol key
+├── pdb.rs            Portable PDB parsing → SSQP symbol key, PDB checksum
+├── pe.rs             PE debug-directory reader (ties a PDB to its assembly)
 ├── symbols.rs        `.snupkg` ingest: extract PDBs, index by symbol key
 ├── ratelimit.rs      Per-client-IP fixed-window throttle
 ├── proxy.rs          Trusted-proxy gate for `X-Forwarded-*` / `Forwarded`

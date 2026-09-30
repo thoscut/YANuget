@@ -265,6 +265,43 @@ mod tests {
     }
 
     #[test]
+    fn reads_the_whole_id_and_where_it_is() {
+        let mut pdb = make_portable_pdb(&[5u8; 16]);
+        let at = pdb.len() - 4;
+        pdb[at..].copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
+        let id = read_pdb_id(&mut std::io::Cursor::new(&pdb))
+            .unwrap()
+            .unwrap();
+        assert_eq!(id.guid, [5u8; 16]);
+        assert_eq!(id.stamp, 0xDEAD_BEEF);
+        assert_eq!(id.offset as usize, pdb.len() - 20);
+    }
+
+    /// The checksum an assembly records is over the PDB with its id zeroed —
+    /// the id is derived from the content, so it cannot be part of its hash.
+    #[test]
+    fn checksum_zeroes_the_id() {
+        let mut pdb = make_portable_pdb(&[5u8; 16]);
+        pdb.extend_from_slice(&[0xAB; 100_000]); // spans several read chunks
+        let mut cursor = std::io::Cursor::new(&pdb);
+        let id = read_pdb_id(&mut cursor).unwrap().unwrap();
+        let sum = pdb_checksum(&mut cursor, &id, "SHA256").unwrap().unwrap();
+
+        let mut zeroed = pdb.clone();
+        let at = id.offset as usize;
+        zeroed[at..at + 20].fill(0);
+        assert_eq!(sum, sha2::Sha256::digest(&zeroed).to_vec());
+        assert_eq!(
+            pdb_checksum(&mut cursor, &id, "SHA512")
+                .unwrap()
+                .unwrap()
+                .len(),
+            64
+        );
+        assert!(pdb_checksum(&mut cursor, &id, "MD5").unwrap().is_none());
+    }
+
+    #[test]
     fn rejects_non_portable_pdb() {
         assert!(portable_pdb_signature(b"Microsoft C/C++ MSF 7.00\r\n").is_none());
         assert!(portable_pdb_signature(b"").is_none());
