@@ -434,9 +434,11 @@ requires_approval = true        # versions are pending until approved
 A feed with `[feeds.mirror] enabled = true` becomes a read-through cache:
 on a request for a package it does not have, YANuget fetches that package's
 versions from the upstream V3 feed (default `https://api.nuget.org/v3/index.json`),
-streams each `.nupkg` to disk and indexes it locally. Mirrored versions honour
-the feed's `requires_approval` gate and `license_policy`. Mirroring is
-best-effort: an upstream outage degrades to a normal cache miss.
+streams each `.nupkg` to disk and indexes it locally, and re-lists it every
+`refresh_secs` so new upstream releases appear. Mirrored versions honour
+the feed's `requires_approval` gate and `license_policy`, and a version deleted
+from the feed is not fetched back. Mirroring is best-effort: an upstream outage
+degrades to a normal cache miss.
 
 ### Bulk migration
 
@@ -452,10 +454,15 @@ ETA and transfer rate:
 # Import every package from a source server into the "default" feed.
 yanuget migrate --source https://old-server/v3/index.json --feed default
 
-# Authenticated source, more parallelism, stable versions only.
+# Authenticated source, more parallelism, stable versions only. The password
+# comes from the environment, not the command line, where `ps` shows it.
+export YANUGET_SOURCE_PASSWORD="$TOKEN"
 yanuget migrate --source https://old-server/v3/index.json \
-  --source-username ci --source-password "$TOKEN" \
-  --concurrency 8 --skip-prerelease
+  --source-username ci --concurrency 8 --skip-prerelease
+
+# Or from a file, e.g. a mounted secret.
+yanuget migrate --source https://old-server/v3/index.json \
+  --source-token-file /run/secrets/nuget-token
 
 # See what would be copied without downloading anything.
 yanuget migrate --source https://old-server/v3/index.json --dry-run
@@ -463,8 +470,13 @@ yanuget migrate --source https://old-server/v3/index.json --dry-run
 
 Versions already present in the target feed are skipped, so a migration is
 **idempotent and resumable** — re-run it to pick up only what is missing.
-Source credentials accept `--source-username`/`--source-password` (Basic),
-`--source-token` (Bearer) or repeated `--source-header "Name: Value"`.
+Source credentials accept a username and password (Basic), a token (Bearer) or
+repeated `Name: Value` headers. Pass the secrets through `YANUGET_SOURCE_PASSWORD`,
+`YANUGET_SOURCE_TOKEN` and `YANUGET_SOURCE_HEADERS`, or `--source-password-file`
+and `--source-token-file`, rather than as arguments: anything on the command
+line is visible to other users in `ps` and stays in shell history, and
+`"$TOKEN"` does not help — the shell expands it into the argument list. See
+[Bulk migration](docs/migrate.md).
 
 ### Offline license policy
 

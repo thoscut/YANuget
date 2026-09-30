@@ -14,8 +14,11 @@ see [Large packages](large-packages.md).
 | `cargo install yanuget` | ❌ (placeholder page) | Trying it out, custom builds |
 | `cargo build --release` | Only if you ran `mkdocs build` first | Development |
 
-The binary has no runtime dependencies beyond a C runtime and CA certificates
-(the latter only if you enable mirroring or migration).
+The binary has no runtime dependencies beyond a C runtime. For mirroring and
+migration it trusts the Mozilla root certificates built into it *and* the
+system's CA store when there is one, so an upstream behind an internal CA or a
+TLS-inspecting proxy works once that CA is in the system store — or named in
+the feed's `mirror.ca_cert_path` (`--source-ca-cert` for `migrate`).
 
 ## Minimum viable production setup
 
@@ -258,7 +261,6 @@ to roll back the database.
 - **Mirroring** makes your server fetch from an upstream and republish under
   your own name. Review the upstream, and prefer a feed dedicated to it over
   mirroring into the feed your own packages live in. To pull a mirrored version
-  (one found to be malicious, say), **disable it in `/admin` rather than
-  deleting it**: the next read of that package fetches a deleted version from
-  the upstream again, while a disabled one stays withheld. See
-  [Feeds](configuration.md#feeds).
+  (one found to be malicious, say), delete or disable it in `/admin`: a
+  deleted version is recorded, and the mirror never fetches it back (pushing
+  it again undoes that). See [Feeds](configuration.md#feeds).

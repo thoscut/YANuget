@@ -287,9 +287,10 @@ impl Default for LicensePolicyConfig {
 }
 
 /// Authentication for an upstream mirror. All fields are optional; set the
-/// `username`/`password` pair for HTTP Basic, `token` for a Bearer token, and/or
-/// `headers` for arbitrary custom headers (e.g. a private-feed API key). When
-/// more than one is set they are all sent.
+/// `username`/`password` pair for HTTP Basic *or* `token` for a Bearer token,
+/// and/or `headers` for arbitrary custom headers (e.g. a private-feed API key).
+/// Headers are sent alongside either. They go only to the upstream's own
+/// scheme, host and port, never to hosts its service index names.
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MirrorAuthConfig {
@@ -308,18 +309,60 @@ impl MirrorAuthConfig {
     pub fn is_set(&self) -> bool {
         self.username.is_some() || self.token.is_some() || !self.headers.is_empty()
     }
+
+    /// Reject combinations that cannot all be sent. Basic and Bearer both
+    /// need `Authorization`, and one of them used to be dropped without a
+    /// word — so a token the operator believed was in use never was.
+    pub fn validate(&self) -> Result<()> {
+        if self.username.is_some() && self.token.is_some() {
+            return Err(Error::BadRequest(
+                "mirror auth sets both username (HTTP Basic) and token (Bearer); \
+                 both need the Authorization header, so set only one"
+                    .into(),
+            ));
+        }
+        if self.password.is_some() && self.username.is_none() {
+            return Err(Error::BadRequest(
+                "mirror auth sets a password without a username".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Debug for MirrorAuthConfig {
+    /// Secrets are shown only as present; custom headers by name only, since
+    /// their values are keys.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let redacted = |v: &Option<String>| v.as_ref().map(|_| "<redacted>");
+        f.debug_struct("MirrorAuthConfig")
+            .field("username", &self.username)
+            .field("password", &redacted(&self.password))
+            .field("token", &redacted(&self.token))
+            .field("headers", &self.headers.keys().collect::<Vec<_>>())
+            .finish()
+    }
 }
 
 /// Per-feed upstream mirroring (read-through caching of a public NuGet feed).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MirrorConfig {
     /// Master switch. Off by default.
     pub enabled: bool,
     /// Upstream V3 service index to mirror from.
     pub upstream: String,
-    /// Per-request timeout (seconds) when talking to the upstream.
+    /// Timeout (seconds) for connecting to the upstream, for any silence while
+    /// it answers, and for a whole metadata request.
     pub timeout_secs: u64,
+    /// Deadline (seconds) for one whole `.nupkg` download; `0` removes it. A
+    /// stalled transfer is cut off by `timeout_secs` either way; this bounds
+    /// one that trickles.
+    pub download_timeout_secs: u64,
+    /// How long (seconds) a package's upstream version list is trusted before
+    /// a read lists it again, so new upstream releases appear. It is also how
+    /// long an id the upstream does not have is not asked for again.
+    pub refresh_secs: u64,
     /// Credentials for an authenticated upstream feed (default: none).
     pub auth: MirrorAuthConfig,
     /// Allow upstream URLs that point at loopback/link-local/private addresses.
@@ -338,6 +381,42 @@ pub struct MirrorConfig {
     /// have hundreds of versions and tens of gigabytes behind it; without a
     /// bound one anonymous request for it pulls the lot.
     pub max_versions_per_package: Option<usize>,
+    /// Outbound proxy for upstream requests (`http://proxy:3128`). Unset, the
+    /// mirror connects directly and ignores `HTTP(S)_PROXY` in the environment.
+    pub proxy: Option<String>,
+    /// PEM file of extra CA certificates to trust for the upstream, on top of
+    /// the system store and the bundled Mozilla roots — for an upstream behind
+    /// an internal CA or a TLS-inspecting proxy.
+    pub ca_cert_path: Option<PathBuf>,
+}
+
+impl MirrorConfig {
+    /// Reject a mirror configuration that cannot work as written.
+    pub fn validate(&self) -> Result<()> {
+        self.auth.validate()
+    }
+}
+
+impl std::fmt::Debug for MirrorConfig {
+    /// The upstream and proxy URLs can carry credentials of their own
+    /// (`https://user:token@host/…`), so they are shown without userinfo or
+    /// query.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let redact = crate::mirror::redact_url;
+        f.debug_struct("MirrorConfig")
+            .field("enabled", &self.enabled)
+            .field("upstream", &redact(&self.upstream))
+            .field("timeout_secs", &self.timeout_secs)
+            .field("download_timeout_secs", &self.download_timeout_secs)
+            .field("refresh_secs", &self.refresh_secs)
+            .field("auth", &self.auth)
+            .field("allow_private_upstream", &self.allow_private_upstream)
+            .field("max_package_size_bytes", &self.max_package_size_bytes)
+            .field("max_versions_per_package", &self.max_versions_per_package)
+            .field("proxy", &self.proxy.as_deref().map(redact))
+            .field("ca_cert_path", &self.ca_cert_path)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for MirrorConfig {
@@ -346,10 +425,14 @@ impl Default for MirrorConfig {
             enabled: false,
             upstream: "https://api.nuget.org/v3/index.json".to_string(),
             timeout_secs: 30,
+            download_timeout_secs: 3600,
+            refresh_secs: 600,
             auth: MirrorAuthConfig::default(),
             allow_private_upstream: false,
             max_package_size_bytes: None,
             max_versions_per_package: Some(50),
+            proxy: None,
+            ca_cert_path: None,
         }
     }
 }
@@ -961,6 +1044,9 @@ impl Config {
                     f.name
                 )));
             }
+            f.mirror
+                .validate()
+                .map_err(|e| Error::BadRequest(format!("feed {:?}: {e}", f.name)))?;
             // A feed that sets any push key of its own uses only those; otherwise
             // it falls back to the global keys.
             let feed_keys = combine_keys(&f.api_key, &f.api_keys);
@@ -1098,18 +1184,6 @@ impl std::fmt::Debug for Config {
                     .collect::<Vec<_>>(),
             )
             .finish_non_exhaustive()
-    }
-}
-
-impl std::fmt::Debug for MirrorAuthConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MirrorAuthConfig")
-            .field("username", &self.username)
-            .field("password", &redact_opt(&self.password))
-            .field("token", &redact_opt(&self.token))
-            // Header names say what kind of credential it is; values are it.
-            .field("headers", &self.headers.keys().collect::<Vec<_>>())
-            .finish()
     }
 }
 
@@ -1653,8 +1727,8 @@ mod tests {
             mirror: MirrorConfig {
                 upstream: "https://u:up-secret@feed.example/_auth/path-secret/index.json".into(),
                 auth: MirrorAuthConfig {
+                    username: Some("ci".into()),
                     password: Some("basic-secret".into()),
-                    token: Some("token-secret".into()),
                     headers: [("X-Api-Key".to_string(), "header-secret".to_string())].into(),
                     ..MirrorAuthConfig::default()
                 },
@@ -1704,5 +1778,25 @@ mod tests {
         };
         assert_eq!(overridden.storage_path(), PathBuf::from("/mnt/pkgs"));
         assert_eq!(overridden.database_path(), "/mnt/db.sqlite");
+    }
+
+    #[test]
+    fn a_mirror_with_basic_and_bearer_credentials_is_rejected() {
+        // Both need `Authorization`; one used to be dropped without a word.
+        let config: Config = toml::from_str(
+            r#"
+            [[feeds]]
+            name = "up"
+              [feeds.mirror]
+              enabled = true
+                [feeds.mirror.auth]
+                username = "ci"
+                password = "pw"
+                token = "tok"
+            "#,
+        )
+        .unwrap();
+        let err = config.resolved_feeds().unwrap_err().to_string();
+        assert!(err.contains("\"up\"") && err.contains("token"), "{err}");
     }
 }

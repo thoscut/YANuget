@@ -32,7 +32,7 @@ struct Cli {
 enum Command {
     /// Migrate every package from a source NuGet server into a local feed,
     /// with live progress, ETA and transfer rate.
-    Migrate(MigrateArgs),
+    Migrate(Box<MigrateArgs>),
     /// Probe the readiness endpoint of the server running on this machine
     /// (the configured port and scheme) and exit 0 when it is ready, 1 when
     /// it is not. Meant for container health checks.
@@ -40,7 +40,7 @@ enum Command {
 }
 
 /// Arguments for `yanuget migrate`.
-#[derive(Debug, Args)]
+#[derive(Args)]
 struct MigrateArgs {
     /// Source NuGet V3 service-index URL (e.g. https://host/v3/index.json).
     #[arg(long)]
@@ -49,16 +49,35 @@ struct MigrateArgs {
     #[arg(long, default_value = "default")]
     feed: String,
     /// HTTP Basic username for the source feed.
-    #[arg(long)]
+    #[arg(long, env = "YANUGET_SOURCE_USERNAME")]
     source_username: Option<String>,
-    /// HTTP Basic password for the source feed.
-    #[arg(long)]
+    // The secrets below also come from the environment or a file. A value on
+    // the command line is readable by every local user in `ps` and
+    // `/proc/*/cmdline`, and stays in shell history; `--source-token "$TOKEN"`
+    // does not help, since the shell expands it into the argument list.
+    /// HTTP Basic password for the source feed. Prefer the environment
+    /// variable or --source-password-file: a value given here is visible in
+    /// `ps`.
+    #[arg(long, env = "YANUGET_SOURCE_PASSWORD", hide_env_values = true)]
     source_password: Option<String>,
-    /// Bearer token for the source feed.
+    /// Read the HTTP Basic password from this file.
     #[arg(long)]
+    source_password_file: Option<std::path::PathBuf>,
+    /// Bearer token for the source feed. Prefer the environment variable or
+    /// --source-token-file: a value given here is visible in `ps`.
+    #[arg(long, env = "YANUGET_SOURCE_TOKEN", hide_env_values = true)]
     source_token: Option<String>,
-    /// Extra source request header as "Name: Value"; may be repeated.
+    /// Read the Bearer token from this file.
     #[arg(long)]
+    source_token_file: Option<std::path::PathBuf>,
+    /// Extra source request header as "Name: Value"; may be repeated. In the
+    /// environment variable, separate several with newlines.
+    #[arg(
+        long,
+        env = "YANUGET_SOURCE_HEADERS",
+        hide_env_values = true,
+        value_delimiter = '\n'
+    )]
     source_header: Vec<String>,
     /// Timeout, in seconds, for connecting to the source and for any silence
     /// while it answers. Listing requests must also finish within it; package
@@ -80,13 +99,50 @@ struct MigrateArgs {
     /// Skip any source package larger than this many bytes (default: no limit).
     #[arg(long)]
     max_package_size_bytes: Option<u64>,
+    /// PEM file of extra CA certificates to trust for the source, on top of
+    /// the system store (e.g. an internal CA).
+    #[arg(long)]
+    source_ca_cert: Option<std::path::PathBuf>,
+}
+
+impl std::fmt::Debug for MigrateArgs {
+    /// The source credentials are shown only as present, custom headers by
+    /// name, and the source URL without userinfo or query.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let redacted = |v: &Option<String>| v.as_ref().map(|_| "<redacted>");
+        let header_names: Vec<&str> = self
+            .source_header
+            .iter()
+            .map(|h| {
+                h.split_once(':')
+                    .map_or("<malformed>", |(name, _)| name.trim())
+            })
+            .collect();
+        f.debug_struct("MigrateArgs")
+            .field("source", &yanuget::mirror::redact_url(&self.source))
+            .field("feed", &self.feed)
+            .field("source_username", &self.source_username)
+            .field("source_password", &redacted(&self.source_password))
+            .field("source_password_file", &self.source_password_file)
+            .field("source_token", &redacted(&self.source_token))
+            .field("source_token_file", &self.source_token_file)
+            .field("source_header", &header_names)
+            .field("timeout_secs", &self.timeout_secs)
+            .field("concurrency", &self.concurrency)
+            .field("skip_prerelease", &self.skip_prerelease)
+            .field("overwrite", &self.overwrite)
+            .field("dry_run", &self.dry_run)
+            .field("max_package_size_bytes", &self.max_package_size_bytes)
+            .field("source_ca_cert", &self.source_ca_cert)
+            .finish()
+    }
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Some(Command::Migrate(args)) => run_migrate(cli.config.as_deref(), args).await,
+        Some(Command::Migrate(args)) => run_migrate(cli.config.as_deref(), *args).await,
         Some(Command::Healthcheck) => run_healthcheck(cli.config.as_deref()).await,
         None => {
             init_tracing();
@@ -474,21 +530,31 @@ async fn run_migrate(config_path: Option<&str>, args: MigrateArgs) -> anyhow::Re
     let db = SqliteDatabase::connect(&config.database_path()).await?;
 
     // Temp files must share the package store's filesystem so indexing can move
-    // each download into place with an atomic rename.
-    let temp_dir = config.storage_path().join(".migrate");
+    // each download into place with an atomic rename. Each run gets its own
+    // directory, so cleaning up after one cannot delete the downloads of
+    // another running at the same time.
+    let temp_dir = config
+        .storage_path()
+        .join(".migrate")
+        .join(uuid::Uuid::new_v4().to_string());
     tokio::fs::create_dir_all(&temp_dir).await?;
 
-    let source = build_source_config(&args);
+    let source = build_source_config(&args)?;
     let opts = MigrateOptions {
         concurrency: args.concurrency,
         include_prerelease: !args.skip_prerelease,
+        // Only `--overwrite` replaces what the target has. Following the
+        // feed's own policy re-downloaded everything on every re-run of a
+        // feed that allows overwrites, and pushed each version through the
+        // overwrite path.
         overwrite: if args.overwrite {
             OverwriteMode::Enabled
         } else {
-            feed.allow_overwrite
+            OverwriteMode::Disabled
         },
         dry_run: args.dry_run,
         quiet: false,
+        min_free_disk_bytes: config.min_free_disk_bytes,
     };
 
     let summary = yanuget::migrate::run(
@@ -500,20 +566,22 @@ async fn run_migrate(config_path: Option<&str>, args: MigrateArgs) -> anyhow::Re
         opts,
         indicatif::ProgressDrawTarget::stderr(),
     )
-    .await?;
+    .await;
 
-    // Best-effort cleanup of the scratch directory.
+    // Best-effort cleanup of this run's scratch directory, however it ended.
     let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    let summary = summary?;
 
-    // Any failure is a non-zero exit, even when everything else got through.
-    // Scripts gate on it ("stop the old server once the copy is done"), and a
-    // partial copy that exits 0 reads as a finished one. A re-run is cheap: it
-    // skips what is already there and retries only what failed.
-    if summary.failed > 0 {
+    // Any failure is a non-zero exit, even when everything else got through —
+    // a version, a package whose versions could not be listed, or a catalog
+    // page. Scripts gate on it ("stop the old server once the copy is done"),
+    // and a partial copy that exits 0 reads as a finished one. A re-run is
+    // cheap: it skips what is already there and retries only what failed.
+    if !summary.is_complete() {
         anyhow::bail!(
-            "migration incomplete: {} failed (listed above); re-run to retry them, \
+            "migration incomplete: {} failure(s) (listed above); re-run to retry them, \
              versions already migrated are skipped",
-            summary.failed
+            summary.failures.len()
         );
     }
     Ok(())
@@ -521,23 +589,44 @@ async fn run_migrate(config_path: Option<&str>, args: MigrateArgs) -> anyhow::Re
 
 /// Translate the CLI's source flags into a [`MirrorConfig`] the existing mirror
 /// client knows how to authenticate against.
-fn build_source_config(args: &MigrateArgs) -> MirrorConfig {
+fn build_source_config(args: &MigrateArgs) -> anyhow::Result<MirrorConfig> {
     let mut headers = std::collections::BTreeMap::new();
-    for raw in &args.source_header {
-        if let Some((name, value)) = raw.split_once(':') {
-            headers.insert(name.trim().to_string(), value.trim().to_string());
-        }
+    for raw in args.source_header.iter().filter(|h| !h.trim().is_empty()) {
+        let (name, value) = raw
+            .split_once(':')
+            // The value is not echoed: it is likely a key.
+            .ok_or_else(|| {
+                anyhow::anyhow!("a --source-header has no ':'; write it as \"Name: Value\"")
+            })?;
+        headers.insert(name.trim().to_string(), value.trim().to_string());
     }
-    MirrorConfig {
+    let password = secret(
+        "--source-password",
+        &args.source_password,
+        &args.source_password_file,
+    )?;
+    let token = secret(
+        "--source-token",
+        &args.source_token,
+        &args.source_token_file,
+    )?;
+    let auth = MirrorAuthConfig {
+        username: args.source_username.clone(),
+        password,
+        token,
+        headers,
+    };
+    auth.validate()
+        .map_err(|_| anyhow::anyhow!("give the source either a username and password (HTTP Basic) or a token (Bearer), not both; and no password without a username"))?;
+    Ok(MirrorConfig {
         enabled: true,
         upstream: args.source.clone(),
         timeout_secs: args.timeout_secs,
-        auth: MirrorAuthConfig {
-            username: args.source_username.clone(),
-            password: args.source_password.clone(),
-            token: args.source_token.clone(),
-            headers,
-        },
+        // A migration downloads without a whole-transfer deadline, and does
+        // not use the read-through mirror's refresh bookkeeping.
+        download_timeout_secs: 0,
+        refresh_secs: 0,
+        auth,
         // A migration is an operator running a command against a source they
         // chose, so a source on the private network is expected and allowed —
         // unlike the read-through mirror, which anonymous requests can trigger.
@@ -545,6 +634,33 @@ fn build_source_config(args: &MigrateArgs) -> MirrorConfig {
         max_package_size_bytes: args.max_package_size_bytes,
         // A migration is meant to copy everything.
         max_versions_per_package: None,
+        // The shell's `HTTP(S)_PROXY` applies, as it would to `curl`.
+        proxy: None,
+        ca_cert_path: args.source_ca_cert.clone(),
+    })
+}
+
+/// A secret given directly (on the command line or in the environment) or
+/// read from a file, but not both. A file's trailing newline is not part of
+/// the secret.
+fn secret(
+    flag: &str,
+    value: &Option<String>,
+    file: &Option<std::path::PathBuf>,
+) -> anyhow::Result<Option<String>> {
+    match (value, file) {
+        (Some(_), Some(_)) => {
+            anyhow::bail!(
+                "{flag} and {flag}-file both given (or {flag} set in the environment); use one"
+            )
+        }
+        (Some(value), None) => Ok(Some(value.clone())),
+        (None, Some(path)) => {
+            let raw = std::fs::read_to_string(path)
+                .map_err(|e| anyhow::anyhow!("{flag}-file {}: {e}", path.display()))?;
+            Ok(Some(raw.trim_end_matches(['\r', '\n']).to_string()))
+        }
+        (None, None) => Ok(None),
     }
 }
 
@@ -693,6 +809,94 @@ mod tests {
             Path::new("/var/lib/yanuget"),
             unauthenticated,
         )
+    }
+
+    #[test]
+    fn migrate_arguments_debug_without_their_secrets() {
+        let cli = Cli::try_parse_from([
+            "yanuget",
+            "migrate",
+            "--source",
+            "https://ci:url-secret@old.example/v3/index.json?key=query-secret",
+            "--source-username",
+            "ci",
+            "--source-password",
+            "password-secret",
+            "--source-header",
+            "X-Feed-Key: header-secret",
+        ])
+        .unwrap();
+        let shown = format!("{cli:?}");
+        for secret in [
+            "url-secret",
+            "query-secret",
+            "password-secret",
+            "header-secret",
+        ] {
+            assert!(!shown.contains(secret), "{secret} in {shown}");
+        }
+        assert!(shown.contains("old.example"), "{shown}");
+        assert!(shown.contains("X-Feed-Key"), "{shown}");
+    }
+
+    fn migrate_args(extra: &[&str]) -> MigrateArgs {
+        let mut argv = vec![
+            "yanuget",
+            "migrate",
+            "--source",
+            "https://old.example/v3/index.json",
+        ];
+        argv.extend_from_slice(extra);
+        match Cli::try_parse_from(argv).unwrap().command {
+            Some(Command::Migrate(args)) => *args,
+            _ => panic!("not a migrate command"),
+        }
+    }
+
+    #[test]
+    fn migrate_secrets_can_come_from_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let token = dir.path().join("token");
+        std::fs::write(&token, "tok-from-file\n").unwrap();
+        let args = migrate_args(&["--source-token-file", token.to_str().unwrap()]);
+        let source = build_source_config(&args).unwrap();
+        assert_eq!(source.auth.token.as_deref(), Some("tok-from-file"));
+
+        let password = dir.path().join("password");
+        std::fs::write(&password, "pw\r\n").unwrap();
+        let args = migrate_args(&[
+            "--source-username",
+            "ci",
+            "--source-password-file",
+            password.to_str().unwrap(),
+        ]);
+        assert_eq!(
+            build_source_config(&args).unwrap().auth.password.as_deref(),
+            Some("pw")
+        );
+    }
+
+    #[test]
+    fn conflicting_migrate_credentials_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("secret");
+        std::fs::write(&file, "x").unwrap();
+        let file = file.to_str().unwrap();
+        for extra in [
+            // A value and a file for the same secret.
+            &["--source-token", "a", "--source-token-file", file][..],
+            // Basic and Bearer both want `Authorization`.
+            &["--source-username", "ci", "--source-token", "t"][..],
+            // A header that is not "Name: Value".
+            &["--source-header", "X-Feed-Key"][..],
+        ] {
+            assert!(
+                build_source_config(&migrate_args(extra)).is_err(),
+                "{extra:?} should be refused"
+            );
+        }
+        let missing = migrate_args(&["--source-token-file", "/nonexistent/yanuget/token"]);
+        assert!(build_source_config(&missing).is_err());
     }
 
     #[test]

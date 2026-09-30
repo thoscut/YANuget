@@ -26,7 +26,7 @@ A fully commented template lives in
 | `gallery_page_size` | `YANUGET_GALLERY_PAGE_SIZE` | int | `20` | Packages per gallery page (`?take=` overrides). |
 | `max_package_size_bytes` | `YANUGET_MAX_PACKAGE_SIZE_BYTES` | int | *(unlimited)* | Upload cap; streamed either way. |
 | `upload_idle_timeout_secs` | `YANUGET_UPLOAD_IDLE_TIMEOUT_SECS` | int | `300` | Abort an upload after this long without a byte arriving (`408`). Only silence counts; a slow transfer is never cut off. `0` waits forever. |
-| `min_free_disk_bytes` | `YANUGET_MIN_FREE_DISK_BYTES` | int | `2147483648` (2 GiB) | Refuse an upload (`507`) that would leave less than this free on the storage volume. Checked against the declared size when there is one. `0` turns the check off. |
+| `min_free_disk_bytes` | `YANUGET_MIN_FREE_DISK_BYTES` | int | `2147483648` (2 GiB) | Refuse an upload (`507`) that would leave less than this free on the storage volume. Checked against the declared size when there is one. Mirror fetches and `yanuget migrate` downloads are held to it too, against the upstream's `Content-Length`. `0` turns the check off. |
 | `max_connections` | `YANUGET_MAX_CONNECTIONS` | int | `4096` | Concurrent connections accepted; one over the cap is closed at once. `0` is unlimited. |
 | `allow_overwrite` | `YANUGET_ALLOW_OVERWRITE` | bool \| string | `false` | Re-push an existing version: `false`, `true`, or `"prerelease-only"` (overwrite pre-releases only). |
 | `hard_delete_enabled` | `YANUGET_HARD_DELETE_ENABLED` | bool | `false` | DELETE removes vs. unlists. |
@@ -318,19 +318,31 @@ affected.
 | `feeds[].reserved_id_prefixes` | string[] | `[]` | Id prefixes (e.g. `"Contoso."`) only this feed may bring in; every other feed refuses them. See below. |
 | `feeds[].mirror.enabled` | bool | `false` | Read-through cache of an upstream V3 feed. |
 | `feeds[].mirror.upstream` | string | `https://api.nuget.org/v3/index.json` | Upstream service index. |
-| `feeds[].mirror.timeout_secs` | int | `30` | Per-request upstream timeout. |
+| `feeds[].mirror.timeout_secs` | int | `30` | Connect timeout, the longest the upstream may go silent, and the deadline for one metadata request. |
+| `feeds[].mirror.download_timeout_secs` | int | `3600` | Deadline for one whole `.nupkg` download; `0` removes it. |
+| `feeds[].mirror.refresh_secs` | int | `600` | How long a package's upstream version list is trusted before a read lists it again — and how long an id the upstream lacks is not asked for again. |
 | `feeds[].mirror.auth.username` / `.password` | string | *(none)* | HTTP Basic credentials for the upstream. |
-| `feeds[].mirror.auth.token` | string | *(none)* | Bearer token for the upstream (`Authorization: Bearer …`). |
+| `feeds[].mirror.auth.token` | string | *(none)* | Bearer token for the upstream (`Authorization: Bearer …`). Set this *or* `username`, not both. |
 | `feeds[].mirror.auth.headers` | table | `{}` | Arbitrary extra request headers (e.g. a private-feed API key). |
+
 | `feeds[].mirror.max_versions_per_package` | int | `50` | Newest-first cap on how many versions one read-through miss fetches. |
 | `feeds[].mirror.max_package_size_bytes` | int | *(server-wide cap, else 2 GiB)* | Cap on a single mirrored `.nupkg`. |
 | `feeds[].mirror.allow_private_upstream` | bool | `false` | Permit an upstream on a private/loopback address. |
+| `feeds[].mirror.proxy` | string | *(none)* | Outbound proxy for upstream requests. Unset, the mirror connects directly and ignores `HTTP(S)_PROXY`. |
+| `feeds[].mirror.ca_cert_path` | path | *(none)* | PEM file of extra CA certificates to trust for the upstream, on top of the system store and the bundled Mozilla roots. |
 | `feeds[].license_policy.enabled` | bool | `false` | Evaluate the offline license policy. |
 | `feeds[].license_policy.allowed` | string[] | `[]` | If non-empty, license must match one. |
 | `feeds[].license_policy.blocked` | string[] | `[]` | Always rejected (even if also allowed). |
 | `feeds[].license_policy.allow_unlicensed` | bool | `true` | Allow packages with no declared license. |
 | `feeds[].license_policy.action` | string | `warn` | `warn` (accept + flag) or `block` (reject). |
 | `feeds[].retention` | table | *(global `[retention]`)* | Per-feed retention overrides. |
+
+Upstream credentials are sent only to the service index's own scheme, host and
+port. The resource URLs inside the service index are the upstream's choice, so
+a `PackageBaseAddress`, search or catalog URL on another host — or a redirect
+to one, such as a download handed off to a CDN — is fetched without them. A
+redirect from `https` to `http` is refused. Setting both `username` and `token`,
+or a header that cannot be sent, is a startup error.
 
 Three things bound a read-through miss, because it is started by an
 *unauthenticated read* and writes what it fetches to your disk:
@@ -346,14 +358,33 @@ Three things bound a read-through miss, because it is started by an
   what has been mirrored so far and the remaining versions are fetched on a
   later request. Nothing is lost — a mirror is a cache, and it warms up
   incrementally rather than holding one connection open for the whole job.
+  A single download is bounded by `download_timeout_secs` instead, and by
+  `timeout_secs` of silence.
 
-To take a mirrored version out of circulation, **disable it in `/admin`; do
-not delete it.** The mirror fetches any version the feed does not hold, so a
-deleted version — whether by the admin area, a hard `DELETE` or a retention
-run — comes back from the upstream on the next read of that package, by
-anyone. A disabled version stays in the feed and is withheld from clients.
-For the same reason, retention on a mirror feed and the mirror undo each
-other's work.
+How the mirror keeps up, and what it does not repeat:
+
+* **New upstream releases appear.** A package's version list is fetched again
+  once it is older than `refresh_secs` — in the background when the feed
+  already has versions of it, so the read that noticed is not held up.
+* **The version a client asks for is fetched first**, even when it is older
+  than the newest `max_versions_per_package`, so a project pinned to an old
+  version restores.
+* **Misses are not repeated.** An id the upstream does not have is not asked
+  for again within `refresh_secs`; a version that failed (absent, over the size
+  cap, the wrong identity, refused by policy) not for 15 minutes; and an
+  upstream that fails is backed off, from 30 seconds doubling up to 30
+  minutes. A feed with `requires_approval` does not re-list on every read
+  while its mirrored versions wait for approval.
+* **Concurrent requests share one fetch.** A request for a package another
+  request is fetching waits for it (up to a minute) rather than answering
+  `404`, per feed and id.
+
+A version removed from a mirror feed stays removed. Deleting it (from `/admin`,
+a hard `DELETE`, or a retention sweep) or moving it to another feed records a
+tombstone for that feed, id and version, and the mirror never fetches a
+tombstoned version again — so a package pulled as malicious does not come back
+on the next read, and retention and the mirror do not fight over old versions.
+Pushing the version to the feed again clears its tombstone.
 
 The license policy reads SPDX expressions the way SPDX means them. Case, the
 `+` suffix and the deprecated ids are normalised on both sides, so a rule for
@@ -464,7 +495,11 @@ responses also carry a `Strict-Transport-Security` header (one year).
   setting fails loudly instead of silently reverting to its default.
 - A feed with `[feeds.mirror]` follows resource URLs chosen by the
   *upstream*. Non-HTTP schemes and private/loopback targets are refused unless
-  `allow_private_upstream = true`, mirrored downloads are bounded by
+  `allow_private_upstream = true` — checked on the addresses a host name
+  resolves to when each connection is made, so a name pointing at the local
+  network, a redirect to one, or a DNS answer that changes between requests is
+  refused too. Through a configured `proxy`, the proxy resolves names, so its
+  own egress rules apply. Mirrored downloads are bounded by
   `max_package_size_bytes` and `max_versions_per_package`, and a mirrored
   package must declare the id/version that was actually requested — so a
   compromised upstream cannot substitute a different package under a name your

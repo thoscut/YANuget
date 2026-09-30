@@ -100,9 +100,9 @@ Configuration choices that matter most:
   not what a name means.
 - **Review `[feeds.mirror]` upstreams.** A mirror makes your server fetch
   from, and republish under your name, whatever that upstream serves.
-- **Disable, don't delete, a bad version on a mirror feed.** A deleted version
-  is fetched from the upstream again by the next read; a disabled one stays
-  withheld.
+- **Pull a bad version from a mirror feed by deleting or disabling it.** A
+  deleted version is recorded and never fetched from the upstream again; a
+  disabled one stays in the feed, withheld.
 
 ## Verifying a release
 
