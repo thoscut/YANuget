@@ -43,10 +43,27 @@ src/
 │   ├── mod.rs        JSON response builders (pure)
 │   └── urls.rs       UrlBuilder (absolute resource URLs, feed-prefix aware)
 └── web/
-    ├── mod.rs        AppState, FeedContext, per-feed routers, handlers
-    ├── ui.rs         HTML rendering (gallery, stats, settings, feeds, admin)
+    ├── mod.rs        The routers: build_app, per-feed routes, the admin route_layer
+    ├── state.rs      AppState, FeedContext, FeedMeta
+    ├── middleware.rs Global layers: security headers + CSP, host / cross-site guard,
+    │                 forwarded-header filter, rate limit, CORS; HTML error pages
+    ├── protocol.rs   NuGet V3 reads: service index, flat container, registration,
+    │                 search, autocomplete, symbol download; health probes
+    ├── publish.rs    Push, symbol push, delete/unlist, relist
+    ├── gallery.rs    Gallery handlers: list, package page, icon, tags, stats, settings
+    ├── admin.rs      Admin area: auth gate, CSRF check, version actions, bulk,
+    │                 copy/move/promote, retention
+    ├── hosted.rs     Files attached to versions; resumable (tus) uploads
+    ├── forms.rs      Form-body and lenient query-value parsing
+    ├── helpers.rs    check_id / parse_version, header helpers, detached()
     ├── files.rs      Range-aware streaming file responses
-    └── docs.rs       The embedded documentation site (this page), served at /docs
+    ├── assets.rs     The embedded gallery font
+    ├── docs.rs       The embedded documentation site (this page), served at /docs
+    └── ui/           HTML rendering with format!, one module per page family
+        ├── escape.rs escape_html / safe_href / enc_path, and when each applies
+        ├── layout.rs Shared chrome, inline style + script, the CSP, error page
+        ├── gallery.rs, package.rs, stats.rs, settings.rs, admin.rs
+        └── format.rs Counts, sizes, truncation, key/value rows
 ```
 
 ## Feeds
@@ -64,10 +81,10 @@ path prefix. `main` builds one state per resolved feed and nests their routers.
 
 ```
 PUT /api/v2/package
-  └─ web::push_package
+  └─ web::publish::push_package
        ├─ auth.check_headers              (X-NuGet-ApiKey, constant-time)
        ├─ create temp file under {storage}/.uploads
-       ├─ web::write_upload  ─▶ streaming::stream_to_writer_limited
+       ├─ web::publish::write_upload ─▶ streaming::stream_to_writer_limited
        │     (multipart or raw body → temp file, + SHA-512, + size cap)
        └─ indexing::index_package
             ├─ nupkg::read_archive        (seek to nuspec; never reads payload)
