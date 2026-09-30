@@ -213,6 +213,10 @@ lenient:
   trusted publishing. CI adds `cargo deny`, a weekly audit and tests at the
   MSRV. The docs and media toolchains install from hashed lock files. The
   image is built on Debian trixie with base images pinned by digest.
+- Symbol packages for assemblies built without a PDB checksum (compilers
+  older than Visual Studio 15.9) are refused, as on nuget.org.
+- Only the manifest (and a declared readme or icon) is opened in a pushed
+  archive, so an unreadable entry elsewhere no longer rejects the package.
 
 ### Fixed
 
@@ -261,6 +265,18 @@ lenient:
   client-address headers, consistent `base_url` advice, backups (ordering,
   `tls/`, the full layout), the upload idle timeout, the feeds table, and the
   systemd unit's `AF_UNIX`.
+- Versions follow NuGet's rules for new input: no leading `v`, no leading
+  zeros in numeric pre-release parts, components up to Int32, validated build
+  metadata, at most 64 characters. `1.0.0-01` and `1.0.0-1` can no longer
+  become two versions. Versions already stored stay readable under the rules
+  they were stored with.
+- An embedded readme or icon over 1 MiB is refused with a clear error instead
+  of being stored cut off (possibly mid-UTF-8) and still marked present.
+- Symbol pushes take the version lock and are all-or-nothing.
+- Autocomplete's `prerelease` defaults to `false`; search `totalDownloads`
+  counts every version; dependency-group `@id`s are percent-encoded.
+- An inbox import is refused, like a push, when it would leave less than
+  `min_free_disk_bytes` free.
 
 ### Security
 
@@ -295,6 +311,27 @@ lenient:
   an allow list accepts only known SPDX exceptions after `WITH`.
 - Different content under an id and version the server already stores is
   reported as a failure (`409`) rather than skipped as a race.
+- Symbol packages are verified against the version they belong to, as on
+  nuget.org: each Portable PDB must match the CodeView entry and PDB checksum
+  of the `.dll`/`.exe` beside it in the stored package. A symbol key is claimed
+  once, under a lock, and stored bytes are never replaced by different ones, so
+  an identical copy of a package pushed to another feed can no longer replace
+  the PDBs the first feed serves, and nobody can claim a key before its owner.
+- The manifest is read the way NuGet's reader reads it: fields only as direct
+  children of `<metadata>`, in its namespace, case-sensitively. Manifests NuGet
+  could read differently are refused — repeated `id`, `version`, `license` and
+  similar fields, elements inside a text field, dependencies outside
+  `metadata/dependencies`, a DOCTYPE or an undeclared prefix — so the feed can
+  no longer index an identity, dependencies or a license other than the one a
+  client sees.
+- A crafted manifest can no longer cost CPU out of proportion to its size: at
+  most 64 attributes per element, manifests capped at 1 MiB (was 16 MiB), and
+  parsing moved off the async runtime.
+- Symbol pushes stream PDBs to disk instead of holding up to 512 MiB in memory,
+  and an oversized PDB is refused rather than stored cut off.
+- A ZIP whose central directory is inconsistent — disagreeing entry counts,
+  ZIP64 records, extra or duplicate records — or that has two root manifests is
+  refused; an archive may hold at most 100 000 entries.
 
 ## [0.5.1] — 2026-09-24
 
