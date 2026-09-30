@@ -441,15 +441,16 @@ async fn user_version(db: &SqliteDatabase) -> i64 {
         .unwrap()
 }
 
-/// Every table's columns and every index, trigger and table by name.
-async fn tables(db: &SqliteDatabase) -> Vec<(String, Vec<String>)> {
-    let names: Vec<(String, String)> =
-        sqlx::query_as("SELECT type, name FROM sqlite_master ORDER BY type, name")
+/// The whole schema: every table, index and trigger with the SQL that
+/// defines it, and every table's columns in order.
+async fn schema(db: &SqliteDatabase) -> Vec<(String, Option<String>, Vec<String>)> {
+    let entries: Vec<(String, String, Option<String>)> =
+        sqlx::query_as("SELECT type, name, sql FROM sqlite_master ORDER BY type, name")
             .fetch_all(pool(db))
             .await
             .unwrap();
     let mut out = Vec::new();
-    for (kind, name) in names {
+    for (kind, name, sql) in entries {
         let mut columns: Vec<String> = Vec::new();
         if kind == "table" {
             for row in sqlx::query(&format!("PRAGMA table_info(\"{name}\")"))
@@ -459,11 +460,14 @@ async fn tables(db: &SqliteDatabase) -> Vec<(String, Vec<String>)> {
             {
                 columns.push(row.get("name"));
             }
-            columns.sort();
         }
-        out.push((format!("{kind} {name}"), columns));
+        out.push((format!("{kind} {name}"), sql, columns));
     }
     out
+}
+
+async fn count(db: &SqliteDatabase, sql: &str) -> i64 {
+    sqlx::query_scalar(sql).fetch_one(pool(db)).await.unwrap()
 }
 
 fn v(s: &str) -> NuGetVersion {
@@ -477,17 +481,35 @@ async fn upgrade(era: Era) {
     let db = SqliteDatabase::connect(&path).await.unwrap();
     assert_eq!(user_version(&db).await, LATEST, "{era:?}");
 
-    // The schema a new database gets, whatever the path here.
+    // Exactly the schema a new database gets, whatever the path here, down
+    // to the text of every definition.
     let fresh = SqliteDatabase::in_memory().await.unwrap();
-    assert_eq!(tables(&db).await, tables(&fresh).await, "{era:?}");
-    let dead: i64 = sqlx::query_scalar(
+    assert_eq!(schema(&db).await, schema(&fresh).await, "{era:?}");
+    let dead = count(
+        &db,
         "SELECT COUNT(*) FROM pragma_table_info('packages') \
          WHERE name IN ('listed', 'enabled', 'downloads', 'version_major')",
     )
-    .fetch_one(pool(&db))
-    .await
-    .unwrap();
+    .await;
     assert_eq!(dead, 0, "{era:?}: legacy columns are gone");
+
+    // Every row belongs to a stored version: the ones that did not are gone.
+    let violations = sqlx::query("PRAGMA foreign_key_check")
+        .fetch_all(pool(&db))
+        .await
+        .unwrap();
+    assert!(violations.is_empty(), "{era:?}");
+    for table in ["feed_packages", "package_tags", "package_files", "symbols"] {
+        let sql = format!("SELECT COUNT(*) FROM {table} WHERE lower_id = 'ghost'");
+        assert_eq!(count(&db, &sql).await, 0, "{era:?}: {table}");
+    }
+    let foreign_keys = count(
+        &db,
+        "SELECT COUNT(*) FROM pragma_foreign_key_list('feed_packages') \
+         WHERE \"table\" = 'packages' AND on_delete = 'CASCADE'",
+    )
+    .await;
+    assert_eq!(foreign_keys, 2, "{era:?}: one row per key column");
 
     // Memberships, with their state: copied from the package where the era
     // had no feeds.
@@ -535,13 +557,24 @@ async fn upgrade(era: Era) {
         assert!(db.is_tombstoned(FEED, "gone", &v("1.0.0")).await.unwrap());
     }
 
+    // Deleting a version takes everything that belongs to it.
+    assert!(db.delete_package_data("alpha", &v("1.0.0")).await.unwrap());
+    for table in ["feed_packages", "package_tags", "package_files", "symbols"] {
+        let sql = format!(
+            "SELECT COUNT(*) FROM {table} \
+             WHERE lower_id = 'alpha' AND normalized_version = '1.0.0'"
+        );
+        assert_eq!(count(&db, &sql).await, 0, "{era:?}: {table}");
+    }
+    assert!(hits(&db, "pha tit").await.is_empty(), "{era:?}");
+
     // It takes new versions like any other database.
     db.add_to_feed(FEED, &sample("Alpha", "3.0.0"))
         .await
         .unwrap();
     assert_eq!(
         db.find_versions(FEED, "alpha", true).await.unwrap().len(),
-        3
+        2
     );
 
     // And opening it again changes nothing.
@@ -549,7 +582,7 @@ async fn upgrade(era: Era) {
     let db = SqliteDatabase::connect(&path).await.unwrap();
     assert_eq!(
         db.find_versions(FEED, "alpha", true).await.unwrap().len(),
-        3
+        2
     );
 }
 

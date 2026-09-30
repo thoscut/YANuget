@@ -16,13 +16,13 @@
 //!
 //! ## Steps 1 to 5: the schema before it was numbered
 //!
-//! Until 0.6 only data migrations were numbered. The tables, indexes and
-//! triggers were created with `IF NOT EXISTS` and columns added when missing
-//! on every start, whatever `user_version` said, so a database at a given
-//! number can have the shape of any build since that step. Steps 1 to 5
-//! therefore bring whatever they find up to the last unnumbered shape first,
+//! Until this table existed, only data migrations were numbered. The tables,
+//! indexes and triggers were created with `IF NOT EXISTS` and columns added
+//! when missing on every start, whatever `user_version` said, so a database at
+//! a given number can have the shape of any build since that step. Steps 1 to
+//! 5 therefore bring whatever they find up to the last unnumbered shape first,
 //! with [`legacy_shape`], which is idempotent and frozen: it is what every
-//! database created before 0.6 converges to, and it never changes again.
+//! database from those builds converges to, and it never changes again.
 //!
 //! ## Steps 6 onwards
 //!
@@ -91,6 +91,11 @@ const MIGRATIONS: &[Migration] = &[
         description: "drop the columns of `packages` that nothing reads",
         step: Step::DropDeadColumns,
     },
+    Migration {
+        version: 7,
+        description: "tie memberships, tags, files and symbols to their version with foreign keys",
+        step: Step::AddForeignKeys,
+    },
 ];
 
 /// What a [`Migration`] runs. An enum rather than a function pointer in the
@@ -104,6 +109,7 @@ enum Step {
     FillSearchIndex,
     LegacyShape,
     DropDeadColumns,
+    AddForeignKeys,
 }
 
 async fn apply(step: Step, c: &mut SqliteConnection) -> Result<()> {
@@ -114,6 +120,7 @@ async fn apply(step: Step, c: &mut SqliteConnection) -> Result<()> {
         Step::FillSearchIndex => fill_search_index(c).await,
         Step::LegacyShape => legacy_shape(c).await,
         Step::DropDeadColumns => drop_dead_columns(c).await,
+        Step::AddForeignKeys => add_foreign_keys(c).await,
     }
 }
 
@@ -710,6 +717,158 @@ END;
     };
 }
 use search_triggers;
+
+/// A table whose rows belong to one version, as step 7 rebuilds it.
+struct Child {
+    table: &'static str,
+    /// What an orphaned row leaves behind, for the log.
+    left_behind: &'static str,
+    /// Its columns, to copy.
+    columns: &'static str,
+    /// Its definition, foreign key included.
+    definition: &'static str,
+    /// Its indexes, which go with the old table.
+    indexes: &'static str,
+}
+
+const CHILDREN: &[Child] = &[
+    Child {
+        table: "feed_packages",
+        left_behind: "nothing: every query joined them to a version and never saw them",
+        columns: "feed, lower_id, normalized_version, listed, enabled, pending, flagged, \
+                  flag_reason, added, downloads, pinned",
+        definition: "
+    feed               TEXT    NOT NULL,
+    lower_id           TEXT    NOT NULL,
+    normalized_version TEXT    NOT NULL,
+    listed             INTEGER NOT NULL DEFAULT 1,
+    enabled            INTEGER NOT NULL DEFAULT 1,
+    pending            INTEGER NOT NULL DEFAULT 0,
+    flagged            INTEGER NOT NULL DEFAULT 0,
+    flag_reason        TEXT,
+    added              TEXT    NOT NULL,
+    downloads          INTEGER NOT NULL DEFAULT 0,
+    pinned             INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (feed, lower_id, normalized_version),
+    FOREIGN KEY (lower_id, normalized_version)
+        REFERENCES packages (lower_id, normalized_version) ON DELETE CASCADE
+",
+        indexes: "
+-- Covers the search ranking: the (feed, lower_id) prefix scopes a feed and
+-- supports GROUP BY lower_id, while including `downloads` lets SUM(downloads)
+-- be read straight from the index instead of looking up each table row.
+CREATE INDEX idx_feed_packages_rank ON feed_packages (feed, lower_id, downloads);
+-- Joins to `packages`, and the foreign key's lookups when a version goes.
+CREATE INDEX idx_feed_packages_pkg ON feed_packages (lower_id, normalized_version);
+",
+    },
+    Child {
+        table: "package_tags",
+        left_behind: "nothing: the tag filter and tag cloud joined them to a feed",
+        columns: "lower_id, normalized_version, tag",
+        definition: "
+    lower_id           TEXT NOT NULL,
+    normalized_version TEXT NOT NULL,
+    tag                TEXT NOT NULL,
+    PRIMARY KEY (lower_id, normalized_version, tag),
+    FOREIGN KEY (lower_id, normalized_version)
+        REFERENCES packages (lower_id, normalized_version) ON DELETE CASCADE
+",
+        indexes: "CREATE INDEX idx_package_tags_tag ON package_tags (tag, lower_id);",
+    },
+    Child {
+        table: "package_files",
+        left_behind: "their blobs, which stay in storage unless another version uses them",
+        columns: "lower_id, normalized_version, name, lower_name, sha256, size, uploaded, \
+                  downloads",
+        definition: "
+    lower_id           TEXT    NOT NULL,
+    normalized_version TEXT    NOT NULL,
+    name               TEXT    NOT NULL,
+    lower_name         TEXT    NOT NULL,
+    sha256             TEXT    NOT NULL,
+    size               INTEGER NOT NULL,
+    uploaded           TEXT    NOT NULL,
+    downloads          INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (lower_id, normalized_version, lower_name),
+    FOREIGN KEY (lower_id, normalized_version)
+        REFERENCES packages (lower_id, normalized_version) ON DELETE CASCADE
+",
+        indexes: "CREATE INDEX idx_package_files_blob ON package_files (sha256);",
+    },
+    Child {
+        table: "symbols",
+        left_behind: "their PDB files, which stay in storage and are no longer served",
+        columns: "ssqp_key, filename, lower_id, normalized_version",
+        definition: "
+    ssqp_key           TEXT NOT NULL,   -- upper-case {GUID}{age}
+    filename           TEXT NOT NULL,   -- the .pdb file name, lower-cased
+    lower_id           TEXT NOT NULL,   -- owning package version
+    normalized_version TEXT NOT NULL,
+    PRIMARY KEY (ssqp_key, filename),
+    FOREIGN KEY (lower_id, normalized_version)
+        REFERENCES packages (lower_id, normalized_version) ON DELETE CASCADE
+",
+        indexes: "CREATE INDEX idx_symbols_owner ON symbols (lower_id, normalized_version);",
+    },
+];
+
+/// Step 7: rebuild the tables whose rows belong to a version with a foreign
+/// key to it in `packages`, first dropping the rows whose version is gone.
+///
+/// Nothing stopped such rows before: a membership whose data a failed purge
+/// had removed, the tags or files of a version deleted by hand. Each was
+/// invisible or unreachable, and the counts removed are logged per table.
+///
+/// `ON DELETE CASCADE`, because every delete path already takes these rows
+/// with the version, the children first (`delete_package_data`, and the
+/// symbol and file cleanup before it that needs their rows to find the
+/// bytes); the cascade makes that the schema's rule rather than the code's.
+/// Enforcement is on for every connection (`foreign_keys(true)`), and was
+/// before, with nothing yet to enforce. Parents are never re-keyed, so no
+/// `ON UPDATE`.
+async fn add_foreign_keys(c: &mut SqliteConnection) -> Result<()> {
+    // Every name interpolated below is a literal of [`CHILDREN`].
+    const ORPHAN: &str = "NOT EXISTS (SELECT 1 FROM packages p \
+         WHERE p.lower_id = c.lower_id AND p.normalized_version = c.normalized_version)";
+    for child in CHILDREN {
+        let table = child.table;
+        let orphans: i64 =
+            sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table} c WHERE {ORPHAN}"))
+                .fetch_one(&mut *c)
+                .await?;
+        if orphans > 0 {
+            tracing::warn!(
+                table,
+                rows = orphans,
+                "removing rows of package versions that are no longer stored; left behind: {}",
+                child.left_behind
+            );
+        }
+        let columns = child.columns;
+        sqlx::raw_sql(&format!(
+            "CREATE TABLE {table}_new ({definition});
+             INSERT INTO {table}_new ({columns}) SELECT {columns} FROM {table} c WHERE NOT {ORPHAN};
+             DROP TABLE {table};
+             ALTER TABLE {table}_new RENAME TO {table};
+             {indexes}",
+            definition = child.definition,
+            indexes = child.indexes,
+        ))
+        .execute(&mut *c)
+        .await?;
+    }
+    let violations = sqlx::query("PRAGMA foreign_key_check")
+        .fetch_all(&mut *c)
+        .await?;
+    if !violations.is_empty() {
+        return Err(Error::Other(anyhow::anyhow!(
+            "{} rows still refer to package versions that do not exist",
+            violations.len()
+        )));
+    }
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {

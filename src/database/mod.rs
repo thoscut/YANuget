@@ -297,8 +297,10 @@ pub trait PackageDatabase: Send + Sync {
     /// downloads; read a feed for those.
     async fn get_package_data(&self, id: &str, version: &NuGetVersion) -> Result<Option<Package>>;
 
-    /// Hard-delete global metadata (and every feed membership). Returns `true`
-    /// if a row was removed. Caller is responsible for storage/symbol cleanup.
+    /// Hard-delete global metadata and everything recorded against the
+    /// version: every feed membership, its tags, attached-file rows and symbol
+    /// mappings. Returns `true` if a row was removed. The caller deletes the
+    /// stored bytes those rows point at first (payload, file blobs, PDBs).
     async fn delete_package_data(&self, id: &str, version: &NuGetVersion) -> Result<bool>;
 
     /// How many feeds currently contain this version.

@@ -143,6 +143,13 @@ mod tests {
         assert!(db.add_symbol("K", "a.pdb", "Sym", &v).await.unwrap());
         db.delete_symbol("k", "A.pdb").await.unwrap();
         assert!(db.find_symbol("K", "a.pdb").await.unwrap().is_none());
+        // By a version the server has: a claim belongs to a stored version.
+        assert!(db.add_symbol("K", "a.pdb", "Sym", &other).await.is_err());
+        db.add_to_feed(FEED, &sample("Sym", "2.0.0")).await.unwrap();
         assert!(db.add_symbol("K", "a.pdb", "Sym", &other).await.unwrap());
+
+        // Deleting the version takes its claims with it.
+        assert!(db.delete_package_data("sym", &other).await.unwrap());
+        assert!(db.find_symbol("K", "a.pdb").await.unwrap().is_none());
     }
 }

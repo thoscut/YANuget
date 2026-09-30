@@ -177,34 +177,18 @@ pub(super) async fn delete_package_data(
     id: &str,
     version: &NuGetVersion,
 ) -> Result<bool> {
-    let lower = canonical_id(id);
-    let normalized = version.normalized();
-    // All or nothing. As separate statements, a failure after the
-    // memberships went left a `packages` row that no feed held and nothing
-    // would ever revisit; a later push then adopted its missing payload.
-    let mut tx = db.write_tx().await?;
-    //
-    // The file blobs are the caller's to delete (see
-    // `retention::purge_global_data`), which it does before this, while
-    // these rows still say what they were.
-    for statement in [
-        "DELETE FROM feed_packages WHERE lower_id = ?1 AND normalized_version = ?2",
-        "DELETE FROM package_tags WHERE lower_id = ?1 AND normalized_version = ?2",
-        "DELETE FROM package_files WHERE lower_id = ?1 AND normalized_version = ?2",
-    ] {
-        sqlx::query(statement)
-            .bind(&lower)
-            .bind(&normalized)
-            .execute(&mut *tx)
-            .await?;
-    }
+    // One statement, so all or nothing: the foreign keys take the version's
+    // memberships, tags, attached-file rows and symbol mappings with it.
+    // (Deleted one table at a time, a failure after the memberships went
+    // used to leave a `packages` row that no feed held.) The bytes those rows
+    // point at are the caller's to delete first, while the rows still say
+    // what they were: see `retention::purge_global_data`.
     let result =
         sqlx::query("DELETE FROM packages WHERE lower_id = ?1 AND normalized_version = ?2")
-            .bind(&lower)
-            .bind(&normalized)
-            .execute(&mut *tx)
+            .bind(canonical_id(id))
+            .bind(version.normalized())
+            .execute(&db.pool)
             .await?;
-    tx.commit().await?;
     Ok(result.rows_affected() > 0)
 }
 
@@ -428,6 +412,50 @@ mod tests {
         let all = db.find_all_versions(FEED, "global.pkg").await.unwrap();
         assert!(!all[0].package.listed && !all[0].package.enabled);
         assert_eq!(all[0].package.downloads, 1);
+    }
+
+    /// Memberships, tags, files and symbols belong to a stored version: none
+    /// can be recorded without it, and all go with it.
+    #[tokio::test]
+    async fn rows_of_a_version_need_it_and_go_with_it() {
+        let db = SqliteDatabase::in_memory().await.unwrap();
+        let p = tagged("Owned.Pkg", "1.0.0", &["one"]);
+        let err = db
+            .add_membership(&Membership::active(FEED, &p))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Database(_)), "{err:?}");
+
+        db.add_to_feed(FEED, &p).await.unwrap();
+        db.add_to_feed("other", &p).await.unwrap();
+        db.add_symbol("KEY", "owned.pdb", "Owned.Pkg", &p.version)
+            .await
+            .unwrap();
+        db.add_file(&PackageFile {
+            lower_id: "owned.pkg".into(),
+            normalized_version: "1.0.0".into(),
+            name: "a.bin".into(),
+            sha256: "aa".repeat(32),
+            size: 1,
+            uploaded: Utc::now(),
+            downloads: 0,
+        })
+        .await
+        .unwrap();
+
+        // Straight at the table, as a purge part-way through would leave it.
+        sqlx::query("DELETE FROM packages WHERE lower_id = 'owned.pkg'")
+            .execute(super::super::test_support::pool(&db))
+            .await
+            .unwrap();
+        assert_eq!(db.feed_count("owned.pkg", &p.version).await.unwrap(), 0);
+        assert!(db.find_symbol("KEY", "owned.pdb").await.unwrap().is_none());
+        assert!(db
+            .files_for("owned.pkg", &p.version)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(db.tag_counts("other", 10).await.unwrap().is_empty());
     }
 
     #[tokio::test]
