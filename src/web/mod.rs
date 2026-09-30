@@ -215,7 +215,9 @@ impl AppState {
                 .unwrap_or_else(|| "localhost".into());
             format!("{scheme}://{host}")
         };
-        UrlBuilder::with_prefix(root, &self.feed.prefix)
+        // Embedded icons are served by the gallery's icon route, so they can
+        // only be advertised when the gallery is mounted.
+        UrlBuilder::with_prefix(root, &self.feed.prefix).with_icons(self.config.enable_web_ui)
     }
 
     /// Refuse an upload of `incoming` bytes (when the client declared a size)
@@ -1373,7 +1375,9 @@ async fn autocomplete(
 ) -> Result<Json<serde_json::Value>> {
     state.require_read(&headers)?;
     let include_semver2 = is_semver2_level(params.semver_level.as_deref());
-    let include_prerelease = params.prerelease.unwrap_or(true);
+    // The protocol's default is `false`, as for search: a client that does not
+    // ask for pre-releases is not offered them.
+    let include_prerelease = params.prerelease.unwrap_or(false);
 
     // `id` present => enumerate that package's versions.
     if let Some(id) = params.id.filter(|s| !s.is_empty()) {

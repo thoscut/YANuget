@@ -525,8 +525,22 @@ async fn registration_leaf_serves_single_version() {
         .json()
         .await
         .unwrap();
-    assert_eq!(leaf["catalogEntry"]["id"], "Leaf.Pkg");
-    assert_eq!(leaf["catalogEntry"]["version"], "1.2.3");
+    // The standalone leaf has the spec's leaf shape: `catalogEntry` is a URL
+    // (there is no catalog, so it names the leaf), and `listed`/`published`
+    // sit at the top level. It used to repeat a page item's shape.
+    let leaf_url = leaf["@id"].as_str().unwrap();
+    assert!(leaf_url.ends_with("/v3/registration/leaf.pkg/1.2.3.json"));
+    assert_eq!(leaf["catalogEntry"], leaf_url);
+    assert_eq!(leaf["listed"], true);
+    assert!(leaf["published"].is_string());
+    assert!(leaf["packageContent"]
+        .as_str()
+        .unwrap()
+        .ends_with("/v3/package/leaf.pkg/1.2.3/leaf.pkg.1.2.3.nupkg"));
+    assert!(leaf["registration"]
+        .as_str()
+        .unwrap()
+        .ends_with("/v3/registration/leaf.pkg/index.json"));
 }
 
 #[tokio::test]
@@ -3929,12 +3943,13 @@ async fn the_semver1_hive_withholds_versions_that_client_cannot_parse() {
         .json()
         .await
         .unwrap();
+    // Displayed as published: the SemVer2 hive keeps the build metadata.
     assert_eq!(
         versions_in(&sv2),
         vec![
             "1.0.0".to_string(),
             "2.0.0-alpha.1".to_string(),
-            "3.0.0".to_string()
+            "3.0.0+build".to_string()
         ]
     );
 

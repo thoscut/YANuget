@@ -322,6 +322,8 @@ impl SqliteDatabase {
         const CHUNK: usize = 400;
         let mut by_id: std::collections::HashMap<String, Vec<Package>> =
             std::collections::HashMap::with_capacity(ids.len());
+        let mut totals: std::collections::HashMap<String, u64> =
+            std::collections::HashMap::with_capacity(ids.len());
 
         for chunk in ids.chunks(CHUNK) {
             // Parameters ?1..?4 are the flags; the ids follow from ?5.
@@ -356,6 +358,29 @@ impl SqliteDatabase {
                 let package = row_to_feed_package(&row)?.package;
                 by_id.entry(package.lower_id()).or_default().push(package);
             }
+
+            // A package's total counts every version the feed serves, not
+            // only those this search's filters admitted: `totalDownloads` is
+            // the package's figure, and it used to shrink when a client left
+            // out pre-releases.
+            let placeholders = (0..chunk.len())
+                .map(|i| format!("?{}", i + 2))
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT lower_id, COALESCE(SUM(downloads), 0) AS total FROM feed_packages \
+                 WHERE feed = ?1 AND enabled = 1 AND pending = 0 \
+                   AND lower_id IN ({placeholders}) \
+                 GROUP BY lower_id"
+            );
+            let mut query = sqlx::query(&sql).bind(feed);
+            for id in chunk {
+                query = query.bind(id);
+            }
+            for row in query.fetch_all(&self.pool).await? {
+                let total: i64 = row.try_get("total")?;
+                totals.insert(row.try_get("lower_id")?, total.max(0) as u64);
+            }
         }
 
         // Emit in the order the caller asked for — that order is the search
@@ -364,7 +389,10 @@ impl SqliteDatabase {
         for id in ids {
             if let Some(mut packages) = by_id.remove(id) {
                 packages.sort_by(|a, b| a.version.cmp(&b.version));
-                groups.push(SearchGroup { packages });
+                groups.push(SearchGroup {
+                    packages,
+                    total_downloads: totals.get(id).copied().unwrap_or(0),
+                });
             }
         }
         Ok(groups)

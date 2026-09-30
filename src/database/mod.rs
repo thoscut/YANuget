@@ -146,6 +146,10 @@ impl SearchSort {
 #[derive(Debug, Clone)]
 pub struct SearchGroup {
     pub packages: Vec<Package>,
+    /// Downloads of every version of the id this feed serves, whether or not
+    /// the search's filters (pre-release, SemVer2, listed) admitted it: the
+    /// package's total, as `totalDownloads` means on nuget.org.
+    pub total_downloads: u64,
 }
 
 impl SearchGroup {
@@ -171,9 +175,12 @@ impl SearchGroup {
             .unwrap_or_else(|| self.latest())
     }
 
-    /// Total downloads across all versions in the group.
+    /// Total downloads of the package, across all its versions in the feed
+    /// (the `total_downloads` field); never less than what the matching
+    /// versions alone add up to, so a group built without it still counts.
     pub fn total_downloads(&self) -> u64 {
-        self.packages.iter().map(|p| p.downloads).sum()
+        let shown: u64 = self.packages.iter().map(|p| p.downloads).sum();
+        self.total_downloads.max(shown)
     }
 }
 

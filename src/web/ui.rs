@@ -2901,6 +2901,7 @@ mod tests {
                     p.id = (*id).into();
                     p
                 }],
+                total_downloads: 0,
             })
             .collect::<Vec<_>>();
         crate::database::SearchPage {
@@ -2983,6 +2984,7 @@ mod tests {
         };
         let mut group = crate::database::SearchGroup {
             packages: vec![versioned("1.9.0"), versioned("2.0.0-beta")],
+            total_downloads: 0,
         };
         assert_eq!(group.latest().normalized_version(), "2.0.0-beta");
         assert_eq!(group.headline().normalized_version(), "1.9.0");
@@ -2994,6 +2996,7 @@ mod tests {
         let page = crate::database::SearchPage {
             groups: vec![crate::database::SearchGroup {
                 packages: vec![versioned("1.9.0"), versioned("2.0.0-beta")],
+                total_downloads: 0,
             }],
             total_hits: 1,
         };

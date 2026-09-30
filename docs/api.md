@@ -159,6 +159,16 @@ Unlisted versions additionally report `published` in the year 1900, per NuGet
 convention. `dependencyGroups` is omitted when a version has no dependencies.
 `404` if unknown.
 
+`catalogEntry.version` is the version as published — the pre-release label in
+its original casing and, in the SemVer2 hive, the build metadata — as on
+nuget.org; every URL, and a page's `lower`/`upper`, use the normalized,
+lower-cased form. A package with an embedded icon gets an `iconUrl` pointing at
+this feed's `/packages/{id}/{version}/icon` (when the web UI, which serves it,
+is enabled), in preference to a `<iconUrl>` in its nuspec. A license expression
+without a `<licenseUrl>` gets `https://licenses.nuget.org/{expression}`, the URL
+`dotnet pack` itself writes. Dependency-group `@id` fragments are
+percent-encoded.
+
 Packages with **fewer than 128 versions** get a single inlined page — the
 whole registration in one response. At 128 versions or more the index instead
 lists external pages of 64 versions each, without inline `items`, and the
@@ -176,7 +186,10 @@ package. It has nothing to do with package *size*.
 GET /v3/registration/{id}/{version}.json
 ```
 
-A single registration leaf for one version.
+A single registration leaf for one version, in the protocol's leaf shape:
+`@id`, `catalogEntry`, `listed`, `published`, `packageContent` and
+`registration` at the top level. `catalogEntry` is a URL rather than an inlined
+object; YANuget has no catalog, so it names the leaf itself.
 
 ## Search
 
@@ -195,6 +208,9 @@ GET /v3/search?q=&skip=&take=&prerelease=&semVerLevel=&packageType=
 
 Returns `{ "@context": {...}, "totalHits": N, "data": [...] }`. Each hit groups
 all matching versions of one package id and is ranked by total downloads.
+`totalDownloads` counts every version the feed serves, including those the
+`prerelease`/`semVerLevel` filters left out of `versions`. Versions are
+displayed as published, like `catalogEntry.version` above.
 
 ## Autocomplete & version enumeration
 
@@ -204,7 +220,8 @@ GET /v3/autocomplete?id={id}&prerelease=     # versions of one package
 ```
 
 Both return `{ "@context": {...}, "totalHits": N, "data": [...] }` — a list of
-package ids, or of versions when `id` is supplied.
+package ids, or of versions when `id` is supplied. `prerelease` defaults to
+`false`, as the protocol specifies (it used to default to `true` here).
 
 ## Symbol server
 
