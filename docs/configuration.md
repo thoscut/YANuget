@@ -24,6 +24,8 @@ A fully commented template lives in
 | `admin_api_key` | `YANUGET_ADMIN_API_KEY` | string | *(none)* | Protects `/admin` (Basic auth). Unset ⇒ admin area off. |
 | `gallery_page_size` | `YANUGET_GALLERY_PAGE_SIZE` | int | `20` | Packages per gallery page (`?take=` overrides). |
 | `max_package_size_bytes` | `YANUGET_MAX_PACKAGE_SIZE_BYTES` | int | *(unlimited)* | Upload cap; streamed either way. |
+| `upload_idle_timeout_secs` | `YANUGET_UPLOAD_IDLE_TIMEOUT_SECS` | int | `300` | Abort an upload after this long without a byte arriving (`408`). Only silence counts; a slow transfer is never cut off. `0` waits forever. |
+| `min_free_disk_bytes` | `YANUGET_MIN_FREE_DISK_BYTES` | int | `2147483648` (2 GiB) | Refuse an upload (`507`) that would leave less than this free on the storage volume. Checked against the declared size when there is one. `0` turns the check off. |
 | `allow_overwrite` | `YANUGET_ALLOW_OVERWRITE` | bool \| string | `false` | Re-push an existing version: `false`, `true`, or `"prerelease-only"` (overwrite pre-releases only). |
 | `hard_delete_enabled` | `YANUGET_HARD_DELETE_ENABLED` | bool | `false` | DELETE removes vs. unlists. |
 | `tls_enabled` | `YANUGET_TLS_ENABLED` | bool | `true` | Serve HTTPS (self-signed fallback). |
@@ -123,6 +125,75 @@ package can never be pruned out of existence.
 | `retention.max_age_days` | `YANUGET_RETENTION_MAX_AGE_DAYS` | int | *(unset)* | Prune versions published more than N days ago. |
 
 With no limit set, the sweep does nothing even when `enabled`.
+
+An admin can **pin** a version in `/admin`; retention then keeps it whatever
+the rules say, and it does not use up one of the "newest *N*" either — a pin is
+kept in addition to what the rules keep. A pin survives an overwriting push and
+moves with a version to another feed; it does not stop an explicit delete.
+
+`/admin/retention` shows these rules, what the last cleanup did, and exactly
+what the next one would delete and why, with a button that deletes that list
+and nothing else (it is refused if the feed changed in the meantime). To clean
+up only from that page, set `enabled = true` and `interval_hours = 0`.
+
+## Attached files
+
+Disk images and archives attached to package versions (see
+[the HTTP API](api.md#attached-files)), under the `[files]` table. They go
+wherever their version goes, retention included.
+
+| TOML key | Env var | Type | Default | Description |
+| --- | --- | --- | --- | --- |
+| `files.enabled` | `YANUGET_FILES_ENABLED` | bool | `true` | Accept and serve attached files. |
+| `files.max_file_size_bytes` | `YANUGET_FILES_MAX_FILE_SIZE_BYTES` | int | *(`max_package_size_bytes`)* | Largest file accepted; unset falls back to the package limit, and both unset is unlimited. |
+| `files.allowed_extensions` | `YANUGET_FILES_ALLOWED_EXTENSIONS` | string[] | `wim, swm, esd, iso, vhd, vhdx, zip, 7z, cab` | Accepted file types (env: comma-separated). |
+| `files.upload_expiry_hours` | `YANUGET_FILES_UPLOAD_EXPIRY_HOURS` | int | `72` | How long an unfinished resumable upload is kept. |
+| `files.inbox_dir` | `YANUGET_FILES_INBOX_DIR` | path | *(off)* | The SSH inbox (below). |
+| `files.inbox_scan_secs` | `YANUGET_FILES_INBOX_SCAN_SECS` | int | `30` | How often the inbox is scanned (at least 5). |
+
+Uploading over HTTP needs the feed's push key, and a feed without one refuses
+files even when it accepts package pushes. Whatever a file contains, it is
+served as a download, never as a page.
+
+### The SSH inbox
+
+YANuget runs no SSH server. With `files.inbox_dir` set, the host's `sshd`
+receives the files and YANuget imports them from that directory:
+
+```text
+{inbox_dir}/{feed}/{id}/{version}/{name}          the file
+{inbox_dir}/{feed}/{id}/{version}/{name}.sha256   its checksum, as sha256sum writes it
+```
+
+The feed directories are created on startup (`default` without `[[feeds]]`).
+A file is imported once its `.sha256` file is there, so upload the file first
+and the checksum last; `rsync --partial --append-verify` resumes a broken
+transfer. The importer moves the file out of the inbox before it checks it,
+then attaches it to the version, which the feed must already hold, and removes
+both files. When a file cannot be imported, a `{name}.error` next to it says
+why; the file stays, and removing the `.error` retries it.
+
+```bash
+sha256sum base.wim > base.wim.sha256
+rsync --partial --append-verify base.wim        upload@nuget:inbox/default/Contoso.Images/1.2.0/
+rsync                           base.wim.sha256 upload@nuget:inbox/default/Contoso.Images/1.2.0/
+```
+
+An upload-only account that can reach nothing but the inbox, in
+`/etc/ssh/sshd_config`:
+
+```text
+Match User upload
+    ChrootDirectory /srv/yanuget-chroot     # owned by root; holds inbox/
+    ForceCommand internal-sftp
+    AllowTcpForwarding no
+    X11Forwarding no
+```
+
+`internal-sftp` serves `scp` and `sftp`. `rsync` needs an `rsync` binary
+inside the chroot or a restricted shell instead of the jail. The inbox must be
+writable by that account and by YANuget, and must not be inside the package
+store (checked on startup; the inbox is then disabled).
 
 ## Feeds
 

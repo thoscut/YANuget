@@ -38,6 +38,15 @@ gallery_page_size = 20     # YANUGET_GALLERY_PAGE_SIZE
 # 26843545600 = 25 GiB.
 # max_package_size_bytes = 26843545600    # YANUGET_MAX_PACKAGE_SIZE_BYTES
 
+# Abort an upload once no byte has arrived for this many seconds (408). Only
+# silence counts: a slow but moving 25 GiB transfer is never cut off. 0 = never.
+upload_idle_timeout_secs = 300            # YANUGET_UPLOAD_IDLE_TIMEOUT_SECS
+
+# Refuse an upload (507) that would leave less than this many bytes free on the
+# storage volume — a full disk fails the database and every other writer at
+# once. Checked against the declared size when the client sends one. 0 = off.
+min_free_disk_bytes = 2147483648          # YANUGET_MIN_FREE_DISK_BYTES
+
 # Whether re-pushing an existing id/version overwrites it. Off by default to
 # preserve NuGet's immutability guarantee. Accepts a bool or a string:
 #   false  — never overwrite (default)
@@ -146,6 +155,24 @@ interval_hours = 24           # YANUGET_RETENTION_INTERVAL_HOURS — background 
 # keep_latest_stable = 10       # YANUGET_RETENTION_KEEP_LATEST_STABLE
 # keep_latest_prerelease = 5    # YANUGET_RETENTION_KEEP_LATEST_PRERELEASE
 # max_age_days = 180            # YANUGET_RETENTION_MAX_AGE_DAYS
+
+# ---------------------------------------------------------------------------
+# Attached files — disk images and archives a package's install script fetches
+# (resumably: BITS, Invoke-WebRequest -Resume, curl -C -). Uploaded with the
+# push key (PUT or tus), or over SSH through the inbox. A feed without a push
+# key refuses them. They are deleted, pruned and moved with their version.
+# ---------------------------------------------------------------------------
+[files]
+enabled = true                      # YANUGET_FILES_ENABLED
+# Largest file; unset falls back to max_package_size_bytes (unset = unlimited).
+# max_file_size_bytes = 107374182400  # YANUGET_FILES_MAX_FILE_SIZE_BYTES (100 GiB)
+allowed_extensions = ["wim", "swm", "esd", "iso", "vhd", "vhdx", "zip", "7z", "cab"]  # YANUGET_FILES_ALLOWED_EXTENSIONS
+upload_expiry_hours = 72            # YANUGET_FILES_UPLOAD_EXPIRY_HOURS — unfinished resumable uploads
+# An inbox the host's sshd writes to: {inbox}/{feed}/{id}/{version}/{name}
+# plus {name}.sha256 (sha256sum format) once the file is complete. Must not be
+# inside the package store.
+# inbox_dir = "/srv/yanuget-chroot/inbox"   # YANUGET_FILES_INBOX_DIR
+inbox_scan_secs = 30                # YANUGET_FILES_INBOX_SCAN_SECS
 
 # ---------------------------------------------------------------------------
 # Feeds — host several NuGet feeds from one server.

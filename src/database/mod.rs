@@ -39,6 +39,54 @@ pub struct SearchRequest {
     pub package_type: Option<String>,
     /// The order of the page's package ids.
     pub sort: SearchSort,
+    /// Only packages carrying this tag (case-insensitive, exact).
+    pub tag: Option<String>,
+}
+
+/// A file attached to a package version (a disk image, an archive).
+///
+/// Global like the package data itself: every feed holding the version holds
+/// its files. The bytes live in the blob store under [`PackageFile::sha256`],
+/// once however many versions share them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackageFile {
+    pub lower_id: String,
+    pub normalized_version: String,
+    /// The name as uploaded (validated; unique per version, ignoring case).
+    pub name: String,
+    /// Lower-case hex SHA-256 of the content: its blob name and its ETag.
+    pub sha256: String,
+    pub size: u64,
+    pub uploaded: chrono::DateTime<chrono::Utc>,
+    pub downloads: u64,
+}
+
+/// An unfinished resumable (tus) upload of a [`PackageFile`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadSession {
+    /// Random, unguessable id; also names the partial file.
+    pub id: String,
+    /// The feed it was started in, whose push key it answers to.
+    pub feed: String,
+    pub lower_id: String,
+    pub normalized_version: String,
+    pub name: String,
+    /// The declared total size.
+    pub length: u64,
+    /// Bytes received so far.
+    pub received: u64,
+    /// The SHA-256 (hex) the finished file must have, if the client said.
+    pub expected_sha256: Option<String>,
+    pub expires: chrono::DateTime<chrono::Utc>,
+}
+
+/// How many packages of a feed carry one tag.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TagCount {
+    /// The tag, lower-cased.
+    pub tag: String,
+    /// Distinct package ids (not versions) with a visible version carrying it.
+    pub packages: i64,
 }
 
 impl Default for SearchRequest {
@@ -51,6 +99,7 @@ impl Default for SearchRequest {
             include_semver2: true,
             package_type: None,
             sort: SearchSort::default(),
+            tag: None,
         }
     }
 }
@@ -153,6 +202,9 @@ pub struct Membership {
     pub flagged: bool,
     /// Human-readable reason for [`Membership::flagged`].
     pub flag_reason: Option<String>,
+    /// Kept by retention whatever its rules say. Affects nothing else: an
+    /// explicit delete still removes a pinned version.
+    pub pinned: bool,
 }
 
 impl Membership {
@@ -168,6 +220,7 @@ impl Membership {
             pending: false,
             flagged: false,
             flag_reason: None,
+            pinned: false,
         }
     }
 }
@@ -180,6 +233,8 @@ pub struct FeedVersion {
     pub pending: bool,
     pub flagged: bool,
     pub flag_reason: Option<String>,
+    /// Exempt from retention (see [`Membership::pinned`]).
+    pub pinned: bool,
 }
 
 /// Metadata store for indexed packages.
@@ -283,6 +338,16 @@ pub trait PackageDatabase: Send + Sync {
         enabled: bool,
     ) -> Result<bool>;
 
+    /// Set the retention pin on a membership. Returns `true` if a row was
+    /// updated.
+    async fn set_pinned(
+        &self,
+        feed: &str,
+        id: &str,
+        version: &NuGetVersion,
+        pinned: bool,
+    ) -> Result<bool>;
+
     /// Whether a version may be served from `feed`: present, enabled and not
     /// pending. (Unlisted-but-enabled versions are still servable by version.)
     async fn is_servable(&self, feed: &str, id: &str, version: &NuGetVersion) -> Result<bool>;
@@ -329,6 +394,58 @@ pub trait PackageDatabase: Send + Sync {
     /// The most recently published versions in `feed`, newest first.
     async fn recent_packages(&self, feed: &str, limit: i64) -> Result<Vec<Package>>;
 
+    /// The tags of `feed`'s visible (listed, enabled, approved) versions with
+    /// how many packages carry each, most used first, at most `limit`.
+    async fn tag_counts(&self, feed: &str, limit: i64) -> Result<Vec<TagCount>>;
+
+    // --- files attached to versions (global, like package data) ---
+
+    /// Attach a file. [`Error::PackageAlreadyExists`](crate::error::Error::PackageAlreadyExists)
+    /// when the version already has a file of that name (ignoring case).
+    async fn add_file(&self, file: &PackageFile) -> Result<()>;
+
+    /// A version's files, by name.
+    async fn files_for(&self, id: &str, version: &NuGetVersion) -> Result<Vec<PackageFile>>;
+
+    /// One of a version's files, by name (ignoring case).
+    async fn get_file(
+        &self,
+        id: &str,
+        version: &NuGetVersion,
+        name: &str,
+    ) -> Result<Option<PackageFile>>;
+
+    /// Detach a file, returning what was detached.
+    async fn delete_file(
+        &self,
+        id: &str,
+        version: &NuGetVersion,
+        name: &str,
+    ) -> Result<Option<PackageFile>>;
+
+    /// How many attached files, across all versions, reference a blob.
+    async fn blob_references(&self, sha256: &str) -> Result<i64>;
+
+    /// Count one download of a file.
+    async fn increment_file_downloads(
+        &self,
+        id: &str,
+        version: &NuGetVersion,
+        name: &str,
+    ) -> Result<()>;
+
+    // --- resumable uploads ---
+
+    async fn create_upload(&self, upload: &UploadSession) -> Result<()>;
+    async fn get_upload(&self, id: &str) -> Result<Option<UploadSession>>;
+    async fn set_upload_received(&self, id: &str, received: u64) -> Result<()>;
+    async fn delete_upload(&self, id: &str) -> Result<()>;
+    /// Uploads whose expiry has passed at `now`.
+    async fn expired_uploads(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<UploadSession>>;
+
     // --- symbols (global; keyed by SSQP signature) ---
 
     /// Record a symbol-file mapping: its SSQP `key`/`filename` and the owning
@@ -368,6 +485,10 @@ pub struct DatabaseStats {
     pub total_size: i64,
     /// Number of indexed symbol files.
     pub symbol_count: i64,
+    /// Files attached to the feed's visible versions.
+    pub file_count: i64,
+    /// Their total size, in bytes.
+    pub file_bytes: i64,
 }
 
 /// A symbol file's owning package, resolved from an SSQP lookup.

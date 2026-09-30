@@ -1075,6 +1075,486 @@ async fn the_gallery_sorts_by_downloads_name_and_last_update() {
 }
 
 #[tokio::test]
+async fn the_gallery_filters_by_tag_and_lists_every_tag() {
+    let server = spawn().await;
+    // Every test package is tagged `integration test`.
+    for id in ["Tag.One", "Tag.Two"] {
+        push_multipart(&server, API_KEY, build_nupkg(id, "1.0.0", b"x")).await;
+    }
+    let page = |q: &'static str| {
+        let url = server.url(q);
+        let client = server.client.clone();
+        async move { client.get(url).send().await.unwrap().text().await.unwrap() }
+    };
+    // Case does not matter; the heading names the tag.
+    let tagged = page("/packages?tag=INTEGRATION").await;
+    assert!(
+        tagged.contains("2 packages tagged \u{201c}integration\u{201d}"),
+        "{tagged}"
+    );
+    let none = page("/packages?tag=nothing-has-this").await;
+    assert!(none.contains("No packages tagged"), "{none}");
+    // A value no tag could be (it has a space) is no filter at all.
+    let all = page("/packages?tag=two%20words").await;
+    assert!(all.contains("2 packages<"), "{all}");
+
+    let cloud = page("/tags").await;
+    assert!(cloud.contains(">integration</a>"), "{cloud}");
+    assert!(cloud.contains("<span class=\"n\">2<span class=\"vh\"> packages</span></span>"));
+    // The landing page offers them too.
+    let landing = page("/").await;
+    assert!(landing.contains("aria-label=\"Popular tags\""), "{landing}");
+}
+
+// ---------------------------------------------------------------------------
+// Files attached to versions
+// ---------------------------------------------------------------------------
+
+/// Bytes that look like an image to nobody but are big enough to page: 300 KB.
+fn image_bytes(seed: u8) -> Vec<u8> {
+    (0..300_000u32)
+        .map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed))
+        .collect()
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    hex::encode(sha2::Sha256::digest(bytes))
+}
+
+async fn put_file(
+    server: &TestServer,
+    id: &str,
+    v: &str,
+    name: &str,
+    body: Vec<u8>,
+    sha: Option<&str>,
+) -> reqwest::Response {
+    let mut req = server
+        .client
+        .put(server.url(&format!("/api/v2/files/{id}/{v}/{name}")))
+        .header("X-NuGet-ApiKey", API_KEY)
+        .body(body);
+    if let Some(sha) = sha {
+        req = req.header("x-checksum-sha256", sha);
+    }
+    req.send().await.unwrap()
+}
+
+#[tokio::test]
+async fn a_file_attached_in_one_request_downloads_resumably() {
+    let server = spawn().await;
+    push_multipart(&server, API_KEY, build_nupkg("Img.Pkg", "1.0.0", b"x")).await;
+    let image = image_bytes(1);
+    let sha = sha256_hex(&image);
+
+    let created = put_file(
+        &server,
+        "Img.Pkg",
+        "1.0.0",
+        "base.wim",
+        image.clone(),
+        Some(&sha),
+    )
+    .await;
+    assert_eq!(created.status(), reqwest::StatusCode::CREATED);
+    let body: serde_json::Value = created.json().await.unwrap();
+    assert_eq!(body["sha256"], sha.as_str());
+    assert_eq!(body["size"], image.len());
+    // The same file again changes nothing; different bytes under the name are refused.
+    let same = put_file(&server, "Img.Pkg", "1.0.0", "base.wim", image.clone(), None).await;
+    assert_eq!(same.status(), reqwest::StatusCode::OK);
+    let other = put_file(
+        &server,
+        "Img.Pkg",
+        "1.0.0",
+        "base.wim",
+        image_bytes(2),
+        None,
+    )
+    .await;
+    assert_eq!(other.status(), reqwest::StatusCode::CONFLICT);
+    // A body that is not what the client said is refused, and nothing stays.
+    let corrupt = put_file(
+        &server,
+        "Img.Pkg",
+        "1.0.0",
+        "other.wim",
+        image_bytes(3),
+        Some(&sha),
+    )
+    .await;
+    assert_eq!(corrupt.status(), reqwest::StatusCode::BAD_REQUEST);
+    // So are names that could be anything but an image.
+    for name in ["page.html", "image.svg", "..%2Fx.wim"] {
+        let r = put_file(&server, "Img.Pkg", "1.0.0", name, b"x".to_vec(), None).await;
+        assert!(r.status().is_client_error(), "{name}: {}", r.status());
+    }
+    // Only to a version the feed holds.
+    let nowhere = put_file(&server, "Img.Pkg", "9.9.9", "base.wim", b"x".to_vec(), None).await;
+    assert_eq!(nowhere.status(), reqwest::StatusCode::NOT_FOUND);
+
+    let url = server.url("/files/img.pkg/1.0.0/base.wim");
+    let head = server.client.head(&url).send().await.unwrap();
+    assert_eq!(head.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        head.headers()["content-length"],
+        image.len().to_string().as_str()
+    );
+    assert_eq!(head.headers()["etag"], format!("\"{sha}\"").as_str());
+    assert!(head.headers()["repr-digest"]
+        .to_str()
+        .unwrap()
+        .starts_with("sha-256=:"));
+    let full = server.client.get(&url).send().await.unwrap();
+    assert_eq!(full.headers()["content-type"], "application/octet-stream");
+    assert!(full.headers()["content-disposition"]
+        .to_str()
+        .unwrap()
+        .starts_with("attachment; filename=\"base.wim\""));
+    assert_eq!(
+        full.headers()["content-security-policy"],
+        "default-src 'none'"
+    );
+    assert_eq!(full.bytes().await.unwrap().as_ref(), image.as_slice());
+    let rest = server
+        .client
+        .get(&url)
+        .header("range", "bytes=100000-")
+        .header("if-range", format!("\"{sha}\""))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rest.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+    assert_eq!(rest.bytes().await.unwrap().as_ref(), &image[100_000..]);
+
+    let index: serde_json::Value = server
+        .client
+        .get(server.url("/files/img.pkg/1.0.0/index.json"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(index["files"].as_array().unwrap().len(), 1);
+    assert_eq!(index["files"][0]["url"], url.as_str());
+
+    // The package page shows it, with the script that fetches and checks it.
+    let page = server
+        .client
+        .get(server.url("/packages/img.pkg"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(page.contains("<h2>Files</h2>"), "{page}");
+    assert!(
+        page.contains(&format!("Start-BitsTransfer -Source &#39;{url}&#39;")),
+        "{page}"
+    );
+    assert!(
+        page.contains(&format!("-Checksum &#39;{sha}&#39; -ChecksumType sha256")),
+        "{page}"
+    );
+
+    // Deleting it frees the name.
+    let gone = server
+        .client
+        .delete(server.url("/api/v2/files/img.pkg/1.0.0/base.wim"))
+        .header("X-NuGet-ApiKey", API_KEY)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(gone.status(), reqwest::StatusCode::NO_CONTENT);
+    assert_eq!(
+        status_of(&server, "/files/img.pkg/1.0.0/base.wim").await,
+        reqwest::StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn a_feed_open_for_pushes_is_not_open_for_files() {
+    let server = spawn_with(|c| c.api_key = None).await;
+    push_multipart(&server, "anything", build_nupkg("Open.Pkg", "1.0.0", b"x")).await;
+    let r = put_file(
+        &server,
+        "Open.Pkg",
+        "1.0.0",
+        "base.wim",
+        b"x".to_vec(),
+        None,
+    )
+    .await;
+    assert_eq!(r.status(), reqwest::StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn a_blob_shared_by_two_versions_outlives_the_first() {
+    let server = spawn_with(|c| c.admin_api_key = Some(ADMIN_KEY.to_string())).await;
+    let image = image_bytes(9);
+    for v in ["1.0.0", "2.0.0"] {
+        push_multipart(&server, API_KEY, build_nupkg("Shared.Img", v, b"x")).await;
+        let r = put_file(&server, "Shared.Img", v, "base.wim", image.clone(), None).await;
+        assert_eq!(r.status(), reqwest::StatusCode::CREATED);
+    }
+    let blob = server
+        ._dir
+        .path()
+        .join("packages/.blobs/sha256")
+        .join(&sha256_hex(&image)[..2])
+        .join(sha256_hex(&image));
+    assert!(blob.exists(), "one blob for both: {}", blob.display());
+
+    let delete = |v: &'static str| {
+        admin_bulk(
+            &server,
+            "",
+            "shared.img",
+            ADMIN_KEY,
+            if v == "1.0.0" {
+                "op=delete&v=1.0.0"
+            } else {
+                "op=delete&v=2.0.0"
+            },
+        )
+    };
+    assert_eq!(
+        delete("1.0.0").await.status(),
+        reqwest::StatusCode::SEE_OTHER
+    );
+    assert!(blob.exists(), "still referenced by 2.0.0");
+    assert!(status_of(&server, "/files/shared.img/2.0.0/base.wim")
+        .await
+        .is_success());
+    assert_eq!(
+        delete("2.0.0").await.status(),
+        reqwest::StatusCode::SEE_OTHER
+    );
+    assert!(!blob.exists(), "the last reference took the blob with it");
+}
+
+/// A tus request builder with the protocol header set.
+fn tus(req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    req.header("Tus-Resumable", "1.0.0")
+        .header("X-NuGet-ApiKey", API_KEY)
+}
+
+fn tus_metadata(pairs: &[(&str, &str)]) -> String {
+    use base64::Engine;
+    pairs
+        .iter()
+        .map(|(k, v)| {
+            format!(
+                "{k} {}",
+                base64::engine::general_purpose::STANDARD.encode(v)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+#[tokio::test]
+async fn a_resumable_upload_continues_where_it_stopped() {
+    let server = spawn().await;
+    push_multipart(&server, API_KEY, build_nupkg("Tus.Pkg", "1.0.0", b"x")).await;
+    let image = image_bytes(5);
+    let sha = sha256_hex(&image);
+    let no_redirect = no_redirect();
+
+    // Without the protocol header, a client is told what is spoken here.
+    let bare = no_redirect
+        .post(server.url("/api/v2/uploads"))
+        .header("X-NuGet-ApiKey", API_KEY)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bare.status(), reqwest::StatusCode::PRECONDITION_FAILED);
+    assert_eq!(bare.headers()["tus-version"], "1.0.0");
+
+    let created = tus(no_redirect.post(server.url("/api/v2/uploads")))
+        .header("Upload-Length", image.len().to_string())
+        .header(
+            "Upload-Metadata",
+            tus_metadata(&[
+                ("id", "Tus.Pkg"),
+                ("version", "1.0.0"),
+                ("filename", "base.wim"),
+                ("sha256", &sha),
+            ]),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), reqwest::StatusCode::CREATED);
+    let location = created.headers()["location"].to_str().unwrap().to_string();
+    assert!(created.headers().contains_key("upload-expires"));
+
+    let patch = |offset: usize, bytes: &[u8]| {
+        tus(server.client.patch(&location))
+            .header("Content-Type", "application/offset+octet-stream")
+            .header("Upload-Offset", offset.to_string())
+            .body(bytes.to_vec())
+            .send()
+    };
+    let half = image.len() / 2;
+    let first = patch(0, &image[..half]).await.unwrap();
+    assert_eq!(first.status(), reqwest::StatusCode::NO_CONTENT);
+    assert_eq!(first.headers()["upload-offset"], half.to_string().as_str());
+
+    // The connection dropped here; the client asks where to go on from.
+    let head = tus(server.client.head(&location)).send().await.unwrap();
+    assert_eq!(head.headers()["upload-offset"], half.to_string().as_str());
+    assert_eq!(
+        head.headers()["upload-length"],
+        image.len().to_string().as_str()
+    );
+    // Sending from the wrong place is refused, with the right place.
+    let wrong = patch(0, &image[..10]).await.unwrap();
+    assert_eq!(wrong.status(), reqwest::StatusCode::CONFLICT);
+    assert_eq!(wrong.headers()["upload-offset"], half.to_string().as_str());
+    // Nothing is attached until the last byte.
+    assert_eq!(
+        status_of(&server, "/files/tus.pkg/1.0.0/base.wim").await,
+        reqwest::StatusCode::NOT_FOUND
+    );
+
+    let last = patch(half, &image[half..]).await.unwrap();
+    assert_eq!(last.status(), reqwest::StatusCode::NO_CONTENT);
+    let got = server
+        .client
+        .get(server.url("/files/tus.pkg/1.0.0/base.wim"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(got.bytes().await.unwrap().as_ref(), image.as_slice());
+    // The finished upload is gone.
+    let after = tus(server.client.head(&location)).send().await.unwrap();
+    assert_eq!(after.status(), reqwest::StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn a_resumable_upload_that_does_not_match_its_checksum_is_discarded() {
+    let server = spawn().await;
+    push_multipart(&server, API_KEY, build_nupkg("Tus.Bad", "1.0.0", b"x")).await;
+    let image = image_bytes(6);
+    let created = tus(no_redirect().post(server.url("/api/v2/uploads")))
+        .header("Upload-Length", image.len().to_string())
+        .header(
+            "Upload-Metadata",
+            tus_metadata(&[
+                ("id", "Tus.Bad"),
+                ("version", "1.0.0"),
+                ("filename", "base.wim"),
+                ("sha256", &"0".repeat(64)),
+            ]),
+        )
+        .send()
+        .await
+        .unwrap();
+    let location = created.headers()["location"].to_str().unwrap().to_string();
+    let done = tus(server.client.patch(&location))
+        .header("Content-Type", "application/offset+octet-stream")
+        .header("Upload-Offset", "0")
+        .body(image)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(done.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(
+        status_of(&server, "/files/tus.bad/1.0.0/base.wim").await,
+        reqwest::StatusCode::NOT_FOUND
+    );
+
+    // An abandoned upload can be ended by the client.
+    let created = tus(no_redirect().post(server.url("/api/v2/uploads")))
+        .header("Upload-Length", "10")
+        .header(
+            "Upload-Metadata",
+            tus_metadata(&[
+                ("id", "Tus.Bad"),
+                ("version", "1.0.0"),
+                ("filename", "later.wim"),
+            ]),
+        )
+        .send()
+        .await
+        .unwrap();
+    let location = created.headers()["location"].to_str().unwrap().to_string();
+    let ended = tus(server.client.delete(&location)).send().await.unwrap();
+    assert_eq!(ended.status(), reqwest::StatusCode::NO_CONTENT);
+    let head = tus(server.client.head(&location)).send().await.unwrap();
+    assert_eq!(head.status(), reqwest::StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn files_dropped_in_the_inbox_are_verified_and_attached() {
+    let server = spawn().await;
+    push_multipart(&server, API_KEY, build_nupkg("Drop.Pkg", "1.0.0", b"x")).await;
+    let data = server._dir.path();
+    let inbox = tempfile::tempdir().unwrap();
+    let dir = inbox.path().join("default/Drop.Pkg/1.0.0");
+    std::fs::create_dir_all(&dir).unwrap();
+    let good = image_bytes(7);
+    std::fs::write(dir.join("base.wim"), &good).unwrap();
+    std::fs::write(
+        dir.join("base.wim.sha256"),
+        format!("{}  base.wim\n", sha256_hex(&good)),
+    )
+    .unwrap();
+    // A second file whose checksum does not match…
+    std::fs::write(dir.join("bad.wim"), b"not what was promised").unwrap();
+    std::fs::write(dir.join("bad.wim.sha256"), "0".repeat(64)).unwrap();
+    // …and a third still being copied: no checksum file yet.
+    std::fs::write(dir.join("partial.wim"), b"half").unwrap();
+
+    let storage = FilesystemStorage::new(data.join("packages")).await.unwrap();
+    let db = SqliteDatabase::connect(&data.join("yanuget.db").to_string_lossy())
+        .await
+        .unwrap();
+    let files = yanuget::config::FilesConfig::default();
+    let feeds = vec!["default".to_string()];
+    let staging = data.join("packages/.uploads");
+    let scan = yanuget::inbox::Inbox {
+        dir: inbox.path(),
+        storage: &storage,
+        db: &db,
+        files: &files,
+        max_file_size: None,
+        feeds: &feeds,
+        staging: &staging,
+    };
+    let report = scan.scan().await;
+    assert_eq!(
+        report,
+        yanuget::inbox::ScanReport {
+            imported: 1,
+            failed: 1
+        }
+    );
+
+    // The good one is attached and gone from the inbox.
+    let got = server
+        .client
+        .get(server.url("/files/drop.pkg/1.0.0/base.wim"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(got.bytes().await.unwrap().as_ref(), good.as_slice());
+    assert!(!dir.join("base.wim").exists() && !dir.join("base.wim.sha256").exists());
+    // The bad one is back where it was, with the reason next to it.
+    assert!(dir.join("bad.wim").exists());
+    let why = std::fs::read_to_string(dir.join("bad.wim.error")).unwrap();
+    assert!(why.contains("checksum mismatch"), "{why}");
+    // The partial one waits.
+    assert!(dir.join("partial.wim").exists());
+    // A second scan leaves the failed one alone until its .error is removed.
+    assert_eq!(scan.scan().await, yanuget::inbox::ScanReport::default());
+}
+
+#[tokio::test]
 async fn the_gallery_font_is_served_once_for_every_feed_and_cached() {
     let server = spawn_feeds(|c| c.feeds = vec![feed("stable"), feed("dev")]).await;
     let html = server
@@ -1101,6 +1581,147 @@ async fn the_gallery_font_is_served_once_for_every_feed_and_cached() {
         .unwrap()
         .contains("immutable"));
     assert!(resp.bytes().await.unwrap().starts_with(b"wOF2"));
+}
+
+/// The retention page, fetched as the admin.
+async fn retention_page(server: &TestServer) -> String {
+    server
+        .client
+        .get(server.url("/admin/retention"))
+        .basic_auth("admin", Some(ADMIN_KEY))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap()
+}
+
+/// The plan fingerprint the retention page's delete button would send.
+fn plan_of(page: &str) -> String {
+    page.split("name=\"plan\" value=\"")
+        .nth(1)
+        .and_then(|s| s.split('"').next())
+        .unwrap_or_else(|| panic!("no delete button: {page}"))
+        .to_string()
+}
+
+async fn run_retention(server: &TestServer, fields: &str) -> reqwest::Response {
+    no_redirect()
+        .post(server.url("/admin/retention/run"))
+        .basic_auth("admin", Some(ADMIN_KEY))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(format!("{}&{fields}", admin_body(ADMIN_KEY)))
+        .send()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_cleanup_deletes_what_it_showed_and_keeps_pins() {
+    let server = spawn_with(|c| {
+        c.admin_api_key = Some(ADMIN_KEY.to_string());
+        // Manual cleanups only: no schedule, nothing on push.
+        c.retention.enabled = true;
+        c.retention.interval_hours = 0;
+        c.retention.keep_latest_stable = Some(1);
+    })
+    .await;
+    for v in ["1.0.0", "2.0.0", "3.0.0"] {
+        push_multipart(&server, API_KEY, build_nupkg("Clean.Pkg", v, b"x")).await;
+    }
+    // Pin the oldest: an LTS line that would otherwise go.
+    let pin = admin_bulk(&server, "", "clean.pkg", ADMIN_KEY, "op=pin&v=1.0.0").await;
+    assert_eq!(pin.status(), reqwest::StatusCode::SEE_OTHER);
+
+    let page = retention_page(&server).await;
+    assert!(page.contains("1 version would be deleted"), "{page}");
+    assert!(
+        page.contains("beyond the newest 1 stable version"),
+        "{page}"
+    );
+    let plan = plan_of(&page);
+
+    // A stale plan deletes nothing, and says so.
+    let stale = run_retention(&server, "plan=not-what-was-shown").await;
+    assert_eq!(stale.status(), reqwest::StatusCode::SEE_OTHER);
+    assert_eq!(stale.headers()["location"], "/admin/retention?changed=1");
+    let flat = |v: &str| format!("/v3/package/clean.pkg/{v}/clean.pkg.{v}.nupkg");
+    assert!(status_of(&server, &flat("2.0.0")).await.is_success());
+
+    // Without the CSRF token, nothing either.
+    let forged = no_redirect()
+        .post(server.url("/admin/retention/run"))
+        .basic_auth("admin", Some(ADMIN_KEY))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(format!("plan={plan}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(forged.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    // The plan as shown: 2.0.0 goes; the pinned 1.0.0 and the newest stay.
+    let run = run_retention(&server, &format!("plan={plan}")).await;
+    assert_eq!(run.status(), reqwest::StatusCode::SEE_OTHER);
+    let location = run.headers()["location"].to_str().unwrap().to_string();
+    assert!(
+        location.starts_with("/admin/retention?deleted=1&"),
+        "{location}"
+    );
+    assert_eq!(
+        status_of(&server, &flat("2.0.0")).await,
+        reqwest::StatusCode::NOT_FOUND
+    );
+    for kept in ["1.0.0", "3.0.0"] {
+        assert!(status_of(&server, &flat(kept)).await.is_success(), "{kept}");
+    }
+    let after = retention_page(&server).await;
+    assert!(after.contains("Nothing to delete"), "{after}");
+    assert!(after.contains("Last cleanup"), "{after}");
+    assert!(after.contains("Pinned, kept regardless"), "{after}");
+}
+
+#[tokio::test]
+async fn pruning_on_push_keeps_pinned_versions_and_an_overwrite_keeps_the_pin() {
+    let server = spawn_with(|c| {
+        c.admin_api_key = Some(ADMIN_KEY.to_string());
+        c.allow_overwrite = yanuget::config::OverwriteMode::Enabled;
+        c.retention.enabled = true;
+        c.retention.interval_hours = 0;
+        c.retention.prune_on_push = true;
+        c.retention.keep_latest_stable = Some(1);
+    })
+    .await;
+    push_multipart(&server, API_KEY, build_nupkg("Lts.Pkg", "1.0.0", b"x")).await;
+    let pin = no_redirect()
+        .post(server.url("/admin/packages/lts.pkg/1.0.0/pin"))
+        .basic_auth("admin", Some(ADMIN_KEY))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(admin_body(ADMIN_KEY))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(pin.status(), reqwest::StatusCode::SEE_OTHER);
+    // Re-pushing the pinned version replaces its bytes, not the pin.
+    push_multipart(
+        &server,
+        API_KEY,
+        build_nupkg("Lts.Pkg", "1.0.0", b"rebuilt"),
+    )
+    .await;
+    for v in ["2.0.0", "3.0.0"] {
+        push_multipart(&server, API_KEY, build_nupkg("Lts.Pkg", v, b"x")).await;
+    }
+    let versions: serde_json::Value = server
+        .client
+        .get(server.url("/v3/package/lts.pkg/index.json"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(versions["versions"], serde_json::json!(["1.0.0", "3.0.0"]));
 }
 
 #[tokio::test]
@@ -3733,4 +4354,162 @@ async fn the_defaults_do_not_trust_the_network_around_them() {
     let config = yanuget::config::Config::default();
     assert!(config.rate_limit.enabled);
     assert!(config.rate_limit.max_requests >= 5_000);
+}
+
+// ---------------------------------------------------------------------------
+// Hardening: overwrites, resumable downloads, stalled uploads, a full disk
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_refused_overwrite_leaves_the_version_in_its_feed() {
+    // `dev` may overwrite; `stable` holds the same version, which pins its
+    // payload. A different build under that id/version must be refused — and
+    // refused *without* first taking the version out of `dev`.
+    let server = spawn_feeds(|c| {
+        c.api_key = Some(API_KEY.into());
+        let mut dev = feed("dev");
+        dev.allow_overwrite = Some(yanuget::config::OverwriteMode::Enabled);
+        c.feeds = vec![dev, feed("stable")];
+    })
+    .await;
+    let original = build_nupkg("Shared.Pkg", "1.0.0", b"first build");
+    for path in ["/dev/api/v2/package", "/stable/api/v2/package"] {
+        assert_eq!(
+            push_to(&server, path, API_KEY, original.clone())
+                .await
+                .status(),
+            reqwest::StatusCode::CREATED
+        );
+    }
+    let rebuilt = build_nupkg("Shared.Pkg", "1.0.0", b"second build, other bytes");
+    assert_eq!(
+        push_to(&server, "/dev/api/v2/package", API_KEY, rebuilt)
+            .await
+            .status(),
+        reqwest::StatusCode::CONFLICT
+    );
+    assert!(status_of(&server, "/dev/v3/package/shared.pkg/index.json")
+        .await
+        .is_success());
+    // An identical re-push is still an overwrite dev allows.
+    assert_eq!(
+        push_to(&server, "/dev/api/v2/package", API_KEY, original)
+            .await
+            .status(),
+        reqwest::StatusCode::CREATED
+    );
+}
+
+#[tokio::test]
+async fn downloads_resume_safely_and_count_once() {
+    let server = spawn().await;
+    push_multipart(
+        &server,
+        API_KEY,
+        build_nupkg("Resume.Pkg", "1.0.0", &[7u8; 4096]),
+    )
+    .await;
+    let url = server.url("/v3/package/resume.pkg/1.0.0/resume.pkg.1.0.0.nupkg");
+
+    // BITS opens with a HEAD: the size, validators and range support, no body.
+    let head = server.client.head(&url).send().await.unwrap();
+    assert_eq!(head.status(), reqwest::StatusCode::OK);
+    let total: u64 = head.headers()["content-length"]
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(total > 0);
+    assert_eq!(head.headers()["accept-ranges"], "bytes");
+    let etag = head.headers()["etag"].to_str().unwrap().to_string();
+    let last_modified = head.headers()["last-modified"]
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(last_modified.ends_with(" GMT"), "{last_modified}");
+
+    // The first chunk, then a resume that proves it is the same file.
+    let first = server
+        .client
+        .get(&url)
+        .header("range", "bytes=0-99")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+    for validator in [etag.as_str(), last_modified.as_str()] {
+        let rest = server
+            .client
+            .get(&url)
+            .header("range", "bytes=100-")
+            .header("if-range", validator)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(rest.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            rest.headers()["content-range"],
+            format!("bytes 100-{}/{total}", total - 1).as_str()
+        );
+    }
+    // A resume against a different file gets the whole current one.
+    let stale = server
+        .client
+        .get(&url)
+        .header("range", "bytes=100-")
+        .header("if-range", "\"some-other-build\"")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stale.status(), reqwest::StatusCode::OK);
+    assert_eq!(stale.bytes().await.unwrap().len() as u64, total);
+
+    // HEAD, the continuations and the refused resume are one download.
+    let search: serde_json::Value = server
+        .client
+        .get(server.url("/v3/search?q=resume.pkg"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(search["data"][0]["totalDownloads"], 1);
+}
+
+#[tokio::test]
+async fn a_stalled_upload_is_cut_off() {
+    use futures::StreamExt;
+    let server = spawn_with(|c| c.upload_idle_timeout_secs = 1).await;
+    // A few bytes, then nothing for longer than the limit.
+    let stream =
+        futures::stream::once(async { Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"PK")) })
+            .chain(futures::stream::once(async {
+                tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+                Ok(bytes::Bytes::from_static(b"never mind"))
+            }));
+    let result = server
+        .client
+        .put(server.url("/api/v2/package"))
+        .header("X-NuGet-ApiKey", API_KEY)
+        .body(reqwest::Body::wrap_stream(stream))
+        .send()
+        .await;
+    // The server answers 408 and drops the connection; depending on timing the
+    // client sees the answer or only the dropped connection. Either way,
+    // nothing was published.
+    if let Ok(resp) = result {
+        assert_eq!(resp.status(), reqwest::StatusCode::REQUEST_TIMEOUT);
+    }
+}
+
+#[tokio::test]
+async fn an_upload_that_would_fill_the_disk_is_refused() {
+    let server = spawn_with(|c| c.min_free_disk_bytes = u64::MAX / 2).await;
+    let resp = push_multipart(&server, API_KEY, build_nupkg("Full.Disk", "1.0.0", b"x")).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::INSUFFICIENT_STORAGE);
+    assert_eq!(
+        status_of(&server, "/v3/package/full.disk/index.json").await,
+        reqwest::StatusCode::NOT_FOUND
+    );
 }

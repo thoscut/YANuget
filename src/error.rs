@@ -52,6 +52,23 @@ pub enum Error {
     #[error("invalid version: {0}")]
     InvalidVersion(String),
 
+    /// An upload stalled: no bytes arrived for longer than the idle limit.
+    #[error("upload timed out: {0}")]
+    UploadTimeout(String),
+
+    /// Accepting the request would leave the storage volume too full.
+    #[error("insufficient storage: {0}")]
+    InsufficientStorage(String),
+
+    /// The request conflicts with the resource's current state (for example
+    /// a resumable upload continued from the wrong offset).
+    #[error("conflict: {0}")]
+    Conflict(String),
+
+    /// The caller is known, but the action is not allowed here.
+    #[error("forbidden: {0}")]
+    Forbidden(String),
+
     /// Underlying storage failure.
     #[error("storage error: {0}")]
     Storage(String),
@@ -82,6 +99,10 @@ impl Error {
             Error::BadRequest(_) => StatusCode::BAD_REQUEST,
             Error::PolicyViolation(_) => StatusCode::FORBIDDEN,
             Error::InvalidVersion(_) => StatusCode::BAD_REQUEST,
+            Error::UploadTimeout(_) => StatusCode::REQUEST_TIMEOUT,
+            Error::InsufficientStorage(_) => StatusCode::INSUFFICIENT_STORAGE,
+            Error::Conflict(_) => StatusCode::CONFLICT,
+            Error::Forbidden(_) => StatusCode::FORBIDDEN,
             Error::Database(sqlx::Error::RowNotFound) => StatusCode::NOT_FOUND,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         }

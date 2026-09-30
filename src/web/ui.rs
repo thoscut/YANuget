@@ -9,7 +9,7 @@
 //! the `choco install` command (configurable via `primary_client`).
 
 use crate::config::Config;
-use crate::database::SearchSort;
+use crate::database::{PackageFile, SearchSort, TagCount};
 use crate::models::{Package, PackageType};
 use crate::nuget::UrlBuilder;
 
@@ -106,9 +106,23 @@ h2{margin:0 0 10px;font-size:19px;font-weight:750}\
 @media(max-width:640px){.pkg{grid-template-columns:minmax(0,1fr)}.pkg .figs{grid-column:1;grid-row:auto;margin-top:6px;text-align:left}}\
 .tags{display:flex;flex-wrap:wrap;gap:6px;margin:12px 0 0;padding:0;list-style:none}\
 .tag{padding:0 8px;border:1px solid var(--rule);border-radius:4px;background:var(--stock);color:var(--pencil);font-size:13px;line-height:20px}\
+a.tag{text-decoration:none}a.tag:hover{border-color:var(--ink)}\
+.filter{display:flex;flex-wrap:wrap;gap:4px 20px;margin:-6px 0 16px;font-size:15px}\
+.popular{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin:0 0 18px;font-size:14px;color:var(--pencil)}\
+.popular>span{margin-right:6px}.popular .all{margin-left:6px}\
+.cloud{display:flex;flex-wrap:wrap;align-items:baseline;gap:8px 22px;max-width:960px;margin:20px 0 0;padding:0;list-style:none}\
+.cloud a{font-weight:600;line-height:1.2;text-decoration:none}\
+.cloud .n{margin-left:5px;color:var(--pencil);font-size:13px;font-weight:400}\
+.cloud .t1{font-size:15px}.cloud .t2{font-size:18px}.cloud .t3{font-size:22px;font-weight:700}\
+.cloud .t4{font-size:27px;font-weight:750}.cloud .t5{font-size:33px;font-weight:800;letter-spacing:-.01em}\
 .badge{display:inline-block;margin-left:2px;padding:0 6px;border:1.5px solid currentColor;border-radius:4px;\
 color:var(--pencil);font-size:12px;font-weight:700;line-height:18px;vertical-align:.15em;white-space:nowrap}\
 .badge.pre{color:var(--warn);border-style:dashed}\
+.badge.pin{color:var(--ink)}\
+.doomed{color:var(--dangerfg)}\
+.notice{margin:0 0 24px;padding:12px 16px;background:var(--stock);border:2px solid var(--ink);border-radius:8px;font-weight:600}\
+.notice.warn{border-color:var(--warn)}\
+.run{margin:18px 0 0}\
 .badge.ok{color:var(--ok)}\
 .grid{display:grid;grid-template-columns:minmax(0,1fr) 340px;gap:0 40px}\
 .detail{grid-template-areas:\"main side\" \"readme side\";grid-template-rows:auto 1fr}\
@@ -118,7 +132,7 @@ color:var(--pencil);font-size:12px;font-weight:700;line-height:18px;vertical-ali
 .label{margin:0 0 22px;background:var(--stock);border:3px solid var(--ink);border-radius:14px;overflow:hidden}\
 .label-head{display:flex;align-items:center;gap:16px;padding:20px 24px 18px}\
 .label h1{flex:1 1 0;min-width:0;margin:0;font-size:40px;line-height:1.08;letter-spacing:-.02em}\
-.label .manage{flex:0 0 auto;font-size:15px;font-weight:700}\
+.label .acts{flex:0 0 auto;display:flex;flex-direction:column;align-items:flex-end;gap:2px;font-size:15px;font-weight:700}\
 img.picon{flex:0 0 auto;width:48px;height:48px;object-fit:contain;border-radius:8px}\
 .fields{display:flex;flex-wrap:wrap;margin:0 0 0 -2px}\
 .fields>div{flex:1 1 9.5rem;min-width:0;padding:10px 16px 12px;border-left:2px solid var(--ink);border-top:2px solid var(--ink)}\
@@ -126,7 +140,7 @@ img.picon{flex:0 0 auto;width:48px;height:48px;object-fit:contain;border-radius:
 .fields dd{margin:0;font-size:17px;font-weight:700;overflow-wrap:anywhere}\
 .fields .wide{flex-basis:100%}\
 @media(max-width:560px){.label-head{flex-wrap:wrap;gap:10px 14px;padding:16px 16px 14px}.label h1{font-size:28px}\
-.label .manage{flex-basis:100%}img.picon{width:36px;height:36px}.fields>div{padding:8px 12px 10px}}\
+.label .acts{flex-basis:100%;flex-direction:row;flex-wrap:wrap;gap:4px 18px}img.picon{width:36px;height:36px}.fields>div{padding:8px 12px 10px}}\
 .lede{max-width:65ch;margin:0 0 14px;font-size:18px;line-height:1.5}\
 .links{display:flex;flex-wrap:wrap;gap:4px 20px;margin:16px 0 0}\
 .links a[rel~=nofollow]::after{content:\" \u{2197}\";font-size:.8em}\
@@ -145,6 +159,13 @@ pre code{font-size:inherit}\
 .install pre,.steps pre{white-space:pre-wrap;overflow-wrap:break-word}\
 .install .primary pre{background:var(--stock);border:2px solid var(--ink)}\
 .nw{white-space:nowrap}\
+.attached{margin:0;padding:0;list-style:none;border-top:2px solid var(--ink)}\
+.attached li{padding:10px 0;border-bottom:1px solid var(--rule)}\
+.attached .id{font-weight:700;text-decoration:none}\
+.attached .sha{margin-top:2px;font-size:13px;overflow-wrap:anywhere}\
+.script{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:end;column-gap:12px;margin-top:18px}\
+.script h3{margin:0;font-size:15px}\
+.script pre{white-space:pre}\
 .copy{min-height:36px;padding:0 14px;background:var(--stock);color:var(--ink);font-size:14px}\
 .primary .copy{background:var(--hivis);color:var(--onhivis)}\
 .versions{list-style:none;margin:0;padding:0;max-height:360px;overflow:auto;border-top:2px solid var(--ink)}\
@@ -160,12 +181,12 @@ font-size:15px;line-height:1.6;white-space:pre-wrap;overflow-wrap:anywhere}\
 .kv b{flex:0 0 14em;color:var(--pencil);font-weight:500}\
 .kv a,.kv code{overflow-wrap:anywhere}\
 @media(max-width:560px){.kv div{flex-direction:column;gap:0}.kv b{flex:0 0 auto}}\
-.stats{display:grid;grid-template-columns:repeat(3,1fr);margin:0 0 40px;background:var(--stock);\
+.stats{display:grid;grid-template-columns:repeat(4,1fr);margin:0 0 40px;background:var(--stock);\
 border:3px solid var(--ink);border-radius:14px;overflow:hidden}\
 .stat{min-width:0;margin:-2px 0 0 -2px;padding:12px 20px 16px;border-left:2px solid var(--ink);border-top:2px solid var(--ink)}\
 .stat .l{font-size:14px;color:var(--pencil)}\
 .stat .n{font-size:30px;font-weight:800;line-height:1.15;overflow-wrap:anywhere}\
-@media(max-width:560px){.stats{grid-template-columns:repeat(2,1fr)}.stat{padding:10px 14px 12px}.stat .n{font-size:24px}}\
+@media(max-width:760px){.stats{grid-template-columns:repeat(2,1fr)}}@media(max-width:560px){.stat{padding:10px 14px 12px}.stat .n{font-size:24px}}\
 .lists{display:grid;grid-template-columns:1fr 1fr;gap:0 40px}\
 .lists>.card{margin:0}\
 @media(max-width:760px){.lists{grid-template-columns:1fr;gap:28px}}\
@@ -203,6 +224,7 @@ input[type=checkbox]{width:20px;height:20px;margin:0;accent-color:var(--ink)}\
 .actions{display:flex;flex-wrap:wrap;gap:6px}\
 .actions form{margin:0}\
 .actions button,.bulk button{min-height:38px;font-size:14px;white-space:nowrap}\
+.actions .btn{min-height:38px;padding:0 12px;font-size:14px}\
 button.danger{background:var(--stock);border-color:var(--danger);color:var(--dangerfg)}\
 button.danger:hover{background:var(--danger);border-color:var(--danger);color:var(--ondanger)}\
 .bulk{display:flex;flex-wrap:wrap;align-items:center;gap:10px 12px;margin:18px 0 0;padding:14px 16px;\
@@ -210,13 +232,18 @@ background:var(--stock);border:2px solid var(--ink);border-radius:10px}\
 .bulk [role=status]{flex-basis:100%;color:var(--dangerfg);font-weight:700}.bulk [role=status]:empty{display:none}\
 .bulk .to{display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding-left:12px;border-left:1px solid var(--rule)}\
 .bulk select{min-height:38px;font-size:15px}\
-@media(max-width:640px){.atbl,.atbl tbody{display:block}\
-.atbl thead tr{display:flex;align-items:center;padding:8px 0;border-bottom:1px solid var(--rule)}\
-.atbl thead th{padding:0 0 0 6px;border:0}.atbl thead th:not(.pick){display:none}\
-.atbl tbody tr{display:grid;grid-template-columns:2.75em minmax(0,1fr) auto auto;align-items:center;gap:10px 10px;\
+@media(max-width:640px){.vers,.vers tbody,.plan,.plan tbody,.files,.files tbody{display:block}\
+.files thead{display:none}.files tbody tr{display:block;padding:10px 0;border-bottom:1px solid var(--rule)}\
+.files td{display:inline;padding:0 10px 0 0;border:0}.files td:last-child{display:block;padding:6px 0 0}\
+.vers thead tr{display:flex;align-items:center;padding:8px 0;border-bottom:1px solid var(--rule)}\
+.vers thead th{padding:0 0 0 6px;border:0}.vers thead th:not(.pick){display:none}\
+.vers tbody tr{display:grid;grid-template-columns:2.75em minmax(0,1fr) auto auto;align-items:center;gap:10px 10px;\
 padding:12px 0;border-bottom:1px solid var(--rule)}\
-.atbl td{padding:0;border:0}.atbl td:last-child{grid-column:2/-1}\
+.vers td{padding:0;border:0}.vers td:last-child{grid-column:2/-1}\
+.plan thead{display:none}.plan tbody tr{display:block;padding:10px 0;border-bottom:1px solid var(--rule)}\
+.plan td{display:inline;padding:0 10px 0 0;border:0}.plan td:nth-child(4){display:block;padding:2px 0}\
 .bulk .to{flex-basis:100%;padding-left:0;border-left:0}.bulk .danger{margin-left:0}}\
+.title+.card{margin-top:22px}\
 .bulk .danger{margin-left:auto}\
 footer{padding:20px 0 32px;border-top:1px solid var(--rule);color:var(--pencil);font-size:14px}\
 footer .wrap{display:flex;flex-wrap:wrap;justify-content:space-between;gap:6px 24px}\
@@ -420,7 +447,8 @@ fn layout_with_chrome(
             escape_html(&urls.app(path))
         )
     };
-    let mut links = item("stats", "/stats", "Stats");
+    let mut links = item("tags", "/tags", "Tags");
+    links.push_str(&item("stats", "/stats", "Stats"));
     links.push_str(&item("settings", "/settings", "Settings"));
     links.push_str(&item("docs", "/docs/", "Docs"));
     if nav.admin {
@@ -517,6 +545,10 @@ pub struct GalleryView<'a> {
     pub prerelease: Option<bool>,
     pub package_type: Option<&'a str>,
     pub sort: SearchSort,
+    /// Only packages with this (lower-cased) tag.
+    pub tag: Option<&'a str>,
+    /// The feed's most used tags, offered above the list on the landing page.
+    pub popular: &'a [TagCount],
     /// Whether this feed has an admin area, for the header's link to it.
     pub admin: bool,
 }
@@ -549,6 +581,9 @@ impl GalleryView<'_> {
         if let Some(ty) = self.package_type {
             href.push_str(&format!("&amp;packageType={}", enc_path(ty)));
         }
+        if let Some(tag) = self.tag {
+            href.push_str(&format!("&amp;tag={}", enc_path(tag)));
+        }
         if sort != SearchSort::default() {
             href.push_str(&format!("&amp;sort={}", sort.as_str()));
         }
@@ -573,6 +608,7 @@ impl GalleryView<'_> {
                 escape_html(ty)
             ));
         }
+        out.push_str(&tag_field(self.tag));
         out.push_str(&sort_field(self.sort));
         out
     }
@@ -588,6 +624,26 @@ fn sort_field(sort: SearchSort) -> String {
             sort.as_str()
         )
     }
+}
+
+/// A hidden `tag` input, or nothing without a tag filter.
+fn tag_field(tag: Option<&str>) -> String {
+    match tag {
+        Some(tag) => format!(
+            "<input type=\"hidden\" name=\"tag\" value=\"{}\">",
+            escape_html(tag)
+        ),
+        None => String::new(),
+    }
+}
+
+/// The gallery filtered to one tag, from its first page.
+fn tag_href(urls: &UrlBuilder, tag: &str) -> String {
+    format!(
+        "{}?tag={}",
+        escape_html(&urls.app("/packages")),
+        enc_path(&tag.to_lowercase())
+    )
 }
 
 /// The orders the gallery offers, as links: one click, no form, and each one
@@ -615,6 +671,28 @@ fn sort_links(urls: &UrlBuilder, view: &GalleryView) -> String {
     )
 }
 
+/// The landing page's way in by tag: the most used tags, and the whole cloud.
+fn popular_tags(urls: &UrlBuilder, tags: &[TagCount]) -> String {
+    if tags.len() < 2 {
+        return String::new();
+    }
+    let links: String = tags
+        .iter()
+        .map(|t| {
+            format!(
+                "<a class=\"tag\" href=\"{}\">{}</a>",
+                tag_href(urls, &t.tag),
+                escape_html(&t.tag)
+            )
+        })
+        .collect();
+    format!(
+        "<nav class=\"popular\" aria-label=\"Popular tags\"><span>Popular tags</span>{links}\
+         <a class=\"all\" href=\"{}\">All tags</a></nav>",
+        escape_html(&urls.app("/tags"))
+    )
+}
+
 /// The gallery / search-results page.
 pub fn gallery_page(
     urls: &UrlBuilder,
@@ -627,8 +705,15 @@ pub fn gallery_page(
         ..*view
     };
     let query = view.query;
+    let searching = !query.trim().is_empty();
     let pages = (page.total_hits + view.take - 1) / view.take;
     let current = view.skip / view.take + 1;
+    // The same search and order without the tag: what "clear the tag" means.
+    let untagged = GalleryView { tag: None, ..view };
+    let tagged = view
+        .tag
+        .map(|t| format!(" tagged \u{201c}{}\u{201d}", escape_html(t)))
+        .unwrap_or_default();
     let body = if page.groups.is_empty() {
         let browse_all = escape_html(&urls.app("/packages"));
         if page.total_hits > 0 {
@@ -654,7 +739,23 @@ pub fn gallery_page(
                  {last}<p><a href=\"{first}\">Back to the first page</a></p></div>",
                 first = view.href(urls, 0),
             )
-        } else if !query.trim().is_empty() {
+        } else if view.tag.is_some() {
+            let heading = if searching {
+                format!(
+                    "No packages match \u{201c}{}\u{201d}{tagged}",
+                    escape_html(query)
+                )
+            } else {
+                format!("No packages{tagged}")
+            };
+            format!(
+                "<div class=\"empty\"><h1 class=\"title\">{heading}</h1>\
+                 <p><a href=\"{clear}\">Show them without the tag</a></p>\
+                 <p><a href=\"{all}\">See every tag</a></p></div>",
+                clear = untagged.href(urls, 0),
+                all = escape_html(&urls.app("/tags")),
+            )
+        } else if searching {
             format!(
                 "<div class=\"empty\"><h1 class=\"title\">No packages match \u{201c}{}\u{201d}</h1>\
                  <p><a href=\"{browse_all}\">Clear search and browse all packages</a></p></div>",
@@ -669,14 +770,18 @@ pub fn gallery_page(
         // without one a screen reader announces no page heading at all — while
         // the *empty* state did have one, so the structure changed with the
         // content.
-        let heading = if query.trim().is_empty() {
-            format!("{} package{}", page.total_hits, plural(page.total_hits))
-        } else {
+        let heading = if searching {
             format!(
-                "{} result{} for \u{201c}{}\u{201d}",
+                "{} result{} for \u{201c}{}\u{201d}{tagged}",
                 page.total_hits,
                 plural(page.total_hits),
                 escape_html(query)
+            )
+        } else {
+            format!(
+                "{} package{}{tagged}",
+                page.total_hits,
+                plural(page.total_hits)
             )
         };
         // One package has no order to choose.
@@ -685,8 +790,19 @@ pub fn gallery_page(
         } else {
             String::new()
         };
+        let filter = match view.tag {
+            Some(_) => format!(
+                "<p class=\"filter\"><a href=\"{}\">Clear the tag</a> \
+                 <a href=\"{}\">See every tag</a></p>",
+                untagged.href(urls, 0),
+                escape_html(&urls.app("/tags")),
+            ),
+            None => String::new(),
+        };
         rows.push_str(&format!(
-            "<div class=\"bar\"><h1 class=\"title\">{heading}</h1>{sort}</div><ul class=\"manifest\">"
+            "<div class=\"bar\"><h1 class=\"title\">{heading}</h1>{sort}</div>{filter}{popular}\
+             <ul class=\"manifest\">",
+            popular = popular_tags(urls, view.popular),
         ));
         for group in &page.groups {
             // The newest *stable* version, matching what a NuGet client
@@ -719,7 +835,7 @@ pub fn gallery_page(
                 vs = plural(group.packages.len() as i64),
                 dl = group_digits(group.total_downloads() as i64),
                 ds = plural(group.total_downloads() as i64),
-                tags = render_tags(&p.tags),
+                tags = render_tags(urls, &p.tags),
             ));
         }
         rows.push_str("</ul>");
@@ -731,10 +847,17 @@ pub fn gallery_page(
         ));
         rows
     };
-    // Searches and later pages get titles of their own. Otherwise every search,
-    // and every page of one, shares one <title>, so tabs, bookmarks and history
-    // entries look identical.
-    let search = (!query.trim().is_empty()).then(|| format!("Search: \u{201c}{query}\u{201d}"));
+    // Searches, tags and later pages get titles of their own. Otherwise every
+    // search, and every page of one, shares one <title>, so tabs, bookmarks and
+    // history entries look identical.
+    let search = match (searching, view.tag) {
+        (true, None) => Some(format!("Search: \u{201c}{query}\u{201d}")),
+        (true, Some(t)) => Some(format!(
+            "Search: \u{201c}{query}\u{201d}, tagged \u{201c}{t}\u{201d}"
+        )),
+        (false, Some(t)) => Some(format!("Tagged \u{201c}{t}\u{201d}")),
+        (false, None) => None,
+    };
     let later_page = current > 1 && !page.groups.is_empty();
     let title = match (search, later_page) {
         (None, false) => "YANuget".to_string(),
@@ -742,8 +865,8 @@ pub fn gallery_page(
         (Some(s), false) => format!("{s} \u{2014} YANuget"),
         (Some(s), true) => format!("{s}, page {current} of {pages} \u{2014} YANuget"),
     };
-    // A new search starts on page one, but keeps a page size and an order
-    // someone chose.
+    // A new search starts on page one, but keeps a page size, a tag and an
+    // order someone chose.
     let mut search_hidden = if view.take != view.default_take.max(1) {
         format!(
             "<input type=\"hidden\" name=\"take\" value=\"{}\">",
@@ -752,6 +875,7 @@ pub fn gallery_page(
     } else {
         String::new()
     };
+    search_hidden.push_str(&tag_field(view.tag));
     search_hidden.push_str(&sort_field(view.sort));
     layout_with_chrome(
         urls,
@@ -764,6 +888,74 @@ pub fn gallery_page(
         &body,
         Chrome::Feed,
         &search_hidden,
+    )
+}
+
+/// How many tags the tag page shows at most.
+pub const MAX_CLOUD_TAGS: i64 = 300;
+
+/// The tag cloud: every tag of the feed's visible packages, alphabetically,
+/// set larger the more packages carry it.
+///
+/// Size is never the only signal: each tag carries its count, so the page
+/// reads the same to a screen reader and to someone who cannot tell 18 px
+/// from 22 px. Five steps on a log scale, because a feed's tag counts are
+/// long-tailed — a linear scale makes one tag huge and every other one tiny.
+pub fn tags_page(urls: &UrlBuilder, tags: &[TagCount], admin: bool) -> String {
+    let body = if tags.is_empty() {
+        "<div class=\"empty\"><h1 class=\"title\">No tags yet</h1>\
+         <p>Packages get their tags from the <code>&lt;tags&gt;</code> element of their \
+         <code>.nuspec</code>.</p></div>"
+            .to_string()
+    } else {
+        let most = tags.iter().map(|t| t.packages).max().unwrap_or(1).max(1);
+        // While counts are small, a step per package reads truer than a log
+        // scale: with counts of 1 and 2 the log puts the 2 at the largest size.
+        let step = |n: i64| -> usize {
+            if most <= 5 {
+                return n.clamp(1, 5) as usize;
+            }
+            let ratio = (n.max(1) as f64).ln() / (most as f64).ln();
+            1 + (ratio * 4.0).round().clamp(0.0, 4.0) as usize
+        };
+        let mut sorted: Vec<&TagCount> = tags.iter().collect();
+        sorted.sort_by(|a, b| a.tag.cmp(&b.tag));
+        let items: String = sorted
+            .iter()
+            .map(|t| {
+                format!(
+                    "<li><a class=\"t{step}\" href=\"{href}\">{tag}</a>\
+                     <span class=\"n\">{n}<span class=\"vh\"> package{s}</span></span></li>",
+                    step = step(t.packages),
+                    href = tag_href(urls, &t.tag),
+                    tag = escape_html(&t.tag),
+                    n = group_digits(t.packages),
+                    s = plural(t.packages),
+                )
+            })
+            .collect();
+        let capped = if tags.len() as i64 >= MAX_CLOUD_TAGS {
+            format!(" The {MAX_CLOUD_TAGS} most used are shown.")
+        } else {
+            String::new()
+        };
+        format!(
+            "<h1 class=\"title\">Tags</h1>\
+             <p class=\"muted\">{n} tag{s} on this feed's packages; the larger, the more \
+             packages carry it.{capped}</p>\
+             <ul class=\"cloud\">{items}</ul>",
+            n = tags.len(),
+            s = plural(tags.len() as i64),
+        )
+    };
+    layout(
+        urls,
+        "Tags \u{2014} YANuget",
+        Nav {
+            active: "tags",
+            admin,
+        },
+        &body,
     )
 }
 
@@ -921,12 +1113,17 @@ pub fn stats_page(
     admin: bool,
 ) -> String {
     let cards = [
-        (stats.package_count.to_string(), "Packages"),
-        (stats.version_count.to_string(), "Versions"),
+        (group_digits(stats.package_count), "Packages"),
+        (group_digits(stats.version_count), "Versions"),
+        (group_digits(stats.listed_count), "Listed versions"),
         (group_digits(stats.total_downloads), "Downloads"),
-        (human_size(stats.total_size.max(0) as u64), "Storage"),
-        (stats.symbol_count.to_string(), "Symbol files"),
-        (stats.listed_count.to_string(), "Listed versions"),
+        (
+            human_size(stats.total_size.max(0) as u64),
+            "Package storage",
+        ),
+        (group_digits(stats.file_count), "Attached files"),
+        (human_size(stats.file_bytes.max(0) as u64), "File storage"),
+        (group_digits(stats.symbol_count), "Symbol files"),
     ];
     // The same ruled cells as the package label: a caption over each value.
     let mut tiles = String::from("<div class=\"stats\">");
@@ -1126,6 +1323,48 @@ pub fn settings_page(urls: &UrlBuilder, config: &Config, feed: &super::FeedConte
         ));
     }
     retention.push_str("</div>");
+    if feed.admin.is_enabled() {
+        retention.push_str(&format!(
+            "<p><a href=\"{}\">See what the next cleanup would delete</a></p>",
+            escape_html(&urls.app("/admin/retention"))
+        ));
+    }
+
+    let fc = &config.files;
+    let mut files = String::from("<div class=\"kv wide\">");
+    files.push_str(&kv("Attached files", on_off(fc.enabled)));
+    if fc.enabled {
+        files.push_str(&kv(
+            "Uploads",
+            if feed.auth.is_enabled() {
+                "Accepted with the push key"
+            } else {
+                "Refused: this feed has no push key"
+            },
+        ));
+        files.push_str(&kv(
+            "Largest file",
+            &match config.max_file_size_bytes() {
+                Some(n) => human_size(n),
+                None => "Unlimited".to_string(),
+            },
+        ));
+        files.push_str(&kv("File types", &fc.allowed_extensions.join(", ")));
+        files.push_str(&kv(
+            "Unfinished uploads kept",
+            &format!("{} h", fc.upload_expiry_hours),
+        ));
+        // Whether there is an inbox, not where: the path is infrastructure.
+        files.push_str(&kv(
+            "SSH inbox",
+            if fc.inbox_dir.is_some() {
+                "Enabled"
+            } else {
+                "Disabled"
+            },
+        ));
+    }
+    files.push_str("</div>");
 
     // Said even when the admin area is off: otherwise nothing on any page
     // tells an operator that disabling, deleting and moving versions exist.
@@ -1151,6 +1390,7 @@ pub fn settings_page(urls: &UrlBuilder, config: &Config, feed: &super::FeedConte
          <div class=\"card\"><h2>Server</h2>{server}</div>\
          <div class=\"card\"><h2>Mirror &amp; policy</h2>{policy}</div>\
          <div class=\"card\"><h2>Retention</h2>{retention}</div>\
+         <div class=\"card\"><h2>Attached files</h2>{files}</div>\
          <div class=\"card\"><h2>Endpoints</h2><div class=\"kv wide\">\
          {svc}{sym}</div></div>{admin}",
         svc = kv_html(
@@ -1188,9 +1428,15 @@ const ADMIN_NAV: Nav<'static> = Nav {
 
 /// The admin dashboard: every package id, linking to its management page.
 pub fn admin_dashboard_page(urls: &UrlBuilder, ids: &[String]) -> String {
+    let retention = format!(
+        "<a href=\"{}\">Retention: preview and clean up</a>",
+        escape_html(&urls.app("/admin/retention"))
+    );
     let body = if ids.is_empty() {
-        "<h1 class=\"title\">Admin</h1><p class=\"muted\">No packages published yet.</p>"
-            .to_string()
+        format!(
+            "<div class=\"bar\"><h1 class=\"title\">Admin</h1>{retention}</div>\
+             <p class=\"muted\">No packages published yet.</p>"
+        )
     } else {
         let mut list = String::from("<ul class=\"rank\">");
         for id in ids {
@@ -1204,13 +1450,29 @@ pub fn admin_dashboard_page(urls: &UrlBuilder, ids: &[String]) -> String {
         }
         list.push_str("</ul>");
         format!(
-            "<h1 class=\"title\">Admin</h1>\
-             <p class=\"muted\">Pick a package to approve, disable, delete or move its \
+            "<div class=\"bar\"><h1 class=\"title\">Admin</h1>{retention}</div>\
+             <p class=\"muted\">Pick a package to approve, disable, pin, delete or move its \
              versions.</p>\
              <div class=\"card\">{list}</div>"
         )
     };
     layout(urls, "Admin \u{2014} YANuget", ADMIN_NAV, &body)
+}
+
+/// What the per-package admin page offers besides the versions themselves.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct AdminPackageExtras<'a> {
+    /// The next release ring, when this feed has one.
+    pub promote_target: Option<&'a str>,
+    /// The other feeds this admin may copy or move versions into; with none,
+    /// the page offers neither.
+    pub transfer_targets: &'a [String],
+    /// What the next retention cleanup would delete of this package.
+    pub retention_plan: &'a [crate::retention::Pruned],
+    /// Whether files can be attached (`[files].enabled`).
+    pub files_enabled: bool,
+    /// The files attached to any of the versions.
+    pub files: &'a [PackageFile],
 }
 
 /// The per-package admin page: every version (incl. disabled, pending and
@@ -1221,16 +1483,11 @@ pub fn admin_dashboard_page(urls: &UrlBuilder, ids: &[String]) -> String {
 /// whole package is disabled, deleted or moved: tick them all. The boxes sit
 /// in the table but belong to that form through their `form` attribute,
 /// because a form cannot wrap the rows' own forms.
-///
-/// `promote_target`, when set, names the next release ring. `transfer_targets`
-/// are the other feeds this admin may copy or move versions into; with none,
-/// the page offers neither.
 pub fn admin_package_page(
     urls: &UrlBuilder,
     id: &str,
     versions: &[crate::database::FeedVersion],
-    promote_target: Option<&str>,
-    transfer_targets: &[String],
+    extras: &AdminPackageExtras,
     csrf_token: &str,
 ) -> String {
     let mut ordered: Vec<&crate::database::FeedVersion> = versions.iter().collect();
@@ -1252,6 +1509,12 @@ pub fn admin_package_page(
         "<input type=\"hidden\" name=\"{CSRF_FIELD}\" value=\"{}\">",
         escape_html(csrf_token)
     );
+    let button = |v: &str, op: &str, label: &str| {
+        format!(
+            "<form method=\"post\" action=\"{}\">{csrf}<button type=\"submit\">{label}</button></form>",
+            action(v, op)
+        )
+    };
 
     let mut rows = String::new();
     for fv in &ordered {
@@ -1270,50 +1533,77 @@ pub fn admin_package_page(
         if fv.flagged {
             status.push_str(" <span class=\"badge\" title=\"policy\">flagged</span>");
         }
+        if fv.pinned {
+            status.push_str(" <span class=\"badge pin\">pinned</span>");
+        }
 
         let mut actions = String::new();
+        // Only what clients could fetch too: a disabled or pending version is
+        // withheld by the download endpoint, and a link to a 404 helps nobody.
+        if p.enabled && !fv.pending {
+            actions.push_str(&format!(
+                "<a class=\"btn\" href=\"{}\" aria-label=\"Download {dv}\">Download</a>",
+                escape_html(&urls.package_download(&lower, &v)),
+            ));
+        }
         if fv.pending {
-            actions.push_str(&format!(
-                "<form method=\"post\" action=\"{}\">{csrf}<button type=\"submit\">Approve</button></form>",
-                action(&v, "approve")
+            actions.push_str(&button(&v, "approve", "Approve"));
+        }
+        if let Some(target) = extras.promote_target {
+            actions.push_str(&button(
+                &v,
+                "promote",
+                &format!("Promote \u{2192} {}", escape_html(target)),
             ));
         }
-        if let Some(target) = promote_target {
-            actions.push_str(&format!(
-                "<form method=\"post\" action=\"{}\">{csrf}<button type=\"submit\">Promote \u{2192} {}</button></form>",
-                action(&v, "promote"),
-                escape_html(target),
-            ));
-        }
-        // Enable/disable toggle depending on current state.
+        // Enable/disable and pin/unpin toggle with the current state.
         if p.enabled {
-            actions.push_str(&format!(
-                "<form method=\"post\" action=\"{}\">{csrf}<button type=\"submit\">Disable</button></form>",
-                action(&v, "disable")
-            ));
+            actions.push_str(&button(&v, "disable", "Disable"));
         } else {
-            actions.push_str(&format!(
-                "<form method=\"post\" action=\"{}\">{csrf}<button type=\"submit\">Enable</button></form>",
-                action(&v, "enable")
-            ));
+            actions.push_str(&button(&v, "enable", "Enable"));
         }
+        if fv.pinned {
+            actions.push_str(&button(&v, "unpin", "Unpin"));
+        } else {
+            actions.push_str(&button(&v, "pin", "Pin"));
+        }
+        // A pin keeps a version from retention, not from an admin: say so
+        // before deleting one.
+        let confirm = if fv.pinned {
+            format!(
+                "{id} {v} is pinned, which only keeps it from retention. Remove it from this \
+                 feed anyway? If no other feed uses it, the files are deleted."
+            )
+        } else {
+            format!(
+                "Remove {id} {v} from this feed? If no other feed uses it, the files are deleted."
+            )
+        };
         actions.push_str(&format!(
             "<form method=\"post\" action=\"{a}\" data-confirm=\"{confirm}\">{csrf}\
              <button type=\"submit\" class=\"danger\">Delete</button></form>",
             a = action(&v, "delete"),
-            confirm = escape_html(&format!(
-                "Remove {id} {v} from this feed? If no other feed uses it, the files are deleted."
-            )),
+            confirm = escape_html(&confirm),
         ));
 
-        let reason = match (fv.flagged, fv.flag_reason.as_deref()) {
+        let mut notes = match (fv.flagged, fv.flag_reason.as_deref()) {
             (true, Some(r)) => format!("<div class=\"meta\">{}</div>", escape_html(r)),
             _ => String::new(),
         };
+        if let Some(planned) = extras
+            .retention_plan
+            .iter()
+            .find(|planned| planned.version == p.version)
+        {
+            notes.push_str(&format!(
+                "<div class=\"meta doomed\">The next cleanup deletes this: {}.</div>",
+                escape_html(&planned.reason.describe())
+            ));
+        }
         rows.push_str(&format!(
             "<tr><td class=\"pick\"><input type=\"checkbox\" name=\"v\" value=\"{dv}\" \
              form=\"bulk\" aria-label=\"Select {dv}\"></td>\
-             <td>{pre}<span class=\"nw\">{dv}</span>{reason}</td><td>{status}</td>\
+             <td>{pre}<span class=\"nw\">{dv}</span>{notes}</td><td>{status}</td>\
              <td class=\"muted\">{dl}</td>\
              <td><div class=\"actions\">{actions}</div></td></tr>",
             pre = if p.is_prerelease() {
@@ -1332,10 +1622,11 @@ pub fn admin_package_page(
     } else {
         ""
     };
-    let transfer = if transfer_targets.is_empty() {
+    let transfer = if extras.transfer_targets.is_empty() {
         String::new()
     } else {
-        let options: String = transfer_targets
+        let options: String = extras
+            .transfer_targets
             .iter()
             .map(|t| format!("<option value=\"{t}\">{t}</option>", t = escape_html(t)))
             .collect();
@@ -1351,13 +1642,15 @@ pub fn admin_package_page(
          aria-labelledby=\"bulk-l\">{csrf}\
          <span id=\"bulk-l\"><b>With the selected versions</b></span>\
          <button type=\"submit\" name=\"op\" value=\"enable\">Enable</button>\
-         <button type=\"submit\" name=\"op\" value=\"disable\">Disable</button>{approve}{transfer}\
+         <button type=\"submit\" name=\"op\" value=\"disable\">Disable</button>{approve}\
+         <button type=\"submit\" name=\"op\" value=\"pin\">Pin</button>\
+         <button type=\"submit\" name=\"op\" value=\"unpin\">Unpin</button>{transfer}\
          <button type=\"submit\" name=\"op\" value=\"delete\" class=\"danger\" \
          data-confirm=\"{confirm}\">Delete</button>\
          <span id=\"bulk-note\" role=\"status\"></span></form>",
         act = escape_html(&urls.app(&format!("/admin/packages/{}", enc_path(&lower)))),
         confirm = escape_html(&format!(
-            "Remove the selected versions of {id} from this feed? \
+            "Remove the selected versions of {id} from this feed, pinned or not? \
              Versions no other feed holds are deleted for good."
         )),
     );
@@ -1368,18 +1661,295 @@ pub fn admin_package_page(
          <div class=\"bar\"><h1 class=\"title\">{eid}</h1>\
          <a href=\"{gallery}\">Open in the gallery</a></div>\
          <p class=\"muted\">Disabled and pending versions are hidden from clients and not \
-         downloadable. Delete removes this feed's membership; moving keeps the files, since \
-         the other feed then holds them.</p>\
-         <div class=\"card\"><div class=\"scroll\"><table class=\"atbl\">\
+         downloadable. A pinned version is never deleted by retention. Delete removes this \
+         feed's membership; moving keeps the files, since the other feed then holds them.</p>\
+         <div class=\"card\"><div class=\"scroll\"><table class=\"atbl vers\">\
          <thead><tr><th class=\"pick\"><input type=\"checkbox\" class=\"all\" \
          aria-label=\"Select every version\" hidden></th>\
          <th>Version</th><th>Status</th><th>Downloads</th><th>Actions</th></tr></thead>\
-         <tbody>{rows}</tbody></table></div>{bulk}</div>",
+         <tbody>{rows}</tbody></table></div>{bulk}</div>{files}",
         admin = escape_html(&urls.app("/admin")),
         gallery = escape_html(&urls.app(&format!("/packages/{}", enc_path(&lower)))),
         eid = escape_html(id),
+        files = admin_files(urls, id, extras, &csrf),
     );
     layout(urls, &format!("Admin \u{2014} {id}"), ADMIN_NAV, &body)
+}
+
+/// The admin page's list of a package's attached files, each downloadable and
+/// deletable, and how to attach more.
+fn admin_files(urls: &UrlBuilder, id: &str, extras: &AdminPackageExtras, csrf: &str) -> String {
+    if !extras.files_enabled {
+        return String::new();
+    }
+    let how = format!(
+        "<p class=\"muted\">Attach a file with <code>PUT {put}</code> and the push key, resumably \
+         with tus at <code>{tus}</code>, or over SSH through the inbox; \
+         <a href=\"{docs}\">the documentation</a> has the details.</p>",
+        put = escape_html(&urls.app("/api/v2/files/{id}/{version}/{name}")),
+        tus = escape_html(&urls.app("/api/v2/uploads")),
+        docs = escape_html(&urls.app("/docs/api/#attached-files")),
+    );
+    if extras.files.is_empty() {
+        return format!("<div class=\"card\"><h2>Files</h2><p>No files attached.</p>{how}</div>");
+    }
+    let mut rows = String::new();
+    for f in extras.files {
+        let action = escape_html(&urls.app(&format!(
+            "/admin/packages/{}/{}/files/{}/delete",
+            enc_path(&f.lower_id),
+            enc_path(&f.normalized_version),
+            enc_path(&f.name)
+        )));
+        rows.push_str(&format!(
+            "<tr><td><span class=\"nw\">{v}</span></td><td>{name}</td><td class=\"muted\">{size}</td>\
+             <td><code title=\"{sha}\">{short}\u{2026}</code></td><td class=\"muted\">{dl}</td>\
+             <td><div class=\"actions\"><a class=\"btn\" href=\"{href}\" aria-label=\"Download {name}\">Download</a>\
+             <form method=\"post\" action=\"{action}\" data-confirm=\"{confirm}\">{csrf}\
+             <button type=\"submit\" class=\"danger\">Delete</button></form></div></td></tr>",
+            v = escape_html(&f.normalized_version),
+            name = escape_html(&f.name),
+            size = human_size(f.size),
+            sha = escape_html(&f.sha256),
+            short = escape_html(&f.sha256[..f.sha256.len().min(12)]),
+            dl = group_digits(f.downloads as i64),
+            href = escape_html(&urls.file_download(&f.lower_id, &f.normalized_version, &f.name)),
+            confirm = escape_html(&format!(
+                "Delete {} from {id} {}? Install scripts that fetch it will fail.",
+                f.name, f.normalized_version
+            )),
+        ));
+    }
+    format!(
+        "<div class=\"card\"><h2>Files</h2><div class=\"scroll\"><table class=\"atbl files\">\
+         <thead><tr><th>Version</th><th>File</th><th>Size</th><th>SHA-256</th><th>Downloads</th>\
+         <th>Actions</th></tr></thead><tbody>{rows}</tbody></table></div>{how}</div>"
+    )
+}
+
+/// What the retention page says after a cleanup it was asked for.
+#[derive(Debug, Clone, Copy)]
+pub enum RetentionNotice {
+    None,
+    /// A cleanup ran and did this.
+    Done(crate::retention::Outcome),
+    /// The plan changed between looking and clicking; nothing was deleted.
+    Changed,
+    /// A cleanup was already running; nothing was deleted.
+    Busy,
+}
+
+/// Everything the retention page shows.
+pub struct RetentionView<'a> {
+    pub rules: &'a crate::config::RetentionConfig,
+    pub last: Option<crate::retention::Report>,
+    pub running: bool,
+    /// The next cleanup's plan, when there are rules to plan with.
+    pub preview: Option<&'a crate::retention::Preview>,
+    pub csrf_token: &'a str,
+    pub notice: RetentionNotice,
+}
+
+/// How many planned deletions the retention page lists before summarising.
+const MAX_PREVIEW_ROWS: usize = 500;
+
+/// The retention page: the rules as configured, what the last cleanup did,
+/// and exactly what the next one would delete — with a button that deletes
+/// that and nothing else.
+pub fn admin_retention_page(urls: &UrlBuilder, view: &RetentionView) -> String {
+    use crate::retention::Trigger;
+    let rules = view.rules;
+    let on_off = |b: bool| if b { "On" } else { "Off" };
+    let limit = |n: Option<usize>| match n {
+        Some(n) => format!("{n} per package"),
+        None => "No limit".to_string(),
+    };
+    let notice = match view.notice {
+        RetentionNotice::None => String::new(),
+        RetentionNotice::Done(o) => {
+            let errors = if o.errors > 0 {
+                format!(
+                    " {} could not be deleted; the details are in the server log.",
+                    o.errors
+                )
+            } else {
+                String::new()
+            };
+            format!(
+                "<p class=\"notice\" role=\"status\">Deleted {} version{}, freeing {}.{errors}</p>",
+                o.deleted,
+                plural(o.deleted as i64),
+                human_size(o.freed),
+            )
+        }
+        RetentionNotice::Changed => "<p class=\"notice warn\" role=\"status\">The feed changed \
+            since you looked, so nothing was deleted. Below is the list as it is now.</p>"
+            .to_string(),
+        RetentionNotice::Busy => "<p class=\"notice warn\" role=\"status\">A cleanup was already \
+            running, so nothing was deleted. Look again once it has finished.</p>"
+            .to_string(),
+    };
+
+    let mut kv_rows = String::from("<div class=\"kv wide\">");
+    kv_rows.push_str(&kv("Retention", on_off(rules.enabled)));
+    kv_rows.push_str(&kv(
+        "Newest stable versions kept",
+        &limit(rules.keep_latest_stable),
+    ));
+    kv_rows.push_str(&kv(
+        "Newest pre-release versions kept",
+        &limit(rules.keep_latest_prerelease),
+    ));
+    kv_rows.push_str(&kv(
+        "Maximum age",
+        &match rules.max_age_days {
+            Some(d) => format!("{d} day{}", plural(d as i64)),
+            None => "No limit".to_string(),
+        },
+    ));
+    kv_rows.push_str(&kv(
+        "Scheduled cleanup",
+        &if rules.enabled && rules.interval_hours > 0 {
+            format!("Every {} h", rules.interval_hours)
+        } else {
+            "Off".to_string()
+        },
+    ));
+    kv_rows.push_str(&kv(
+        "After each push",
+        on_off(rules.enabled && rules.prune_on_push),
+    ));
+    kv_rows.push_str("</div>");
+
+    let last = if view.running {
+        "<p>A cleanup is running right now.</p>".to_string()
+    } else {
+        match view.last {
+            None => {
+                "<p class=\"muted\">No cleanup has run since the server started.</p>".to_string()
+            }
+            Some(r) => format!(
+                "<p>Last cleanup {when} ({how}): deleted {n} version{s}, freed {freed}.</p>",
+                when = escape_html(&r.finished.format("%Y-%m-%d %H:%M UTC").to_string()),
+                how = match r.trigger {
+                    Trigger::Schedule => "scheduled",
+                    Trigger::Manual => "from this page",
+                },
+                n = r.outcome.deleted,
+                s = plural(r.outcome.deleted as i64),
+                freed = human_size(r.outcome.freed),
+            ),
+        }
+    };
+
+    let next = match view.preview {
+        None => "<p>No rules are set, so a cleanup deletes nothing. Set \
+                 <code>keep_latest_stable</code>, <code>keep_latest_prerelease</code> or \
+                 <code>max_age_days</code> to give it some.</p>"
+            .to_string(),
+        Some(plan) if plan.planned.is_empty() => {
+            "<p>Nothing to delete: every version is within the rules.</p>".to_string()
+        }
+        Some(plan) => {
+            let mut table = String::from(
+                "<div class=\"scroll\"><table class=\"atbl plan\"><thead><tr><th>Package</th>\
+                 <th>Version</th><th>Published</th><th>Why</th><th>Frees</th></tr></thead><tbody>",
+            );
+            for p in plan.planned.iter().take(MAX_PREVIEW_ROWS) {
+                table.push_str(&format!(
+                    "<tr><td><a class=\"id\" href=\"{href}\">{id}</a></td>\
+                     <td><span class=\"nw\">{v}</span></td><td class=\"muted\">{when}</td>\
+                     <td>{why}</td><td class=\"muted\">{frees}</td></tr>",
+                    href = escape_html(&urls.app(&format!(
+                        "/admin/packages/{}",
+                        enc_path(&p.id.to_lowercase())
+                    ))),
+                    id = escape_html(&p.id),
+                    v = escape_html(&p.version.normalized()),
+                    when = escape_html(&p.published.format("%Y-%m-%d").to_string()),
+                    why = escape_html(&p.reason.describe()),
+                    frees = if p.frees > 0 {
+                        human_size(p.frees)
+                    } else {
+                        "Kept by another feed".to_string()
+                    },
+                ));
+            }
+            table.push_str("</tbody></table></div>");
+            let more = plan.planned.len().saturating_sub(MAX_PREVIEW_ROWS);
+            let more = if more > 0 {
+                format!("<p class=\"muted\">And {more} more not listed here.</p>")
+            } else {
+                String::new()
+            };
+            let n = plan.planned.len();
+            let action = if rules.enabled {
+                format!(
+                    "<form class=\"run\" method=\"post\" action=\"{act}\" data-confirm=\"{confirm}\">\
+                     <input type=\"hidden\" name=\"{CSRF_FIELD}\" value=\"{csrf}\">\
+                     <input type=\"hidden\" name=\"plan\" value=\"{fp}\">\
+                     <button type=\"submit\" class=\"danger\">{label}</button>\
+                     </form>",
+                    label = if n == 1 {
+                        "Delete this version now".to_string()
+                    } else {
+                        format!("Delete these {n} versions now")
+                    },
+                    act = escape_html(&urls.app("/admin/retention/run")),
+                    confirm = escape_html(&format!(
+                        "Delete {n} version{} from this feed now? Versions no other feed \
+                         holds are deleted for good.",
+                        plural(n as i64)
+                    )),
+                    csrf = escape_html(view.csrf_token),
+                    fp = escape_html(&plan.fingerprint()),
+                )
+            } else {
+                "<p class=\"muted\">Retention is off (<code>enabled = false</code>), so nothing \
+                 is deleted. To clean up only from this page, set <code>enabled = true</code> \
+                 and <code>interval_hours = 0</code>.</p>"
+                    .to_string()
+            };
+            format!(
+                "<p>{n} version{s} would be deleted, freeing {freed}.</p>{table}{more}{action}",
+                s = plural(n as i64),
+                freed = human_size(plan.frees()),
+            )
+        }
+    };
+
+    let pinned = match view.preview {
+        Some(plan) if !plan.pinned.is_empty() => {
+            let mut list = String::from("<ul class=\"rank\">");
+            for (id, v) in &plan.pinned {
+                list.push_str(&format!(
+                    "<li><span><a class=\"id\" href=\"{href}\">{eid}</a> \
+                     <span class=\"muted\">{v}</span></span></li>",
+                    href = escape_html(
+                        &urls.app(&format!("/admin/packages/{}", enc_path(&id.to_lowercase())))
+                    ),
+                    eid = escape_html(id),
+                    v = escape_html(&v.normalized()),
+                ));
+            }
+            list.push_str("</ul>");
+            format!("<div class=\"card\"><h2>Pinned, kept regardless</h2>{list}</div>")
+        }
+        _ => String::new(),
+    };
+
+    let body = format!(
+        "<nav class=\"crumbs\" aria-label=\"Breadcrumb\">\
+         <a href=\"{admin}\">Admin</a> <span aria-hidden=\"true\">/</span> <span>Retention</span></nav>\
+         <h1 class=\"title\">Retention</h1>{notice}\
+         <div class=\"card\"><h2>Rules</h2>{kv_rows}\
+         <p class=\"muted\">Set in the configuration file, under <code>[retention]</code> or a \
+         feed's <code>[feeds.retention]</code>. The newest version of every package is always \
+         kept, and pinned versions are kept whatever the rules say.</p>{last}</div>\
+         <div class=\"card\"><h2>Next cleanup</h2>{next}</div>{pinned}",
+        admin = escape_html(&urls.app("/admin")),
+    );
+    layout(urls, "Retention \u{2014} YANuget", ADMIN_NAV, &body)
 }
 
 /// The root feed index, shown when more than one feed is hosted. Each entry is
@@ -1451,19 +2021,35 @@ fn opt_count(n: Option<usize>) -> String {
     }
 }
 
+/// What the package page shows about the selected version besides its
+/// metadata.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Detail<'a> {
+    pub readme: Option<&'a str>,
+    /// Which install command comes first (`choco`, `dotnet`, `nuget`).
+    pub primary_client: &'a str,
+    pub has_symbols: bool,
+    /// Whether this feed has an admin area: the label then links to the page
+    /// that disables, deletes or moves this package's versions.
+    pub admin: bool,
+    /// Files attached to the selected version.
+    pub files: &'a [PackageFile],
+}
+
 /// The package detail page for one selected version.
-///
-/// `admin` is whether this feed has an admin area: the label then links to the
-/// page that disables, deletes or moves this package's versions.
 pub fn detail_page(
     urls: &UrlBuilder,
     packages: &[Package],
     selected: &Package,
-    readme: Option<&str>,
-    primary_client: &str,
-    has_symbols: bool,
-    admin: bool,
+    detail: &Detail,
 ) -> String {
+    let Detail {
+        readme,
+        primary_client,
+        has_symbols,
+        admin,
+        files,
+    } = *detail;
     let id = escape_html(&selected.id);
     let version = selected.normalized_version();
     let lower = selected.lower_id();
@@ -1492,14 +2078,19 @@ pub fn detail_page(
     }
     versions.push_str("</ul>");
 
-    let manage = if admin {
-        format!(
-            "<a class=\"manage\" href=\"{}\">Manage versions</a>",
+    // The package file itself, from the same endpoint clients restore from —
+    // so read auth, ranges and caching behave exactly as they do for them.
+    let mut manage = format!(
+        "<a href=\"{}\">Download .nupkg</a>",
+        escape_html(&urls.package_download(&lower, &version))
+    );
+    if admin {
+        manage.push_str(&format!(
+            "<a href=\"{}\">Manage versions</a>",
             escape_html(&urls.app(&format!("/admin/packages/{}", enc_path(&lower))))
-        )
-    } else {
-        String::new()
-    };
+        ));
+    }
+    let manage = format!("<div class=\"acts\">{manage}</div>");
     let desc = if selected.description.trim().is_empty() {
         String::new()
     } else {
@@ -1516,13 +2107,14 @@ pub fn detail_page(
          <section class=\"label\" aria-labelledby=\"pkg\"><div class=\"label-head\">{icon}\
          <h1 class=\"title\" id=\"pkg\">{id_breaks}</h1>{manage}</div>\
          <dl class=\"fields\">{fields}</dl></section>\
-         {desc}{tags}{links}{deps}{symbols}",
+         {desc}{tags}{links}{attached}{deps}{symbols}",
         packages = escape_html(&urls.app("/packages")),
         icon = render_icon(urls, selected),
         id_breaks = id.replace('.', ".<wbr>"),
         fields = render_fields(selected),
-        tags = render_tags(&selected.tags),
+        tags = render_tags(urls, &selected.tags),
         links = render_links(selected),
+        attached = render_files(urls, selected, files),
         deps = render_dependencies(urls, selected),
         symbols = if has_symbols {
             "<p class=\"muted\">Debug symbols are available for this package.</p>"
@@ -1563,6 +2155,54 @@ pub fn detail_page(
             ..Nav::default()
         },
         &body,
+    )
+}
+
+/// The files attached to a version, with what a `chocolateyInstall.ps1`
+/// needs to fetch and check them.
+///
+/// The snippet uses BITS, which resumes a dropped transfer by itself and
+/// survives a reboot mid-download, and Chocolatey's own `Get-ChecksumValid`,
+/// which fails the install on a mismatch. It is assembled raw and escaped
+/// once, like the install commands, so the copy button puts exactly the
+/// script on the clipboard.
+fn render_files(urls: &UrlBuilder, p: &Package, files: &[PackageFile]) -> String {
+    if files.is_empty() {
+        return String::new();
+    }
+    let lower = p.lower_id();
+    let version = p.normalized_version();
+    let mut list = String::from("<ul class=\"attached\">");
+    let mut script = format!(
+        "$dir = Join-Path $env:TEMP '{}.{}'\nNew-Item -ItemType Directory -Force $dir | Out-Null",
+        p.id, version
+    );
+    for f in files {
+        let url = urls.file_download(&lower, &version, &f.name);
+        list.push_str(&format!(
+            "<li><div><a class=\"id\" href=\"{href}\">{name}</a> \
+             <span class=\"muted\">{size}</span></div>\
+             <div class=\"sha\"><span class=\"muted\">SHA-256</span> <code>{sha}</code></div></li>",
+            href = escape_html(&url),
+            name = escape_html(&f.name),
+            size = human_size(f.size),
+            sha = escape_html(&f.sha256),
+        ));
+        script.push_str(&format!(
+            "\n$file = Join-Path $dir '{name}'\n\
+             Start-BitsTransfer -Source '{url}' -Destination $file\n\
+             Get-ChecksumValid -File $file -Checksum '{sha}' -ChecksumType sha256",
+            name = f.name,
+            sha = f.sha256,
+        ));
+    }
+    list.push_str("</ul>");
+    format!(
+        "<h2>Files</h2>{list}\
+         <div class=\"script\"><h3>In chocolateyInstall.ps1</h3><div class=\"snip\">\
+         <button type=\"button\" class=\"copy\" aria-label=\"Copy the download script\" hidden>Copy</button>\
+         <pre><code>{code}</code></pre></div></div>",
+        code = escape_html(&script),
     )
 }
 
@@ -1812,13 +2452,23 @@ fn truncate_bytes(s: &str, max: usize) -> (&str, bool) {
     (&s[..end], true)
 }
 
-fn render_tags(tags: &[String]) -> String {
+/// The most tags a package shows on a page.
+const MAX_RENDERED_TAGS: usize = 32;
+
+/// A package's tags, each a link to the packages that share it.
+fn render_tags(urls: &UrlBuilder, tags: &[String]) -> String {
     if tags.is_empty() {
         return String::new();
     }
     let mut out = String::from("<div class=\"tags\">");
-    for t in tags {
-        out.push_str(&format!("<span class=\"tag\">{}</span>", escape_html(t)));
+    // Tags are capped when a package is pushed; this bounds what rows stored
+    // before that cap can put on a page.
+    for t in tags.iter().take(MAX_RENDERED_TAGS) {
+        out.push_str(&format!(
+            "<a class=\"tag\" href=\"{}\">{}</a>",
+            tag_href(urls, t),
+            escape_html(t)
+        ));
     }
     out.push_str("</div>");
     out
@@ -2075,10 +2725,13 @@ mod tests {
             &urls,
             std::slice::from_ref(&p),
             &p,
-            None,
-            "choco",
-            false,
-            false,
+            &Detail {
+                readme: None,
+                primary_client: "choco",
+                has_symbols: false,
+                admin: false,
+                files: &[],
+            },
         );
         for label in ["Chocolatey", "dotnet CLI", "nuget.exe"] {
             let button = format!(
@@ -2130,10 +2783,13 @@ mod tests {
             &urls,
             std::slice::from_ref(&p),
             &p,
-            None,
-            "choco",
-            false,
-            false,
+            &Detail {
+                readme: None,
+                primary_client: "choco",
+                has_symbols: false,
+                admin: false,
+                files: &[],
+            },
         );
         assert!(!html.contains("<img src=x"));
         assert!(html.contains("&lt;img src=x"));
@@ -2187,10 +2843,13 @@ mod tests {
             &urls,
             std::slice::from_ref(&p),
             &p,
-            None,
-            "choco",
-            true,
-            false,
+            &Detail {
+                readme: None,
+                primary_client: "choco",
+                has_symbols: true,
+                admin: false,
+                files: &[],
+            },
         );
         assert!(html.contains("badge pre"));
         assert!(html.contains("badge un"));
@@ -2208,10 +2867,13 @@ mod tests {
             &urls,
             std::slice::from_ref(&p),
             &p,
-            Some("A long readme."),
-            "choco",
-            false,
-            false,
+            &Detail {
+                readme: Some("A long readme."),
+                primary_client: "choco",
+                has_symbols: false,
+                admin: false,
+                files: &[],
+            },
         );
         assert!(!STYLE.contains("sticky"));
         let at = |needle: &str| {
@@ -2692,10 +3354,13 @@ mod tests {
             &urls,
             std::slice::from_ref(&p),
             &p,
-            None,
-            "choco",
-            false,
-            false,
+            &Detail {
+                readme: None,
+                primary_client: "choco",
+                has_symbols: false,
+                admin: false,
+                files: &[],
+            },
         );
         assert!(
             plain.contains(&format!("Served by YANuget {}", env!("CARGO_PKG_VERSION"))),
@@ -2707,15 +3372,28 @@ mod tests {
             &urls,
             std::slice::from_ref(&p),
             &p,
-            None,
-            "choco",
-            false,
-            true,
+            &Detail {
+                readme: None,
+                primary_client: "choco",
+                has_symbols: false,
+                admin: true,
+                files: &[],
+            },
         );
         assert!(
-            managed.contains("<a class=\"manage\" href=\"/admin/packages/contoso.utils\">"),
+            managed.contains("<a href=\"/admin/packages/contoso.utils\">Manage versions</a>"),
             "{managed}"
         );
+        // The package file is linked for everyone, from the client endpoint.
+        for html in [&plain, &managed] {
+            assert!(
+                html.contains(
+                    "<a href=\"https://host/v3/package/contoso.utils/1.0.0/contoso.utils.1.0.0.nupkg\">\
+                     Download .nupkg</a>"
+                ),
+                "{html}"
+            );
+        }
         assert!(
             managed.contains("<a href=\"/admin\">Admin</a>"),
             "{managed}"
@@ -2734,6 +3412,135 @@ mod tests {
     }
 
     #[test]
+    fn tags_link_to_a_filtered_gallery_that_every_page_keeps() {
+        let urls = UrlBuilder::new("https://host");
+        let mut page = page_of(&["A", "B"]);
+        page.groups[0].packages[0].tags = vec!["Logging".into(), "a&b<c".into()];
+        page.total_hits = 6;
+        // A row's tags link to the tag, lower-cased and escaped.
+        let html = gallery_page(&urls, &page, &view("", 0, 2));
+        assert!(
+            html.contains("<a class=\"tag\" href=\"/packages?tag=logging\">Logging</a>"),
+            "{html}"
+        );
+        assert!(
+            html.contains("<a class=\"tag\" href=\"/packages?tag=a%26b%3Cc\">a&amp;b&lt;c</a>"),
+            "{html}"
+        );
+
+        let tagged = GalleryView {
+            tag: Some("logging"),
+            ..view("", 2, 2)
+        };
+        let html = gallery_page(&urls, &page, &tagged);
+        assert!(
+            html.contains("<h1 class=\"title\">6 packages tagged \u{201c}logging\u{201d}</h1>"),
+            "{html}"
+        );
+        assert!(
+            html.contains(
+                "<title>Tagged \u{201c}logging\u{201d}, page 2 of 3 \u{2014} YANuget</title>"
+            ),
+            "{html}"
+        );
+        // Paging, the pager's forms and a new search all keep the tag…
+        assert!(html.contains("skip=4&amp;take=2&amp;tag=logging"), "{html}");
+        assert_eq!(
+            html.matches("<input type=\"hidden\" name=\"tag\" value=\"logging\">")
+                .count(),
+            3,
+            "{html}"
+        );
+        // …and clearing it keeps the rest.
+        assert!(
+            html.contains("<a href=\"/packages?q=&amp;skip=0&amp;take=2\">Clear the tag</a>"),
+            "{html}"
+        );
+
+        // A tag with no packages says so and offers the way back.
+        let none = gallery_page(&urls, &page_of(&[]), &tagged);
+        assert!(
+            none.contains("No packages tagged \u{201c}logging\u{201d}"),
+            "{none}"
+        );
+        assert!(!none.contains("Your feed is live"), "{none}");
+    }
+
+    #[test]
+    fn the_landing_page_offers_popular_tags_and_the_cloud_scales_with_use() {
+        let urls = UrlBuilder::new("https://host");
+        let counts = vec![
+            TagCount {
+                tag: "logging".into(),
+                packages: 40,
+            },
+            TagCount {
+                tag: "build".into(),
+                packages: 3,
+            },
+            TagCount {
+                tag: "zeta".into(),
+                packages: 1,
+            },
+        ];
+        let landing = gallery_page(
+            &urls,
+            &page_of(&["A", "B"]),
+            &GalleryView {
+                popular: &counts,
+                ..view("", 0, 20)
+            },
+        );
+        assert!(
+            landing.contains("<nav class=\"popular\" aria-label=\"Popular tags\">"),
+            "{landing}"
+        );
+        assert!(landing.contains("<a class=\"all\" href=\"/tags\">All tags</a>"));
+
+        let cloud = tags_page(&urls, &counts, false);
+        // Alphabetical, the most used largest, the least smallest, and every
+        // count written out rather than left to the size.
+        let at = |needle: &str| {
+            cloud
+                .find(needle)
+                .unwrap_or_else(|| panic!("{needle}: {cloud}"))
+        };
+        assert!(at(">build<") < at(">logging<") && at(">logging<") < at(">zeta<"));
+        assert!(cloud.contains("<a class=\"t5\" href=\"/packages?tag=logging\">logging</a>"));
+        assert!(cloud.contains("<a class=\"t1\" href=\"/packages?tag=zeta\">zeta</a>"));
+        assert!(cloud.contains("<span class=\"n\">40<span class=\"vh\"> packages</span></span>"));
+        assert!(cloud.contains("<span class=\"n\">1<span class=\"vh\"> package</span></span>"));
+        assert!(cloud.contains("<a href=\"/tags\" aria-current=\"page\">Tags</a>"));
+
+        // Small counts step once per package instead of jumping to the top.
+        let small = tags_page(
+            &urls,
+            &[
+                TagCount {
+                    tag: "a".into(),
+                    packages: 2,
+                },
+                TagCount {
+                    tag: "b".into(),
+                    packages: 1,
+                },
+            ],
+            false,
+        );
+        assert!(
+            small.contains("<a class=\"t2\" href=\"/packages?tag=a\">"),
+            "{small}"
+        );
+        assert!(
+            small.contains("<a class=\"t1\" href=\"/packages?tag=b\">"),
+            "{small}"
+        );
+
+        let empty = tags_page(&urls, &[], false);
+        assert!(empty.contains("No tags yet"), "{empty}");
+    }
+
+    #[test]
     fn the_admin_page_acts_on_the_selected_versions() {
         let urls = UrlBuilder::new("https://host");
         let mut beta = sample();
@@ -2742,7 +3549,13 @@ mod tests {
             feed_version(sample(), false, false),
             feed_version(beta, false, false),
         ];
-        let html = admin_package_page(&urls, "Contoso.Utils", &versions, None, &[], "tok");
+        let html = admin_package_page(
+            &urls,
+            "Contoso.Utils",
+            &versions,
+            &AdminPackageExtras::default(),
+            "tok",
+        );
         // One box per version, belonging to the form below the table.
         for v in ["1.0.0", "2.0.0-beta"] {
             assert!(
@@ -2768,13 +3581,24 @@ mod tests {
         assert!(html.contains("value=\"delete\" class=\"danger\" data-confirm="));
         // No other feed to hand versions to: no copy or move.
         assert!(!html.contains("value=\"move\""), "{html}");
+        // Each servable version links to its package file.
+        assert!(
+            html.contains(
+                "<a class=\"btn\" href=\"https://host/v3/package/contoso.utils/2.0.0-beta/\
+                 contoso.utils.2.0.0-beta.nupkg\" aria-label=\"Download 2.0.0-beta\">Download</a>"
+            ),
+            "{html}"
+        );
 
+        let targets = ["stable".to_string()];
         let html = admin_package_page(
             &urls,
             "Contoso.Utils",
             &versions,
-            None,
-            &["stable".to_string()],
+            &AdminPackageExtras {
+                transfer_targets: &targets,
+                ..Default::default()
+            },
             "tok",
         );
         assert!(
@@ -2797,17 +3621,23 @@ mod tests {
             total_downloads: 1234,
             total_size: 2048,
             symbol_count: 1,
+            file_count: 2,
+            file_bytes: 3 * 1024 * 1024 * 1024,
         };
         let html = stats_page(&urls, &stats, &page_of(&["Top.Pkg"]), &[sample()], false);
         assert!(html.contains("Statistics"));
         assert!(html.contains("1,234")); // grouped downloads
         assert!(html.contains("Top.Pkg"));
         assert!(html.contains("Recently published"));
-        // Six tiles in rows of three (two on a phone), not five and an orphan;
-        // the two lists share the width evenly, not the package page's
-        // `1fr 340px` split.
-        assert_eq!(html.matches("class=\"stat\"").count(), 6);
-        assert!(STYLE.contains(".stats{display:grid;grid-template-columns:repeat(3,1fr)"));
+        // Eight tiles in rows of four (two on narrow screens), never a row
+        // with an orphan; the two lists share the width evenly, not the
+        // package page's `1fr 340px` split.
+        assert_eq!(html.matches("class=\"stat\"").count(), 8);
+        assert!(STYLE.contains(".stats{display:grid;grid-template-columns:repeat(4,1fr)"));
+        assert!(
+            html.contains("<div class=\"l\">File storage</div><div class=\"n\">3.0 GB</div>"),
+            "{html}"
+        );
         assert!(
             html.contains("<div class=\"lists\"><div class=\"card\">"),
             "{html}"
@@ -2847,6 +3677,7 @@ mod tests {
             total_downloads: 1,
             total_size: 1,
             symbol_count: 0,
+            ..Default::default()
         };
         let pages = [
             (
@@ -2855,10 +3686,13 @@ mod tests {
                     &urls,
                     std::slice::from_ref(&p),
                     &p,
-                    Some("docs"),
-                    "choco",
-                    false,
-                    false,
+                    &Detail {
+                        readme: Some("docs"),
+                        primary_client: "choco",
+                        has_symbols: false,
+                        admin: false,
+                        files: &[],
+                    },
                 ),
             ),
             (
@@ -2896,10 +3730,13 @@ mod tests {
             &urls,
             std::slice::from_ref(&p),
             &p,
-            None,
-            "choco",
-            false,
-            false,
+            &Detail {
+                readme: None,
+                primary_client: "choco",
+                has_symbols: false,
+                admin: false,
+                files: &[],
+            },
         );
         // The label's count is a bare number under its caption; the version
         // list spells it out.
@@ -2946,6 +3783,7 @@ mod tests {
             mirror: None,
             license_policy: crate::config::LicensePolicyConfig::default(),
             retention: crate::config::RetentionConfig::default(),
+            cleanup: Default::default(),
         }
     }
 
@@ -2955,6 +3793,7 @@ mod tests {
             pending,
             flagged,
             flag_reason: flagged.then(|| "license MIT is blocked".to_string()),
+            pinned: false,
         }
     }
 
@@ -2985,12 +3824,215 @@ mod tests {
             feed_version(sample(), false, false),
             feed_version(disabled, false, false),
         ];
-        let pkg = admin_package_page(&urls, "Contoso.Utils", &versions, None, &[], "tok");
+        let pkg = admin_package_page(
+            &urls,
+            "Contoso.Utils",
+            &versions,
+            &AdminPackageExtras::default(),
+            "tok",
+        );
         assert!(pkg.contains("/disable"));
         assert!(pkg.contains("/enable"));
         assert!(pkg.contains("/delete"));
         assert!(pkg.contains("badge un")); // the disabled one
         assert!(pkg.contains("badge ok")); // the active one
+    }
+
+    #[test]
+    fn the_admin_page_pins_and_says_what_the_next_cleanup_deletes() {
+        let urls = UrlBuilder::new("https://host");
+        let mut old = sample();
+        old.version = crate::version::NuGetVersion::parse("0.9.0").unwrap();
+        let mut pinned = feed_version(sample(), false, false);
+        pinned.pinned = true;
+        let versions = vec![pinned, feed_version(old.clone(), false, false)];
+        let plan = [crate::retention::Pruned {
+            version: old.version.clone(),
+            reason: crate::retention::PruneReason {
+                beyond_newest: None,
+                older_than_days: Some(30),
+            },
+        }];
+        let html = admin_package_page(
+            &urls,
+            "Contoso.Utils",
+            &versions,
+            &AdminPackageExtras {
+                retention_plan: &plan,
+                ..Default::default()
+            },
+            "tok",
+        );
+        assert!(
+            html.contains("<span class=\"badge pin\">pinned</span>"),
+            "{html}"
+        );
+        assert!(
+            html.contains("/admin/packages/contoso.utils/1.0.0/unpin"),
+            "{html}"
+        );
+        assert!(
+            html.contains("/admin/packages/contoso.utils/0.9.0/pin"),
+            "{html}"
+        );
+        assert!(
+            html.contains("The next cleanup deletes this: older than 30 days."),
+            "{html}"
+        );
+        // Deleting a pinned version says what a pin does and does not do.
+        assert!(
+            html.contains("is pinned, which only keeps it from retention"),
+            "{html}"
+        );
+        assert!(html.contains("name=\"op\" value=\"pin\""), "{html}");
+    }
+
+    #[test]
+    fn attached_files_are_listed_with_a_script_and_can_be_deleted() {
+        let urls = UrlBuilder::new("https://host");
+        let p = sample();
+        let file = PackageFile {
+            lower_id: "contoso.utils".into(),
+            normalized_version: "1.0.0".into(),
+            name: "base.wim".into(),
+            sha256: "ab".repeat(32),
+            size: 4 * 1024 * 1024 * 1024,
+            uploaded: chrono::Utc::now(),
+            downloads: 3,
+        };
+        let files = [file];
+        let page = detail_page(
+            &urls,
+            std::slice::from_ref(&p),
+            &p,
+            &Detail {
+                primary_client: "choco",
+                files: &files,
+                ..Default::default()
+            },
+        );
+        let url = "https://host/files/contoso.utils/1.0.0/base.wim";
+        assert!(
+            page.contains(&format!("<a class=\"id\" href=\"{url}\">base.wim</a>")),
+            "{page}"
+        );
+        assert!(page.contains("4.0 GB"), "{page}");
+        // The script is escaped once, so the clipboard gets exactly this.
+        let script = page
+            .split("<pre><code>")
+            .find(|s| s.contains("Start-BitsTransfer"))
+            .and_then(|s| s.split("</code>").next())
+            .map(text_of)
+            .unwrap_or_else(|| panic!("no script: {page}"));
+        assert!(script.contains(&format!(
+            "Start-BitsTransfer -Source '{url}' -Destination $file"
+        )));
+        assert!(script.contains(&format!(
+            "-Checksum '{}' -ChecksumType sha256",
+            "ab".repeat(32)
+        )));
+        assert!(page.contains("aria-label=\"Copy the download script\""));
+
+        let admin = admin_package_page(
+            &urls,
+            "Contoso.Utils",
+            &[feed_version(sample(), false, false)],
+            &AdminPackageExtras {
+                files_enabled: true,
+                files: &files,
+                ..Default::default()
+            },
+            "tok",
+        );
+        assert!(
+            admin.contains("action=\"/admin/packages/contoso.utils/1.0.0/files/base.wim/delete\""),
+            "{admin}"
+        );
+        assert!(
+            admin.contains("Install scripts that fetch it will fail."),
+            "{admin}"
+        );
+        // With the feature off, the admin page does not mention files.
+        let off = admin_package_page(
+            &urls,
+            "Contoso.Utils",
+            &[feed_version(sample(), false, false)],
+            &AdminPackageExtras::default(),
+            "tok",
+        );
+        assert!(!off.contains("<h2>Files</h2>"), "{off}");
+    }
+
+    #[test]
+    fn the_retention_page_shows_the_plan_and_deletes_only_when_enabled() {
+        use crate::retention::{Planned, Preview, PruneReason};
+        let urls = UrlBuilder::new("https://host");
+        let plan = Preview {
+            planned: vec![Planned {
+                id: "Old.Pkg".into(),
+                version: crate::version::NuGetVersion::parse("1.0.0").unwrap(),
+                published: chrono::Utc::now(),
+                reason: PruneReason {
+                    beyond_newest: Some((2, false)),
+                    older_than_days: None,
+                },
+                frees: 2048,
+            }],
+            pinned: vec![(
+                "Lts.Pkg".into(),
+                crate::version::NuGetVersion::parse("3.1.0").unwrap(),
+            )],
+        };
+        let mut rules = crate::config::RetentionConfig {
+            keep_latest_stable: Some(2),
+            ..Default::default()
+        };
+        let page = |rules: &crate::config::RetentionConfig, notice| {
+            admin_retention_page(
+                &urls,
+                &RetentionView {
+                    rules,
+                    last: None,
+                    running: false,
+                    preview: Some(&plan),
+                    csrf_token: "tok",
+                    notice,
+                },
+            )
+        };
+        let off = page(&rules, RetentionNotice::None);
+        assert!(off.contains("beyond the newest 2 stable versions"), "{off}");
+        assert!(
+            off.contains("1 version would be deleted, freeing 2.0 KB."),
+            "{off}"
+        );
+        assert!(off.contains(">Lts.Pkg</a>"), "{off}");
+        // Off: the plan is shown, but there is nothing to press.
+        assert!(!off.contains("/admin/retention/run"), "{off}");
+
+        rules.enabled = true;
+        let on = page(&rules, RetentionNotice::None);
+        assert!(on.contains("action=\"/admin/retention/run\""), "{on}");
+        assert!(
+            on.contains(&format!("name=\"plan\" value=\"{}\"", plan.fingerprint())),
+            "{on}"
+        );
+        assert!(on.contains("<input type=\"hidden\" name=\"_csrf\" value=\"tok\">"));
+
+        let changed = page(&rules, RetentionNotice::Changed);
+        assert!(changed.contains("nothing was deleted"), "{changed}");
+        let done = page(
+            &rules,
+            RetentionNotice::Done(crate::retention::Outcome {
+                deleted: 3,
+                freed: 1024,
+                errors: 0,
+            }),
+        );
+        assert!(
+            done.contains("Deleted 3 versions, freeing 1.0 KB."),
+            "{done}"
+        );
     }
 
     #[test]
@@ -3001,8 +4043,10 @@ mod tests {
             &urls,
             "Contoso.Utils",
             &versions,
-            Some("stable"),
-            &[],
+            &AdminPackageExtras {
+                promote_target: Some("stable"),
+                ..Default::default()
+            },
             "tok",
         );
         assert!(pkg.contains("/approve"));

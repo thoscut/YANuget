@@ -31,6 +31,57 @@ expected to change incompatibly at any version.
   settings page says which setting turns it on.
 - The server's version is shown in every page's footer and on the settings
   page. The stats page's lists show each package's version.
+- The gallery filters by tag: every tag shown is a link to `/packages?tag=…`,
+  which narrows the list — and a search — to packages carrying it,
+  case-insensitively, and keeps the tag across paging, the page-size form and
+  a new search. `/tags` lists every tag of the feed's visible packages
+  alphabetically, set larger the more packages use it, with the count written
+  out; the landing page offers the twelve most used. Tags are indexed in a new
+  `package_tags` table, filled for existing databases once on startup.
+- A package page links its `.nupkg` ("Download .nupkg"), and the admin page
+  links each servable version's, both from the flat-container endpoint clients
+  restore from.
+- A feed can no longer be named `tags`.
+- Versions can be **pinned** in the admin area, one at a time or as a
+  selection. Retention never deletes a pinned version, and a pin does not use up
+  one of the "newest N" the rules keep. A pin survives an overwriting push and a
+  move to another feed; it does not stop an explicit delete, whose confirmation
+  says the version is pinned. Stored in a new `feed_packages.pinned` column,
+  added to existing databases on startup.
+- `/admin/retention` shows the feed's retention rules as configured, what the
+  last cleanup did, and every version the next one would delete, with the
+  reason ("beyond the newest 5 stable versions", "older than 90 days") and the
+  space it frees. Its button deletes exactly that list: it sends a fingerprint
+  of the plan it showed, and the server recomputes the plan and deletes only if
+  it still matches, so a push between looking and clicking cannot widen what is
+  deleted. A cleanup and the scheduled sweep never run at once. The admin
+  package page marks the versions the next cleanup would delete.
+- **Attached files**: large files (`.wim` and other disk images, archives)
+  attached to a package version, for its install script to fetch.
+  - Served at `/files/{id}/{version}/{name}` for resumable clients: `HEAD`,
+    single ranges, `If-Range`, a strong `ETag` (the SHA-256), `Last-Modified`,
+    `Repr-Digest`, and always as a download (`octet-stream`, `attachment`,
+    `default-src 'none'`). Verified with BITS (including a suspended and
+    resumed job), `Invoke-WebRequest -Resume` and `curl -C -`.
+  - Uploaded with the push key in one `PUT` (optionally checked against
+    `X-Checksum-SHA256`), or resumably over tus 1.0.0 at `/api/v2/uploads`
+    (creation, expiration, termination; stock clients work, and a resume also
+    works across a server restart). `scripts/Send-YanugetFile.ps1` uploads
+    resumably from PowerShell 7. A feed without a push key refuses files.
+  - Or dropped over SSH into `[files].inbox_dir` with a `sha256sum` checksum
+    file; the importer moves each file out of the uploader's reach, verifies
+    it, attaches it, and explains a failure in a `.error` file next to it.
+    YANuget runs no SSH server of its own.
+  - Stored once per content under `.blobs/sha256/`, so versions that attach
+    the same image share its bytes; a file goes with its version when it is
+    deleted, pruned or moved, and its blob when nothing references it any
+    more. File names are held to `A-Z a-z 0-9 . _ -` with an allowed
+    extension, and never become part of a server path.
+  - The package page lists a version's files with their SHA-256 and the
+    `chocolateyInstall.ps1` lines (BITS plus `Get-ChecksumValid`) that fetch
+    and check them; the admin page lists, downloads and deletes them; the
+    stats page counts them; the settings page shows the file limits.
+  - Configured under `[files]`. A feed can no longer be named `files`.
 
 ### Changed
 
@@ -57,6 +108,35 @@ expected to change incompatibly at any version.
 - A feed can no longer be named `_assets`: that is where the font is served.
 - `web::FeedMeta` carries the feed's admin key and has a
   `FeedMeta::from_resolved` constructor.
+- Downloads now carry `Last-Modified` (the publish time) and honour `If-Range`,
+  so a resuming client — BITS compares both between the requests of one
+  transfer — never splices bytes of two different builds together: a resume
+  whose validator no longer matches gets the whole current file. A download is
+  counted once per transfer, for a `GET` of the whole file or of a range from
+  its first byte, rather than once per ranged request and `HEAD`.
+- An upload is aborted (`408`) once no byte has arrived for
+  `upload_idle_timeout_secs` (default 300). Only silence counts; a slow but
+  moving transfer is never cut off. Nothing timed a request body out before, so
+  a stalled client held its connection and temp file open indefinitely.
+- An upload is refused (`507`) when it would leave less than
+  `min_free_disk_bytes` (default 2 GiB) free on the storage volume, checked
+  against the declared size when the client sends one.
+- A package keeps at most 64 tags of at most 64 characters, de-duplicated
+  case-insensitively, and a gallery row shows at most 32. Nothing bounded the
+  field but the 16 MiB manifest cap, so one push could put millions of tags on
+  every page and search result.
+
+### Fixed
+
+- An overwrite that had to be refused — another feed holds the version, with
+  different bytes — no longer takes the version out of the feed it was pushed
+  to. The feed's membership was removed before the check that refused the push.
+- Storage path segments are refused when Windows would read them as something
+  other than a file name: a `:` (a drive-relative path, which escaped the store
+  when joined, or an NTFS alternate data stream), a device name such as `NUL`
+  or `COM1.pdb`, a trailing dot or space, or a control character. A symbol file
+  named `c:x.pdb` inside a `.snupkg` could otherwise be written outside the
+  store on a Windows host.
 
 ## [0.5.1] — 2026-09-24
 

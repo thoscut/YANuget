@@ -8,7 +8,10 @@
 mod assets;
 mod docs;
 mod files;
+pub(crate) mod hosted;
 mod ui;
+
+pub use hosted::sweep_expired_uploads;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -20,7 +23,7 @@ use axum::extract::{
 };
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{Html, IntoResponse, Json, Redirect, Response};
-use axum::routing::{delete, get, post, put};
+use axum::routing::{delete, get, head, post, put};
 use axum::Router;
 use futures::StreamExt;
 use serde::Deserialize;
@@ -73,6 +76,9 @@ pub struct FeedContext {
     pub mirror: Option<MirrorClient>,
     pub license_policy: LicensePolicyConfig,
     pub retention: RetentionConfig,
+    /// The feed's cleanup lock and last report, shared with the background
+    /// sweep.
+    pub cleanup: Arc<retention::RetentionState>,
 }
 
 impl FeedContext {
@@ -97,6 +103,7 @@ impl FeedContext {
             mirror,
             license_policy: feed.license_policy.clone(),
             retention: feed.retention.clone(),
+            cleanup: Arc::default(),
         }
     }
 }
@@ -209,6 +216,38 @@ impl AppState {
             format!("{scheme}://{host}")
         };
         UrlBuilder::with_prefix(root, &self.feed.prefix)
+    }
+
+    /// Refuse an upload of `incoming` bytes (when the client declared a size)
+    /// that would leave the storage volume with less than
+    /// `min_free_disk_bytes` free.
+    ///
+    /// A full disk does not fail cleanly: the database, the temp file and every
+    /// other writer on the volume run out together, mid-write. Saying no up
+    /// front costs one `statvfs`. With no declared size (a chunked body) only
+    /// the reserve itself is checked; the size limit and the idle timeout bound
+    /// the rest. When free space cannot be measured the upload is let through,
+    /// since a guard that fails closed would take the feed down with it.
+    fn ensure_disk_space(&self, incoming: Option<u64>) -> Result<()> {
+        let reserve = self.config.min_free_disk_bytes;
+        if reserve == 0 {
+            return Ok(());
+        }
+        let available = match fs4::available_space(&self.temp_dir) {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::warn!(error = %e, "could not measure free disk space");
+                return Ok(());
+            }
+        };
+        let needed = incoming.unwrap_or(0).saturating_add(reserve);
+        if available < needed {
+            return Err(Error::InsufficientStorage(format!(
+                "{available} bytes free on the storage volume, {needed} needed \
+                 (the upload plus the configured reserve)"
+            )));
+        }
+        Ok(())
     }
 
     /// Create a fresh temp file for an incoming upload.
@@ -586,7 +625,25 @@ fn feed_routes(state: AppState) -> Router {
         )
         .route("/v3/registration/{id}/{version}", get(registration_leaf))
         .route("/v3/search", get(search))
-        .route("/v3/autocomplete", get(autocomplete));
+        .route("/v3/autocomplete", get(autocomplete))
+        // Files attached to versions (the handlers answer 404 while the
+        // feature is off). Not NuGet protocol; outside the gallery, so a
+        // script gets JSON errors and the files work with the UI disabled.
+        .route("/files/{id}/{version}/{name}", get(hosted::download))
+        .route(
+            "/api/v2/files/{id}/{version}/{name}",
+            put(hosted::put).delete(hosted::delete),
+        )
+        .route(
+            "/api/v2/uploads",
+            post(hosted::tus_create).options(hosted::tus_options),
+        )
+        .route(
+            "/api/v2/uploads/{upload}",
+            head(hosted::tus_head)
+                .patch(hosted::tus_patch)
+                .delete(hosted::tus_delete),
+        );
 
     // The SemVer2 hive mirrors the routes above. A client picks a hive from the
     // service index, so each has to be reachable at its own path and to keep
@@ -631,6 +688,7 @@ fn feed_routes(state: AppState) -> Router {
             .route("/packages/{id}/{version}", get(package_detail_version))
             .route("/packages/{id}/{version}/icon", get(package_icon))
             .route("/stats", get(stats_page))
+            .route("/tags", get(tags_page))
             .route("/settings", get(settings_page))
             // Embedded, offline documentation site. `/docs` redirects to
             // `/docs/` so the site's relative links resolve.
@@ -666,7 +724,18 @@ fn feed_routes(state: AppState) -> Router {
                 .route(
                     "/admin/packages/{id}/{version}/promote",
                     admin_post(admin_promote),
-                );
+                )
+                .route("/admin/packages/{id}/{version}/pin", admin_post(admin_pin))
+                .route(
+                    "/admin/packages/{id}/{version}/unpin",
+                    admin_post(admin_unpin),
+                )
+                .route(
+                    "/admin/packages/{id}/{version}/files/{name}/delete",
+                    admin_post(admin_file_delete),
+                )
+                .route("/admin/retention", get(admin_retention))
+                .route("/admin/retention/run", admin_post(admin_retention_run));
         }
         router = router.merge(ui.layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -798,6 +867,7 @@ async fn push_package(State(state): State<AppState>, request: Request) -> Result
         .map(|s| s.starts_with("multipart/"))
         .unwrap_or(false);
 
+    state.ensure_disk_space(content_length(&headers))?;
     let (temp_path, mut file) = state.create_temp().await?;
     let limit = state.config.max_package_size_bytes;
 
@@ -875,7 +945,7 @@ async fn write_upload(
             .map_err(|e| Error::BadRequest(format!("invalid multipart field: {e}")))?
             .ok_or_else(|| Error::BadRequest("multipart body contained no file".into()))?;
         let stream = Box::pin(field.map(|r| r.map_err(to_io_err)));
-        streaming::stream_to_writer_limited(stream, file, limit)
+        streaming::stream_to_writer_limited(stream, file, limit, state.config.upload_idle_timeout())
             .await
             .map_err(map_upload_err)
     } else {
@@ -885,10 +955,18 @@ async fn write_upload(
                 .into_data_stream()
                 .map(|r| r.map_err(to_io_err)),
         );
-        streaming::stream_to_writer_limited(stream, file, limit)
+        streaming::stream_to_writer_limited(stream, file, limit, state.config.upload_idle_timeout())
             .await
             .map_err(map_upload_err)
     }
+}
+
+/// The declared size of a request body, when the client sent one.
+fn content_length(headers: &HeaderMap) -> Option<u64> {
+    headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse().ok())
 }
 
 async fn delete_package(
@@ -993,6 +1071,7 @@ async fn package_versions(
 
 async fn download_package(
     State(state): State<AppState>,
+    method: axum::http::Method,
     headers: HeaderMap,
     Path((id, version, filename)): Path<(String, String, String)>,
 ) -> Result<Response> {
@@ -1050,20 +1129,23 @@ async fn download_package(
 
     // The stored SHA-512 is a content hash of exactly these bytes, which makes
     // it a correct strong validator: a client that already holds this package
-    // gets a 304 instead of re-downloading gigabytes.
-    let etag = state
+    // gets a 304 instead of re-downloading gigabytes. The publish time is the
+    // matching `Last-Modified`.
+    let package = state
         .db
         .find(state.feed(), &id, &version)
         .await
         .ok()
-        .flatten()
-        .map(|p| p.package_hash);
+        .flatten();
 
-    // Count the download (best effort — never block the response on it).
-    let _ = state
-        .db
-        .increment_downloads(state.feed(), &id, &version)
-        .await;
+    // Count the download (best effort — never block the response on it), once
+    // per transfer rather than once per ranged request of it.
+    if files::counts_as_download(&method, &headers) {
+        let _ = state
+            .db
+            .increment_downloads(state.feed(), &id, &version)
+            .await;
+    }
 
     match content {
         PackageContent::LocalPath(path) => {
@@ -1072,8 +1154,12 @@ async fn download_package(
                 path,
                 &headers,
                 NUPKG_CONTENT_TYPE,
-                Some(&name),
-                etag.as_deref(),
+                files::FileMeta {
+                    download_name: Some(&name),
+                    etag: package.as_ref().map(|p| p.package_hash.as_str()),
+                    last_modified: package.as_ref().map(|p| p.published),
+                    sha256_base64: None,
+                },
             )
             .await
         }
@@ -1252,6 +1338,7 @@ async fn search(
         include_semver2: is_semver2_level(params.semver_level.as_deref()),
         package_type: params.package_type.filter(|s| !s.is_empty()),
         sort: Default::default(),
+        tag: None,
     };
     let page = state.db.search(state.feed(), &request).await?;
     // Link results into the hive matching the caller's semVerLevel, so a client
@@ -1332,6 +1419,7 @@ async fn push_symbol_package(State(state): State<AppState>, request: Request) ->
         .map(|s| s.starts_with("multipart/"))
         .unwrap_or(false);
 
+    state.ensure_disk_space(content_length(&headers))?;
     let (temp_path, mut file) = state.create_temp().await?;
     let limit = state.config.max_package_size_bytes;
 
@@ -1413,7 +1501,16 @@ async fn download_symbol(
         // A symbol is addressed by its own content signature, so the key itself
         // is a sound validator.
         PackageContent::LocalPath(path) => {
-            files::serve_local_file(path, &headers, NUPKG_CONTENT_TYPE, None, Some(&key)).await
+            files::serve_local_file(
+                path,
+                &headers,
+                NUPKG_CONTENT_TYPE,
+                files::FileMeta {
+                    etag: Some(&key),
+                    ..Default::default()
+                },
+            )
+            .await
         }
     }
 }
@@ -1445,6 +1542,20 @@ struct GalleryParams {
     /// `downloads` (the default), `name` or `updated`.
     #[serde(default)]
     sort: Option<String>,
+    /// Only packages with this tag.
+    #[serde(default)]
+    tag: Option<String>,
+}
+
+/// A `?tag=` value worth querying for: trimmed and lower-cased, or `None` for
+/// one no stored tag could equal (empty, too long, or with whitespace or
+/// control characters in it — tags are whitespace-separated when pushed).
+fn gallery_tag(raw: Option<&str>) -> Option<String> {
+    let tag = raw?.trim().to_lowercase();
+    let plausible = !tag.is_empty()
+        && tag.chars().count() <= crate::nuspec::MAX_TAG_CHARS
+        && !tag.chars().any(|c| c.is_whitespace() || c.is_control());
+    plausible.then_some(tag)
 }
 
 /// Parse an optional query value, treating an empty or malformed one as absent.
@@ -1479,6 +1590,7 @@ async fn gallery(
         .as_deref()
         .and_then(SearchSort::parse)
         .unwrap_or_default();
+    let tag = gallery_tag(params.tag.as_deref());
     let request = SearchRequest {
         query: query.clone(),
         skip: skip - skip % take,
@@ -1487,8 +1599,21 @@ async fn gallery(
         include_semver2: true,
         package_type: package_type.clone(),
         sort,
+        tag: tag.clone(),
     };
     let page = state.db.search(state.feed(), &request).await?;
+    // The landing page (no search, no filter, first page) offers a way in by
+    // tag; anywhere else it would be noise above results someone asked for.
+    let landing = query.trim().is_empty()
+        && tag.is_none()
+        && package_type.is_none()
+        && request.skip == 0
+        && !page.groups.is_empty();
+    let popular = if landing {
+        state.db.tag_counts(state.feed(), 12).await?
+    } else {
+        Vec::new()
+    };
     let urls = state.url_builder(&headers).with_hive(true);
     Ok(Html(ui::gallery_page(
         &urls,
@@ -1501,8 +1626,24 @@ async fn gallery(
             prerelease,
             package_type: package_type.as_deref(),
             sort,
+            tag: tag.as_deref(),
+            popular: &popular,
             admin: state.feed.admin.is_enabled(),
         },
+    )))
+}
+
+async fn tags_page(State(state): State<AppState>, headers: HeaderMap) -> Result<Html<String>> {
+    state.require_read(&headers)?;
+    let tags = state
+        .db
+        .tag_counts(state.feed(), ui::MAX_CLOUD_TAGS)
+        .await?;
+    let urls = state.url_builder(&headers);
+    Ok(Html(ui::tags_page(
+        &urls,
+        &tags,
+        state.feed.admin.is_enabled(),
     )))
 }
 
@@ -1687,15 +1828,24 @@ async fn render_detail(
         .unwrap_or_default()
         .is_empty();
 
+    let files = if state.config.files.enabled {
+        state.db.files_for(id, &selected.version).await?
+    } else {
+        Vec::new()
+    };
+
     let urls = state.url_builder(headers);
     Ok(Html(ui::detail_page(
         &urls,
         &packages,
         &selected,
-        readme.as_deref(),
-        &state.config.primary_client,
-        has_symbols,
-        state.feed.admin.is_enabled(),
+        &ui::Detail {
+            readme: readme.as_deref(),
+            primary_client: &state.config.primary_client,
+            has_symbols,
+            admin: state.feed.admin.is_enabled(),
+            files: &files,
+        },
     )))
 }
 
@@ -1806,14 +1956,45 @@ async fn admin_package(
         .collect();
     // The id as published, not as typed into the address.
     let display_id = &versions[0].package.id;
+    // What the next cleanup would do to this package, when one will run.
+    let policy = RetentionPolicy::from(&state.feed.retention);
+    let plan = if state.feed.retention.enabled {
+        retention::plan_for(&versions, &policy, chrono::Utc::now())
+    } else {
+        Vec::new()
+    };
+    let mut files = Vec::new();
+    if state.config.files.enabled {
+        for fv in versions.iter().rev() {
+            files.extend(state.db.files_for(&id, &fv.package.version).await?);
+        }
+    }
     Ok(Html(ui::admin_package_page(
         &urls,
         display_id,
         &versions,
-        state.feed.promotes_to.as_deref(),
-        &targets,
+        &ui::AdminPackageExtras {
+            promote_target: state.feed.promotes_to.as_deref(),
+            transfer_targets: &targets,
+            retention_plan: &plan,
+            files_enabled: state.config.files.enabled,
+            files: &files,
+        },
         &state.feed.admin.csrf_token().unwrap_or_default(),
     )))
+}
+
+/// Detach a file from the admin page.
+async fn admin_file_delete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((id, version, name)): Path<(String, String, String)>,
+    body: String,
+) -> Result<Response> {
+    require_admin_action(&state, &headers, &body)?;
+    let v = parse_version(&version)?;
+    hosted::detach(&state, &id, &v, &name).await?;
+    Ok(Redirect::to(&admin_package_url(&state.feed.prefix, &id)).into_response())
 }
 
 /// The feeds this request may copy or move versions into: every other feed
@@ -1904,6 +2085,7 @@ async fn transfer_version(
     if mode == Transfer::Move {
         membership.listed = here.listed;
         membership.enabled = here.enabled;
+        membership.pinned = here.pinned;
     }
     match state.db.add_membership(&membership).await {
         Ok(()) | Err(Error::PackageAlreadyExists) => {}
@@ -1921,6 +2103,8 @@ enum BulkOp {
     Enable,
     Disable,
     Approve,
+    Pin,
+    Unpin,
     Delete,
     Copy,
     Move,
@@ -1932,6 +2116,8 @@ impl BulkOp {
             "enable" => Self::Enable,
             "disable" => Self::Disable,
             "approve" => Self::Approve,
+            "pin" => Self::Pin,
+            "unpin" => Self::Unpin,
             "delete" => Self::Delete,
             "copy" => Self::Copy,
             "move" => Self::Move,
@@ -1981,6 +2167,12 @@ async fn admin_bulk(
         BulkOp::Approve => {
             for v in &versions {
                 state.db.approve_membership(state.feed(), &id, v).await?;
+            }
+        }
+        BulkOp::Pin | BulkOp::Unpin => {
+            let pinned = matches!(op, BulkOp::Pin);
+            for v in &versions {
+                state.db.set_pinned(state.feed(), &id, v, pinned).await?;
             }
         }
         BulkOp::Delete => {
@@ -2155,6 +2347,145 @@ async fn admin_delete(
     Ok(Redirect::to(&target).into_response())
 }
 
+async fn admin_pin(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((id, version)): Path<(String, String)>,
+    body: String,
+) -> Result<Response> {
+    admin_set_pinned(&state, &headers, &body, &id, &version, true).await
+}
+
+async fn admin_unpin(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((id, version)): Path<(String, String)>,
+    body: String,
+) -> Result<Response> {
+    admin_set_pinned(&state, &headers, &body, &id, &version, false).await
+}
+
+async fn admin_set_pinned(
+    state: &AppState,
+    headers: &HeaderMap,
+    body: &str,
+    id: &str,
+    version: &str,
+    pinned: bool,
+) -> Result<Response> {
+    require_admin_action(state, headers, body)?;
+    let v = parse_version(version)?;
+    if !state.db.set_pinned(state.feed(), id, &v, pinned).await? {
+        return Err(Error::PackageNotFound);
+    }
+    Ok(Redirect::to(&admin_package_url(&state.feed.prefix, id)).into_response())
+}
+
+/// What the retention page reports after a cleanup it was asked for: numbers
+/// only, parsed, never echoed text.
+#[derive(Debug, Deserialize)]
+struct RetentionQuery {
+    #[serde(default)]
+    deleted: Option<String>,
+    #[serde(default)]
+    freed: Option<String>,
+    #[serde(default)]
+    errors: Option<String>,
+    #[serde(default)]
+    changed: Option<String>,
+    #[serde(default)]
+    busy: Option<String>,
+}
+
+async fn admin_retention(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<RetentionQuery>,
+) -> Result<Html<String>> {
+    require_admin(&state, &headers)?;
+    let rules = &state.feed.retention;
+    let policy = RetentionPolicy::from(rules);
+    let preview = if policy.has_limits() {
+        Some(
+            retention::preview(state.db.as_ref(), state.feed(), &policy, chrono::Utc::now())
+                .await?,
+        )
+    } else {
+        None
+    };
+    let notice = if q.busy.is_some() {
+        ui::RetentionNotice::Busy
+    } else if q.changed.is_some() {
+        ui::RetentionNotice::Changed
+    } else if let Some(deleted) = lenient::<usize>(q.deleted.as_deref()) {
+        ui::RetentionNotice::Done(retention::Outcome {
+            deleted,
+            freed: lenient(q.freed.as_deref()).unwrap_or(0),
+            errors: lenient(q.errors.as_deref()).unwrap_or(0),
+        })
+    } else {
+        ui::RetentionNotice::None
+    };
+    let urls = state.url_builder(&headers);
+    Ok(Html(ui::admin_retention_page(
+        &urls,
+        &ui::RetentionView {
+            rules,
+            last: state.feed.cleanup.last(),
+            running: state.feed.cleanup.is_running(),
+            preview: preview.as_ref(),
+            csrf_token: &state.feed.admin.csrf_token().unwrap_or_default(),
+            notice,
+        },
+    )))
+}
+
+/// Delete what the retention page showed — and only that.
+///
+/// The form carries the fingerprint of the plan it displayed. The plan is
+/// recomputed here and applied only when it still matches, so a push landing
+/// between looking and clicking can never widen what the click deletes. A
+/// cleanup already running (the background sweep, or another admin) turns
+/// this away rather than queueing a second one behind it.
+async fn admin_retention_run(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: String,
+) -> Result<Response> {
+    require_admin_action(&state, &headers, &body)?;
+    let policy = RetentionPolicy::from(&state.feed.retention);
+    if !state.feed.retention.enabled || !policy.has_limits() {
+        return Err(Error::BadRequest(
+            "retention is not enabled for this feed".into(),
+        ));
+    }
+    let fingerprint = form_field(&body, "plan").unwrap_or_default();
+    let page = format!("{}/admin/retention", state.feed.prefix);
+    let result = state
+        .feed
+        .cleanup
+        .run_shown(
+            state.storage.as_ref(),
+            state.db.as_ref(),
+            state.feed(),
+            &policy,
+            &fingerprint,
+        )
+        .await?;
+    let target = match result {
+        None => format!("{page}?busy=1"),
+        Some(Err(_)) => format!("{page}?changed=1"),
+        Some(Ok(o)) => {
+            tracing::info!(feed = %state.feed(), deleted = o.deleted, freed = o.freed, "manual retention cleanup");
+            format!(
+                "{page}?deleted={}&freed={}&errors={}",
+                o.deleted, o.freed, o.errors
+            )
+        }
+    };
+    Ok(Redirect::to(&target).into_response())
+}
+
 fn admin_package_url(prefix: &str, id: &str) -> String {
     format!("{prefix}/admin/packages/{}", id.to_lowercase())
 }
@@ -2192,6 +2523,8 @@ fn to_io_err<E: std::fmt::Display>(e: E) -> std::io::Error {
 fn map_upload_err(e: std::io::Error) -> Error {
     if e.kind() == std::io::ErrorKind::InvalidData {
         Error::PayloadTooLarge(e.to_string())
+    } else if e.kind() == std::io::ErrorKind::TimedOut {
+        Error::UploadTimeout(e.to_string())
     } else {
         Error::Io(e)
     }

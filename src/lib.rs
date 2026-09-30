@@ -15,6 +15,7 @@ pub mod auth;
 pub mod config;
 pub mod database;
 pub mod error;
+pub mod inbox;
 pub mod indexing;
 pub mod locks;
 pub mod migrate;

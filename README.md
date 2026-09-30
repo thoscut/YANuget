@@ -185,6 +185,7 @@ YANuget implements the NuGet v3 protocol. Full reference in
 | Package icon | `GET /packages/{id}/{version}/icon` |
 | Documentation | `GET /docs` (embedded, offline) |
 | Admin (Basic auth) | `GET /admin`, `POST /admin/packages/{id}/{version}/{disable\|enable\|delete}`, `POST /admin/packages/{id}` (several versions: disable, delete, copy or move to another feed) |
+| Attached files | `GET\|HEAD /files/{id}/{version}/{name}`, `PUT\|DELETE /api/v2/files/{id}/{version}/{name}`, tus at `/api/v2/uploads` |
 | Health | `GET /health` (readiness), `GET /health/live` (liveness) |
 
 ---
@@ -294,7 +295,7 @@ A self-contained, dependency-free HTML gallery (no external assets, works
 offline) lives at `/`:
 
 * a searchable package list (search box in the header), sortable by downloads,
-  name or last update,
+  name or last update, and filterable by tag, with a tag cloud at `/tags`,
 * a per-package detail page with versions, dependencies, links, readme and the
   install command for Chocolatey / `dotnet` / `nuget.exe`,
 * a package's embedded icon, served from the feed itself — the bytes are
@@ -346,8 +347,29 @@ downloadable — which is stronger than NuGet's *unlist* (an unlisted version
 stays downloadable for restore). Delete is a hard delete (payload, sidecars and
 symbols) once no feed holds the version any more. With several feeds, ticked
 versions can also be **copied** or **moved** to another feed the same admin
-credentials cover; the files stay where they are. The area is only mounted when
-an admin key is configured, and the settings page says how to turn it on.
+credentials cover; the files stay where they are. A version can be **pinned**,
+so retention never deletes it, and `/admin/retention` shows exactly what the next
+cleanup would delete and why — with a button that deletes that list and nothing
+else. The area is only mounted when an admin key is configured, and the settings
+page says how to turn it on.
+
+## Attached files (disk images)
+
+A package version can carry large files — `.wim` images, ISOs, archives — for
+its install script to fetch at install time, resumably. They are served with
+everything a resuming client relies on (`HEAD`, ranges, `If-Range`, a strong
+`ETag`, `Last-Modified`), which BITS, `Invoke-WebRequest -Resume` and
+`curl -C -` all use, and the package page shows the `chocolateyInstall.ps1`
+lines that download one and check its SHA-256.
+
+Files arrive with the push key in one `PUT`, resumably over the
+[tus](https://tus.io) protocol (a multi-gigabyte upload that drops continues
+where it stopped; `scripts/Send-YanugetFile.ps1` does it from PowerShell), or
+over SSH — `scp`, `sftp`, `rsync` through the host's own `sshd` into an inbox
+YANuget imports from, checksum-verified. Each file is stored once under its
+SHA-256, however many versions attach it, and goes with its version: deleted,
+pruned or moved together. See [the API](docs/api.md#attached-files) and
+[the configuration](docs/configuration.md#attached-files).
 
 ## Package retention
 
