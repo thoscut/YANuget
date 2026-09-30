@@ -979,7 +979,7 @@ async fn index_page(State(state): State<AppState>, headers: HeaderMap) -> Html<S
          <p>Add this feed with:</p>\
          <pre>dotnet nuget add source {idx} -n yanuget</pre>\
          </body></html>",
-        idx = urls.service_index()
+        idx = ui::escape_html(&urls.service_index())
     ))
 }
 
