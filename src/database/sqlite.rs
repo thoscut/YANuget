@@ -28,8 +28,9 @@ use crate::models::{DependencyGroup, Package, PackageType};
 use crate::version::NuGetVersion;
 
 use super::{
-    DatabaseStats, FeedVersion, Membership, PackageDatabase, PackageFile, SearchGroup, SearchPage,
-    SearchRequest, SearchSort, SymbolKey, SymbolRef, TagCount, UploadSession,
+    DatabaseStats, FeedVersion, Membership, MembershipChange, PackageDatabase, PackageFile,
+    SearchGroup, SearchPage, SearchRequest, SearchSort, SymbolKey, SymbolRef, TagCount,
+    UploadSession,
 };
 
 const SCHEMA: &str = r#"
@@ -729,6 +730,48 @@ impl PackageDatabase for SqliteDatabase {
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() > 0)
+    }
+
+    async fn update_memberships(
+        &self,
+        feed: &str,
+        id: &str,
+        versions: &[NuGetVersion],
+        change: MembershipChange,
+    ) -> Result<u64> {
+        let (sql, value) = match change {
+            MembershipChange::Enabled(on) => (
+                "UPDATE feed_packages SET enabled = ?4 WHERE feed = ?1 AND lower_id = ?2 AND normalized_version = ?3",
+                i64::from(on),
+            ),
+            MembershipChange::Pinned(on) => (
+                "UPDATE feed_packages SET pinned = ?4 WHERE feed = ?1 AND lower_id = ?2 AND normalized_version = ?3",
+                i64::from(on),
+            ),
+            MembershipChange::Approve => (
+                "UPDATE feed_packages SET pending = ?4 WHERE feed = ?1 AND lower_id = ?2 AND normalized_version = ?3",
+                0,
+            ),
+        };
+        // Dropping the transaction without committing rolls it back, so an
+        // early return below leaves every row as it was.
+        let mut tx = self.pool.begin().await?;
+        let mut updated = 0;
+        for version in versions {
+            let result = sqlx::query(sql)
+                .bind(feed)
+                .bind(id.to_lowercase())
+                .bind(version.normalized())
+                .bind(value)
+                .execute(&mut *tx)
+                .await?;
+            if result.rows_affected() == 0 {
+                return Err(Error::PackageNotFound);
+            }
+            updated += result.rows_affected();
+        }
+        tx.commit().await?;
+        Ok(updated)
     }
 
     async fn is_servable(&self, feed: &str, id: &str, version: &NuGetVersion) -> Result<bool> {
@@ -1557,6 +1600,41 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn a_batch_membership_update_is_all_or_nothing() {
+        let db = SqliteDatabase::in_memory().await.unwrap();
+        let (a, b) = (sample("Batch.Pkg", "1.0.0"), sample("Batch.Pkg", "2.0.0"));
+        db.add_to_feed(FEED, &a).await.unwrap();
+        db.add_to_feed(FEED, &b).await.unwrap();
+        let missing = NuGetVersion::parse("3.0.0").unwrap();
+
+        // One version the feed does not hold: nothing changes.
+        let err = db
+            .update_memberships(
+                FEED,
+                "batch.pkg",
+                &[a.version.clone(), missing, b.version.clone()],
+                MembershipChange::Enabled(false),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::PackageNotFound));
+        assert!(db.is_servable(FEED, "batch.pkg", &a.version).await.unwrap());
+
+        let n = db
+            .update_memberships(
+                FEED,
+                "Batch.Pkg",
+                &[a.version.clone(), b.version.clone()],
+                MembershipChange::Enabled(false),
+            )
+            .await
+            .unwrap();
+        assert_eq!(n, 2);
+        assert!(!db.is_servable(FEED, "batch.pkg", &a.version).await.unwrap());
+        assert!(!db.is_servable(FEED, "batch.pkg", &b.version).await.unwrap());
     }
 
     #[tokio::test]

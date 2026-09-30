@@ -34,7 +34,7 @@ use crate::auth::{AdminAuth, ApiKeyAuth, ReadAuth};
 use crate::config::{
     Config, LicensePolicyConfig, OverwriteMode, RateLimitConfig, ResolvedFeed, RetentionConfig,
 };
-use crate::database::{Membership, PackageDatabase, SearchRequest, SearchSort};
+use crate::database::{Membership, MembershipChange, PackageDatabase, SearchRequest, SearchSort};
 use crate::error::{Error, Result};
 use crate::indexing::{self, IndexOptions};
 use crate::mirror::{self, MirrorClient, MirrorOptions};
@@ -2359,7 +2359,7 @@ impl BulkOp {
 ///
 /// Every version is checked before anything changes, so a typo'd version or
 /// a target that refuses the package leaves the feed as it was rather than
-/// half done. Nothing selected sends the admin back to the page unchanged.
+/// half done, and flag changes are applied in one transaction. Nothing selected sends the admin back to the page unchanged.
 async fn admin_bulk(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2386,24 +2386,27 @@ async fn admin_bulk(
         }
     }
 
+    // Flag changes go through in one transaction, so a database error part
+    // way leaves every version as it was. Deletes and transfers also move
+    // files and take per-version locks, which a transaction cannot cover;
+    // they are checked up front and then applied version by version.
+    let flag = match op {
+        BulkOp::Enable => Some(MembershipChange::Enabled(true)),
+        BulkOp::Disable => Some(MembershipChange::Enabled(false)),
+        BulkOp::Approve => Some(MembershipChange::Approve),
+        BulkOp::Pin => Some(MembershipChange::Pinned(true)),
+        BulkOp::Unpin => Some(MembershipChange::Pinned(false)),
+        BulkOp::Delete | BulkOp::Copy | BulkOp::Move => None,
+    };
+    if let Some(change) = flag {
+        state
+            .db
+            .update_memberships(state.feed(), &id, &versions, change)
+            .await?;
+    }
+
     match op {
-        BulkOp::Enable | BulkOp::Disable => {
-            let enabled = matches!(op, BulkOp::Enable);
-            for v in &versions {
-                state.db.set_enabled(state.feed(), &id, v, enabled).await?;
-            }
-        }
-        BulkOp::Approve => {
-            for v in &versions {
-                state.db.approve_membership(state.feed(), &id, v).await?;
-            }
-        }
-        BulkOp::Pin | BulkOp::Unpin => {
-            let pinned = matches!(op, BulkOp::Pin);
-            for v in &versions {
-                state.db.set_pinned(state.feed(), &id, v, pinned).await?;
-            }
-        }
+        BulkOp::Enable | BulkOp::Disable | BulkOp::Approve | BulkOp::Pin | BulkOp::Unpin => {}
         BulkOp::Delete => {
             for v in &versions {
                 retention::purge_version(

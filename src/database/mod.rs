@@ -225,6 +225,18 @@ impl Membership {
     }
 }
 
+/// A flag change applied to many memberships at once by
+/// [`PackageDatabase::update_memberships`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MembershipChange {
+    /// Set the admin `enabled` flag.
+    Enabled(bool),
+    /// Set the retention pin.
+    Pinned(bool),
+    /// Clear the pending flag.
+    Approve,
+}
+
 /// A package version together with its membership state in one feed. Returned by
 /// admin/retention listings that must see pending, disabled and flagged rows.
 #[derive(Debug, Clone)]
@@ -347,6 +359,17 @@ pub trait PackageDatabase: Send + Sync {
         version: &NuGetVersion,
         pinned: bool,
     ) -> Result<bool>;
+
+    /// Apply one flag change to several versions of `id` in `feed`, in a
+    /// single transaction: every row changes, or — if any is missing or a
+    /// write fails — none does. Returns how many rows were updated.
+    async fn update_memberships(
+        &self,
+        feed: &str,
+        id: &str,
+        versions: &[NuGetVersion],
+        change: MembershipChange,
+    ) -> Result<u64>;
 
     /// Whether a version may be served from `feed`: present, enabled and not
     /// pending. (Unlisted-but-enabled versions are still servable by version.)
