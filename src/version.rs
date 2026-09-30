@@ -131,6 +131,78 @@ impl NuGetVersion {
         Ok(version)
     }
 
+    /// Parse a version this server stored, under the rules that were in force
+    /// when it was stored: what [`Self::parse`] accepted before it matched
+    /// NuGet's strictness (a leading `v`, leading-zero pre-release
+    /// identifiers, any non-empty build metadata, `u64` components, no length
+    /// cap).
+    ///
+    /// Only for reading back what the database or storage already holds. A
+    /// row written by an older release must stay readable: one odd version
+    /// failing to parse would fail every listing, registration and restore of
+    /// its whole package. Normalization is the same function as for new input,
+    /// so a stored version keeps the key it was stored under. Anything new —
+    /// a manifest, an upstream's version list — goes through [`Self::parse`].
+    pub fn parse_stored(input: &str) -> Result<Self, VersionParseError> {
+        if let Ok(version) = Self::parse(input) {
+            return Ok(version);
+        }
+        let original = input.trim().to_string();
+        let err = || VersionParseError(original.clone());
+        let s = original
+            .strip_prefix(['v', 'V'])
+            .unwrap_or(original.as_str());
+        if s.is_empty() {
+            return Err(err());
+        }
+        let (s, metadata) = match s.split_once('+') {
+            Some((_, "")) => return Err(err()),
+            Some((v, m)) => (v, Some(m.to_string())),
+            None => (s, None),
+        };
+        let (core, pre_str) = match s.split_once('-') {
+            Some((v, p)) => (v, Some(p)),
+            None => (s, None),
+        };
+        let mut parts = core.split('.');
+        let major = parts
+            .next()
+            .and_then(|p| p.parse::<u64>().ok())
+            .ok_or_else(err)?;
+        let mut rest = [0u64; 3];
+        for slot in &mut rest {
+            if let Some(part) = parts.next() {
+                *slot = part.parse::<u64>().map_err(|_| err())?;
+            }
+        }
+        let [minor, patch, revision] = rest;
+        if parts.next().is_some() {
+            return Err(err());
+        }
+        let pre = match pre_str {
+            None => Vec::new(),
+            Some(p) => {
+                let ids: Vec<String> = p.split('.').map(str::to_string).collect();
+                if ids
+                    .iter()
+                    .any(|id| id.is_empty() || !id.bytes().all(is_pre_char))
+                {
+                    return Err(err());
+                }
+                ids
+            }
+        };
+        Ok(NuGetVersion {
+            major,
+            minor,
+            patch,
+            revision,
+            pre,
+            metadata,
+            original,
+        })
+    }
+
     /// Whether this is a pre-release version.
     pub fn is_prerelease(&self) -> bool {
         !self.pre.is_empty()
@@ -456,6 +528,45 @@ mod tests {
         // Metadata counts too.
         assert!(NuGetVersion::parse(&format!("1.0.0-{label}+m")).is_err());
         assert!(NuGetVersion::parse(&"1".repeat(10_000)).is_err());
+    }
+
+    /// Versions stored before the strict rules read back as they were stored,
+    /// under the same normalized key.
+    #[test]
+    fn stored_versions_parse_under_the_old_rules() {
+        let legacy = NuGetVersion::parse_stored(" v1.0.0-01+has space ").unwrap();
+        assert_eq!(legacy.normalized(), "1.0.0-01");
+        assert_eq!(legacy.original(), "v1.0.0-01+has space");
+        let long = format!("1.0.0-{}", "x".repeat(200));
+        assert_eq!(
+            NuGetVersion::parse_stored(&long).unwrap().normalized(),
+            long
+        );
+        assert_eq!(
+            NuGetVersion::parse_stored("99999999999.0")
+                .unwrap()
+                .core()
+                .0,
+            99_999_999_999
+        );
+        // What parses strictly parses the same way.
+        assert_eq!(
+            NuGetVersion::parse_stored("1.0.0-Beta+m")
+                .unwrap()
+                .to_full_string(),
+            "1.0.0-Beta+m"
+        );
+        // The old parser's refusals still stand.
+        for bad in ["", "v", "1.2.3.4.5", "1.0.0-", "1.0.0+", "1.0.0-a_b", "x"] {
+            assert!(NuGetVersion::parse_stored(bad).is_err(), "{bad}");
+        }
+        // Eq and Hash still agree across the two spellings of one number.
+        use std::collections::HashSet;
+        let set: HashSet<NuGetVersion> = ["1.0.0-01", "1.0.0-1"]
+            .into_iter()
+            .map(|s| NuGetVersion::parse_stored(s).unwrap())
+            .collect();
+        assert_eq!(set.len(), 1);
     }
 
     #[test]

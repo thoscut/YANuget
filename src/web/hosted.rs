@@ -35,7 +35,7 @@ use futures::StreamExt;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
-use super::{content_length, files, parse_version, to_io_err, AppState};
+use super::{content_length, files, parse_stored_version, parse_version, to_io_err, AppState};
 use crate::database::{PackageFile, UploadSession};
 use crate::error::{Error, Result};
 use crate::storage::{PackageContent, TempPath};
@@ -790,7 +790,7 @@ async fn finish(
             "checksum mismatch: the upload's SHA-256 is {sha256}; it was discarded"
         )));
     }
-    let v = parse_version(&s.normalized_version)?;
+    let v = parse_stored_version(&s.normalized_version)?;
     let target = Target {
         storage: state.storage.as_ref(),
         db: state.db.as_ref(),

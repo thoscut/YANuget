@@ -1887,8 +1887,10 @@ fn is_unique_violation(e: &sqlx::Error) -> bool {
 /// feed reads (each of which sources those values from a different column).
 fn build_package(row: &SqliteRow, listed: bool, enabled: bool, downloads: u64) -> Result<Package> {
     let original_version: String = row.try_get("original_version")?;
-    let version =
-        NuGetVersion::parse(&original_version).map_err(|e| Error::InvalidVersion(e.to_string()))?;
+    // Stored rows are read with the rules they were written under; see
+    // `NuGetVersion::parse_stored`.
+    let version = NuGetVersion::parse_stored(&original_version)
+        .map_err(|e| Error::InvalidVersion(e.to_string()))?;
     let published: String = row.try_get("published")?;
     let published = DateTime::parse_from_rfc3339(&published)
         .map_err(|e| Error::Other(anyhow::anyhow!("bad published timestamp: {e}")))?
@@ -2796,6 +2798,45 @@ mod tests {
         assert_eq!(recent[0].id, "New");
         assert_eq!(recent[1].id, "Old");
         assert_eq!(db.recent_packages(FEED, 1).await.unwrap().len(), 1);
+    }
+
+    /// A version an older release accepted but today's parser refuses must
+    /// not make its package unreadable: every listing, registration and
+    /// restore of the package reads all its rows.
+    #[tokio::test]
+    async fn rows_stored_under_older_version_rules_stay_readable() {
+        let db = SqliteDatabase::in_memory().await.unwrap();
+        db.add_to_feed(FEED, &sample("Legacy", "1.0.0"))
+            .await
+            .unwrap();
+        for legacy in [
+            "v1.1.0-01",
+            "1.2.0+has space",
+            &format!("1.3.0-{}", "a".repeat(80)),
+        ] {
+            assert!(
+                NuGetVersion::parse(legacy).is_err(),
+                "{legacy} parses strictly"
+            );
+            let mut p = sample("Legacy", "1.0.0");
+            p.version = NuGetVersion::parse_stored(legacy).unwrap();
+            db.add_to_feed(FEED, &p).await.unwrap();
+        }
+
+        let versions: Vec<String> = db
+            .find_versions(FEED, "legacy", true)
+            .await
+            .unwrap()
+            .iter()
+            .map(|p| p.normalized_version())
+            .collect();
+        assert_eq!(versions.len(), 4, "{versions:?}");
+        assert_eq!(versions[0], "1.0.0");
+        assert_eq!(versions[1], "1.1.0-01");
+        assert_eq!(versions[2], "1.2.0");
+        // The same key it was stored under still finds it.
+        let stored = NuGetVersion::parse_stored("1.1.0-01").unwrap();
+        assert!(db.find(FEED, "legacy", &stored).await.unwrap().is_some());
     }
 
     #[tokio::test]

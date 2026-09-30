@@ -1571,7 +1571,7 @@ async fn download_symbol(
         .find_symbol(&key, &file)
         .await?
         .ok_or(Error::PackageNotFound)?;
-    let owner_version = parse_version(&owner.normalized_version)?;
+    let owner_version = parse_stored_version(&owner.normalized_version)?;
     if !state
         .db
         .is_servable(state.feed(), &owner.lower_id, &owner_version)
@@ -2586,8 +2586,30 @@ fn admin_package_url(prefix: &str, id: &str) -> String {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Parse a version from a request (a URL segment or a form field).
+///
+/// A request only ever *names* a version to look up — every new version comes
+/// from a manifest, parsed strictly — so a version an older release stored
+/// under its laxer rules (a leading-zero label, more than 64 characters) has
+/// to stay addressable: restorable, and deletable by an admin. Those fall back
+/// to [`NuGetVersion::parse_stored`] and simply miss if no such row exists.
+/// A leading `v` stays refused; no stored normalized form carries one.
 fn parse_version(raw: &str) -> Result<NuGetVersion> {
-    NuGetVersion::parse(raw).map_err(|e| Error::InvalidVersion(e.to_string()))
+    NuGetVersion::parse(raw)
+        .or_else(|e| {
+            if raw.trim_start().starts_with(['v', 'V']) {
+                Err(e)
+            } else {
+                NuGetVersion::parse_stored(raw)
+            }
+        })
+        .map_err(|e| Error::InvalidVersion(e.to_string()))
+}
+
+/// Parse a version read back from the database (see
+/// [`NuGetVersion::parse_stored`]).
+fn parse_stored_version(raw: &str) -> Result<NuGetVersion> {
+    NuGetVersion::parse_stored(raw).map_err(|e| Error::InvalidVersion(e.to_string()))
 }
 
 /// A `semVerLevel` of `2.0.0` (or higher major) enables SemVer2 results.

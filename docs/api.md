@@ -60,8 +60,11 @@ The `<version>` must be one the NuGet client itself accepts: up to four numeric
 components of at most `2147483647`, an optional pre-release label and build
 metadata made of dot-separated `[0-9A-Za-z-]` identifiers, no leading zero on a
 numeric pre-release identifier (`1.0.0-01` is refused), no leading `v`, and at
-most 64 characters in all (as on nuget.org). Anything else is a `400`. The same
-rules apply to versions in request URLs.
+most 64 characters in all (as on nuget.org). Anything else is a `400`, and so
+is the same from a mirrored upstream (that one version is skipped, not the
+package). Versions an older YANuget release already stored under its laxer
+rules stay readable, and stay addressable in URLs (a URL only looks a version
+up); only a leading `v` in a URL is refused.
 
 The archive itself is refused (`400`) when two readers could see different
 contents in it: an entry name that appears twice, more than one `.nuspec` at the
