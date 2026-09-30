@@ -35,7 +35,11 @@ use futures::StreamExt;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
-use super::{content_length, files, parse_stored_version, parse_version, to_io_err, AppState};
+use super::helpers::{
+    check_id, content_length, detached, map_upload_err, parse_stored_version, parse_version,
+    to_io_err,
+};
+use super::{files, AppState};
 use crate::database::{PackageFile, UploadSession};
 use crate::error::{Error, Result};
 use crate::storage::{PackageContent, TempPath};
@@ -56,7 +60,7 @@ pub(super) async fn download(
     headers: HeaderMap,
     Path((id, version, name)): Path<(String, String, String)>,
 ) -> Result<Response> {
-    super::check_id(&id)?;
+    check_id(&id)?;
     state.require_read(&headers)?;
     if !state.config.files.enabled {
         return Err(Error::PackageNotFound);
@@ -206,7 +210,7 @@ pub(crate) async fn attach(
 ) -> Result<Attached> {
     let state = state.clone();
     let (id, v, name) = (id.to_string(), v.clone(), name.to_string());
-    super::detached(async move {
+    detached(async move {
         let target = Target {
             storage: state.storage.as_ref(),
             db: state.db.as_ref(),
@@ -369,7 +373,7 @@ pub(super) async fn put(
     Path((id, version, name)): Path<(String, String, String)>,
     request: Request,
 ) -> Result<Response> {
-    super::check_id(&id)?;
+    check_id(&id)?;
     let headers = request.headers().clone();
     authorize_upload(&state, &headers)?;
     let v = parse_version(&version)?;
@@ -399,7 +403,7 @@ pub(super) async fn put(
     )
     .await;
     // `temp` removes the file on every way out that does not attach it.
-    let (size, sha256) = streamed.map_err(super::map_upload_err)?;
+    let (size, sha256) = streamed.map_err(map_upload_err)?;
     file.sync_all().await?;
     drop(file);
     if expected.as_deref().is_some_and(|want| want != sha256) {
@@ -420,7 +424,7 @@ pub(super) async fn delete(
     headers: HeaderMap,
     Path((id, version, name)): Path<(String, String, String)>,
 ) -> Result<StatusCode> {
-    super::check_id(&id)?;
+    check_id(&id)?;
     authorize_upload(&state, &headers)?;
     let v = parse_version(&version)?;
     detach(&state, &id, &v, &name).await?;
@@ -573,7 +577,7 @@ pub(super) async fn tus_create(
             .ok_or_else(|| Error::BadRequest(format!("Upload-Metadata needs {k:?}")))
     };
     let id = field("id")?;
-    super::check_id(id)?;
+    check_id(id)?;
     let v = parse_version(field("version")?)?;
     let name = field("filename")?;
     crate::validation::validate_file_name(name, &state.config.files)?;
@@ -755,7 +759,7 @@ pub(super) async fn tus_patch(
     *hashing = Some(h);
     state.db.set_upload_received(&upload, received).await?;
     if let Err(e) = streamed {
-        return Err(super::map_upload_err(e));
+        return Err(map_upload_err(e));
     }
 
     if received == s.length {
@@ -769,7 +773,7 @@ pub(super) async fn tus_patch(
             _writing: hashing,
         };
         let (task_state, task_session) = (state.clone(), s.clone());
-        super::detached(finish(task_state, task_session, part, h.hasher, finishing)).await?;
+        detached(finish(task_state, task_session, part, h.hasher, finishing)).await?;
     }
     built(
         tus_response(StatusCode::NO_CONTENT)
