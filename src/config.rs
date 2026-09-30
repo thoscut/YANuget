@@ -117,7 +117,10 @@ impl<'de> Deserialize<'de> for OverwriteMode {
 }
 
 /// Top-level server configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Debug` is written out (below) rather than derived, so the keys it holds
+/// never reach a log line or a panic message.
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     /// Interface to bind to.
@@ -283,7 +286,7 @@ impl Default for LicensePolicyConfig {
 /// `username`/`password` pair for HTTP Basic, `token` for a Bearer token, and/or
 /// `headers` for arbitrary custom headers (e.g. a private-feed API key). When
 /// more than one is set they are all sent.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MirrorAuthConfig {
     /// HTTP Basic username (sent with `password`).
@@ -391,7 +394,7 @@ pub const DEFAULT_FEED: &str = "default";
 
 /// A feed with all fallbacks resolved against the global config, ready to wire
 /// into an [`AppState`](crate::web::AppState).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ResolvedFeed {
     /// Database key / slug.
     pub name: String,
@@ -960,6 +963,101 @@ impl Config {
     }
 }
 
+/// Written in place of a secret by the `Debug` impls below.
+const REDACTED: &str = "<redacted>";
+
+/// Present or not, never the value.
+fn redact_opt(v: &Option<String>) -> Option<&'static str> {
+    v.as_ref().map(|_| REDACTED)
+}
+
+/// Only the scheme, host and port of a URL: what an upstream *is*, without
+/// whatever credentials its userinfo, path or query may carry (`/_auth/TOKEN/`
+/// and `?code=…` are both common). Anything without a scheme is not shown at
+/// all.
+pub fn url_origin(url: &str) -> String {
+    let Some((scheme, rest)) = url.trim().split_once("://") else {
+        return "<not a URL>".to_string();
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    format!("{}://{host}", scheme.to_ascii_lowercase())
+}
+
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("base_url", &self.base_url)
+            .field("data_dir", &self.data_dir)
+            .field("storage_path", &self.storage_path)
+            .field("database_path", &self.database_path)
+            .field("api_key", &redact_opt(&self.api_key))
+            .field("api_keys", &self.api_keys.len())
+            .field("admin_api_key", &redact_opt(&self.admin_api_key))
+            .field("gallery_page_size", &self.gallery_page_size)
+            .field("max_package_size_bytes", &self.max_package_size_bytes)
+            .field("upload_idle_timeout_secs", &self.upload_idle_timeout_secs)
+            .field("min_free_disk_bytes", &self.min_free_disk_bytes)
+            .field("allow_overwrite", &self.allow_overwrite)
+            .field("hard_delete_enabled", &self.hard_delete_enabled)
+            .field("tls_enabled", &self.tls_enabled)
+            .field("tls_cert_path", &self.tls_cert_path)
+            .field("tls_key_path", &self.tls_key_path)
+            .field("enable_symbol_server", &self.enable_symbol_server)
+            .field("enable_web_ui", &self.enable_web_ui)
+            .field("primary_client", &self.primary_client)
+            .field("retention", &self.retention)
+            .field("rate_limit", &self.rate_limit)
+            .field("files", &self.files)
+            .field("trusted_proxies", &self.trusted_proxies)
+            .field("cors_allowed_origins", &self.cors_allowed_origins)
+            .field("allowed_hosts", &self.allowed_hosts)
+            .field(
+                "feeds",
+                &self
+                    .feeds
+                    .iter()
+                    .map(|f| f.name.as_str())
+                    .collect::<Vec<_>>(),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for MirrorAuthConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MirrorAuthConfig")
+            .field("username", &self.username)
+            .field("password", &redact_opt(&self.password))
+            .field("token", &redact_opt(&self.token))
+            // Header names say what kind of credential it is; values are it.
+            .field("headers", &self.headers.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for ResolvedFeed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResolvedFeed")
+            .field("name", &self.name)
+            .field("prefix", &self.prefix)
+            .field("api_keys", &self.api_keys.len())
+            .field("read_api_key", &redact_opt(&self.read_api_key))
+            .field("admin_api_key", &redact_opt(&self.admin_api_key))
+            .field("allow_overwrite", &self.allow_overwrite)
+            .field("hard_delete_enabled", &self.hard_delete_enabled)
+            .field("requires_approval", &self.requires_approval)
+            .field("promotes_to", &self.promotes_to)
+            .field("mirror_enabled", &self.mirror.enabled)
+            .field("mirror_upstream", &url_origin(&self.mirror.upstream))
+            .field("license_policy", &self.license_policy)
+            .field("retention", &self.retention)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Route path segments a feed may not shadow. A feed is mounted at `/{name}`,
 /// so a feed called `health` or `v3` would collide with (or mask) a real route.
 /// `_assets` is where the gallery's font is served, at the root.
@@ -1388,6 +1486,55 @@ mod tests {
         assert_eq!(normalize_host("[2001:DB8::1]:8443"), "2001:db8::1");
         assert_eq!(normalize_host("2001:db8::1"), "2001:db8::1");
         assert_eq!(normalize_host("10.0.0.1:5000"), "10.0.0.1");
+    }
+
+    #[test]
+    fn secrets_never_reach_debug_output() {
+        let mut c = Config {
+            api_key: Some("push-secret".into()),
+            api_keys: vec!["other-push-secret".into()],
+            admin_api_key: Some("admin-secret".into()),
+            ..Config::default()
+        };
+        c.feeds = vec![FeedConfig {
+            name: "stable".into(),
+            read_api_key: Some("read-secret".into()),
+            mirror: MirrorConfig {
+                upstream: "https://u:up-secret@feed.example/_auth/path-secret/index.json".into(),
+                auth: MirrorAuthConfig {
+                    password: Some("basic-secret".into()),
+                    token: Some("token-secret".into()),
+                    headers: [("X-Api-Key".to_string(), "header-secret".to_string())].into(),
+                    ..MirrorAuthConfig::default()
+                },
+                ..MirrorConfig::default()
+            },
+            ..FeedConfig::default()
+        }];
+        let feeds = c.resolved_feeds().unwrap();
+        let dumps = [
+            format!("{c:?}"),
+            format!("{feeds:?}"),
+            format!("{:?}", c.feeds[0].mirror.auth),
+        ];
+        for dump in &dumps {
+            assert!(!dump.contains("secret"), "{dump}");
+        }
+        assert!(dumps[1].contains("https://feed.example"), "{}", dumps[1]);
+    }
+
+    #[test]
+    fn a_url_origin_carries_no_credentials() {
+        assert_eq!(
+            url_origin("https://ci:s3cret@Feed.example.com:8443/_auth/TOKEN/v3/index.json?k=v"),
+            "https://Feed.example.com:8443"
+        );
+        assert_eq!(
+            url_origin("HTTPS://api.nuget.org/v3/index.json"),
+            "https://api.nuget.org"
+        );
+        assert_eq!(url_origin("https://host?token=x"), "https://host");
+        assert_eq!(url_origin("not a url"), "<not a URL>");
     }
 
     #[test]

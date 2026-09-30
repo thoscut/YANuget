@@ -1276,7 +1276,7 @@ pub fn settings_page(urls: &UrlBuilder, config: &Config, feed: &super::FeedConte
     match &feed.mirror {
         Some(m) => {
             policy.push_str(&kv("Upstream mirror", "Enabled"));
-            policy.push_str(&kv("Upstream", &redact_userinfo(m.upstream())));
+            policy.push_str(&kv("Upstream", &crate::config::url_origin(m.upstream())));
         }
         None => policy.push_str(&kv("Upstream mirror", "Disabled")),
     }
@@ -1993,28 +1993,6 @@ pub fn feeds_index_page(feeds: &[(String, String)], some_hidden: bool) -> String
     )
 }
 
-/// Replace any `user:password@` in a URL with `***@`.
-///
-/// The upstream is operator-configured and normally carries its credentials in
-/// the separate `[mirror.auth]` settings — but nothing stops someone putting
-/// them in the URL, and this page is the one place that URL is displayed. The
-/// page is read-auth gated, so this is defence in depth rather than the only
-/// guard.
-fn redact_userinfo(url: &str) -> String {
-    let Some((scheme, rest)) = url.split_once("://") else {
-        return url.to_string();
-    };
-    // Userinfo, if present, is everything before the first `@` of the authority.
-    let (authority, tail) = match rest.find('/') {
-        Some(i) => (&rest[..i], &rest[i..]),
-        None => (rest, ""),
-    };
-    match authority.rsplit_once('@') {
-        Some((_, host)) => format!("{scheme}://***@{host}{tail}"),
-        None => url.to_string(),
-    }
-}
-
 /// A key/value row with an escaped text value.
 fn kv(label: &str, value: &str) -> String {
     kv_html(label, &escape_html(value))
@@ -2592,27 +2570,23 @@ mod tests {
 
     #[test]
     fn credentials_in_an_upstream_url_are_not_displayed() {
-        assert_eq!(
-            super::redact_userinfo("https://ci:s3cret@feed.example.com/v3/index.json"),
-            "https://***@feed.example.com/v3/index.json"
-        );
-        // A password containing an `@` still redacts fully (the *last* `@` in
-        // the authority separates userinfo from host).
-        assert_eq!(
-            super::redact_userinfo("https://ci:p@ss@feed.example.com/v3/index.json"),
-            "https://***@feed.example.com/v3/index.json"
-        );
-        // No credentials, no change.
-        assert_eq!(
-            super::redact_userinfo("https://api.nuget.org/v3/index.json"),
-            "https://api.nuget.org/v3/index.json"
-        );
-        // A path containing `@` is not mistaken for userinfo.
-        assert_eq!(
-            super::redact_userinfo("https://host/feeds/@scope/index.json"),
-            "https://host/feeds/@scope/index.json"
-        );
-        assert_eq!(super::redact_userinfo("not a url"), "not a url");
+        // Only scheme and host: tokens live in userinfo, in paths
+        // (`/_auth/TOKEN/`) and in queries, and this page is readable by
+        // anyone on a feed without a read key.
+        let urls = UrlBuilder::new("https://host");
+        let config = crate::config::Config::default();
+        let mut feed = feed_ctx(None, None);
+        feed.mirror = crate::mirror::MirrorClient::from_config(&crate::config::MirrorConfig {
+            enabled: true,
+            upstream:
+                "https://ci:pw-secret@feed.example.com/_auth/path-secret/v3/index.json?k=q-secret"
+                    .into(),
+            ..crate::config::MirrorConfig::default()
+        });
+        assert!(feed.mirror.is_some());
+        let html = settings_page(&urls, &config, &feed);
+        assert!(html.contains("https://feed.example.com"), "{html}");
+        assert!(!html.contains("secret"), "{html}");
     }
 
     #[test]

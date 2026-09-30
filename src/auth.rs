@@ -14,7 +14,7 @@ pub const API_KEY_HEADER: &str = "X-NuGet-ApiKey";
 /// Authenticator holding the configured API keys. Several keys may be accepted
 /// at once (e.g. one per team/developer); a presented key matching any of them
 /// is valid.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct ApiKeyAuth {
     expected: Vec<String>,
 }
@@ -64,7 +64,7 @@ impl ApiKeyAuth {
 /// configured, reads are open. Otherwise the credential may arrive either as an
 /// `X-NuGet-ApiKey` header or as the password of HTTP Basic credentials (what
 /// `dotnet`/`nuget` send to an authenticated feed).
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct ReadAuth {
     expected: Option<String>,
 }
@@ -109,7 +109,7 @@ impl ReadAuth {
 /// Authenticator for the admin area, validated via HTTP Basic auth so a browser
 /// can prompt for credentials. The username is ignored; the password must match
 /// the configured admin key.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct AdminAuth {
     expected: Option<String>,
 }
@@ -269,6 +269,33 @@ fn trimmed(key: Option<String>) -> Option<String> {
     key.map(|k| k.trim().to_string()).filter(|k| !k.is_empty())
 }
 
+// Written out rather than derived: these hold the keys themselves, and a
+// derived `Debug` would print them into any log line or panic that formats a
+// feed (`FeedMeta` and `FeedContext` carry them).
+impl std::fmt::Debug for ApiKeyAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ApiKeyAuth")
+            .field("keys", &self.expected.len())
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for ReadAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReadAuth")
+            .field("enabled", &self.is_enabled())
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for AdminAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdminAuth")
+            .field("enabled", &self.is_enabled())
+            .finish()
+    }
+}
+
 /// Extract the password from a `Basic base64(user:pass)` header value.
 fn basic_password(value: &str) -> Option<String> {
     use base64::Engine;
@@ -424,6 +451,17 @@ mod tests {
         assert!(admin.check_headers(&basic(" admin ")));
         // Whitespace alone is no key.
         assert!(!AdminAuth::new(Some("  ".into())).is_enabled());
+    }
+
+    #[test]
+    fn debug_output_never_shows_a_key() {
+        let dump = format!(
+            "{:?} {:?} {:?}",
+            ApiKeyAuth::new(["push-secret".to_string()]),
+            ReadAuth::new(Some("read-secret".into())),
+            AdminAuth::new(Some("admin-secret".into())),
+        );
+        assert!(!dump.contains("secret"), "{dump}");
     }
 
     #[test]
