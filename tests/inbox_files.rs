@@ -338,3 +338,103 @@ async fn an_id_that_is_a_windows_device_name_is_refused_up_front() {
     let res = push(&server, build_nupkg("Console.Utils", "1.0.0")).await;
     assert_eq!(res.status(), reqwest::StatusCode::CREATED);
 }
+
+// ---------------------------------------------------------------------------
+// Blobs shared between versions
+// ---------------------------------------------------------------------------
+
+async fn put_file(
+    server: &TestServer,
+    id: &str,
+    v: &str,
+    name: &str,
+    body: Vec<u8>,
+) -> reqwest::Response {
+    server
+        .client
+        .put(server.url(&format!("/api/v2/files/{id}/{v}/{name}")))
+        .header("X-NuGet-ApiKey", API_KEY)
+        .body(body)
+        .send()
+        .await
+        .unwrap()
+}
+
+async fn delete_file(server: &TestServer, id: &str, v: &str, name: &str) -> reqwest::Response {
+    server
+        .client
+        .delete(server.url(&format!("/api/v2/files/{id}/{v}/{name}")))
+        .header("X-NuGet-ApiKey", API_KEY)
+        .send()
+        .await
+        .unwrap()
+}
+
+/// Every file under `dir`, recursively.
+fn walk(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            out.extend(walk(&path));
+        } else {
+            out.push(path);
+        }
+    }
+    out
+}
+
+#[tokio::test]
+async fn a_blob_stays_while_another_version_references_it() {
+    let server = spawn_with(|c| c.hard_delete_enabled = true).await;
+    for v in ["1.0.0", "2.0.0", "3.0.0"] {
+        push(&server, build_nupkg("Shared.Img", v)).await;
+    }
+    let image = b"the same bytes, attached three times".to_vec();
+    for v in ["1.0.0", "2.0.0", "3.0.0"] {
+        let res = put_file(&server, "Shared.Img", v, "base.wim", image.clone()).await;
+        assert_eq!(res.status(), reqwest::StatusCode::CREATED);
+    }
+    // Detached from one version and purged with another, the bytes stay for
+    // the third.
+    let res = delete_file(&server, "Shared.Img", "1.0.0", "base.wim").await;
+    assert_eq!(res.status(), reqwest::StatusCode::NO_CONTENT);
+    let res = server
+        .client
+        .delete(server.url("/api/v2/package/shared.img/2.0.0"))
+        .header("X-NuGet-ApiKey", API_KEY)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), reqwest::StatusCode::NO_CONTENT);
+    let got = download(&server, "shared.img", "3.0.0", "base.wim").await;
+    assert_eq!(got.bytes().await.unwrap().as_ref(), image.as_slice());
+    // The last reference takes the blob with it.
+    delete_file(&server, "Shared.Img", "3.0.0", "base.wim").await;
+    let left = walk(&server.data().join("packages/.blobs"));
+    assert!(left.is_empty(), "{left:?}");
+}
+
+#[tokio::test]
+async fn detaching_from_one_version_never_deletes_a_blob_another_is_attaching() {
+    let server = spawn().await;
+    push(&server, build_nupkg("Race.Img", "1.0.0")).await;
+    push(&server, build_nupkg("Race.Img", "2.0.0")).await;
+    let image = vec![7u8; 64 * 1024];
+    // Detaching the last reference from 1.0.0 races attaching the same bytes
+    // to 2.0.0; whichever gets there first, 2.0.0 must end up with its file.
+    for round in 0..20 {
+        let res = put_file(&server, "Race.Img", "1.0.0", "a.wim", image.clone()).await;
+        assert_eq!(res.status(), reqwest::StatusCode::CREATED);
+        let (detached, attached) = tokio::join!(
+            delete_file(&server, "Race.Img", "1.0.0", "a.wim"),
+            put_file(&server, "Race.Img", "2.0.0", "b.wim", image.clone()),
+        );
+        assert_eq!(detached.status(), reqwest::StatusCode::NO_CONTENT);
+        assert_eq!(attached.status(), reqwest::StatusCode::CREATED);
+        let got = download(&server, "race.img", "2.0.0", "b.wim").await;
+        assert_eq!(got.status(), reqwest::StatusCode::OK, "round {round}");
+        assert_eq!(got.bytes().await.unwrap().len(), image.len());
+        delete_file(&server, "Race.Img", "2.0.0", "b.wim").await;
+    }
+}

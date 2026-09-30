@@ -238,6 +238,10 @@ async fn attach_locked(
             )))
         };
     }
+    // The blob may be shared with other versions, whose locks are not ours:
+    // from finding it stored to the row that references it, no detach or
+    // purge elsewhere may count it unused and delete it.
+    let _blob = crate::locks::lock_blob(sha256).await;
     storage.store_blob(sha256, temp.to_path_buf()).await?;
     let file = PackageFile {
         lower_id: id.to_lowercase(),
@@ -273,6 +277,8 @@ pub(crate) async fn detach(state: &AppState, id: &str, v: &NuGetVersion, name: &
         .delete_file(id, v, name)
         .await?
         .ok_or(Error::PackageNotFound)?;
+    // Counted and deleted as one step against attaches to other versions.
+    let _blob = crate::locks::lock_blob(&file.sha256).await;
     if state.db.blob_references(&file.sha256).await? == 0 {
         state.storage.delete_blob(&file.sha256).await?;
     }
