@@ -918,6 +918,14 @@ mod tests {
         async fn get_aux(&self, id: &str, version: &str, kind: AuxFile) -> Result<Vec<u8>> {
             self.inner.get_aux(id, version, kind).await
         }
+        async fn aux_content(
+            &self,
+            id: &str,
+            version: &str,
+            kind: AuxFile,
+        ) -> Result<PackageContent> {
+            self.inner.aux_content(id, version, kind).await
+        }
         async fn delete(&self, id: &str, version: &str) -> Result<()> {
             self.inner.delete(id, version).await
         }

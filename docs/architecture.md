@@ -10,7 +10,7 @@ from I/O), and **swappable backends** (storage and database behind traits).
 ```
 src/
 ├── lib.rs            Crate root; re-exports
-├── main.rs           Binary: config load, wiring, axum::serve, graceful shutdown
+├── main.rs           Binary: config load, wiring, background tasks, graceful shutdown
 ├── error.rs          Error enum + IntoResponse (HTTP status mapping)
 ├── version.rs        NuGetVersion: parse / normalize / order / SemVer2
 ├── models.rs         Domain types: Package, Dependency, DependencyGroup, ...
@@ -31,6 +31,7 @@ src/
 ├── proxy.rs          Trusted-proxy gate for `X-Forwarded-*` / `Forwarded`
 ├── retention.rs      Pure prune policy + feed-scoped version pruning / GC
 ├── locks.rs          Process-global per-version async lock (store/purge races)
+├── server.rs         Serving over HTTP or TLS: header timeout, connection cap, shutdown
 ├── tls.rs            TLS cert loading + cached self-signed generation
 ├── storage/
 │   ├── mod.rs        PackageStorage trait, PackageContent, AuxFile

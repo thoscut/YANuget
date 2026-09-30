@@ -30,6 +30,7 @@ pub mod policy;
 pub mod proxy;
 pub mod ratelimit;
 pub mod retention;
+pub mod server;
 pub mod storage;
 pub mod streaming;
 pub mod symbols;

@@ -340,6 +340,15 @@ impl PackageStorage for FilesystemStorage {
         }
     }
 
+    async fn aux_content(&self, id: &str, version: &str, kind: AuxFile) -> Result<PackageContent> {
+        let path = self.aux_path(id, version, kind)?;
+        if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+            Ok(PackageContent::LocalPath(path))
+        } else {
+            Err(Error::PackageNotFound)
+        }
+    }
+
     async fn delete(&self, id: &str, version: &str) -> Result<()> {
         let dir = self.version_dir(id, version)?;
         match tokio::fs::remove_dir_all(&dir).await {

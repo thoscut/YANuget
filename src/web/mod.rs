@@ -34,7 +34,7 @@ use crate::auth::{AdminAuth, ApiKeyAuth, ReadAuth};
 use crate::config::{
     Config, LicensePolicyConfig, OverwriteMode, RateLimitConfig, ResolvedFeed, RetentionConfig,
 };
-use crate::database::{Membership, PackageDatabase, SearchRequest, SearchSort};
+use crate::database::{Membership, MembershipChange, PackageDatabase, SearchRequest, SearchSort};
 use crate::error::{Error, Result};
 use crate::indexing::{self, IndexOptions};
 use crate::mirror::{self, MirrorClient, MirrorOptions};
@@ -49,9 +49,6 @@ use crate::version::NuGetVersion;
 
 const NUPKG_CONTENT_TYPE: &str = "application/octet-stream";
 const MAX_SEARCH_TAKE: i64 = 1000;
-/// A published id/version never changes its bytes, so its sidecars are cacheable
-/// indefinitely.
-const IMMUTABLE_CACHE: &str = "public, max-age=31536000, immutable";
 
 /// The resolved, ready-to-serve context for a single feed: its identity, its
 /// own put/get/delete authenticators, and its mirror/policy/retention settings.
@@ -84,6 +81,21 @@ pub struct FeedContext {
 }
 
 impl FeedContext {
+    /// How content addressed by id and version — a payload, its manifest and
+    /// icon, its symbols — may be cached.
+    ///
+    /// `private` when the feed gates reads, so a shared cache or CDN in front
+    /// of the server never hands it to someone without the key. `immutable`
+    /// only while overwriting is off: with it on, the same URL can serve new
+    /// bytes, and a year-long `immutable` would keep the old ones in every
+    /// client and proxy that saw them.
+    pub(crate) fn content_cache(&self) -> files::CachePolicy {
+        files::CachePolicy {
+            private: self.read_auth.is_enabled(),
+            immutable: self.allow_overwrite == OverwriteMode::Disabled,
+        }
+    }
+
     /// Build a feed's serving context. Mirrored downloads inherit the
     /// server-wide `max_package_size_bytes` unless the feed's mirror set a
     /// tighter one of its own, and are held to `min_free_disk_bytes`.
@@ -206,7 +218,11 @@ impl AppState {
         let root = if let Some(base) = &self.config.base_url {
             base.clone()
         } else {
+            // Only a scheme a client can actually fetch from. Anything else
+            // would be pasted into every absolute URL handed out.
             let scheme = forwarded(headers, "x-forwarded-proto")
+                .map(|s| s.to_ascii_lowercase())
+                .filter(|s| s == "http" || s == "https")
                 .unwrap_or_else(|| self.config.scheme().to_string());
             let host = forwarded(headers, "x-forwarded-host")
                 .or_else(|| {
@@ -372,11 +388,14 @@ pub fn build_app(states: Vec<AppState>) -> Router {
     if states.len() == 1 && states[0].feed.prefix.is_empty() {
         top = top.merge(feed_routes(states.into_iter().next().expect("one state")));
     } else {
+        // Read-gated feeds are left off the public index (see
+        // `feeds_index_page`).
         let index: Vec<(String, String)> = states
             .iter()
+            .filter(|s| !s.feed.read_auth.is_enabled())
             .map(|s| (s.feed.name.clone(), s.feed.prefix.clone()))
             .collect();
-        let html = ui::feeds_index_page(&index);
+        let html = ui::feeds_index_page(&index, index.len() < states.len());
         top = top.route(
             "/",
             get(move || {
@@ -433,6 +452,8 @@ struct GlobalLayers {
     trusted_proxies: Arc<TrustedProxies>,
     /// Browser origins allowed to read this server. Empty means no CORS headers.
     cors_allowed_origins: Vec<String>,
+    /// Host names requests may carry; `None` accepts any.
+    allowed_hosts: Option<Arc<Vec<String>>>,
 }
 
 /// The CORS layer for the configured origins.
@@ -445,13 +466,24 @@ struct GlobalLayers {
 ///
 /// `*` remains available as an explicit choice, and is the right one for a feed
 /// that really is public.
+///
+/// Either way only reads are allowed cross-origin. A browser page has no
+/// business pushing, deleting or relisting on a package feed, and `permissive()`
+/// allowed every method: on a feed without an API key — the default — that let
+/// any page a user visited change it.
 fn cors_layer(origins: &[String]) -> CorsLayer {
+    use axum::http::Method;
+    const READS: [Method; 3] = [Method::GET, Method::HEAD, Method::OPTIONS];
     if origins.is_empty() {
         // `CorsLayer::new()` adds no headers at all.
         return CorsLayer::new();
     }
     if origins.iter().any(|o| o == "*") {
-        return CorsLayer::permissive();
+        return CorsLayer::new()
+            .allow_origin(tower_http::cors::Any)
+            .allow_methods(READS)
+            .allow_headers(tower_http::cors::Any)
+            .expose_headers(tower_http::cors::Any);
     }
     let parsed: Vec<HeaderValue> = origins
         .iter()
@@ -465,7 +497,7 @@ fn cors_layer(origins: &[String]) -> CorsLayer {
         .collect();
     CorsLayer::new()
         .allow_origin(parsed)
-        .allow_methods(tower_http::cors::Any)
+        .allow_methods(READS)
         .allow_headers(tower_http::cors::Any)
 }
 
@@ -524,6 +556,10 @@ impl GlobalLayers {
                 .as_ref()
                 .map(|c| c.cors_allowed_origins.clone())
                 .unwrap_or_default(),
+            allowed_hosts: config
+                .as_ref()
+                .and_then(|c| c.host_allowlist())
+                .map(Arc::new),
             trusted_proxies: Arc::new(
                 config
                     .as_ref()
@@ -552,12 +588,24 @@ fn apply_global_layers(router: Router, layers: GlobalLayers) -> Router {
     // Added before HSTS so it stays inner: short-circuits abusive callers, and
     // its 429 response still flows out through the HSTS layer below.
     if let Some(cfg) = layers.rate_limit.filter(|c| c.enabled) {
-        let limiter = RateLimiter::new(cfg.max_requests, Duration::from_secs(cfg.window_secs));
+        let window = Duration::from_secs(cfg.window_secs);
+        let throttle = ratelimit::Throttle {
+            requests: RateLimiter::new(cfg.max_requests, window),
+            auth_failures: (cfg.max_failed_auth > 0)
+                .then(|| RateLimiter::new(cfg.max_failed_auth, window)),
+            trusted: layers.trusted_proxies.clone(),
+        };
         router = router.layer(axum::middleware::from_fn_with_state(
-            limiter,
+            throttle,
             ratelimit::enforce,
         ));
     }
+    // Refuse misdirected and cross-site writes before anything else runs;
+    // inside the security headers, so the refusal carries them too.
+    router = router.layer(axum::middleware::from_fn_with_state(
+        layers.allowed_hosts,
+        request_guard,
+    ));
     // Stamp the baseline security headers (and HSTS when we terminate TLS) on
     // every response, including the rate limiter's 429 and every error body.
     let hsts = layers.hsts;
@@ -598,6 +646,62 @@ async fn filter_forwarded_headers(
         }
     }
     adopt_authority_as_host(&mut req);
+    next.run(req).await
+}
+
+/// Refuse a request for a host this server does not serve, and a state
+/// change a browser says came from another site.
+///
+/// **Host.** With `base_url` or `allowed_hosts` set, the `Host` (or, from a
+/// trusted proxy, `X-Forwarded-Host`) must name one of them, or the answer is
+/// `421 Misdirected Request`. That is what defeats DNS rebinding: a hostile
+/// page can point a name it controls at an intranet feed's address and make
+/// the browser talk to it, but the browser still sends the hostile name. The
+/// health probes are exempt, since orchestrators probe by address.
+///
+/// **Cross-site writes.** A browser labels every request with
+/// `Sec-Fetch-Site`, and a `POST`, `PUT`, `PATCH` or `DELETE` from another
+/// site is never something this server's own pages sent. The relist `POST`
+/// needs no CORS preflight at all, so without this a hostile page could
+/// relist packages on a feed without an API key. Clients that are not
+/// browsers do not send the header and are unaffected.
+async fn request_guard(
+    State(allowed): State<Option<Arc<Vec<String>>>>,
+    req: Request,
+    next: axum::middleware::Next,
+) -> Response {
+    use axum::http::Method;
+    if let Some(allowed) = &allowed {
+        if !req.uri().path().starts_with("/health") {
+            let host = forwarded(req.headers(), "x-forwarded-host").or_else(|| {
+                req.headers()
+                    .get(header::HOST)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string)
+            });
+            let host = host.as_deref().map(crate::config::normalize_host);
+            if !host.is_some_and(|h| allowed.contains(&h)) {
+                return (
+                    StatusCode::MISDIRECTED_REQUEST,
+                    Json(serde_json::json!({ "error": "this server does not serve that host" })),
+                )
+                    .into_response();
+            }
+        }
+    }
+    let safe = matches!(
+        *req.method(),
+        Method::GET | Method::HEAD | Method::OPTIONS | Method::TRACE
+    );
+    let cross_site = req
+        .headers()
+        .get("sec-fetch-site")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.trim().eq_ignore_ascii_case("cross-site"));
+    if !safe && cross_site {
+        return Error::Forbidden("cross-site requests may not change anything here".into())
+            .into_response();
+    }
     next.run(req).await
 }
 
@@ -647,7 +751,12 @@ async fn security_headers(req: Request, next: axum::middleware::Next, hsts: bool
     // scheme, so a shared cache in front of this server must key on them.
     // Without it, one request's answer — including where clients are told to
     // fetch packages from — can be replayed to everyone else.
-    headers.insert(
+    //
+    // Appended, not inserted: the CORS layer's `Vary: origin, …` and a gated
+    // feed's `Vary: Authorization, …` must survive, or a shared cache replays
+    // one origin's `Access-Control-Allow-Origin`, or one key's answer, to
+    // another.
+    headers.append(
         header::VARY,
         HeaderValue::from_static("Host, X-Forwarded-Host, X-Forwarded-Proto"),
     );
@@ -773,8 +882,13 @@ fn feed_routes(state: AppState) -> Router {
 
         // Admin area (disable/enable/delete/approve/promote versions), behind
         // HTTP Basic auth. Only mounted when an admin key is configured.
+        //
+        // Authentication is a `route_layer` over the whole group rather than
+        // the first line of each handler, so a handler added here later cannot
+        // forget it. State changes additionally check a CSRF token in the
+        // handler, since only the handler reads the form body.
         if state.feed.admin.is_enabled() {
-            ui = ui
+            let admin = Router::new()
                 .route("/admin", get(admin_dashboard))
                 .route(
                     "/admin/packages/{id}",
@@ -810,7 +924,12 @@ fn feed_routes(state: AppState) -> Router {
                     admin_post(admin_file_delete),
                 )
                 .route("/admin/retention", get(admin_retention))
-                .route("/admin/retention/run", admin_post(admin_retention_run));
+                .route("/admin/retention/run", admin_post(admin_retention_run))
+                .route_layer(axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    admin_gate,
+                ));
+            ui = ui.merge(admin);
         }
         router = router.merge(ui.layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -820,7 +939,31 @@ fn feed_routes(state: AppState) -> Router {
         router = router.route("/", get(index_page));
     }
 
+    if state.feed.read_auth.is_enabled() {
+        router = router.layer(axum::middleware::from_fn(gated_feed_headers));
+    }
     router.with_state(state)
+}
+
+/// Keep a read-gated feed's answers out of shared caches.
+///
+/// Whatever a handler says about caching, the answer depends on the
+/// credential the request carried, so a cache has to key on it (`Vary`) and
+/// must not share it (`private`). Content handlers already mark themselves
+/// `private`; this covers every other answer (registration, search, the
+/// gallery), which carries no `Cache-Control` of its own and would otherwise
+/// be left to a cache's heuristics.
+async fn gated_feed_headers(request: Request, next: axum::middleware::Next) -> Response {
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    headers.append(
+        header::VARY,
+        HeaderValue::from_static("Authorization, X-NuGet-ApiKey"),
+    );
+    if !headers.contains_key(header::CACHE_CONTROL) {
+        headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("private"));
+    }
+    response
 }
 
 /// Re-render an error from a gallery route as an HTML page.
@@ -849,10 +992,18 @@ async fn html_errors(
     // `WWW-Authenticate` challenge on a 401, without which a browser never
     // prompts — and replace only the body and its content type.
     let (mut parts, _) = response.into_parts();
+    // The admin area's challenge names its own realm; its page must ask for
+    // the admin key, not the read key.
+    let admin_login = parts
+        .headers
+        .get(header::WWW_AUTHENTICATE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.contains("Admin"));
     let page = ui::error_page(
         &state.url_builder(&headers),
         status,
         state.feed.admin.is_enabled(),
+        admin_login,
     );
     parts.headers.remove(header::CONTENT_LENGTH);
     parts.headers.insert(
@@ -905,6 +1056,7 @@ async fn health_live() -> &'static str {
 
 async fn index_page(State(state): State<AppState>, headers: HeaderMap) -> Html<String> {
     let urls = state.url_builder(&headers);
+    // Built from the request's `Host`, so escaped like every other sink.
     Html(format!(
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
          <title>YANuget</title></head><body>\
@@ -914,7 +1066,7 @@ async fn index_page(State(state): State<AppState>, headers: HeaderMap) -> Html<S
          <p>Add this feed with:</p>\
          <pre>dotnet nuget add source {idx} -n yanuget</pre>\
          </body></html>",
-        idx = urls.service_index()
+        idx = ui::escape_html(&urls.service_index())
     ))
 }
 
@@ -931,31 +1083,7 @@ async fn service_index(
 // ---------------------------------------------------------------------------
 
 async fn push_package(State(state): State<AppState>, request: Request) -> Result<Response> {
-    let headers = request.headers().clone();
-    if !state.feed.auth.check_headers(&headers) {
-        return Err(Error::Unauthorized);
-    }
-
-    let is_multipart = headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.starts_with("multipart/"))
-        .unwrap_or(false);
-
-    state.ensure_disk_space(content_length(&headers))?;
-    // Removed on every way out that does not store it, a dropped connection
-    // included.
-    let (temp, mut file) = state.create_temp().await?;
-    let limit = state.config.max_package_size_bytes;
-
-    // Stream the body to disk.
-    let summary = write_upload(request, &mut file, is_multipart, limit, &state).await?;
-    // Flush the OS page cache to stable storage before the payload is renamed
-    // into the store. The database row that follows says the package exists; if
-    // a crash lands between the rename and the kernel's own writeback, that row
-    // would point at a truncated or empty file.
-    file.sync_all().await?;
-    drop(file);
+    let (temp, summary) = receive_push(&state, request).await?;
 
     let options = IndexOptions {
         overwrite: state.feed.allow_overwrite,
@@ -1009,6 +1137,34 @@ async fn push_package(State(state): State<AppState>, request: Request) -> Result
     Ok(StatusCode::CREATED.into_response())
 }
 
+/// The part of a push that a package and a symbol package share: check the
+/// push key, then stream the body (raw or multipart) to a fresh temp file,
+/// synced to disk. The temp file is removed on every way out that does not
+/// store it — an error here, a failed index later, or a dropped connection.
+async fn receive_push(state: &AppState, request: Request) -> Result<(TempPath, StreamSummary)> {
+    let headers = request.headers();
+    if !state.feed.auth.check_headers(headers) {
+        return Err(Error::Unauthorized);
+    }
+    let is_multipart = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|s| s.starts_with("multipart/"));
+
+    state.ensure_disk_space(content_length(headers))?;
+    let (temp, mut file) = state.create_temp().await?;
+    let limit = state.config.max_package_size_bytes;
+
+    let summary = write_upload(request, &mut file, is_multipart, limit, state).await?;
+    // Flush the OS page cache to stable storage before the payload is renamed
+    // into the store. The database row that follows says the package exists; if
+    // a crash lands between the rename and the kernel's own writeback, that row
+    // would point at a truncated or empty file.
+    file.sync_all().await?;
+    drop(file);
+    Ok((temp, summary))
+}
+
 /// Write the upload (raw body or the first multipart file field) to `file`.
 async fn write_upload(
     request: Request,
@@ -1057,6 +1213,7 @@ async fn delete_package(
     headers: HeaderMap,
     Path((id, version)): Path<(String, String)>,
 ) -> Result<StatusCode> {
+    check_id(&id)?;
     if !state.feed.auth.check_headers(&headers) {
         return Err(Error::Unauthorized);
     }
@@ -1097,6 +1254,7 @@ async fn relist_package(
     headers: HeaderMap,
     Path((id, version)): Path<(String, String)>,
 ) -> Result<StatusCode> {
+    check_id(&id)?;
     if !state.feed.auth.check_headers(&headers) {
         return Err(Error::Unauthorized);
     }
@@ -1121,6 +1279,7 @@ async fn package_versions(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>> {
+    check_id(&id)?;
     state.require_read(&headers)?;
     // The flat container is how a client resolves a version it is *about to
     // restore*, so it must include unlisted versions. Unlisting means "hide
@@ -1160,6 +1319,7 @@ async fn download_package(
     headers: HeaderMap,
     Path((id, version, filename)): Path<(String, String, String)>,
 ) -> Result<Response> {
+    check_id(&id)?;
     state.require_read(&headers)?;
     let version = parse_version(&version)?;
     let normalized = version.normalized();
@@ -1175,11 +1335,67 @@ async fn download_package(
 
     // The flat container exposes both the `.nupkg` and the bare `.nuspec` under
     // the same path prefix; dispatch on the requested file's extension.
-    if filename.to_lowercase().ends_with(".nuspec") {
-        let nuspec = state
+    let is_nuspec = filename.to_lowercase().ends_with(".nuspec");
+    let content = if is_nuspec {
+        state
             .storage
-            .get_aux(&id, &normalized, AuxFile::Nuspec)
-            .await?;
+            .aux_content(&id, &normalized, AuxFile::Nuspec)
+            .await?
+    } else {
+        state.storage.get_package(&id, &normalized).await?
+    };
+    let PackageContent::LocalPath(path) = content;
+
+    // The stored SHA-512 is a content hash of the package, which makes it a
+    // correct strong validator: a client that already holds this package gets
+    // a 304 instead of re-downloading gigabytes. The manifest is extracted
+    // from exactly those bytes, so a tag derived from the same hash validates
+    // it too. The publish time is the matching `Last-Modified`.
+    //
+    // The row is read on both sides of opening the file. An overwrite renames
+    // new bytes into place, so a tag read only before the open could be served
+    // with bytes opened after it — and an `If-Range` would then splice old and
+    // new. If anything moved in between, the response goes out without
+    // validators rather than with wrong ones.
+    let before = state
+        .db
+        .find(state.feed(), &id, &version)
+        .await
+        .ok()
+        .flatten();
+    let file = files::open(&path).await?;
+    let after = state
+        .db
+        .find(state.feed(), &id, &version)
+        .await
+        .ok()
+        .flatten();
+    let size = file.metadata().await?.len();
+    let package = match (before, after) {
+        (Some(b), Some(a))
+            if b.package_hash == a.package_hash
+                && b.published == a.published
+                && (is_nuspec || a.package_size == size) =>
+        {
+            Some(a)
+        }
+        _ => None,
+    };
+    let etag = package.as_ref().map(|p| {
+        if is_nuspec {
+            format!("{}-nuspec", p.package_hash)
+        } else {
+            p.package_hash.clone()
+        }
+    });
+    let meta = files::FileMeta {
+        etag: etag.as_deref(),
+        last_modified: package.as_ref().map(|p| p.published),
+        cache: state.feed.content_cache(),
+        ..Default::default()
+    };
+
+    if is_nuspec {
         // These bytes are whatever the pusher put in the manifest, stored
         // verbatim — including anything before or around `<metadata>`, which the
         // parser ignores. Served as bare `application/xml` from this origin, a
@@ -1194,61 +1410,48 @@ async fn download_package(
         // download. Clients fetch this with an HTTP library, which ignores all
         // three; only a browser is affected, and a browser has no business
         // rendering it.
-        return Ok((
-            [
-                (header::CONTENT_TYPE, "application/xml"),
-                (header::CACHE_CONTROL, IMMUTABLE_CACHE),
-                (header::CONTENT_SECURITY_POLICY, "default-src 'none'"),
-                (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
-                (
-                    header::CONTENT_DISPOSITION,
-                    "attachment; filename=\"manifest.nuspec\"",
-                ),
-            ],
-            nuspec,
+        let mut response = files::serve_open_file(
+            file,
+            &headers,
+            "application/xml",
+            files::FileMeta {
+                download_name: Some("manifest.nuspec"),
+                ..meta
+            },
         )
-            .into_response());
+        .await?;
+        response.headers_mut().insert(
+            header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static("default-src 'none'"),
+        );
+        return Ok(response);
     }
 
-    let content = state.storage.get_package(&id, &normalized).await?;
+    let name = format!("{}.{}.nupkg", id.to_lowercase(), normalized.to_lowercase());
+    let response = files::serve_open_file(
+        file,
+        &headers,
+        NUPKG_CONTENT_TYPE,
+        files::FileMeta {
+            download_name: Some(&name),
+            ..meta
+        },
+    )
+    .await?;
 
-    // The stored SHA-512 is a content hash of exactly these bytes, which makes
-    // it a correct strong validator: a client that already holds this package
-    // gets a 304 instead of re-downloading gigabytes. The publish time is the
-    // matching `Last-Modified`.
-    let package = state
-        .db
-        .find(state.feed(), &id, &version)
-        .await
-        .ok()
-        .flatten();
-
-    // Count the download (best effort — never block the response on it), once
-    // per transfer rather than once per ranged request of it.
-    if files::counts_as_download(&method, &headers) {
-        let _ = state
-            .db
-            .increment_downloads(state.feed(), &id, &version)
-            .await;
+    // Count the download once per transfer rather than once per ranged request
+    // of it, and only when bytes actually go out: a 304 is a client confirming
+    // it already has them. The write runs off the request path, so a busy
+    // database never holds up the file.
+    if files::counts_as_download(&method, &headers) && files::sends_content(&response) {
+        let (db, feed) = (state.db.clone(), state.feed.name.clone());
+        tokio::spawn(async move {
+            if let Err(e) = db.increment_downloads(&feed, &id, &version).await {
+                tracing::debug!(%feed, %id, error = %e, "download not counted");
+            }
+        });
     }
-
-    match content {
-        PackageContent::LocalPath(path) => {
-            let name = format!("{}.{}.nupkg", id.to_lowercase(), normalized.to_lowercase());
-            files::serve_local_file(
-                path,
-                &headers,
-                NUPKG_CONTENT_TYPE,
-                files::FileMeta {
-                    download_name: Some(&name),
-                    etag: package.as_ref().map(|p| p.package_hash.as_str()),
-                    last_modified: package.as_ref().map(|p| p.published),
-                    sha256_base64: None,
-                },
-            )
-            .await
-        }
-    }
+    Ok(response)
 }
 
 // ---------------------------------------------------------------------------
@@ -1281,6 +1484,7 @@ async fn registration_index_for(
     id: &str,
     semver2: bool,
 ) -> Result<Json<serde_json::Value>> {
+    check_id(id)?;
     state.require_read(headers)?;
     // Registration includes unlisted versions (flagged listed=false).
     let mut packages = state.db.find_versions(state.feed(), id, true).await?;
@@ -1325,6 +1529,7 @@ async fn registration_page_for(
     upper: &str,
     semver2: bool,
 ) -> Result<Json<serde_json::Value>> {
+    check_id(id)?;
     state.require_read(headers)?;
     let upper = upper.strip_suffix(".json").unwrap_or(upper);
     let lower = parse_version(lower)?;
@@ -1363,6 +1568,7 @@ async fn registration_leaf_for(
     version: &str,
     semver2: bool,
 ) -> Result<Json<serde_json::Value>> {
+    check_id(id)?;
     state.require_read(headers)?;
     let version = version.strip_suffix(".json").unwrap_or(version);
     let version = parse_version(version)?;
@@ -1466,7 +1672,12 @@ async fn autocomplete(
 
     // `id` present => enumerate that package's versions.
     if let Some(id) = params.id.filter(|s| !s.is_empty()) {
-        let packages = state.db.find_versions(state.feed(), &id, false).await?;
+        // An id no package can have has no versions.
+        let packages = if check_id(&id).is_ok() {
+            state.db.find_versions(state.feed(), &id, false).await?
+        } else {
+            Vec::new()
+        };
         let versions: Vec<String> = packages
             .iter()
             .filter(|p| include_prerelease || !p.is_prerelease())
@@ -1497,32 +1708,11 @@ async fn autocomplete(
 // ---------------------------------------------------------------------------
 
 async fn push_symbol_package(State(state): State<AppState>, request: Request) -> Result<Response> {
-    let headers = request.headers().clone();
-    if !state.feed.auth.check_headers(&headers) {
-        return Err(Error::Unauthorized);
-    }
-
-    let is_multipart = headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.starts_with("multipart/"))
-        .unwrap_or(false);
-
-    state.ensure_disk_space(content_length(&headers))?;
-    let (temp, mut file) = state.create_temp().await?;
-    let limit = state.config.max_package_size_bytes;
-
     // The size and hash are computed while the bytes stream past, so recording
     // them costs nothing. Dropping them left the one number in the log that says
     // how much a symbol push actually cost, and any later question about which
     // bytes were stored, unanswerable.
-    let summary = write_upload(request, &mut file, is_multipart, limit, &state).await?;
-    // Flush the OS page cache to stable storage before the payload is renamed
-    // into the store. The database row that follows says the package exists; if
-    // a crash lands between the rename and the kernel's own writeback, that row
-    // would point at a truncated or empty file.
-    file.sync_all().await?;
-    drop(file);
+    let (temp, summary) = receive_push(&state, request).await?;
 
     let indexing = state.clone();
     let result = detached(async move {
@@ -1591,6 +1781,7 @@ async fn download_symbol(
                 NUPKG_CONTENT_TYPE,
                 files::FileMeta {
                     etag: Some(&key),
+                    cache: state.feed.content_cache(),
                     ..Default::default()
                 },
             )
@@ -1794,10 +1985,24 @@ async fn package_icon(
     headers: HeaderMap,
     Path((id, version)): Path<(String, String)>,
 ) -> Result<Response> {
+    check_id(&id)?;
     state.require_read(&headers)?;
     let version = parse_version(&version)?;
-    if !state.db.is_servable(state.feed(), &id, &version).await? {
+    let Some(package) = state.db.find(state.feed(), &id, &version).await? else {
         return Err(Error::PackageNotFound);
+    };
+    // Extracted from the package, so the package's hash validates it.
+    let etag = format!("\"{}-icon\"", package.package_hash);
+    let cache = state.feed.content_cache().header_value();
+    if files::if_none_match_hits(&headers, &etag) {
+        return Ok((
+            StatusCode::NOT_MODIFIED,
+            [
+                (header::ETAG, etag.as_str()),
+                (header::CACHE_CONTROL, cache),
+            ],
+        )
+            .into_response());
     }
     let bytes = state
         .storage
@@ -1810,7 +2015,8 @@ async fn package_icon(
     Ok((
         [
             (header::CONTENT_TYPE, content_type),
-            (header::CACHE_CONTROL, IMMUTABLE_CACHE),
+            (header::CACHE_CONTROL, cache),
+            (header::ETAG, etag.as_str()),
             (header::CONTENT_SECURITY_POLICY, "default-src 'none'"),
             (header::CONTENT_DISPOSITION, "inline"),
         ],
@@ -1858,6 +2064,7 @@ async fn render_detail(
     id: &str,
     version: Option<&str>,
 ) -> Result<Html<String>> {
+    check_id(id)?;
     state.require_read(headers)?;
     let packages = state.db.find_versions(state.feed(), id, true).await?;
     if packages.is_empty() {
@@ -1937,21 +2144,33 @@ async fn render_detail(
 // Admin area (HTTP Basic auth)
 // ---------------------------------------------------------------------------
 
-/// Reject the request with a Basic-auth challenge unless valid admin
-/// credentials are presented.
-fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<()> {
-    if state.feed.admin.check_headers(headers) {
-        Ok(())
+/// Guard every admin route: valid admin credentials or a Basic-auth
+/// challenge, and never a cached copy of what is behind it.
+///
+/// Admin pages embed a CSRF token and list what an operator can see; neither
+/// belongs in a browser's disk cache or a shared cache, so every answer —
+/// the challenge included — is `no-store`.
+async fn admin_gate(
+    State(state): State<AppState>,
+    request: Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let mut response = if state.feed.admin.check_headers(request.headers()) {
+        next.run(request).await
     } else {
-        Err(Error::AdminUnauthorized)
-    }
+        Error::AdminUnauthorized.into_response()
+    };
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
 }
 
 /// Header alternative to the hidden form field, for scripted admin calls.
 const CSRF_HEADER: &str = "x-csrf-token";
 
-/// Authenticate an admin *state change*: valid credentials **and** proof the
-/// request was actually issued from the admin UI.
+/// Check that an admin *state change* was actually issued from the admin UI.
+/// The credentials themselves were already checked by [`admin_gate`].
 ///
 /// HTTP Basic credentials are replayed by the browser on every request to this
 /// origin, so authentication alone does not distinguish a click in `/admin`
@@ -1960,11 +2179,10 @@ const CSRF_HEADER: &str = "x-csrf-token";
 ///
 /// * `Sec-Fetch-Site` — browsers set it on every request; anything other than
 ///   same-origin is rejected outright. Non-browser callers omit it.
-/// * The CSRF token, derived from the admin key. An attacker who cannot read
-///   an admin page cannot produce it.
+/// * The CSRF token, an HMAC under a per-process secret (see
+///   [`crate::auth::AdminAuth::csrf_token`]). An attacker who cannot read an
+///   admin page cannot produce it.
 fn require_admin_action(state: &AppState, headers: &HeaderMap, body: &str) -> Result<()> {
-    require_admin(state, headers)?;
-
     if let Some(site) = headers.get("sec-fetch-site").and_then(|v| v.to_str().ok()) {
         if !matches!(site.trim(), "same-origin" | "none") {
             return Err(Error::BadRequest(
@@ -1983,7 +2201,7 @@ fn require_admin_action(state: &AppState, headers: &HeaderMap, body: &str) -> Re
         Ok(())
     } else {
         Err(Error::BadRequest(format!(
-            "missing or invalid {} token",
+            "missing, expired or invalid {} token (reload the page)",
             ui::CSRF_FIELD
         )))
     }
@@ -2018,7 +2236,6 @@ async fn admin_dashboard(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Html<String>> {
-    require_admin(&state, &headers)?;
     let ids = state.db.all_package_ids(state.feed()).await?;
     let urls = state.url_builder(&headers);
     Ok(Html(ui::admin_dashboard_page(&urls, &ids)))
@@ -2029,7 +2246,7 @@ async fn admin_package(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Html<String>> {
-    require_admin(&state, &headers)?;
+    check_id(&id)?;
     let versions = state.db.find_all_versions(state.feed(), &id).await?;
     if versions.is_empty() {
         return Err(Error::PackageNotFound);
@@ -2079,6 +2296,7 @@ async fn admin_file_delete(
     Path((id, version, name)): Path<(String, String, String)>,
     body: String,
 ) -> Result<Response> {
+    check_id(&id)?;
     require_admin_action(&state, &headers, &body)?;
     let v = parse_version(&version)?;
     hosted::detach(&state, &id, &v, &name).await?;
@@ -2114,10 +2332,13 @@ enum Transfer {
 /// Copy or move one version of this feed into `target`.
 ///
 /// The target's license policy and approval gate apply, exactly as for a push
-/// into it. A copy arrives active, as a promotion always has; a move keeps
-/// the listed and enabled state it had here, since it is the same version,
-/// elsewhere. A version the target already holds keeps its state there. Its
-/// files are never touched: the target holds them afterwards either way.
+/// into it. Either way the version arrives with the listed and enabled state
+/// it has here, and still pending if it is pending here: a copy or promotion
+/// must not re-publish what this feed withholds (an admin who disabled a
+/// broken build would otherwise see it go live in the next ring). A move
+/// also keeps its pin, since it is the same version, elsewhere. A version the
+/// target already holds keeps its state there. Its files are never touched:
+/// the target holds them afterwards either way.
 async fn transfer_version(
     state: &AppState,
     target: &FeedMeta,
@@ -2164,17 +2385,15 @@ async fn transfer_version(
     if !state.db.package_data_exists(id, v).await? {
         return Err(Error::PackageNotFound);
     }
-    let mut membership = Membership {
-        pending: target.requires_approval,
+    let membership = Membership {
+        pending: target.requires_approval || here.pending,
         flagged: outcome.violation.is_some(),
         flag_reason: outcome.violation,
+        listed: here.listed,
+        enabled: here.enabled,
+        pinned: mode == Transfer::Move && here.pinned,
         ..Membership::active(&target.name, &package)
     };
-    if mode == Transfer::Move {
-        membership.listed = here.listed;
-        membership.enabled = here.enabled;
-        membership.pinned = here.pinned;
-    }
     match state.db.add_membership(&membership).await {
         Ok(()) | Err(Error::PackageAlreadyExists) => {}
         Err(e) => return Err(e),
@@ -2223,13 +2442,14 @@ impl BulkOp {
 ///
 /// Every version is checked before anything changes, so a typo'd version or
 /// a target that refuses the package leaves the feed as it was rather than
-/// half done. Nothing selected sends the admin back to the page unchanged.
+/// half done, and flag changes are applied in one transaction. Nothing selected sends the admin back to the page unchanged.
 async fn admin_bulk(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<String>,
     body: String,
 ) -> Result<Response> {
+    check_id(&id)?;
     require_admin_action(&state, &headers, &body)?;
     let back = Redirect::to(&admin_package_url(&state.feed.prefix, &id)).into_response();
     let op = form_field(&body, "op")
@@ -2249,24 +2469,27 @@ async fn admin_bulk(
         }
     }
 
+    // Flag changes go through in one transaction, so a database error part
+    // way leaves every version as it was. Deletes and transfers also move
+    // files and take per-version locks, which a transaction cannot cover;
+    // they are checked up front and then applied version by version.
+    let flag = match op {
+        BulkOp::Enable => Some(MembershipChange::Enabled(true)),
+        BulkOp::Disable => Some(MembershipChange::Enabled(false)),
+        BulkOp::Approve => Some(MembershipChange::Approve),
+        BulkOp::Pin => Some(MembershipChange::Pinned(true)),
+        BulkOp::Unpin => Some(MembershipChange::Pinned(false)),
+        BulkOp::Delete | BulkOp::Copy | BulkOp::Move => None,
+    };
+    if let Some(change) = flag {
+        state
+            .db
+            .update_memberships(state.feed(), &id, &versions, change)
+            .await?;
+    }
+
     match op {
-        BulkOp::Enable | BulkOp::Disable => {
-            let enabled = matches!(op, BulkOp::Enable);
-            for v in &versions {
-                state.db.set_enabled(state.feed(), &id, v, enabled).await?;
-            }
-        }
-        BulkOp::Approve => {
-            for v in &versions {
-                state.db.approve_membership(state.feed(), &id, v).await?;
-            }
-        }
-        BulkOp::Pin | BulkOp::Unpin => {
-            let pinned = matches!(op, BulkOp::Pin);
-            for v in &versions {
-                state.db.set_pinned(state.feed(), &id, v, pinned).await?;
-            }
-        }
+        BulkOp::Enable | BulkOp::Disable | BulkOp::Approve | BulkOp::Pin | BulkOp::Unpin => {}
         BulkOp::Delete => {
             for v in &versions {
                 retention::purge_version(
@@ -2364,6 +2587,7 @@ async fn admin_set_enabled(
     version: &str,
     enabled: bool,
 ) -> Result<Response> {
+    check_id(id)?;
     require_admin_action(state, headers, body)?;
     let v = parse_version(version)?;
     if !state.db.set_enabled(state.feed(), id, &v, enabled).await? {
@@ -2378,6 +2602,7 @@ async fn admin_approve(
     Path((id, version)): Path<(String, String)>,
     body: String,
 ) -> Result<Response> {
+    check_id(&id)?;
     require_admin_action(&state, &headers, &body)?;
     let v = parse_version(&version)?;
     if !state.db.approve_membership(state.feed(), &id, &v).await? {
@@ -2392,6 +2617,7 @@ async fn admin_promote(
     Path((id, version)): Path<(String, String)>,
     body: String,
 ) -> Result<Response> {
+    check_id(&id)?;
     require_admin_action(&state, &headers, &body)?;
     let Some(target) = &state.feed.promotes_to else {
         return Err(Error::BadRequest(
@@ -2416,6 +2642,7 @@ async fn admin_delete(
     Path((id, version)): Path<(String, String)>,
     body: String,
 ) -> Result<Response> {
+    check_id(&id)?;
     require_admin_action(&state, &headers, &body)?;
     let v = parse_version(&version)?;
     if !retention::purge_version(
@@ -2465,6 +2692,7 @@ async fn admin_set_pinned(
     version: &str,
     pinned: bool,
 ) -> Result<Response> {
+    check_id(id)?;
     require_admin_action(state, headers, body)?;
     let v = parse_version(version)?;
     if !state.db.set_pinned(state.feed(), id, &v, pinned).await? {
@@ -2494,7 +2722,6 @@ async fn admin_retention(
     headers: HeaderMap,
     Query(q): Query<RetentionQuery>,
 ) -> Result<Html<String>> {
-    require_admin(&state, &headers)?;
     let rules = &state.feed.retention;
     let policy = RetentionPolicy::from(rules);
     let preview = if policy.has_limits() {
@@ -2585,6 +2812,18 @@ fn admin_package_url(prefix: &str, id: &str) -> String {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Refuse a package id taken from a URL unless it is one a package could
+/// have, before it reaches the database, the store or a lock.
+///
+/// The same rule a push is held to (`validate_package_id`), so every layer
+/// below sees only ASCII ids, which `database::canonical_id`, storage paths
+/// and the version lock all fold identically. An id no push could create —
+/// one with the Kelvin sign `\u{212A}`, say, or a Windows device name — names
+/// nothing, so it is a 404 before any of them is consulted.
+fn check_id(id: &str) -> Result<()> {
+    crate::validation::validate_package_id(id).map_err(|_| Error::PackageNotFound)
+}
 
 /// Parse a version from a request (a URL segment or a form field).
 ///

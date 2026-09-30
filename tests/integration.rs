@@ -1151,6 +1151,7 @@ async fn the_gallery_sorts_by_downloads_name_and_last_update() {
         .await
         .unwrap();
     assert!(dl.status().is_success());
+    await_downloads(&server, "zulu.pkg", 1).await;
 
     let order = |html: &str| {
         let mut ids: Vec<(usize, &str)> = ["Alpha.Pkg", "Mike.Pkg", "Zulu.Pkg"]
@@ -3451,8 +3452,16 @@ async fn responses_carry_baseline_security_headers() {
     assert_eq!(headers.get("x-content-type-options").unwrap(), "nosniff");
     assert_eq!(headers.get("x-frame-options").unwrap(), "DENY");
     assert_eq!(headers.get("referrer-policy").unwrap(), "no-referrer");
-    let vary = headers.get("vary").unwrap().to_str().unwrap();
-    assert!(vary.contains("X-Forwarded-Host"), "vary was {vary}");
+    // Several `Vary` lines (the CORS layer adds its own), all of which count.
+    let vary: Vec<&str> = headers
+        .get_all("vary")
+        .iter()
+        .map(|v| v.to_str().unwrap())
+        .collect();
+    assert!(
+        vary.iter().any(|v| v.contains("X-Forwarded-Host")),
+        "vary was {vary:?}"
+    );
 
     // The gallery renders package-supplied metadata, so it gets a policy that
     // denies everything except the two inline assets the server itself emits.
@@ -3546,7 +3555,8 @@ async fn admin_actions_require_a_csrf_token() {
     assert_eq!(bad_token.status(), reqwest::StatusCode::BAD_REQUEST);
 
     // A browser that tells us the request came from another site is refused
-    // even when it somehow carries the token.
+    // even when it somehow carries the token — by the server-wide guard on
+    // cross-site writes, before the admin area sees it.
     let cross_site = client
         .post(&url)
         .basic_auth("admin", Some(ADMIN_KEY))
@@ -3556,7 +3566,7 @@ async fn admin_actions_require_a_csrf_token() {
         .send()
         .await
         .unwrap();
-    assert_eq!(cross_site.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(cross_site.status(), reqwest::StatusCode::FORBIDDEN);
 
     // The real thing, as the admin page submits it, still works.
     let good = client
@@ -4613,16 +4623,35 @@ async fn downloads_resume_safely_and_count_once() {
     assert_eq!(stale.bytes().await.unwrap().len() as u64, total);
 
     // HEAD, the continuations and the refused resume are one download.
-    let search: serde_json::Value = server
-        .client
-        .get(server.url("/v3/search?q=resume.pkg"))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(search["data"][0]["totalDownloads"], 1);
+    await_downloads(&server, "resume.pkg", 1).await;
+    // And nothing else lands late.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    await_downloads(&server, "resume.pkg", 1).await;
+}
+
+/// Wait until search reports `expected` downloads of `id`.
+///
+/// Downloads are counted off the request path, so the count can trail the
+/// response that caused it by a moment.
+async fn await_downloads(server: &TestServer, id: &str, expected: u64) {
+    let mut last = serde_json::Value::Null;
+    for _ in 0..100 {
+        let search: serde_json::Value = server
+            .client
+            .get(server.url(&format!("/v3/search?q={id}")))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        last = search["data"][0]["totalDownloads"].clone();
+        if last == expected {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("{id}: expected {expected} downloads, search says {last}");
 }
 
 #[tokio::test]

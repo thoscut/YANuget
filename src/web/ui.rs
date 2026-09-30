@@ -482,16 +482,30 @@ fn layout_with_chrome(
 /// deliberately not parsed through: a 5xx message is generic on purpose (the
 /// underlying I/O, SQL or upstream detail goes to the log), and re-rendering an
 /// error string into HTML is a needless place to get escaping wrong.
-pub fn error_page(urls: &UrlBuilder, status: axum::http::StatusCode, admin: bool) -> String {
+pub fn error_page(
+    urls: &UrlBuilder,
+    status: axum::http::StatusCode,
+    admin: bool,
+    admin_login: bool,
+) -> String {
     use axum::http::StatusCode;
     let (heading, detail) = match status {
         StatusCode::NOT_FOUND => (
             "Not found",
-            "This feed does not have that package, version or page. It may never              have been published here, or it may have been deleted.",
+            "This feed does not have that package, version or page. It may never \
+             have been published here, or it may have been deleted.",
+        ),
+        // The admin area asks for the admin key, not the read key: sending an
+        // operator hunting for the wrong one is the whole failure here.
+        StatusCode::UNAUTHORIZED if admin_login => (
+            "Sign-in required",
+            "The admin area needs the admin key. Sign in with any user name and \
+             the admin key as the password.",
         ),
         StatusCode::UNAUTHORIZED => (
             "Sign-in required",
-            "This feed requires credentials to browse. Use the API key configured              for reading it.",
+            "This feed requires credentials to browse. Use the API key configured \
+             for reading it.",
         ),
         StatusCode::BAD_REQUEST => (
             "That request did not make sense",
@@ -503,16 +517,14 @@ pub fn error_page(urls: &UrlBuilder, status: axum::http::StatusCode, admin: bool
         ),
         StatusCode::SERVICE_UNAVAILABLE => (
             "Temporarily unavailable",
-            "The server cannot reach its database right now. It should recover on              its own.",
+            "The server cannot reach its database right now. It should recover on \
+             its own.",
         ),
         s if s.is_server_error() => (
             "Something went wrong",
             "The server hit an unexpected error. The details are in its log.",
         ),
-        _ => (
-            "That did not work",
-            "The request could not be completed.",
-        ),
+        _ => ("That did not work", "The request could not be completed."),
     };
     let body = format!(
         "<div class=\"empty\"><h1 class=\"title\">{heading}</h1>\
@@ -1276,7 +1288,7 @@ pub fn settings_page(urls: &UrlBuilder, config: &Config, feed: &super::FeedConte
     match &feed.mirror {
         Some(m) => {
             policy.push_str(&kv("Upstream mirror", "Enabled"));
-            policy.push_str(&kv("Upstream", &redact_userinfo(m.upstream())));
+            policy.push_str(&kv("Upstream", &crate::config::url_origin(m.upstream())));
         }
         None => policy.push_str(&kv("Upstream mirror", "Disabled")),
     }
@@ -1956,7 +1968,12 @@ pub fn admin_retention_page(urls: &UrlBuilder, view: &RetentionView) -> String {
 
 /// The root feed index, shown when more than one feed is hosted. Each entry is
 /// `(feed name, path prefix)` where the prefix is e.g. `/stable`.
-pub fn feeds_index_page(feeds: &[(String, String)]) -> String {
+///
+/// Only feeds anyone may read are listed. A read-gated feed's name is itself
+/// something its key withholds (`internal-security-fixes` says plenty), and
+/// its users already have its address; `some_hidden` adds one line saying
+/// such feeds exist, without naming or counting them.
+pub fn feeds_index_page(feeds: &[(String, String)], some_hidden: bool) -> String {
     let urls = UrlBuilder::new("");
     let mut list = String::from("<ul class=\"rank\">");
     for (name, prefix) in feeds {
@@ -1968,10 +1985,16 @@ pub fn feeds_index_page(feeds: &[(String, String)]) -> String {
         ));
     }
     list.push_str("</ul>");
+    let hidden = if some_hidden {
+        "<p class=\"muted\">Feeds that require credentials are not listed here; \
+         ask whoever runs this server for their address.</p>"
+    } else {
+        ""
+    };
     let body = format!(
         "<h1 class=\"title\">Feeds</h1>\
          <p class=\"muted\">This server hosts several NuGet feeds. Pick one:</p>\
-         <div class=\"card\">{list}</div>"
+         <div class=\"card\">{list}</div>{hidden}"
     );
     layout_with_chrome(
         &urls,
@@ -1982,28 +2005,6 @@ pub fn feeds_index_page(feeds: &[(String, String)]) -> String {
         Chrome::Root,
         "",
     )
-}
-
-/// Replace any `user:password@` in a URL with `***@`.
-///
-/// The upstream is operator-configured and normally carries its credentials in
-/// the separate `[mirror.auth]` settings — but nothing stops someone putting
-/// them in the URL, and this page is the one place that URL is displayed. The
-/// page is read-auth gated, so this is defence in depth rather than the only
-/// guard.
-fn redact_userinfo(url: &str) -> String {
-    let Some((scheme, rest)) = url.split_once("://") else {
-        return url.to_string();
-    };
-    // Userinfo, if present, is everything before the first `@` of the authority.
-    let (authority, tail) = match rest.find('/') {
-        Some(i) => (&rest[..i], &rest[i..]),
-        None => (rest, ""),
-    };
-    match authority.rsplit_once('@') {
-        Some((_, host)) => format!("{scheme}://***@{host}{tail}"),
-        None => url.to_string(),
-    }
 }
 
 /// A key/value row with an escaped text value.
@@ -2582,28 +2583,51 @@ mod tests {
     }
 
     #[test]
+    fn error_pages_read_as_prose_and_name_the_right_key() {
+        use axum::http::StatusCode;
+        let urls = UrlBuilder::new("https://host");
+        for status in [
+            StatusCode::NOT_FOUND,
+            StatusCode::UNAUTHORIZED,
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::BAD_REQUEST,
+        ] {
+            let html = error_page(&urls, status, false, false);
+            let text = html
+                .split("<p>")
+                .nth(1)
+                .unwrap()
+                .split("</p>")
+                .next()
+                .unwrap();
+            assert!(!text.contains("  "), "{status}: {text:?}");
+        }
+        let admin = error_page(&urls, StatusCode::UNAUTHORIZED, true, true);
+        assert!(admin.contains("admin key"), "{admin}");
+        assert!(!admin.contains("for reading"), "{admin}");
+        let read = error_page(&urls, StatusCode::UNAUTHORIZED, false, false);
+        assert!(read.contains("for reading"), "{read}");
+    }
+
+    #[test]
     fn credentials_in_an_upstream_url_are_not_displayed() {
-        assert_eq!(
-            super::redact_userinfo("https://ci:s3cret@feed.example.com/v3/index.json"),
-            "https://***@feed.example.com/v3/index.json"
-        );
-        // A password containing an `@` still redacts fully (the *last* `@` in
-        // the authority separates userinfo from host).
-        assert_eq!(
-            super::redact_userinfo("https://ci:p@ss@feed.example.com/v3/index.json"),
-            "https://***@feed.example.com/v3/index.json"
-        );
-        // No credentials, no change.
-        assert_eq!(
-            super::redact_userinfo("https://api.nuget.org/v3/index.json"),
-            "https://api.nuget.org/v3/index.json"
-        );
-        // A path containing `@` is not mistaken for userinfo.
-        assert_eq!(
-            super::redact_userinfo("https://host/feeds/@scope/index.json"),
-            "https://host/feeds/@scope/index.json"
-        );
-        assert_eq!(super::redact_userinfo("not a url"), "not a url");
+        // Only scheme and host: tokens live in userinfo, in paths
+        // (`/_auth/TOKEN/`) and in queries, and this page is readable by
+        // anyone on a feed without a read key.
+        let urls = UrlBuilder::new("https://host");
+        let config = crate::config::Config::default();
+        let mut feed = feed_ctx(None, None);
+        feed.mirror = crate::mirror::MirrorClient::from_config(&crate::config::MirrorConfig {
+            enabled: true,
+            upstream:
+                "https://ci:pw-secret@feed.example.com/_auth/path-secret/v3/index.json?k=q-secret"
+                    .into(),
+            ..crate::config::MirrorConfig::default()
+        });
+        assert!(feed.mirror.is_some());
+        let html = settings_page(&urls, &config, &feed);
+        assert!(html.contains("https://feed.example.com"), "{html}");
+        assert!(!html.contains("secret"), "{html}");
     }
 
     #[test]
@@ -2946,10 +2970,13 @@ mod tests {
         // else — every feed route lives under `/{name}`. The shared chrome
         // pointed the search form and three footer links at feed routes, so the
         // first page a visitor saw had a search box returning a bare 404.
-        let html = feeds_index_page(&[
-            ("stable".into(), "/stable".into()),
-            ("dev".into(), "/dev".into()),
-        ]);
+        let html = feeds_index_page(
+            &[
+                ("stable".into(), "/stable".into()),
+                ("dev".into(), "/dev".into()),
+            ],
+            false,
+        );
         assert!(
             !html.contains("<form"),
             "no search form at the root: {html}"
@@ -4063,12 +4090,17 @@ mod tests {
 
     #[test]
     fn feeds_index_lists_feeds() {
-        let html = feeds_index_page(&[
-            ("stable".into(), "/stable".into()),
-            ("dev".into(), "/dev".into()),
-        ]);
+        let html = feeds_index_page(
+            &[
+                ("stable".into(), "/stable".into()),
+                ("dev".into(), "/dev".into()),
+            ],
+            false,
+        );
         assert!(html.contains("href=\"/stable\""));
         assert!(html.contains("/dev/v3/index.json"));
+        assert!(!html.contains("require credentials"));
+        assert!(feeds_index_page(&[], true).contains("require credentials"));
     }
 
     fn sample() -> Package {

@@ -3348,6 +3348,7 @@ dependencies = [
  "futures-util",
  "hex",
  "hyper",
+ "hyper-util",
  "indicatif",
  "mime",
  "percent-encoding",

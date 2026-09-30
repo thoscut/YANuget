@@ -56,6 +56,7 @@ pub(super) async fn download(
     headers: HeaderMap,
     Path((id, version, name)): Path<(String, String, String)>,
 ) -> Result<Response> {
+    super::check_id(&id)?;
     state.require_read(&headers)?;
     if !state.config.files.enabled {
         return Err(Error::PackageNotFound);
@@ -75,9 +76,6 @@ pub(super) async fn download(
         .await?
         .ok_or(Error::PackageNotFound)?;
     let PackageContent::LocalPath(path) = state.storage.get_blob(&file.sha256).await?;
-    if files::counts_as_download(&method, &headers) {
-        let _ = state.db.increment_file_downloads(&id, &v, &name).await;
-    }
     let digest = hex::decode(&file.sha256)
         .map(|d| base64::engine::general_purpose::STANDARD.encode(d))
         .ok();
@@ -90,6 +88,12 @@ pub(super) async fn download(
             etag: Some(&file.sha256),
             last_modified: Some(file.uploaded),
             sha256_base64: digest.as_deref(),
+            // A name can be detached and attached again with other bytes, so
+            // never `immutable`; the content-hash ETag makes revalidating cheap.
+            cache: files::CachePolicy {
+                private: state.feed.read_auth.is_enabled(),
+                immutable: false,
+            },
         },
     )
     .await?;
@@ -100,6 +104,16 @@ pub(super) async fn download(
         header::CONTENT_SECURITY_POLICY,
         HeaderValue::from_static("default-src 'none'"),
     );
+    // Counted like a package download: once per transfer, only when bytes go
+    // out, and off the request path.
+    if files::counts_as_download(&method, &headers) && files::sends_content(&response) {
+        let db = state.db.clone();
+        tokio::spawn(async move {
+            if let Err(e) = db.increment_file_downloads(&id, &v, &name).await {
+                tracing::debug!(%id, %name, error = %e, "file download not counted");
+            }
+        });
+    }
     Ok(response)
 }
 
@@ -355,6 +369,7 @@ pub(super) async fn put(
     Path((id, version, name)): Path<(String, String, String)>,
     request: Request,
 ) -> Result<Response> {
+    super::check_id(&id)?;
     let headers = request.headers().clone();
     authorize_upload(&state, &headers)?;
     let v = parse_version(&version)?;
@@ -405,6 +420,7 @@ pub(super) async fn delete(
     headers: HeaderMap,
     Path((id, version, name)): Path<(String, String, String)>,
 ) -> Result<StatusCode> {
+    super::check_id(&id)?;
     authorize_upload(&state, &headers)?;
     let v = parse_version(&version)?;
     detach(&state, &id, &v, &name).await?;
@@ -557,6 +573,7 @@ pub(super) async fn tus_create(
             .ok_or_else(|| Error::BadRequest(format!("Upload-Metadata needs {k:?}")))
     };
     let id = field("id")?;
+    super::check_id(id)?;
     let v = parse_version(field("version")?)?;
     let name = field("filename")?;
     crate::validation::validate_file_name(name, &state.config.files)?;
