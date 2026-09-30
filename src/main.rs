@@ -35,7 +35,7 @@ enum Command {
 }
 
 /// Arguments for `yanuget migrate`.
-#[derive(Debug, Args)]
+#[derive(Args)]
 struct MigrateArgs {
     /// Source NuGet V3 service-index URL (e.g. https://host/v3/index.json).
     #[arg(long)]
@@ -75,6 +75,36 @@ struct MigrateArgs {
     /// Skip any source package larger than this many bytes (default: no limit).
     #[arg(long)]
     max_package_size_bytes: Option<u64>,
+}
+
+impl std::fmt::Debug for MigrateArgs {
+    /// The source credentials are shown only as present, custom headers by
+    /// name, and the source URL without userinfo or query.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let redacted = |v: &Option<String>| v.as_ref().map(|_| "<redacted>");
+        let header_names: Vec<&str> = self
+            .source_header
+            .iter()
+            .map(|h| {
+                h.split_once(':')
+                    .map_or("<malformed>", |(name, _)| name.trim())
+            })
+            .collect();
+        f.debug_struct("MigrateArgs")
+            .field("source", &yanuget::mirror::redact_url(&self.source))
+            .field("feed", &self.feed)
+            .field("source_username", &self.source_username)
+            .field("source_password", &redacted(&self.source_password))
+            .field("source_token", &redacted(&self.source_token))
+            .field("source_header", &header_names)
+            .field("timeout_secs", &self.timeout_secs)
+            .field("concurrency", &self.concurrency)
+            .field("skip_prerelease", &self.skip_prerelease)
+            .field("overwrite", &self.overwrite)
+            .field("dry_run", &self.dry_run)
+            .field("max_package_size_bytes", &self.max_package_size_bytes)
+            .finish()
+    }
 }
 
 #[tokio::main]
@@ -573,6 +603,34 @@ mod tests {
             Path::new("/var/lib/yanuget"),
             unauthenticated,
         )
+    }
+
+    #[test]
+    fn migrate_arguments_debug_without_their_secrets() {
+        let cli = Cli::try_parse_from([
+            "yanuget",
+            "migrate",
+            "--source",
+            "https://ci:url-secret@old.example/v3/index.json?key=query-secret",
+            "--source-username",
+            "ci",
+            "--source-password",
+            "password-secret",
+            "--source-header",
+            "X-Feed-Key: header-secret",
+        ])
+        .unwrap();
+        let shown = format!("{cli:?}");
+        for secret in [
+            "url-secret",
+            "query-secret",
+            "password-secret",
+            "header-secret",
+        ] {
+            assert!(!shown.contains(secret), "{secret} in {shown}");
+        }
+        assert!(shown.contains("old.example"), "{shown}");
+        assert!(shown.contains("X-Feed-Key"), "{shown}");
     }
 
     #[test]

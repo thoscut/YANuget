@@ -224,8 +224,15 @@ deleted only when the **last** feed referencing it lets go.
 | `feeds[].mirror.upstream` | string | `https://api.nuget.org/v3/index.json` | Upstream service index. |
 | `feeds[].mirror.timeout_secs` | int | `30` | Per-request upstream timeout. |
 | `feeds[].mirror.auth.username` / `.password` | string | *(none)* | HTTP Basic credentials for the upstream. |
-| `feeds[].mirror.auth.token` | string | *(none)* | Bearer token for the upstream (`Authorization: Bearer …`). |
+| `feeds[].mirror.auth.token` | string | *(none)* | Bearer token for the upstream (`Authorization: Bearer …`). Set this *or* `username`, not both. |
 | `feeds[].mirror.auth.headers` | table | `{}` | Arbitrary extra request headers (e.g. a private-feed API key). |
+
+Upstream credentials are sent only to the service index's own scheme, host and
+port. The resource URLs inside the service index are the upstream's choice, so
+a `PackageBaseAddress`, search or catalog URL on another host — or a redirect
+to one, such as a download handed off to a CDN — is fetched without them. A
+redirect from `https` to `http` is refused. Setting both `username` and `token`,
+or a header that cannot be sent, is a startup error.
 | `feeds[].mirror.max_versions_per_package` | int | `50` | Newest-first cap on how many versions one read-through miss fetches. |
 | `feeds[].mirror.max_package_size_bytes` | int | *(server-wide cap, else 2 GiB)* | Cap on a single mirrored `.nupkg`. |
 | `feeds[].mirror.allow_private_upstream` | bool | `false` | Permit an upstream on a private/loopback address. |

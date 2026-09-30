@@ -140,13 +140,12 @@ pub async fn run(
     // long the source goes silent, not by how long it takes. A deadline on the
     // whole transfer failed everything the source could not send within
     // `timeout_secs`: at ~2 MiB/s and the default 60 s, anything past ~120 MB.
-    let client = MirrorClient::for_migration(&source)
-        .ok_or_else(|| Error::Other(anyhow::anyhow!("could not build a source client")))?;
+    let client = MirrorClient::for_migration(&source)?;
 
     if !opts.quiet {
         println!(
             "Migrating packages from {} into feed '{}'{}",
-            source.upstream,
+            crate::mirror::redact_url(&source.upstream),
             feed.name,
             if opts.dry_run { " (dry run)" } else { "" }
         );

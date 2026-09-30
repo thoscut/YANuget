@@ -85,12 +85,14 @@ impl FeedContext {
     /// Build a feed's serving context. `upload_limit` is the server-wide
     /// `max_package_size_bytes`, which mirrored downloads inherit unless the
     /// feed's mirror set a tighter one of its own.
-    fn from_resolved(feed: &ResolvedFeed, upload_limit: Option<u64>) -> Self {
-        let mut mirror = MirrorClient::from_config(&feed.mirror);
+    fn from_resolved(feed: &ResolvedFeed, upload_limit: Option<u64>) -> Result<Self> {
+        // A mirror that cannot be built stops startup rather than quietly
+        // serving the feed without it.
+        let mut mirror = MirrorClient::try_from_config(&feed.mirror)?;
         if let Some(client) = mirror.as_mut() {
             client.set_default_size_limit(upload_limit);
         }
-        Self {
+        Ok(Self {
             name: feed.name.clone(),
             prefix: feed.prefix.clone(),
             auth: ApiKeyAuth::new(feed.api_keys.clone()),
@@ -104,7 +106,7 @@ impl FeedContext {
             license_policy: feed.license_policy.clone(),
             retention: feed.retention.clone(),
             cleanup: Arc::default(),
-        }
+        })
     }
 }
 
@@ -181,7 +183,7 @@ impl AppState {
         let feed = Arc::new(FeedContext::from_resolved(
             resolved,
             config.max_package_size_bytes,
-        ));
+        )?);
         Ok(Self {
             storage,
             db,

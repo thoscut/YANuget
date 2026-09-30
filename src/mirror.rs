@@ -167,12 +167,29 @@ impl reqwest::dns::Resolve for GuardedResolver {
 
 impl MirrorClient {
     /// Build a client from a feed's [`MirrorConfig`]. Returns `None` when
-    /// mirroring is disabled for the feed.
+    /// mirroring is disabled for the feed — or when the client cannot be
+    /// built, which is logged: a mirror that silently turned itself off looked
+    /// exactly like an upstream that had nothing. The server itself uses
+    /// [`Self::try_from_config`] and refuses to start instead.
     pub fn from_config(config: &MirrorConfig) -> Option<Self> {
+        Self::try_from_config(config).unwrap_or_else(|e| {
+            tracing::error!(
+                upstream = %redact_url(&config.upstream),
+                error = %e,
+                "mirror disabled: the upstream client could not be built"
+            );
+            None
+        })
+    }
+
+    /// [`Self::from_config`], with a configuration that cannot work — an
+    /// unparseable upstream or proxy, conflicting credentials, an unreadable
+    /// CA file — reported as an error.
+    pub fn try_from_config(config: &MirrorConfig) -> Result<Option<Self>> {
         if !config.enabled {
-            return None;
+            return Ok(None);
         }
-        Self::build(config, false)
+        Self::build(config, false).map(Some)
     }
 
     /// Build the client `yanuget migrate` copies a source with.
@@ -181,17 +198,26 @@ impl MirrorClient {
     /// runs by hand, like `curl`, so it uses the shell's `HTTP(S)_PROXY` when
     /// no proxy is configured; and a download may take as long as it needs
     /// (see [`Self::set_download_deadline`]).
-    pub fn for_migration(config: &MirrorConfig) -> Option<Self> {
+    pub fn for_migration(config: &MirrorConfig) -> Result<Self> {
         let mut client = Self::build(config, true)?;
         client.set_download_deadline(None);
-        Some(client)
+        Ok(client)
     }
 
-    fn build(config: &MirrorConfig, env_proxy: bool) -> Option<Self> {
+    fn build(config: &MirrorConfig, env_proxy: bool) -> Result<Self> {
+        let invalid = |msg: String| Error::BadRequest(format!("mirror: {msg}"));
+        config.validate()?;
         let upstream_origin = reqwest::Url::parse(&config.upstream)
             .ok()
             .as_ref()
-            .and_then(origin)?;
+            .and_then(origin)
+            .ok_or_else(|| {
+                invalid(format!(
+                    "upstream {} is not an absolute URL",
+                    redact_url(&config.upstream)
+                ))
+            })?;
+        let credentials = auth_headers(&config.auth).map_err(invalid)?;
         // Connecting and every read are bounded on the client. A read timeout
         // restarts with each chunk received, so it limits how long the upstream
         // may go silent, not how long a transfer may take; each request adds a
@@ -211,7 +237,10 @@ impl MirrorClient {
         let mut proxy_host = None;
         match &config.proxy {
             Some(proxy) => {
-                builder = builder.proxy(reqwest::Proxy::all(proxy.as_str()).ok()?);
+                let parsed = reqwest::Proxy::all(proxy.as_str()).map_err(|_| {
+                    invalid(format!("proxy {} is not a valid URL", redact_url(proxy)))
+                })?;
+                builder = builder.proxy(parsed);
                 proxy_host = reqwest::Url::parse(proxy)
                     .ok()
                     .and_then(|u| u.host_str().map(str::to_string));
@@ -222,11 +251,14 @@ impl MirrorClient {
         if !config.allow_private_upstream {
             builder = builder.dns_resolver(std::sync::Arc::new(GuardedResolver { proxy_host }));
         }
-        Some(Self {
-            client: builder.build().ok()?,
+        let client = builder
+            .build()
+            .map_err(|e| invalid(format!("cannot build the HTTP client: {}", error_chain(&e))))?;
+        Ok(Self {
+            client,
             upstream: config.upstream.clone(),
             upstream_origin,
-            credentials: auth_headers(&config.auth),
+            credentials,
             allow_private_upstream: config.allow_private_upstream,
             max_package_size_bytes: config.max_package_size_bytes,
             max_versions_per_package: config.max_versions_per_package,
@@ -966,41 +998,42 @@ pub fn redact_url(url: &str) -> String {
 }
 
 /// Build the header map a mirror client sends to the upstream's own origin
-/// from its configured credentials. Basic and Bearer both populate
-/// `Authorization` (Basic wins if both are set); custom headers are added as-is.
-/// Malformed header names/values are skipped with a warning rather than failing
-/// the whole client.
-fn auth_headers(auth: &MirrorAuthConfig) -> reqwest::header::HeaderMap {
+/// from its configured credentials: `Authorization` from Basic or Bearer
+/// ([`MirrorAuthConfig::validate`] rules out both), plus the custom headers.
+/// A header that cannot be sent is an error rather than a warning — a
+/// credential dropped at startup surfaces later as a baffling 401.
+fn auth_headers(
+    auth: &MirrorAuthConfig,
+) -> std::result::Result<reqwest::header::HeaderMap, String> {
     use base64::Engine;
     use reqwest::header::{HeaderMap, HeaderName, HeaderValue, AUTHORIZATION};
 
+    let secret = |raw: String| {
+        HeaderValue::from_str(&raw).map(|mut value| {
+            value.set_sensitive(true);
+            value
+        })
+    };
     let mut headers = HeaderMap::new();
     if let Some(user) = &auth.username {
         let pass = auth.password.as_deref().unwrap_or("");
         let raw = base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pass}"));
-        if let Ok(mut value) = HeaderValue::from_str(&format!("Basic {raw}")) {
-            value.set_sensitive(true);
-            headers.insert(AUTHORIZATION, value);
-        }
+        let value = secret(format!("Basic {raw}"))
+            .map_err(|_| "auth.username cannot be sent in a header".to_string())?;
+        headers.insert(AUTHORIZATION, value);
     } else if let Some(token) = &auth.token {
-        if let Ok(mut value) = HeaderValue::from_str(&format!("Bearer {token}")) {
-            value.set_sensitive(true);
-            headers.insert(AUTHORIZATION, value);
-        }
+        let value = secret(format!("Bearer {token}"))
+            .map_err(|_| "auth.token cannot be sent in a header".to_string())?;
+        headers.insert(AUTHORIZATION, value);
     }
     for (name, value) in &auth.headers {
-        match (
-            HeaderName::from_bytes(name.as_bytes()),
-            HeaderValue::from_str(value),
-        ) {
-            (Ok(n), Ok(mut v)) => {
-                v.set_sensitive(true);
-                headers.insert(n, v);
-            }
-            _ => tracing::warn!(header = %name, "ignoring invalid mirror auth header"),
-        }
+        let name = HeaderName::from_bytes(name.as_bytes())
+            .map_err(|_| format!("auth.headers: {name:?} is not a valid header name"))?;
+        let value = secret(value.clone())
+            .map_err(|_| format!("auth.headers: the value of {name} cannot be sent"))?;
+        headers.insert(name, value);
     }
-    headers
+    Ok(headers)
 }
 
 #[cfg(test)]
@@ -1012,7 +1045,9 @@ mod tests {
         use reqwest::header::AUTHORIZATION;
 
         // No credentials → no headers.
-        assert!(auth_headers(&MirrorAuthConfig::default()).is_empty());
+        assert!(auth_headers(&MirrorAuthConfig::default())
+            .unwrap()
+            .is_empty());
 
         // Basic auth populates Authorization.
         let basic = MirrorAuthConfig {
@@ -1020,7 +1055,7 @@ mod tests {
             password: Some("pass".into()),
             ..Default::default()
         };
-        let h = auth_headers(&basic);
+        let h = auth_headers(&basic).unwrap();
         assert!(h
             .get(AUTHORIZATION)
             .unwrap()
@@ -1036,12 +1071,77 @@ mod tests {
             headers,
             ..Default::default()
         };
-        let h = auth_headers(&bearer);
+        let h = auth_headers(&bearer).unwrap();
         assert_eq!(
             h.get(AUTHORIZATION).unwrap().to_str().unwrap(),
             "Bearer tok"
         );
         assert_eq!(h.get("X-Feed-Key").unwrap().to_str().unwrap(), "abc");
+
+        // A header that cannot be sent fails the client instead of vanishing.
+        let mut bad = std::collections::BTreeMap::new();
+        bad.insert("Not A Header".to_string(), "x".to_string());
+        assert!(auth_headers(&MirrorAuthConfig {
+            headers: bad,
+            ..Default::default()
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn basic_and_bearer_together_are_a_configuration_error() {
+        // Both need `Authorization`; the token used to be dropped silently.
+        let both = MirrorConfig {
+            enabled: true,
+            auth: MirrorAuthConfig {
+                username: Some("ci".into()),
+                password: Some("pw".into()),
+                token: Some("tok".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(both.validate().is_err());
+        assert!(MirrorClient::try_from_config(&both).is_err());
+        // `from_config` logs it and turns the mirror off rather than guessing.
+        assert!(MirrorClient::from_config(&both).is_none());
+
+        let orphan_password = MirrorAuthConfig {
+            password: Some("pw".into()),
+            ..Default::default()
+        };
+        assert!(orphan_password.validate().is_err());
+    }
+
+    #[test]
+    fn debug_output_carries_no_secrets() {
+        let mut headers = std::collections::BTreeMap::new();
+        headers.insert("X-Feed-Key".to_string(), "header-secret".to_string());
+        let config = MirrorConfig {
+            enabled: true,
+            upstream: "https://user:url-secret@feed.example/v3/index.json".into(),
+            auth: MirrorAuthConfig {
+                username: Some("ci".into()),
+                password: Some("password-secret".into()),
+                headers,
+                ..Default::default()
+            },
+            proxy: Some("http://proxy:proxy-secret@proxy.internal:3128".into()),
+            ..Default::default()
+        };
+        let client = MirrorClient::from_config(&config).unwrap();
+        for shown in [format!("{config:?}"), format!("{client:?}")] {
+            for secret in [
+                "url-secret",
+                "password-secret",
+                "header-secret",
+                "proxy-secret",
+            ] {
+                assert!(!shown.contains(secret), "{secret} in {shown}");
+            }
+            assert!(shown.contains("feed.example"), "{shown}");
+        }
+        assert!(format!("{config:?}").contains("X-Feed-Key"));
     }
 
     #[test]

@@ -226,8 +226,9 @@ inbox_scan_secs = 30                # YANUGET_FILES_INBOX_SCAN_SECS
 #   # proxy = "http://proxy.internal:3128"
 #
 #     # Credentials for an authenticated upstream (all optional). Set the
-#     # username/password pair for HTTP Basic, token for a Bearer token, and/or
-#     # headers for a custom header (e.g. a private-feed API key).
+#     # username/password pair for HTTP Basic OR token for a Bearer token, plus
+#     # headers for a custom header (e.g. a private-feed API key). They are sent
+#     # only to the upstream's own scheme, host and port.
 #     [feeds.mirror.auth]
 #     # username = "ci"
 #     # password = "secret"
