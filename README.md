@@ -494,6 +494,10 @@ Not yet implemented (contributions welcome): additional storage backends
 scanning, and native (Windows) PDB indexing. These are deliberately behind trait
 boundaries so they can be added without touching the core.
 
+What is planned, and the open findings from the latest full review (security,
+correctness, CI, docs and test gaps, each with an id to reference in commits),
+are tracked in [ROADMAP.md](ROADMAP.md).
+
 ---
 
 ## Contributing & security
