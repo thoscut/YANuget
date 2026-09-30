@@ -334,11 +334,19 @@ responses also carry a `Strict-Transport-Security` header (one year).
 - The `/admin` area (set `admin_api_key`) and the gallery should only be exposed
   over HTTPS — keep TLS on, or terminate it at a proxy.
 - Admin **state changes** additionally require a CSRF token (embedded in the
-  admin forms, derived from the admin key) and reject a request a browser
-  labels cross-site. HTTP Basic credentials are replayed automatically by the
-  browser, so without this a signed-in operator merely visiting a hostile page
-  would be enough to delete packages. Scripted callers can send the token as an
-  `X-CSRF-Token` header instead of the `_csrf` form field.
+  admin forms) and reject a request a browser labels cross-site. HTTP Basic
+  credentials are replayed automatically by the browser, so without this a
+  signed-in operator merely visiting a hostile page would be enough to delete
+  packages. The token is an HMAC, under a secret drawn at random when the
+  server starts, over the feed's admin key and the time it was issued: it
+  expires after 12 hours, and a restart revokes every token handed out (reload
+  the admin page). Scripted callers can take the token from an admin page and
+  send it as an `X-CSRF-Token` header instead of the `_csrf` form field.
+- Every `/admin` response, the authentication challenge included, carries
+  `Cache-Control: no-store`, so neither the pages nor the token they embed are
+  kept by a browser or a shared cache.
+- Keys are compared in constant time, and surrounding whitespace is dropped
+  from push, read and admin keys alike.
 - Every response carries `X-Content-Type-Options: nosniff`,
   `X-Frame-Options: DENY` and `Referrer-Policy: no-referrer`. Gallery pages also
   carry a `Content-Security-Policy` of `default-src 'none'` whose only permitted
