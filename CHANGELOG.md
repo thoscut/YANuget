@@ -56,6 +56,32 @@ expected to change incompatibly at any version.
   it still matches, so a push between looking and clicking cannot widen what is
   deleted. A cleanup and the scheduled sweep never run at once. The admin
   package page marks the versions the next cleanup would delete.
+- **Attached files**: large files (`.wim` and other disk images, archives)
+  attached to a package version, for its install script to fetch.
+  - Served at `/files/{id}/{version}/{name}` for resumable clients: `HEAD`,
+    single ranges, `If-Range`, a strong `ETag` (the SHA-256), `Last-Modified`,
+    `Repr-Digest`, and always as a download (`octet-stream`, `attachment`,
+    `default-src 'none'`). Verified with BITS (including a suspended and
+    resumed job), `Invoke-WebRequest -Resume` and `curl -C -`.
+  - Uploaded with the push key in one `PUT` (optionally checked against
+    `X-Checksum-SHA256`), or resumably over tus 1.0.0 at `/api/v2/uploads`
+    (creation, expiration, termination; stock clients work, and a resume also
+    works across a server restart). `scripts/Send-YanugetFile.ps1` uploads
+    resumably from PowerShell 7. A feed without a push key refuses files.
+  - Or dropped over SSH into `[files].inbox_dir` with a `sha256sum` checksum
+    file; the importer moves each file out of the uploader's reach, verifies
+    it, attaches it, and explains a failure in a `.error` file next to it.
+    YANuget runs no SSH server of its own.
+  - Stored once per content under `.blobs/sha256/`, so versions that attach
+    the same image share its bytes; a file goes with its version when it is
+    deleted, pruned or moved, and its blob when nothing references it any
+    more. File names are held to `A-Z a-z 0-9 . _ -` with an allowed
+    extension, and never become part of a server path.
+  - The package page lists a version's files with their SHA-256 and the
+    `chocolateyInstall.ps1` lines (BITS plus `Get-ChecksumValid`) that fetch
+    and check them; the admin page lists, downloads and deletes them; the
+    stats page counts them; the settings page shows the file limits.
+  - Configured under `[files]`. A feed can no longer be named `files`.
 
 ### Changed
 

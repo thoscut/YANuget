@@ -123,6 +123,22 @@ impl UrlBuilder {
         )
     }
 
+    /// `/files/{id}/{version}/{name}`: a file attached to a version.
+    pub fn file_download(&self, lower_id: &str, normalized_version: &str, name: &str) -> String {
+        format!(
+            "{}/files/{}/{}/{}",
+            self.base,
+            enc(lower_id),
+            enc(&normalized_version.to_lowercase()),
+            enc(name),
+        )
+    }
+
+    /// `/api/v2/uploads/{id}`: a resumable upload in progress.
+    pub fn upload(&self, upload_id: &str) -> String {
+        format!("{}/api/v2/uploads/{}", self.base, enc(upload_id))
+    }
+
     /// Registration base for this builder's hive, with trailing slash
     /// (`RegistrationsBaseUrl`).
     pub fn registration_base(&self) -> String {

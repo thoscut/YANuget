@@ -28,8 +28,8 @@ use crate::models::{DependencyGroup, Package, PackageType};
 use crate::version::NuGetVersion;
 
 use super::{
-    DatabaseStats, FeedVersion, Membership, PackageDatabase, SearchGroup, SearchPage,
-    SearchRequest, SearchSort, SymbolKey, SymbolRef, TagCount,
+    DatabaseStats, FeedVersion, Membership, PackageDatabase, PackageFile, SearchGroup, SearchPage,
+    SearchRequest, SearchSort, SymbolKey, SymbolRef, TagCount, UploadSession,
 };
 
 const SCHEMA: &str = r#"
@@ -117,6 +117,35 @@ CREATE TABLE IF NOT EXISTS package_tags (
     PRIMARY KEY (lower_id, normalized_version, tag)
 );
 CREATE INDEX IF NOT EXISTS idx_package_tags_tag ON package_tags (tag, lower_id);
+
+-- Files attached to versions. The bytes are a blob named by `sha256`; a row
+-- is one reference to it, so a blob goes when its last row does.
+CREATE TABLE IF NOT EXISTS package_files (
+    lower_id           TEXT    NOT NULL,
+    normalized_version TEXT    NOT NULL,
+    name               TEXT    NOT NULL,
+    lower_name         TEXT    NOT NULL,
+    sha256             TEXT    NOT NULL,
+    size               INTEGER NOT NULL,
+    uploaded           TEXT    NOT NULL,
+    downloads          INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (lower_id, normalized_version, lower_name)
+);
+CREATE INDEX IF NOT EXISTS idx_package_files_blob ON package_files (sha256);
+
+-- Resumable uploads in progress; the partial bytes are `.uploads/{id}.part`.
+CREATE TABLE IF NOT EXISTS uploads (
+    id                 TEXT    PRIMARY KEY,
+    feed               TEXT    NOT NULL,
+    lower_id           TEXT    NOT NULL,
+    normalized_version TEXT    NOT NULL,
+    name               TEXT    NOT NULL,
+    length             INTEGER NOT NULL,
+    received           INTEGER NOT NULL DEFAULT 0,
+    expected_sha256    TEXT,
+    created            TEXT    NOT NULL,
+    expires            TEXT    NOT NULL
+);
 "#;
 
 /// Fill `package_tags` for one version from its JSON tag array (`?3`),
@@ -489,6 +518,13 @@ impl PackageDatabase for SqliteDatabase {
             .execute(&self.pool)
             .await?;
         sqlx::query("DELETE FROM package_tags WHERE lower_id = ?1 AND normalized_version = ?2")
+            .bind(&lower)
+            .bind(&normalized)
+            .execute(&self.pool)
+            .await?;
+        // The blobs are the caller's to delete (see `retention::purge_global_data`),
+        // which it does before this, while these rows still say what they were.
+        sqlx::query("DELETE FROM package_files WHERE lower_id = ?1 AND normalized_version = ?2")
             .bind(&lower)
             .bind(&normalized)
             .execute(&self.pool)
@@ -951,12 +987,30 @@ impl PackageDatabase for SqliteDatabase {
         .bind(feed)
         .fetch_one(&self.pool)
         .await?;
+        // The size counts each blob once: identical files share their bytes,
+        // so this is what the feed's files take on disk.
+        let files = sqlx::query(
+            "SELECT COUNT(*) AS n, \
+                    COALESCE((SELECT SUM(size) FROM (SELECT DISTINCT pf2.sha256, pf2.size \
+                        FROM package_files pf2 JOIN feed_packages fp2 \
+                          ON fp2.lower_id = pf2.lower_id \
+                         AND fp2.normalized_version = pf2.normalized_version \
+                        WHERE fp2.feed = ?1 AND fp2.enabled = 1 AND fp2.pending = 0)), 0) AS bytes \
+             FROM package_files pf JOIN feed_packages fp \
+               ON fp.lower_id = pf.lower_id AND fp.normalized_version = pf.normalized_version \
+             WHERE fp.feed = ?1 AND fp.enabled = 1 AND fp.pending = 0",
+        )
+        .bind(feed)
+        .fetch_one(&self.pool)
+        .await?;
         Ok(DatabaseStats {
             package_count: row.try_get("package_count")?,
             version_count: row.try_get("version_count")?,
             listed_count: row.try_get("listed_count")?,
             total_downloads: row.try_get("total_downloads")?,
             total_size: row.try_get("total_size")?,
+            file_count: files.try_get("n")?,
+            file_bytes: files.try_get("bytes")?,
             symbol_count,
         })
     }
@@ -996,6 +1050,161 @@ impl PackageDatabase for SqliteDatabase {
                 packages: r.get("packages"),
             })
             .collect())
+    }
+
+    async fn add_file(&self, f: &PackageFile) -> Result<()> {
+        let result = sqlx::query(
+            "INSERT INTO package_files \
+                 (lower_id, normalized_version, name, lower_name, sha256, size, uploaded, downloads) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0)",
+        )
+        .bind(f.lower_id.to_lowercase())
+        .bind(&f.normalized_version)
+        .bind(&f.name)
+        .bind(f.name.to_lowercase())
+        .bind(&f.sha256)
+        .bind(f.size as i64)
+        .bind(f.uploaded.to_rfc3339())
+        .execute(&self.pool)
+        .await;
+        match result {
+            Ok(_) => Ok(()),
+            Err(e) if is_unique_violation(&e) => Err(Error::PackageAlreadyExists),
+            Err(e) => Err(Error::Database(e)),
+        }
+    }
+
+    async fn files_for(&self, id: &str, version: &NuGetVersion) -> Result<Vec<PackageFile>> {
+        let rows = sqlx::query(
+            "SELECT * FROM package_files WHERE lower_id = ?1 AND normalized_version = ?2 \
+             ORDER BY lower_name",
+        )
+        .bind(id.to_lowercase())
+        .bind(version.normalized())
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(row_to_file).collect()
+    }
+
+    async fn get_file(
+        &self,
+        id: &str,
+        version: &NuGetVersion,
+        name: &str,
+    ) -> Result<Option<PackageFile>> {
+        let row = sqlx::query(
+            "SELECT * FROM package_files \
+             WHERE lower_id = ?1 AND normalized_version = ?2 AND lower_name = ?3",
+        )
+        .bind(id.to_lowercase())
+        .bind(version.normalized())
+        .bind(name.to_lowercase())
+        .fetch_optional(&self.pool)
+        .await?;
+        row.as_ref().map(row_to_file).transpose()
+    }
+
+    async fn delete_file(
+        &self,
+        id: &str,
+        version: &NuGetVersion,
+        name: &str,
+    ) -> Result<Option<PackageFile>> {
+        let Some(file) = self.get_file(id, version, name).await? else {
+            return Ok(None);
+        };
+        sqlx::query(
+            "DELETE FROM package_files \
+             WHERE lower_id = ?1 AND normalized_version = ?2 AND lower_name = ?3",
+        )
+        .bind(id.to_lowercase())
+        .bind(version.normalized())
+        .bind(name.to_lowercase())
+        .execute(&self.pool)
+        .await?;
+        Ok(Some(file))
+    }
+
+    async fn blob_references(&self, sha256: &str) -> Result<i64> {
+        Ok(
+            sqlx::query_scalar("SELECT COUNT(*) FROM package_files WHERE sha256 = ?1")
+                .bind(sha256)
+                .fetch_one(&self.pool)
+                .await?,
+        )
+    }
+
+    async fn increment_file_downloads(
+        &self,
+        id: &str,
+        version: &NuGetVersion,
+        name: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE package_files SET downloads = downloads + 1 \
+             WHERE lower_id = ?1 AND normalized_version = ?2 AND lower_name = ?3",
+        )
+        .bind(id.to_lowercase())
+        .bind(version.normalized())
+        .bind(name.to_lowercase())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn create_upload(&self, u: &UploadSession) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO uploads (id, feed, lower_id, normalized_version, name, length, \
+                                  received, expected_sha256, created, expires) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        )
+        .bind(&u.id)
+        .bind(&u.feed)
+        .bind(u.lower_id.to_lowercase())
+        .bind(&u.normalized_version)
+        .bind(&u.name)
+        .bind(u.length as i64)
+        .bind(u.received as i64)
+        .bind(&u.expected_sha256)
+        .bind(Utc::now().to_rfc3339())
+        .bind(u.expires.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn get_upload(&self, id: &str) -> Result<Option<UploadSession>> {
+        let row = sqlx::query("SELECT * FROM uploads WHERE id = ?1")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.as_ref().map(row_to_upload).transpose()
+    }
+
+    async fn set_upload_received(&self, id: &str, received: u64) -> Result<()> {
+        sqlx::query("UPDATE uploads SET received = ?2 WHERE id = ?1")
+            .bind(id)
+            .bind(received as i64)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn delete_upload(&self, id: &str) -> Result<()> {
+        sqlx::query("DELETE FROM uploads WHERE id = ?1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn expired_uploads(&self, now: DateTime<Utc>) -> Result<Vec<UploadSession>> {
+        // Stored as RFC 3339 in UTC, so the times compare as text.
+        let rows = sqlx::query("SELECT * FROM uploads WHERE expires < ?1")
+            .bind(now.to_rfc3339())
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter().map(row_to_upload).collect()
     }
 
     async fn add_symbol(
@@ -1208,6 +1417,38 @@ fn row_to_package(row: &SqliteRow) -> Result<Package> {
 
 /// A feed-scoped row (package joined to a membership): listed/enabled/pending/
 /// flagged/downloads come from the membership's aliased columns.
+fn parse_time(raw: &str, what: &str) -> Result<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(raw)
+        .map(|t| t.with_timezone(&Utc))
+        .map_err(|e| Error::Other(anyhow::anyhow!("bad {what} timestamp: {e}")))
+}
+
+fn row_to_file(row: &SqliteRow) -> Result<PackageFile> {
+    Ok(PackageFile {
+        lower_id: row.try_get("lower_id")?,
+        normalized_version: row.try_get("normalized_version")?,
+        name: row.try_get("name")?,
+        sha256: row.try_get("sha256")?,
+        size: row.try_get::<i64, _>("size")?.max(0) as u64,
+        uploaded: parse_time(&row.try_get::<String, _>("uploaded")?, "uploaded")?,
+        downloads: row.try_get::<i64, _>("downloads")?.max(0) as u64,
+    })
+}
+
+fn row_to_upload(row: &SqliteRow) -> Result<UploadSession> {
+    Ok(UploadSession {
+        id: row.try_get("id")?,
+        feed: row.try_get("feed")?,
+        lower_id: row.try_get("lower_id")?,
+        normalized_version: row.try_get("normalized_version")?,
+        name: row.try_get("name")?,
+        length: row.try_get::<i64, _>("length")?.max(0) as u64,
+        received: row.try_get::<i64, _>("received")?.max(0) as u64,
+        expected_sha256: row.try_get("expected_sha256")?,
+        expires: parse_time(&row.try_get::<String, _>("expires")?, "expires")?,
+    })
+}
+
 fn row_to_feed_package(row: &SqliteRow) -> Result<FeedVersion> {
     let listed = row.try_get::<i64, _>("m_listed")? != 0;
     let enabled = row.try_get::<i64, _>("m_enabled")? != 0;

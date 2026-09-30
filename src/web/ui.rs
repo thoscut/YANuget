@@ -9,7 +9,7 @@
 //! the `choco install` command (configurable via `primary_client`).
 
 use crate::config::Config;
-use crate::database::{SearchSort, TagCount};
+use crate::database::{PackageFile, SearchSort, TagCount};
 use crate::models::{Package, PackageType};
 use crate::nuget::UrlBuilder;
 
@@ -159,6 +159,13 @@ pre code{font-size:inherit}\
 .install pre,.steps pre{white-space:pre-wrap;overflow-wrap:break-word}\
 .install .primary pre{background:var(--stock);border:2px solid var(--ink)}\
 .nw{white-space:nowrap}\
+.attached{margin:0;padding:0;list-style:none;border-top:2px solid var(--ink)}\
+.attached li{padding:10px 0;border-bottom:1px solid var(--rule)}\
+.attached .id{font-weight:700;text-decoration:none}\
+.attached .sha{margin-top:2px;font-size:13px;overflow-wrap:anywhere}\
+.script{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:end;column-gap:12px;margin-top:18px}\
+.script h3{margin:0;font-size:15px}\
+.script pre{white-space:pre}\
 .copy{min-height:36px;padding:0 14px;background:var(--stock);color:var(--ink);font-size:14px}\
 .primary .copy{background:var(--hivis);color:var(--onhivis)}\
 .versions{list-style:none;margin:0;padding:0;max-height:360px;overflow:auto;border-top:2px solid var(--ink)}\
@@ -174,12 +181,12 @@ font-size:15px;line-height:1.6;white-space:pre-wrap;overflow-wrap:anywhere}\
 .kv b{flex:0 0 14em;color:var(--pencil);font-weight:500}\
 .kv a,.kv code{overflow-wrap:anywhere}\
 @media(max-width:560px){.kv div{flex-direction:column;gap:0}.kv b{flex:0 0 auto}}\
-.stats{display:grid;grid-template-columns:repeat(3,1fr);margin:0 0 40px;background:var(--stock);\
+.stats{display:grid;grid-template-columns:repeat(4,1fr);margin:0 0 40px;background:var(--stock);\
 border:3px solid var(--ink);border-radius:14px;overflow:hidden}\
 .stat{min-width:0;margin:-2px 0 0 -2px;padding:12px 20px 16px;border-left:2px solid var(--ink);border-top:2px solid var(--ink)}\
 .stat .l{font-size:14px;color:var(--pencil)}\
 .stat .n{font-size:30px;font-weight:800;line-height:1.15;overflow-wrap:anywhere}\
-@media(max-width:560px){.stats{grid-template-columns:repeat(2,1fr)}.stat{padding:10px 14px 12px}.stat .n{font-size:24px}}\
+@media(max-width:760px){.stats{grid-template-columns:repeat(2,1fr)}}@media(max-width:560px){.stat{padding:10px 14px 12px}.stat .n{font-size:24px}}\
 .lists{display:grid;grid-template-columns:1fr 1fr;gap:0 40px}\
 .lists>.card{margin:0}\
 @media(max-width:760px){.lists{grid-template-columns:1fr;gap:28px}}\
@@ -225,7 +232,9 @@ background:var(--stock);border:2px solid var(--ink);border-radius:10px}\
 .bulk [role=status]{flex-basis:100%;color:var(--dangerfg);font-weight:700}.bulk [role=status]:empty{display:none}\
 .bulk .to{display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding-left:12px;border-left:1px solid var(--rule)}\
 .bulk select{min-height:38px;font-size:15px}\
-@media(max-width:640px){.vers,.vers tbody,.plan,.plan tbody{display:block}\
+@media(max-width:640px){.vers,.vers tbody,.plan,.plan tbody,.files,.files tbody{display:block}\
+.files thead{display:none}.files tbody tr{display:block;padding:10px 0;border-bottom:1px solid var(--rule)}\
+.files td{display:inline;padding:0 10px 0 0;border:0}.files td:last-child{display:block;padding:6px 0 0}\
 .vers thead tr{display:flex;align-items:center;padding:8px 0;border-bottom:1px solid var(--rule)}\
 .vers thead th{padding:0 0 0 6px;border:0}.vers thead th:not(.pick){display:none}\
 .vers tbody tr{display:grid;grid-template-columns:2.75em minmax(0,1fr) auto auto;align-items:center;gap:10px 10px;\
@@ -1104,12 +1113,17 @@ pub fn stats_page(
     admin: bool,
 ) -> String {
     let cards = [
-        (stats.package_count.to_string(), "Packages"),
-        (stats.version_count.to_string(), "Versions"),
+        (group_digits(stats.package_count), "Packages"),
+        (group_digits(stats.version_count), "Versions"),
+        (group_digits(stats.listed_count), "Listed versions"),
         (group_digits(stats.total_downloads), "Downloads"),
-        (human_size(stats.total_size.max(0) as u64), "Storage"),
-        (stats.symbol_count.to_string(), "Symbol files"),
-        (stats.listed_count.to_string(), "Listed versions"),
+        (
+            human_size(stats.total_size.max(0) as u64),
+            "Package storage",
+        ),
+        (group_digits(stats.file_count), "Attached files"),
+        (human_size(stats.file_bytes.max(0) as u64), "File storage"),
+        (group_digits(stats.symbol_count), "Symbol files"),
     ];
     // The same ruled cells as the package label: a caption over each value.
     let mut tiles = String::from("<div class=\"stats\">");
@@ -1316,6 +1330,42 @@ pub fn settings_page(urls: &UrlBuilder, config: &Config, feed: &super::FeedConte
         ));
     }
 
+    let fc = &config.files;
+    let mut files = String::from("<div class=\"kv wide\">");
+    files.push_str(&kv("Attached files", on_off(fc.enabled)));
+    if fc.enabled {
+        files.push_str(&kv(
+            "Uploads",
+            if feed.auth.is_enabled() {
+                "Accepted with the push key"
+            } else {
+                "Refused: this feed has no push key"
+            },
+        ));
+        files.push_str(&kv(
+            "Largest file",
+            &match config.max_file_size_bytes() {
+                Some(n) => human_size(n),
+                None => "Unlimited".to_string(),
+            },
+        ));
+        files.push_str(&kv("File types", &fc.allowed_extensions.join(", ")));
+        files.push_str(&kv(
+            "Unfinished uploads kept",
+            &format!("{} h", fc.upload_expiry_hours),
+        ));
+        // Whether there is an inbox, not where: the path is infrastructure.
+        files.push_str(&kv(
+            "SSH inbox",
+            if fc.inbox_dir.is_some() {
+                "Enabled"
+            } else {
+                "Disabled"
+            },
+        ));
+    }
+    files.push_str("</div>");
+
     // Said even when the admin area is off: otherwise nothing on any page
     // tells an operator that disabling, deleting and moving versions exist.
     let admin = if feed.admin.is_enabled() {
@@ -1340,6 +1390,7 @@ pub fn settings_page(urls: &UrlBuilder, config: &Config, feed: &super::FeedConte
          <div class=\"card\"><h2>Server</h2>{server}</div>\
          <div class=\"card\"><h2>Mirror &amp; policy</h2>{policy}</div>\
          <div class=\"card\"><h2>Retention</h2>{retention}</div>\
+         <div class=\"card\"><h2>Attached files</h2>{files}</div>\
          <div class=\"card\"><h2>Endpoints</h2><div class=\"kv wide\">\
          {svc}{sym}</div></div>{admin}",
         svc = kv_html(
@@ -1418,6 +1469,10 @@ pub struct AdminPackageExtras<'a> {
     pub transfer_targets: &'a [String],
     /// What the next retention cleanup would delete of this package.
     pub retention_plan: &'a [crate::retention::Pruned],
+    /// Whether files can be attached (`[files].enabled`).
+    pub files_enabled: bool,
+    /// The files attached to any of the versions.
+    pub files: &'a [PackageFile],
 }
 
 /// The per-package admin page: every version (incl. disabled, pending and
@@ -1612,12 +1667,64 @@ pub fn admin_package_page(
          <thead><tr><th class=\"pick\"><input type=\"checkbox\" class=\"all\" \
          aria-label=\"Select every version\" hidden></th>\
          <th>Version</th><th>Status</th><th>Downloads</th><th>Actions</th></tr></thead>\
-         <tbody>{rows}</tbody></table></div>{bulk}</div>",
+         <tbody>{rows}</tbody></table></div>{bulk}</div>{files}",
         admin = escape_html(&urls.app("/admin")),
         gallery = escape_html(&urls.app(&format!("/packages/{}", enc_path(&lower)))),
         eid = escape_html(id),
+        files = admin_files(urls, id, extras, &csrf),
     );
     layout(urls, &format!("Admin \u{2014} {id}"), ADMIN_NAV, &body)
+}
+
+/// The admin page's list of a package's attached files, each downloadable and
+/// deletable, and how to attach more.
+fn admin_files(urls: &UrlBuilder, id: &str, extras: &AdminPackageExtras, csrf: &str) -> String {
+    if !extras.files_enabled {
+        return String::new();
+    }
+    let how = format!(
+        "<p class=\"muted\">Attach a file with <code>PUT {put}</code> and the push key, resumably \
+         with tus at <code>{tus}</code>, or over SSH through the inbox; \
+         <a href=\"{docs}\">the documentation</a> has the details.</p>",
+        put = escape_html(&urls.app("/api/v2/files/{id}/{version}/{name}")),
+        tus = escape_html(&urls.app("/api/v2/uploads")),
+        docs = escape_html(&urls.app("/docs/api/#attached-files")),
+    );
+    if extras.files.is_empty() {
+        return format!("<div class=\"card\"><h2>Files</h2><p>No files attached.</p>{how}</div>");
+    }
+    let mut rows = String::new();
+    for f in extras.files {
+        let action = escape_html(&urls.app(&format!(
+            "/admin/packages/{}/{}/files/{}/delete",
+            enc_path(&f.lower_id),
+            enc_path(&f.normalized_version),
+            enc_path(&f.name)
+        )));
+        rows.push_str(&format!(
+            "<tr><td><span class=\"nw\">{v}</span></td><td>{name}</td><td class=\"muted\">{size}</td>\
+             <td><code title=\"{sha}\">{short}\u{2026}</code></td><td class=\"muted\">{dl}</td>\
+             <td><div class=\"actions\"><a class=\"btn\" href=\"{href}\" aria-label=\"Download {name}\">Download</a>\
+             <form method=\"post\" action=\"{action}\" data-confirm=\"{confirm}\">{csrf}\
+             <button type=\"submit\" class=\"danger\">Delete</button></form></div></td></tr>",
+            v = escape_html(&f.normalized_version),
+            name = escape_html(&f.name),
+            size = human_size(f.size),
+            sha = escape_html(&f.sha256),
+            short = escape_html(&f.sha256[..f.sha256.len().min(12)]),
+            dl = group_digits(f.downloads as i64),
+            href = escape_html(&urls.file_download(&f.lower_id, &f.normalized_version, &f.name)),
+            confirm = escape_html(&format!(
+                "Delete {} from {id} {}? Install scripts that fetch it will fail.",
+                f.name, f.normalized_version
+            )),
+        ));
+    }
+    format!(
+        "<div class=\"card\"><h2>Files</h2><div class=\"scroll\"><table class=\"atbl files\">\
+         <thead><tr><th>Version</th><th>File</th><th>Size</th><th>SHA-256</th><th>Downloads</th>\
+         <th>Actions</th></tr></thead><tbody>{rows}</tbody></table></div>{how}</div>"
+    )
 }
 
 /// What the retention page says after a cleanup it was asked for.
@@ -1914,19 +2021,35 @@ fn opt_count(n: Option<usize>) -> String {
     }
 }
 
+/// What the package page shows about the selected version besides its
+/// metadata.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Detail<'a> {
+    pub readme: Option<&'a str>,
+    /// Which install command comes first (`choco`, `dotnet`, `nuget`).
+    pub primary_client: &'a str,
+    pub has_symbols: bool,
+    /// Whether this feed has an admin area: the label then links to the page
+    /// that disables, deletes or moves this package's versions.
+    pub admin: bool,
+    /// Files attached to the selected version.
+    pub files: &'a [PackageFile],
+}
+
 /// The package detail page for one selected version.
-///
-/// `admin` is whether this feed has an admin area: the label then links to the
-/// page that disables, deletes or moves this package's versions.
 pub fn detail_page(
     urls: &UrlBuilder,
     packages: &[Package],
     selected: &Package,
-    readme: Option<&str>,
-    primary_client: &str,
-    has_symbols: bool,
-    admin: bool,
+    detail: &Detail,
 ) -> String {
+    let Detail {
+        readme,
+        primary_client,
+        has_symbols,
+        admin,
+        files,
+    } = *detail;
     let id = escape_html(&selected.id);
     let version = selected.normalized_version();
     let lower = selected.lower_id();
@@ -1984,13 +2107,14 @@ pub fn detail_page(
          <section class=\"label\" aria-labelledby=\"pkg\"><div class=\"label-head\">{icon}\
          <h1 class=\"title\" id=\"pkg\">{id_breaks}</h1>{manage}</div>\
          <dl class=\"fields\">{fields}</dl></section>\
-         {desc}{tags}{links}{deps}{symbols}",
+         {desc}{tags}{links}{attached}{deps}{symbols}",
         packages = escape_html(&urls.app("/packages")),
         icon = render_icon(urls, selected),
         id_breaks = id.replace('.', ".<wbr>"),
         fields = render_fields(selected),
         tags = render_tags(urls, &selected.tags),
         links = render_links(selected),
+        attached = render_files(urls, selected, files),
         deps = render_dependencies(urls, selected),
         symbols = if has_symbols {
             "<p class=\"muted\">Debug symbols are available for this package.</p>"
@@ -2031,6 +2155,54 @@ pub fn detail_page(
             ..Nav::default()
         },
         &body,
+    )
+}
+
+/// The files attached to a version, with what a `chocolateyInstall.ps1`
+/// needs to fetch and check them.
+///
+/// The snippet uses BITS, which resumes a dropped transfer by itself and
+/// survives a reboot mid-download, and Chocolatey's own `Get-ChecksumValid`,
+/// which fails the install on a mismatch. It is assembled raw and escaped
+/// once, like the install commands, so the copy button puts exactly the
+/// script on the clipboard.
+fn render_files(urls: &UrlBuilder, p: &Package, files: &[PackageFile]) -> String {
+    if files.is_empty() {
+        return String::new();
+    }
+    let lower = p.lower_id();
+    let version = p.normalized_version();
+    let mut list = String::from("<ul class=\"attached\">");
+    let mut script = format!(
+        "$dir = Join-Path $env:TEMP '{}.{}'\nNew-Item -ItemType Directory -Force $dir | Out-Null",
+        p.id, version
+    );
+    for f in files {
+        let url = urls.file_download(&lower, &version, &f.name);
+        list.push_str(&format!(
+            "<li><div><a class=\"id\" href=\"{href}\">{name}</a> \
+             <span class=\"muted\">{size}</span></div>\
+             <div class=\"sha\"><span class=\"muted\">SHA-256</span> <code>{sha}</code></div></li>",
+            href = escape_html(&url),
+            name = escape_html(&f.name),
+            size = human_size(f.size),
+            sha = escape_html(&f.sha256),
+        ));
+        script.push_str(&format!(
+            "\n$file = Join-Path $dir '{name}'\n\
+             Start-BitsTransfer -Source '{url}' -Destination $file\n\
+             Get-ChecksumValid -File $file -Checksum '{sha}' -ChecksumType sha256",
+            name = f.name,
+            sha = f.sha256,
+        ));
+    }
+    list.push_str("</ul>");
+    format!(
+        "<h2>Files</h2>{list}\
+         <div class=\"script\"><h3>In chocolateyInstall.ps1</h3><div class=\"snip\">\
+         <button type=\"button\" class=\"copy\" aria-label=\"Copy the download script\" hidden>Copy</button>\
+         <pre><code>{code}</code></pre></div></div>",
+        code = escape_html(&script),
     )
 }
 
@@ -2553,10 +2725,13 @@ mod tests {
             &urls,
             std::slice::from_ref(&p),
             &p,
-            None,
-            "choco",
-            false,
-            false,
+            &Detail {
+                readme: None,
+                primary_client: "choco",
+                has_symbols: false,
+                admin: false,
+                files: &[],
+            },
         );
         for label in ["Chocolatey", "dotnet CLI", "nuget.exe"] {
             let button = format!(
@@ -2608,10 +2783,13 @@ mod tests {
             &urls,
             std::slice::from_ref(&p),
             &p,
-            None,
-            "choco",
-            false,
-            false,
+            &Detail {
+                readme: None,
+                primary_client: "choco",
+                has_symbols: false,
+                admin: false,
+                files: &[],
+            },
         );
         assert!(!html.contains("<img src=x"));
         assert!(html.contains("&lt;img src=x"));
@@ -2665,10 +2843,13 @@ mod tests {
             &urls,
             std::slice::from_ref(&p),
             &p,
-            None,
-            "choco",
-            true,
-            false,
+            &Detail {
+                readme: None,
+                primary_client: "choco",
+                has_symbols: true,
+                admin: false,
+                files: &[],
+            },
         );
         assert!(html.contains("badge pre"));
         assert!(html.contains("badge un"));
@@ -2686,10 +2867,13 @@ mod tests {
             &urls,
             std::slice::from_ref(&p),
             &p,
-            Some("A long readme."),
-            "choco",
-            false,
-            false,
+            &Detail {
+                readme: Some("A long readme."),
+                primary_client: "choco",
+                has_symbols: false,
+                admin: false,
+                files: &[],
+            },
         );
         assert!(!STYLE.contains("sticky"));
         let at = |needle: &str| {
@@ -3170,10 +3354,13 @@ mod tests {
             &urls,
             std::slice::from_ref(&p),
             &p,
-            None,
-            "choco",
-            false,
-            false,
+            &Detail {
+                readme: None,
+                primary_client: "choco",
+                has_symbols: false,
+                admin: false,
+                files: &[],
+            },
         );
         assert!(
             plain.contains(&format!("Served by YANuget {}", env!("CARGO_PKG_VERSION"))),
@@ -3185,10 +3372,13 @@ mod tests {
             &urls,
             std::slice::from_ref(&p),
             &p,
-            None,
-            "choco",
-            false,
-            true,
+            &Detail {
+                readme: None,
+                primary_client: "choco",
+                has_symbols: false,
+                admin: true,
+                files: &[],
+            },
         );
         assert!(
             managed.contains("<a href=\"/admin/packages/contoso.utils\">Manage versions</a>"),
@@ -3431,17 +3621,23 @@ mod tests {
             total_downloads: 1234,
             total_size: 2048,
             symbol_count: 1,
+            file_count: 2,
+            file_bytes: 3 * 1024 * 1024 * 1024,
         };
         let html = stats_page(&urls, &stats, &page_of(&["Top.Pkg"]), &[sample()], false);
         assert!(html.contains("Statistics"));
         assert!(html.contains("1,234")); // grouped downloads
         assert!(html.contains("Top.Pkg"));
         assert!(html.contains("Recently published"));
-        // Six tiles in rows of three (two on a phone), not five and an orphan;
-        // the two lists share the width evenly, not the package page's
-        // `1fr 340px` split.
-        assert_eq!(html.matches("class=\"stat\"").count(), 6);
-        assert!(STYLE.contains(".stats{display:grid;grid-template-columns:repeat(3,1fr)"));
+        // Eight tiles in rows of four (two on narrow screens), never a row
+        // with an orphan; the two lists share the width evenly, not the
+        // package page's `1fr 340px` split.
+        assert_eq!(html.matches("class=\"stat\"").count(), 8);
+        assert!(STYLE.contains(".stats{display:grid;grid-template-columns:repeat(4,1fr)"));
+        assert!(
+            html.contains("<div class=\"l\">File storage</div><div class=\"n\">3.0 GB</div>"),
+            "{html}"
+        );
         assert!(
             html.contains("<div class=\"lists\"><div class=\"card\">"),
             "{html}"
@@ -3481,6 +3677,7 @@ mod tests {
             total_downloads: 1,
             total_size: 1,
             symbol_count: 0,
+            ..Default::default()
         };
         let pages = [
             (
@@ -3489,10 +3686,13 @@ mod tests {
                     &urls,
                     std::slice::from_ref(&p),
                     &p,
-                    Some("docs"),
-                    "choco",
-                    false,
-                    false,
+                    &Detail {
+                        readme: Some("docs"),
+                        primary_client: "choco",
+                        has_symbols: false,
+                        admin: false,
+                        files: &[],
+                    },
                 ),
             ),
             (
@@ -3530,10 +3730,13 @@ mod tests {
             &urls,
             std::slice::from_ref(&p),
             &p,
-            None,
-            "choco",
-            false,
-            false,
+            &Detail {
+                readme: None,
+                primary_client: "choco",
+                has_symbols: false,
+                admin: false,
+                files: &[],
+            },
         );
         // The label's count is a bare number under its caption; the version
         // list spells it out.
@@ -3682,6 +3885,82 @@ mod tests {
             "{html}"
         );
         assert!(html.contains("name=\"op\" value=\"pin\""), "{html}");
+    }
+
+    #[test]
+    fn attached_files_are_listed_with_a_script_and_can_be_deleted() {
+        let urls = UrlBuilder::new("https://host");
+        let p = sample();
+        let file = PackageFile {
+            lower_id: "contoso.utils".into(),
+            normalized_version: "1.0.0".into(),
+            name: "base.wim".into(),
+            sha256: "ab".repeat(32),
+            size: 4 * 1024 * 1024 * 1024,
+            uploaded: chrono::Utc::now(),
+            downloads: 3,
+        };
+        let files = [file];
+        let page = detail_page(
+            &urls,
+            std::slice::from_ref(&p),
+            &p,
+            &Detail {
+                primary_client: "choco",
+                files: &files,
+                ..Default::default()
+            },
+        );
+        let url = "https://host/files/contoso.utils/1.0.0/base.wim";
+        assert!(
+            page.contains(&format!("<a class=\"id\" href=\"{url}\">base.wim</a>")),
+            "{page}"
+        );
+        assert!(page.contains("4.0 GB"), "{page}");
+        // The script is escaped once, so the clipboard gets exactly this.
+        let script = page
+            .split("<pre><code>")
+            .find(|s| s.contains("Start-BitsTransfer"))
+            .and_then(|s| s.split("</code>").next())
+            .map(text_of)
+            .unwrap_or_else(|| panic!("no script: {page}"));
+        assert!(script.contains(&format!(
+            "Start-BitsTransfer -Source '{url}' -Destination $file"
+        )));
+        assert!(script.contains(&format!(
+            "-Checksum '{}' -ChecksumType sha256",
+            "ab".repeat(32)
+        )));
+        assert!(page.contains("aria-label=\"Copy the download script\""));
+
+        let admin = admin_package_page(
+            &urls,
+            "Contoso.Utils",
+            &[feed_version(sample(), false, false)],
+            &AdminPackageExtras {
+                files_enabled: true,
+                files: &files,
+                ..Default::default()
+            },
+            "tok",
+        );
+        assert!(
+            admin.contains("action=\"/admin/packages/contoso.utils/1.0.0/files/base.wim/delete\""),
+            "{admin}"
+        );
+        assert!(
+            admin.contains("Install scripts that fetch it will fail."),
+            "{admin}"
+        );
+        // With the feature off, the admin page does not mention files.
+        let off = admin_package_page(
+            &urls,
+            "Contoso.Utils",
+            &[feed_version(sample(), false, false)],
+            &AdminPackageExtras::default(),
+            "tok",
+        );
+        assert!(!off.contains("<h2>Files</h2>"), "{off}");
     }
 
     #[test]

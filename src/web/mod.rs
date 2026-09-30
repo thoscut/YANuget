@@ -8,7 +8,10 @@
 mod assets;
 mod docs;
 mod files;
+pub(crate) mod hosted;
 mod ui;
+
+pub use hosted::sweep_expired_uploads;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -20,7 +23,7 @@ use axum::extract::{
 };
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{Html, IntoResponse, Json, Redirect, Response};
-use axum::routing::{delete, get, post, put};
+use axum::routing::{delete, get, head, post, put};
 use axum::Router;
 use futures::StreamExt;
 use serde::Deserialize;
@@ -622,7 +625,25 @@ fn feed_routes(state: AppState) -> Router {
         )
         .route("/v3/registration/{id}/{version}", get(registration_leaf))
         .route("/v3/search", get(search))
-        .route("/v3/autocomplete", get(autocomplete));
+        .route("/v3/autocomplete", get(autocomplete))
+        // Files attached to versions (the handlers answer 404 while the
+        // feature is off). Not NuGet protocol; outside the gallery, so a
+        // script gets JSON errors and the files work with the UI disabled.
+        .route("/files/{id}/{version}/{name}", get(hosted::download))
+        .route(
+            "/api/v2/files/{id}/{version}/{name}",
+            put(hosted::put).delete(hosted::delete),
+        )
+        .route(
+            "/api/v2/uploads",
+            post(hosted::tus_create).options(hosted::tus_options),
+        )
+        .route(
+            "/api/v2/uploads/{upload}",
+            head(hosted::tus_head)
+                .patch(hosted::tus_patch)
+                .delete(hosted::tus_delete),
+        );
 
     // The SemVer2 hive mirrors the routes above. A client picks a hive from the
     // service index, so each has to be reachable at its own path and to keep
@@ -708,6 +729,10 @@ fn feed_routes(state: AppState) -> Router {
                 .route(
                     "/admin/packages/{id}/{version}/unpin",
                     admin_post(admin_unpin),
+                )
+                .route(
+                    "/admin/packages/{id}/{version}/files/{name}/delete",
+                    admin_post(admin_file_delete),
                 )
                 .route("/admin/retention", get(admin_retention))
                 .route("/admin/retention/run", admin_post(admin_retention_run));
@@ -1803,15 +1828,24 @@ async fn render_detail(
         .unwrap_or_default()
         .is_empty();
 
+    let files = if state.config.files.enabled {
+        state.db.files_for(id, &selected.version).await?
+    } else {
+        Vec::new()
+    };
+
     let urls = state.url_builder(headers);
     Ok(Html(ui::detail_page(
         &urls,
         &packages,
         &selected,
-        readme.as_deref(),
-        &state.config.primary_client,
-        has_symbols,
-        state.feed.admin.is_enabled(),
+        &ui::Detail {
+            readme: readme.as_deref(),
+            primary_client: &state.config.primary_client,
+            has_symbols,
+            admin: state.feed.admin.is_enabled(),
+            files: &files,
+        },
     )))
 }
 
@@ -1929,6 +1963,12 @@ async fn admin_package(
     } else {
         Vec::new()
     };
+    let mut files = Vec::new();
+    if state.config.files.enabled {
+        for fv in versions.iter().rev() {
+            files.extend(state.db.files_for(&id, &fv.package.version).await?);
+        }
+    }
     Ok(Html(ui::admin_package_page(
         &urls,
         display_id,
@@ -1937,9 +1977,24 @@ async fn admin_package(
             promote_target: state.feed.promotes_to.as_deref(),
             transfer_targets: &targets,
             retention_plan: &plan,
+            files_enabled: state.config.files.enabled,
+            files: &files,
         },
         &state.feed.admin.csrf_token().unwrap_or_default(),
     )))
+}
+
+/// Detach a file from the admin page.
+async fn admin_file_delete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((id, version, name)): Path<(String, String, String)>,
+    body: String,
+) -> Result<Response> {
+    require_admin_action(&state, &headers, &body)?;
+    let v = parse_version(&version)?;
+    hosted::detach(&state, &id, &v, &name).await?;
+    Ok(Redirect::to(&admin_package_url(&state.feed.prefix, &id)).into_response())
 }
 
 /// The feeds this request may copy or move versions into: every other feed

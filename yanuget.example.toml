@@ -157,6 +157,24 @@ interval_hours = 24           # YANUGET_RETENTION_INTERVAL_HOURS — background 
 # max_age_days = 180            # YANUGET_RETENTION_MAX_AGE_DAYS
 
 # ---------------------------------------------------------------------------
+# Attached files — disk images and archives a package's install script fetches
+# (resumably: BITS, Invoke-WebRequest -Resume, curl -C -). Uploaded with the
+# push key (PUT or tus), or over SSH through the inbox. A feed without a push
+# key refuses them. They are deleted, pruned and moved with their version.
+# ---------------------------------------------------------------------------
+[files]
+enabled = true                      # YANUGET_FILES_ENABLED
+# Largest file; unset falls back to max_package_size_bytes (unset = unlimited).
+# max_file_size_bytes = 107374182400  # YANUGET_FILES_MAX_FILE_SIZE_BYTES (100 GiB)
+allowed_extensions = ["wim", "swm", "esd", "iso", "vhd", "vhdx", "zip", "7z", "cab"]  # YANUGET_FILES_ALLOWED_EXTENSIONS
+upload_expiry_hours = 72            # YANUGET_FILES_UPLOAD_EXPIRY_HOURS — unfinished resumable uploads
+# An inbox the host's sshd writes to: {inbox}/{feed}/{id}/{version}/{name}
+# plus {name}.sha256 (sha256sum format) once the file is complete. Must not be
+# inside the package store.
+# inbox_dir = "/srv/yanuget-chroot/inbox"   # YANUGET_FILES_INBOX_DIR
+inbox_scan_secs = 30                # YANUGET_FILES_INBOX_SCAN_SECS
+
+# ---------------------------------------------------------------------------
 # Feeds — host several NuGet feeds from one server.
 #
 # With NO [[feeds]] blocks (the default), a single implicit feed named

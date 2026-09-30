@@ -96,4 +96,16 @@ pub trait PackageStorage: Send + Sync {
     /// Delete a package and all of its auxiliary files. Succeeds even if some
     /// files are already gone.
     async fn delete(&self, id: &str, version: &str) -> Result<()>;
+
+    /// Move an already-written temp file into the content-addressed blob store
+    /// under its SHA-256 (lower-case hex). When those bytes are already stored,
+    /// the temp file is dropped instead: identical files are kept once. Returns
+    /// the stored size in bytes.
+    async fn store_blob(&self, sha256_hex: &str, temp_path: PathBuf) -> Result<u64>;
+
+    /// Resolve a stored blob for serving.
+    async fn get_blob(&self, sha256_hex: &str) -> Result<PackageContent>;
+
+    /// Delete a stored blob. Succeeds even if it is already gone.
+    async fn delete_blob(&self, sha256_hex: &str) -> Result<()>;
 }

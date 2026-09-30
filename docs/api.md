@@ -213,6 +213,121 @@ Serves an indexed PDB to a debugger (the Simple Symbol Query Protocol path).
 `FFFFFFFF`. Streams with `Range` support. `404` for an unknown file/key so the
 debugger falls through to the next symbol source.
 
+## Attached files
+
+Large files — disk images (`.wim`, `.swm`, `.esd`, `.iso`, `.vhd(x)`) and
+archives — can be attached to a package version, for its install script to
+fetch at install time. Not NuGet protocol. They are enabled by default and
+configured under [`[files]`](configuration.md#attached-files).
+
+A file belongs to one id/version and goes wherever the version goes: it is
+visible in every feed that holds the version, and deleted with it — by an
+admin, by a hard `DELETE`, or by retention. The bytes are stored once, under
+their SHA-256, however many versions attach the same content.
+
+### Download
+
+```
+GET|HEAD /files/{id}/{version}/{name}
+GET      /files/{id}/{version}/index.json   # [{name, size, sha256, uploaded, url}]
+```
+
+Needs read access like any download, and a version the feed serves (not
+disabled, not pending). The response is built for resumable clients:
+
+- `Content-Length` on `HEAD` and `GET`, a fixed length rather than chunked
+  encoding, and no compression.
+- `Accept-Ranges: bytes`, single ranges answered with `206`, and `If-Range`
+  honoured — a resume against changed content gets the whole file.
+- A strong `ETag` (the SHA-256), `Last-Modified` (the upload time), and
+  `Repr-Digest: sha-256=:…:` (RFC 9530). `Cache-Control: immutable`: a file's
+  URL never serves different bytes, because a file of the same name cannot be
+  replaced, only deleted.
+- Always `Content-Type: application/octet-stream`, `Content-Disposition:
+  attachment` and `Content-Security-Policy: default-src 'none'`, so no hosted
+  file can render in a browser as this origin.
+
+A download is counted once per transfer: a `GET` of the whole file, or of a
+range from byte 0. BITS' `HEAD` and ranged continuations are not.
+
+In a `chocolateyInstall.ps1` — the package page shows this with the real URL
+and checksum, ready to copy:
+
+```powershell
+$file = Join-Path $env:TEMP 'base.wim'
+Start-BitsTransfer -Source 'https://nuget.example.com/files/contoso.images/1.2.0/base.wim' -Destination $file
+Get-ChecksumValid -File $file -Checksum '<sha256>' -ChecksumType sha256
+```
+
+`Invoke-WebRequest -Resume` (PowerShell 7) and `curl -C -` resume a partial file
+the same way. On a feed with a `read_api_key`, BITS takes it as the password of
+`-Credential` with `-Authentication Basic` (over HTTPS), or as
+`-CustomHeaders 'X-NuGet-ApiKey: <key>'`.
+
+### Upload in one request
+
+```
+PUT    /api/v2/files/{id}/{version}/{name}   # the body is the file
+DELETE /api/v2/files/{id}/{version}/{name}
+```
+
+Both need the feed's push key in `X-NuGet-ApiKey`, **and** a push key must be
+configured: a feed left open for package pushes answers `403` rather than take
+multi-gigabyte files from anyone. The version must be in the feed (`404`).
+
+The name is 1–128 characters of `A-Z a-z 0-9 . _ -`, starts with a letter or
+digit, and has one of `[files].allowed_extensions`; anything else is `400`.
+The body is streamed to disk and hashed on the way, and is limited by
+`max_file_size_bytes` (`413`), `min_free_disk_bytes` (`507`) and
+`upload_idle_timeout_secs` (`408`). An optional `X-Checksum-SHA256: <hex>` makes
+a body with a different hash fail (`400`) and leave nothing behind.
+
+The answer is `201` with `{name, size, sha256, url}`. The same file again is
+`200` and changes nothing; different content under a name already attached is
+`409` — delete it first.
+
+### Resumable upload (tus)
+
+```
+OPTIONS /api/v2/uploads          # Tus-Version, Tus-Extension, Tus-Max-Size
+POST    /api/v2/uploads          # start: 201 + Location
+HEAD    /api/v2/uploads/{upload} # Upload-Offset: how much arrived
+PATCH   /api/v2/uploads/{upload} # append at Upload-Offset
+DELETE  /api/v2/uploads/{upload} # abandon
+```
+
+The [tus 1.0.0](https://tus.io/protocols/resumable-upload) protocol with the
+creation, expiration and termination extensions, so stock clients work
+(`tuspy`, `TusDotNetClient`, `tusc`). Every request carries `Tus-Resumable:
+1.0.0` (`412` otherwise) and the push key, under the same rules as `PUT`.
+
+`POST` takes `Upload-Length` and `Upload-Metadata` with `id`, `version`,
+`filename` and optionally `sha256` (base64 values, as tus specifies). `PATCH`
+sends `Content-Type: application/offset+octet-stream` and must start exactly at
+the current offset (`409` with the right `Upload-Offset` otherwise); one request
+at a time writes to an upload. Bytes that arrived before a connection dropped
+count, so the client sends `HEAD`, then continues from there — also after a
+server restart, when the first request re-reads what arrived to go on hashing.
+The request that brings the last byte verifies the SHA-256 (discarding the
+upload on a mismatch, `400`) and attaches the file.
+
+Unfinished uploads expire after `[files].upload_expiry_hours` (`Upload-Expires`
+says when) and are swept. [`scripts/Send-YanugetFile.ps1`](https://github.com/thoscut/yanuget/blob/main/scripts/Send-YanugetFile.ps1)
+is a PowerShell 7 function that uploads resumably:
+
+```powershell
+. ./scripts/Send-YanugetFile.ps1
+Send-YanugetFile -Feed https://nuget.example.com -ApiKey $key `
+    -Id Contoso.Images -Version 1.2.0 -Path .\base.wim
+# after an interruption: the same call with -Resume <the URL it printed>
+```
+
+### Over SSH
+
+`scp`, `sftp` and `rsync` reach the server through its own SSH daemon and an
+inbox directory YANuget scans; see
+[the inbox](configuration.md#the-ssh-inbox).
+
 ## Web gallery (HTML)
 
 ```
@@ -282,6 +397,7 @@ POST /admin/packages/{id}/{version}/approve        # clear the pending gate
 POST /admin/packages/{id}/{version}/promote        # add to the next ring
 POST /admin/packages/{id}/{version}/pin            # keep it from retention
 POST /admin/packages/{id}/{version}/unpin          # let retention decide again
+POST /admin/packages/{id}/{version}/files/{name}/delete  # detach a file
 GET  /admin/retention                              # rules, last run, next cleanup's plan
 POST /admin/retention/run                          # delete exactly the plan shown
 ```

@@ -188,6 +188,8 @@ async fn run_server(config_path: Option<&str>) -> anyhow::Result<()> {
         }
     }
 
+    spawn_file_tasks(&config, &storage, &db, &feeds, &shutdown_rx);
+
     let app = web::build_app(states);
     let addr = config.socket_addr();
 
@@ -435,6 +437,79 @@ fn build_source_config(args: &MigrateArgs) -> MirrorConfig {
 }
 
 /// Resolve once the shutdown signal has been broadcast on `rx`.
+/// The attached-files housekeeping: dropping resumable uploads that expired,
+/// and — when an inbox is configured — importing what arrived over SSH.
+fn spawn_file_tasks(
+    config: &Arc<Config>,
+    storage: &Arc<FilesystemStorage>,
+    db: &Arc<SqliteDatabase>,
+    feeds: &[yanuget::config::ResolvedFeed],
+    shutdown: &tokio::sync::watch::Receiver<bool>,
+) {
+    if !config.files.enabled {
+        return;
+    }
+    let staging = config.storage_path().join(".uploads");
+
+    // Expired uploads: once at startup, then every quarter hour.
+    {
+        let db = db.clone();
+        let staging = staging.clone();
+        let mut shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(15 * 60));
+            loop {
+                tokio::select! {
+                    _ = tick.tick() => { web::sweep_expired_uploads(db.as_ref(), &staging).await; }
+                    _ = shutdown.changed() => break,
+                }
+            }
+        });
+    }
+
+    let Some(inbox) = config.files.inbox_dir.clone() else {
+        return;
+    };
+    if let Err(e) = std::fs::create_dir_all(&inbox)
+        .map_err(yanuget::Error::from)
+        .and_then(|_| yanuget::inbox::check_location(&inbox, &config.storage_path()))
+    {
+        tracing::error!(inbox = %inbox.display(), error = %e, "file inbox disabled");
+        return;
+    }
+    let names: Vec<String> = feeds.iter().map(|f| f.name.clone()).collect();
+    for name in &names {
+        let _ = std::fs::create_dir_all(inbox.join(name));
+    }
+    tracing::info!(inbox = %inbox.display(), every_secs = config.files.inbox_scan_secs, "file inbox enabled");
+    let (config, storage, db) = (config.clone(), storage.clone(), db.clone());
+    let mut shutdown = shutdown.clone();
+    tokio::spawn(async move {
+        let period = Duration::from_secs(config.files.inbox_scan_secs.max(5));
+        let mut tick = tokio::time::interval(period);
+        loop {
+            tokio::select! {
+                _ = tick.tick() => {
+                    let scan = yanuget::inbox::Inbox {
+                        dir: &inbox,
+                        storage: storage.as_ref(),
+                        db: db.as_ref(),
+                        files: &config.files,
+                        max_file_size: config.max_file_size_bytes(),
+                        feeds: &names,
+                        staging: &staging,
+                    };
+                    let report = scan.scan().await;
+                    if report.imported + report.failed > 0 {
+                        tracing::info!(imported = report.imported, failed = report.failed, "file inbox scanned");
+                    }
+                }
+                _ = shutdown.changed() => break,
+            }
+        }
+    });
+}
+
 async fn wait_for_shutdown(mut rx: tokio::sync::watch::Receiver<bool>) {
     if *rx.borrow_and_update() {
         return;

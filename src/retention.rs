@@ -233,8 +233,33 @@ pub(crate) async fn purge_global_data(
     version: &NuGetVersion,
 ) -> Result<()> {
     purge_symbols(storage, db, id, version).await?;
+    purge_file_blobs(storage, db, id, version).await?;
     storage.delete(id, &version.normalized()).await?;
     db.delete_package_data(id, version).await?;
+    Ok(())
+}
+
+/// Delete the blobs of a version's attached files that no other version also
+/// references. Their rows go with the package data, after this, so a failure
+/// here leaves the rows that say what is left to delete.
+///
+/// Same contract: the caller must already hold the version lock.
+pub(crate) async fn purge_file_blobs(
+    storage: &dyn PackageStorage,
+    db: &dyn PackageDatabase,
+    id: &str,
+    version: &NuGetVersion,
+) -> Result<()> {
+    let files = db.files_for(id, version).await?;
+    let mut blobs: Vec<&str> = files.iter().map(|f| f.sha256.as_str()).collect();
+    blobs.sort_unstable();
+    blobs.dedup();
+    for sha in blobs {
+        let here = files.iter().filter(|f| f.sha256 == sha).count() as i64;
+        if db.blob_references(sha).await? <= here {
+            storage.delete_blob(sha).await?;
+        }
+    }
     Ok(())
 }
 
@@ -272,6 +297,15 @@ pub struct Outcome {
     pub errors: usize,
 }
 
+/// The size of a version's attached files: what deleting it frees on top of
+/// the package, at most (a blob another version shares stays).
+async fn attached_bytes(db: &dyn PackageDatabase, id: &str, version: &NuGetVersion) -> u64 {
+    db.files_for(id, version)
+        .await
+        .map(|files| files.iter().map(|f| f.size).sum())
+        .unwrap_or(0)
+}
+
 /// Delete one planned version from `feed`, counting what it freed.
 async fn delete_planned(
     storage: &dyn PackageStorage,
@@ -287,7 +321,8 @@ async fn delete_planned(
         .ok()
         .flatten()
         .map(|p| p.package_size)
-        .unwrap_or(0);
+        .unwrap_or(0)
+        + attached_bytes(db, id, version).await;
     match purge_version(storage, db, feed, id, version).await {
         Ok(true) => {
             outcome.deleted += 1;
@@ -446,17 +481,17 @@ pub async fn preview(
             else {
                 continue;
             };
-            let only_here = db.feed_count(&id, &planned.version).await? <= 1;
+            let frees = if db.feed_count(&id, &planned.version).await? <= 1 {
+                fv.package.package_size + attached_bytes(db, &id, &planned.version).await
+            } else {
+                0
+            };
             out.planned.push(Planned {
                 id: fv.package.id.clone(),
                 version: planned.version,
                 published: fv.package.published,
                 reason: planned.reason,
-                frees: if only_here {
-                    fv.package.package_size
-                } else {
-                    0
-                },
+                frees,
             });
         }
     }

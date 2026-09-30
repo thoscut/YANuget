@@ -43,6 +43,43 @@ pub struct SearchRequest {
     pub tag: Option<String>,
 }
 
+/// A file attached to a package version (a disk image, an archive).
+///
+/// Global like the package data itself: every feed holding the version holds
+/// its files. The bytes live in the blob store under [`PackageFile::sha256`],
+/// once however many versions share them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackageFile {
+    pub lower_id: String,
+    pub normalized_version: String,
+    /// The name as uploaded (validated; unique per version, ignoring case).
+    pub name: String,
+    /// Lower-case hex SHA-256 of the content: its blob name and its ETag.
+    pub sha256: String,
+    pub size: u64,
+    pub uploaded: chrono::DateTime<chrono::Utc>,
+    pub downloads: u64,
+}
+
+/// An unfinished resumable (tus) upload of a [`PackageFile`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadSession {
+    /// Random, unguessable id; also names the partial file.
+    pub id: String,
+    /// The feed it was started in, whose push key it answers to.
+    pub feed: String,
+    pub lower_id: String,
+    pub normalized_version: String,
+    pub name: String,
+    /// The declared total size.
+    pub length: u64,
+    /// Bytes received so far.
+    pub received: u64,
+    /// The SHA-256 (hex) the finished file must have, if the client said.
+    pub expected_sha256: Option<String>,
+    pub expires: chrono::DateTime<chrono::Utc>,
+}
+
 /// How many packages of a feed carry one tag.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TagCount {
@@ -361,6 +398,54 @@ pub trait PackageDatabase: Send + Sync {
     /// how many packages carry each, most used first, at most `limit`.
     async fn tag_counts(&self, feed: &str, limit: i64) -> Result<Vec<TagCount>>;
 
+    // --- files attached to versions (global, like package data) ---
+
+    /// Attach a file. [`Error::PackageAlreadyExists`](crate::error::Error::PackageAlreadyExists)
+    /// when the version already has a file of that name (ignoring case).
+    async fn add_file(&self, file: &PackageFile) -> Result<()>;
+
+    /// A version's files, by name.
+    async fn files_for(&self, id: &str, version: &NuGetVersion) -> Result<Vec<PackageFile>>;
+
+    /// One of a version's files, by name (ignoring case).
+    async fn get_file(
+        &self,
+        id: &str,
+        version: &NuGetVersion,
+        name: &str,
+    ) -> Result<Option<PackageFile>>;
+
+    /// Detach a file, returning what was detached.
+    async fn delete_file(
+        &self,
+        id: &str,
+        version: &NuGetVersion,
+        name: &str,
+    ) -> Result<Option<PackageFile>>;
+
+    /// How many attached files, across all versions, reference a blob.
+    async fn blob_references(&self, sha256: &str) -> Result<i64>;
+
+    /// Count one download of a file.
+    async fn increment_file_downloads(
+        &self,
+        id: &str,
+        version: &NuGetVersion,
+        name: &str,
+    ) -> Result<()>;
+
+    // --- resumable uploads ---
+
+    async fn create_upload(&self, upload: &UploadSession) -> Result<()>;
+    async fn get_upload(&self, id: &str) -> Result<Option<UploadSession>>;
+    async fn set_upload_received(&self, id: &str, received: u64) -> Result<()>;
+    async fn delete_upload(&self, id: &str) -> Result<()>;
+    /// Uploads whose expiry has passed at `now`.
+    async fn expired_uploads(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<UploadSession>>;
+
     // --- symbols (global; keyed by SSQP signature) ---
 
     /// Record a symbol-file mapping: its SSQP `key`/`filename` and the owning
@@ -400,6 +485,10 @@ pub struct DatabaseStats {
     pub total_size: i64,
     /// Number of indexed symbol files.
     pub symbol_count: i64,
+    /// Files attached to the feed's visible versions.
+    pub file_count: i64,
+    /// Their total size, in bytes.
+    pub file_bytes: i64,
 }
 
 /// A symbol file's owning package, resolved from an SSQP lookup.

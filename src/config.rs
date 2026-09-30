@@ -178,6 +178,8 @@ pub struct Config {
     pub retention: RetentionConfig,
     /// Per-IP request rate limiting (brute-force mitigation).
     pub rate_limit: RateLimitConfig,
+    /// Large files (disk images, archives) attached to package versions.
+    pub files: FilesConfig,
     /// Peers whose `X-Forwarded-*`/`X-Real-IP` headers are honoured. Those
     /// headers decide the base URL of every absolute package URL handed to
     /// clients and the identity the rate limiter throttles, so they are only
@@ -469,6 +471,57 @@ impl Default for RateLimitConfig {
     }
 }
 
+/// Files attached to package versions: the disk images (`.wim`) and archives
+/// a package's install script fetches, resumably, at install time.
+///
+/// A file hangs off one id/version, is stored once however many versions
+/// share its content, and goes wherever the version goes — deleted with it,
+/// pruned with it, visible in every feed that holds it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FilesConfig {
+    /// Accept and serve attached files.
+    pub enabled: bool,
+    /// Largest file accepted, in bytes. Unset falls back to
+    /// `max_package_size_bytes`; both unset means unlimited.
+    pub max_file_size_bytes: Option<u64>,
+    /// The file extensions accepted, without the dot, case-insensitively.
+    pub allowed_extensions: Vec<String>,
+    /// How long an unfinished resumable upload may sit before it is dropped.
+    pub upload_expiry_hours: u64,
+    /// A directory scanned for files dropped over SSH (`scp`, `sftp`,
+    /// `rsync`). Unset turns the inbox off.
+    pub inbox_dir: Option<PathBuf>,
+    /// How often the inbox is scanned, in seconds.
+    pub inbox_scan_secs: u64,
+}
+
+impl Default for FilesConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_file_size_bytes: None,
+            allowed_extensions: [
+                "wim", "swm", "esd", "iso", "vhd", "vhdx", "zip", "7z", "cab",
+            ]
+            .map(String::from)
+            .to_vec(),
+            upload_expiry_hours: 72,
+            inbox_dir: None,
+            inbox_scan_secs: 30,
+        }
+    }
+}
+
+impl FilesConfig {
+    /// Whether `ext` (without the dot) is one of the accepted extensions.
+    pub fn allows_extension(&self, ext: &str) -> bool {
+        self.allowed_extensions
+            .iter()
+            .any(|allowed| allowed.trim_start_matches('.').eq_ignore_ascii_case(ext))
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -495,6 +548,7 @@ impl Default for Config {
             primary_client: "choco".to_string(),
             retention: RetentionConfig::default(),
             rate_limit: RateLimitConfig::default(),
+            files: FilesConfig::default(),
             trusted_proxies: Vec::new(),
             cors_allowed_origins: Vec::new(),
             feeds: Vec::new(),
@@ -503,6 +557,13 @@ impl Default for Config {
 }
 
 impl Config {
+    /// The largest attached file accepted, if any limit applies.
+    pub fn max_file_size_bytes(&self) -> Option<u64> {
+        self.files
+            .max_file_size_bytes
+            .or(self.max_package_size_bytes)
+    }
+
     /// The upload idle limit, or `None` when it is turned off.
     pub fn upload_idle_timeout(&self) -> Option<std::time::Duration> {
         (self.upload_idle_timeout_secs > 0)
@@ -639,6 +700,32 @@ impl Config {
         if let Ok(v) = std::env::var("YANUGET_RATELIMIT_WINDOW_SECS") {
             if let Ok(n) = v.parse() {
                 self.rate_limit.window_secs = n;
+            }
+        }
+        if let Ok(v) = std::env::var("YANUGET_FILES_ENABLED") {
+            self.files.enabled = truthy(&v);
+        }
+        if let Ok(v) = std::env::var("YANUGET_FILES_MAX_FILE_SIZE_BYTES") {
+            self.files.max_file_size_bytes = v.trim().parse().ok();
+        }
+        if let Ok(v) = std::env::var("YANUGET_FILES_ALLOWED_EXTENSIONS") {
+            self.files.allowed_extensions = v
+                .split(',')
+                .map(|s| s.trim().trim_start_matches('.').to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+        }
+        if let Ok(v) = std::env::var("YANUGET_FILES_UPLOAD_EXPIRY_HOURS") {
+            if let Ok(n) = v.trim().parse() {
+                self.files.upload_expiry_hours = n;
+            }
+        }
+        if let Ok(v) = std::env::var("YANUGET_FILES_INBOX_DIR") {
+            self.files.inbox_dir = (!v.trim().is_empty()).then(|| PathBuf::from(v.trim()));
+        }
+        if let Ok(v) = std::env::var("YANUGET_FILES_INBOX_SCAN_SECS") {
+            if let Ok(n) = v.trim().parse() {
+                self.files.inbox_scan_secs = n;
             }
         }
         // Set (even to the empty string) this replaces the list wholesale, so an
@@ -779,9 +866,9 @@ impl Config {
 /// Route path segments a feed may not shadow. A feed is mounted at `/{name}`,
 /// so a feed called `health` or `v3` would collide with (or mask) a real route.
 /// `_assets` is where the gallery's font is served, at the root.
-const RESERVED_FEED_NAMES: [&str; 12] = [
+const RESERVED_FEED_NAMES: [&str; 13] = [
     "health", "admin", "docs", "packages", "stats", "settings", "v3", "api", "download", "metrics",
-    "_assets", "tags",
+    "_assets", "tags", "files",
 ];
 
 /// Validate a feed name: non-empty, made only of URL-path-safe characters (so it
