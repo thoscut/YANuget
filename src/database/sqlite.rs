@@ -28,8 +28,9 @@ use crate::models::{DependencyGroup, Package, PackageType};
 use crate::version::NuGetVersion;
 
 use super::{
-    DatabaseStats, FeedVersion, Membership, PackageDatabase, PackageFile, SearchGroup, SearchPage,
-    SearchRequest, SearchSort, SymbolKey, SymbolRef, TagCount, UploadSession,
+    canonical_id, DatabaseStats, FeedVersion, Membership, PackageDatabase, PackageFile,
+    SearchGroup, SearchPage, SearchRequest, SearchSort, SymbolKey, SymbolRef, TagCount,
+    UploadSession,
 };
 
 const SCHEMA: &str = r#"
@@ -492,7 +493,7 @@ impl PackageDatabase for SqliteDatabase {
         let row = sqlx::query(
             "SELECT 1 FROM packages WHERE lower_id = ?1 AND normalized_version = ?2 LIMIT 1",
         )
-        .bind(id.to_lowercase())
+        .bind(canonical_id(id))
         .bind(version.normalized())
         .fetch_optional(&self.pool)
         .await?;
@@ -502,7 +503,7 @@ impl PackageDatabase for SqliteDatabase {
     async fn get_package_data(&self, id: &str, version: &NuGetVersion) -> Result<Option<Package>> {
         let row =
             sqlx::query("SELECT * FROM packages WHERE lower_id = ?1 AND normalized_version = ?2")
-                .bind(id.to_lowercase())
+                .bind(canonical_id(id))
                 .bind(version.normalized())
                 .fetch_optional(&self.pool)
                 .await?;
@@ -510,7 +511,7 @@ impl PackageDatabase for SqliteDatabase {
     }
 
     async fn delete_package_data(&self, id: &str, version: &NuGetVersion) -> Result<bool> {
-        let lower = id.to_lowercase();
+        let lower = canonical_id(id);
         let normalized = version.normalized();
         sqlx::query("DELETE FROM feed_packages WHERE lower_id = ?1 AND normalized_version = ?2")
             .bind(&lower)
@@ -542,7 +543,7 @@ impl PackageDatabase for SqliteDatabase {
         let n: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM feed_packages WHERE lower_id = ?1 AND normalized_version = ?2",
         )
-        .bind(id.to_lowercase())
+        .bind(canonical_id(id))
         .bind(version.normalized())
         .fetch_one(&self.pool)
         .await?;
@@ -557,7 +558,7 @@ impl PackageDatabase for SqliteDatabase {
                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10)"#,
         )
         .bind(&m.feed)
-        .bind(m.lower_id.to_lowercase())
+        .bind(canonical_id(&m.lower_id))
         .bind(&m.normalized_version)
         .bind(i64::from(m.listed))
         .bind(i64::from(m.enabled))
@@ -585,7 +586,7 @@ impl PackageDatabase for SqliteDatabase {
             "DELETE FROM feed_packages WHERE feed = ?1 AND lower_id = ?2 AND normalized_version = ?3",
         )
         .bind(feed)
-        .bind(id.to_lowercase())
+        .bind(canonical_id(id))
         .bind(version.normalized())
         .execute(&self.pool)
         .await?;
@@ -602,7 +603,7 @@ impl PackageDatabase for SqliteDatabase {
             "SELECT * FROM feed_packages WHERE feed = ?1 AND lower_id = ?2 AND normalized_version = ?3",
         )
         .bind(feed)
-        .bind(id.to_lowercase())
+        .bind(canonical_id(id))
         .bind(version.normalized())
         .fetch_optional(&self.pool)
         .await?;
@@ -629,7 +630,7 @@ impl PackageDatabase for SqliteDatabase {
             "UPDATE feed_packages SET pending = 0 WHERE feed = ?1 AND lower_id = ?2 AND normalized_version = ?3",
         )
         .bind(feed)
-        .bind(id.to_lowercase())
+        .bind(canonical_id(id))
         .bind(version.normalized())
         .execute(&self.pool)
         .await?;
@@ -641,7 +642,7 @@ impl PackageDatabase for SqliteDatabase {
             "SELECT 1 FROM feed_packages WHERE feed = ?1 AND lower_id = ?2 AND normalized_version = ?3 LIMIT 1",
         )
         .bind(feed)
-        .bind(id.to_lowercase())
+        .bind(canonical_id(id))
         .bind(version.normalized())
         .fetch_optional(&self.pool)
         .await?;
@@ -655,7 +656,7 @@ impl PackageDatabase for SqliteDatabase {
                AND p.normalized_version = ?3 AND fp.enabled = 1 AND fp.pending = 0"
         ))
         .bind(feed)
-        .bind(id.to_lowercase())
+        .bind(canonical_id(id))
         .bind(version.normalized())
         .fetch_optional(&self.pool)
         .await?;
@@ -670,7 +671,7 @@ impl PackageDatabase for SqliteDatabase {
         id: &str,
         include_unlisted: bool,
     ) -> Result<Vec<Package>> {
-        self.find_versions_filtered(feed, &id.to_lowercase(), true, true, !include_unlisted)
+        self.find_versions_filtered(feed, &canonical_id(id), true, true, !include_unlisted)
             .await
     }
 
@@ -685,7 +686,7 @@ impl PackageDatabase for SqliteDatabase {
             "UPDATE feed_packages SET listed = ?4 WHERE feed = ?1 AND lower_id = ?2 AND normalized_version = ?3",
         )
         .bind(feed)
-        .bind(id.to_lowercase())
+        .bind(canonical_id(id))
         .bind(version.normalized())
         .bind(i64::from(listed))
         .execute(&self.pool)
@@ -704,7 +705,7 @@ impl PackageDatabase for SqliteDatabase {
             "UPDATE feed_packages SET enabled = ?4 WHERE feed = ?1 AND lower_id = ?2 AND normalized_version = ?3",
         )
         .bind(feed)
-        .bind(id.to_lowercase())
+        .bind(canonical_id(id))
         .bind(version.normalized())
         .bind(i64::from(enabled))
         .execute(&self.pool)
@@ -723,7 +724,7 @@ impl PackageDatabase for SqliteDatabase {
             "UPDATE feed_packages SET pinned = ?4 WHERE feed = ?1 AND lower_id = ?2 AND normalized_version = ?3",
         )
         .bind(feed)
-        .bind(id.to_lowercase())
+        .bind(canonical_id(id))
         .bind(version.normalized())
         .bind(i64::from(pinned))
         .execute(&self.pool)
@@ -738,7 +739,7 @@ impl PackageDatabase for SqliteDatabase {
                AND enabled = 1 AND pending = 0 LIMIT 1",
         )
         .bind(feed)
-        .bind(id.to_lowercase())
+        .bind(canonical_id(id))
         .bind(version.normalized())
         .fetch_optional(&self.pool)
         .await?;
@@ -751,7 +752,7 @@ impl PackageDatabase for SqliteDatabase {
             " WHERE fp.feed = ?1 AND fp.lower_id = ?2"
         ))
         .bind(feed)
-        .bind(id.to_lowercase())
+        .bind(canonical_id(id))
         .fetch_all(&self.pool)
         .await?;
         let mut versions = rows
@@ -773,7 +774,7 @@ impl PackageDatabase for SqliteDatabase {
              WHERE feed = ?1 AND lower_id = ?2 AND normalized_version = ?3",
         )
         .bind(feed)
-        .bind(id.to_lowercase())
+        .bind(canonical_id(id))
         .bind(version.normalized())
         .execute(&self.pool)
         .await?;
@@ -899,7 +900,7 @@ impl PackageDatabase for SqliteDatabase {
         skip: i64,
         take: i64,
     ) -> Result<(Vec<String>, i64)> {
-        let q = query.trim().to_lowercase();
+        let q = canonical_id(query.trim());
         let pattern = like_pattern(&q);
         // The version predicates sit inside the grouped scan, so an id survives
         // only if it still has at least one version the caller would accept.
@@ -1058,7 +1059,7 @@ impl PackageDatabase for SqliteDatabase {
                  (lower_id, normalized_version, name, lower_name, sha256, size, uploaded, downloads) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0)",
         )
-        .bind(f.lower_id.to_lowercase())
+        .bind(canonical_id(&f.lower_id))
         .bind(&f.normalized_version)
         .bind(&f.name)
         .bind(f.name.to_lowercase())
@@ -1079,7 +1080,7 @@ impl PackageDatabase for SqliteDatabase {
             "SELECT * FROM package_files WHERE lower_id = ?1 AND normalized_version = ?2 \
              ORDER BY lower_name",
         )
-        .bind(id.to_lowercase())
+        .bind(canonical_id(id))
         .bind(version.normalized())
         .fetch_all(&self.pool)
         .await?;
@@ -1096,7 +1097,7 @@ impl PackageDatabase for SqliteDatabase {
             "SELECT * FROM package_files \
              WHERE lower_id = ?1 AND normalized_version = ?2 AND lower_name = ?3",
         )
-        .bind(id.to_lowercase())
+        .bind(canonical_id(id))
         .bind(version.normalized())
         .bind(name.to_lowercase())
         .fetch_optional(&self.pool)
@@ -1117,7 +1118,7 @@ impl PackageDatabase for SqliteDatabase {
             "DELETE FROM package_files \
              WHERE lower_id = ?1 AND normalized_version = ?2 AND lower_name = ?3",
         )
-        .bind(id.to_lowercase())
+        .bind(canonical_id(id))
         .bind(version.normalized())
         .bind(name.to_lowercase())
         .execute(&self.pool)
@@ -1144,7 +1145,7 @@ impl PackageDatabase for SqliteDatabase {
             "UPDATE package_files SET downloads = downloads + 1 \
              WHERE lower_id = ?1 AND normalized_version = ?2 AND lower_name = ?3",
         )
-        .bind(id.to_lowercase())
+        .bind(canonical_id(id))
         .bind(version.normalized())
         .bind(name.to_lowercase())
         .execute(&self.pool)
@@ -1160,7 +1161,7 @@ impl PackageDatabase for SqliteDatabase {
         )
         .bind(&u.id)
         .bind(&u.feed)
-        .bind(u.lower_id.to_lowercase())
+        .bind(canonical_id(&u.lower_id))
         .bind(&u.normalized_version)
         .bind(&u.name)
         .bind(u.length as i64)
@@ -1230,7 +1231,7 @@ impl PackageDatabase for SqliteDatabase {
         )
         .bind(key.to_uppercase())
         .bind(filename.to_lowercase())
-        .bind(id.to_lowercase())
+        .bind(canonical_id(id))
         .bind(version.normalized())
         .execute(&self.pool)
         .await?;
@@ -1257,7 +1258,7 @@ impl PackageDatabase for SqliteDatabase {
             "SELECT ssqp_key, filename FROM symbols
              WHERE lower_id = ?1 AND normalized_version = ?2",
         )
-        .bind(id.to_lowercase())
+        .bind(canonical_id(id))
         .bind(version.normalized())
         .fetch_all(&self.pool)
         .await?;
@@ -1273,7 +1274,7 @@ impl PackageDatabase for SqliteDatabase {
     async fn delete_symbols(&self, id: &str, version: &NuGetVersion) -> Result<u64> {
         let result =
             sqlx::query("DELETE FROM symbols WHERE lower_id = ?1 AND normalized_version = ?2")
-                .bind(id.to_lowercase())
+                .bind(canonical_id(id))
                 .bind(version.normalized())
                 .execute(&self.pool)
                 .await?;
@@ -1522,6 +1523,20 @@ mod tests {
         // Duplicate membership in the same feed is rejected.
         let err = db.add_to_feed(FEED, &p).await.unwrap_err();
         assert!(matches!(err, Error::PackageAlreadyExists));
+    }
+
+    #[tokio::test]
+    async fn ids_fold_like_storage_and_locks_do() {
+        let db = SqliteDatabase::in_memory().await.unwrap();
+        let p = sample("Kit.Pkg", "1.0.0");
+        db.add_to_feed(FEED, &p).await.unwrap();
+        // The Kelvin sign folds to `k` under Unicode rules only. Storage paths
+        // and the version lock fold ASCII, so the database must not match it
+        // either, or a delete removes rows the lock and the directory miss.
+        let kelvin = "\u{212A}it.Pkg";
+        assert!(!db.exists(FEED, kelvin, &p.version).await.unwrap());
+        assert!(!db.delete_package_data(kelvin, &p.version).await.unwrap());
+        assert!(db.exists(FEED, "KIT.pkg", &p.version).await.unwrap());
     }
 
     #[tokio::test]

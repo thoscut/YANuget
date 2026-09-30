@@ -16,7 +16,7 @@
 use chrono::{DateTime, Duration, Utc};
 
 use crate::config::RetentionConfig;
-use crate::database::{FeedVersion, PackageDatabase};
+use crate::database::{canonical_id, FeedVersion, PackageDatabase};
 use crate::error::Result;
 use crate::models::Package;
 use crate::storage::PackageStorage;
@@ -443,7 +443,7 @@ impl Preview {
         let mut keys: Vec<String> = self
             .planned
             .iter()
-            .map(|p| format!("{}\0{}", p.id.to_lowercase(), p.version.normalized()))
+            .map(|p| format!("{}\0{}", canonical_id(&p.id), p.version.normalized()))
             .collect();
         keys.sort();
         let mut hasher = Sha256::new();

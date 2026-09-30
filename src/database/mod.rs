@@ -26,6 +26,20 @@ use crate::version::NuGetVersion;
 
 pub use sqlite::SqliteDatabase;
 
+/// The canonical, case-folded form of a package id: what every table stores
+/// in `lower_id` and what every lookup binds.
+///
+/// ASCII-only on purpose. Storage paths and the per-version lock fold with
+/// `to_ascii_lowercase`, and a valid id is ASCII anyway, so the database has
+/// to agree with them rather than apply Unicode rules of its own. With
+/// `to_lowercase` here, an id containing the Kelvin sign `K` (which folds to an
+/// ASCII `k` under Unicode rules only) matched a row while missing both the
+/// lock and the directory: a delete removed the rows, orphaned the payload and
+/// was not serialised against a concurrent push of the same version.
+pub fn canonical_id(id: &str) -> String {
+    id.to_ascii_lowercase()
+}
+
 /// A search query against the package index.
 #[derive(Debug, Clone)]
 pub struct SearchRequest {
