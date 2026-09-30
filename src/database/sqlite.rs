@@ -191,7 +191,13 @@ impl SqliteDatabase {
             .filename(path)
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal)
-            .synchronous(SqliteSynchronous::Normal)
+            // `FULL`, not WAL's usual `NORMAL`: under `NORMAL` a power loss can
+            // roll back a committed transaction, and deletes remove the payload
+            // before the rows (see `retention::purge_global_data`). A rolled
+            // back DELETE then brings back rows whose files are already gone.
+            // The cost is one fsync of the WAL per commit, which the payload
+            // writes around it dwarf.
+            .synchronous(SqliteSynchronous::Full)
             .busy_timeout(Duration::from_secs(30))
             .foreign_keys(true);
         let pool = SqlitePoolOptions::new()
@@ -259,7 +265,15 @@ impl SqliteDatabase {
         // server and `yanuget migrate`) both read 0 and produced the same
         // failure. Together these make re-running the migration a no-op instead
         // of an error.
-        let mut tx = pool.begin().await?;
+        //
+        // `BEGIN IMMEDIATE` takes the write lock before `user_version` is read.
+        // A deferred transaction only asks for it at the first write, and a
+        // reader upgrading to a writer while another connection holds the lock
+        // gets `SQLITE_BUSY` at once, without waiting out the busy timeout: the
+        // second of two processes started together failed to open the
+        // database. Taken up front, the loser waits, then reads the version the
+        // winner wrote and has nothing left to do.
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
         let schema_version: i64 = sqlx::query_scalar("PRAGMA user_version")
             .fetch_one(&mut *tx)
             .await?;
@@ -1769,6 +1783,32 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(version, 2);
+    }
+
+    #[tokio::test]
+    async fn two_processes_can_migrate_the_same_file_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("race.db").to_string_lossy().into_owned();
+        {
+            let db = SqliteDatabase::connect(&path).await.unwrap();
+            db.add_to_feed(FEED, &sample("Race.Pkg", "1.0.0-beta"))
+                .await
+                .unwrap();
+            sqlx::query("PRAGMA user_version = 0")
+                .execute(&db.pool)
+                .await
+                .unwrap();
+        }
+        // The server and `yanuget migrate` started together: both must open
+        // the file, and the migrations must run once.
+        let (a, b) = tokio::join!(
+            SqliteDatabase::connect(&path),
+            SqliteDatabase::connect(&path)
+        );
+        let (a, b) = (a.unwrap(), b.unwrap());
+        let v = NuGetVersion::parse("1.0.0-beta").unwrap();
+        assert!(a.find(FEED, "race.pkg", &v).await.unwrap().is_some());
+        assert_eq!(b.feed_count("race.pkg", &v).await.unwrap(), 1);
     }
 
     #[tokio::test]
