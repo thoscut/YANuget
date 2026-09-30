@@ -322,6 +322,11 @@ require a credential, supplied either as an `X-NuGet-ApiKey` header or as the
 password of HTTP Basic credentials (what `dotnet`/`nuget` send). The
 `/v3/index.json` service index stays open so clients can discover the feed.
 
+A read-gated feed is left off the feed index at the server root, which anyone
+can read: its name can say as much as its contents, and its users already have
+its address. The index says that such feeds exist, without naming or counting
+them.
+
 ### Release rings & approval
 
 `requires_approval = true` makes every version entering a feed (by push,

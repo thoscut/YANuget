@@ -321,11 +321,14 @@ pub fn build_app(states: Vec<AppState>) -> Router {
     if states.len() == 1 && states[0].feed.prefix.is_empty() {
         top = top.merge(feed_routes(states.into_iter().next().expect("one state")));
     } else {
+        // Read-gated feeds are left off the public index (see
+        // `feeds_index_page`).
         let index: Vec<(String, String)> = states
             .iter()
+            .filter(|s| !s.feed.read_auth.is_enabled())
             .map(|s| (s.feed.name.clone(), s.feed.prefix.clone()))
             .collect();
-        let html = ui::feeds_index_page(&index);
+        let html = ui::feeds_index_page(&index, index.len() < states.len());
         top = top.route(
             "/",
             get(move || {
@@ -970,6 +973,7 @@ async fn health_live() -> &'static str {
 
 async fn index_page(State(state): State<AppState>, headers: HeaderMap) -> Html<String> {
     let urls = state.url_builder(&headers);
+    // Built from the request's `Host`, so escaped like every other sink.
     Html(format!(
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
          <title>YANuget</title></head><body>\

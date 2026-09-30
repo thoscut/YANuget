@@ -1954,7 +1954,12 @@ pub fn admin_retention_page(urls: &UrlBuilder, view: &RetentionView) -> String {
 
 /// The root feed index, shown when more than one feed is hosted. Each entry is
 /// `(feed name, path prefix)` where the prefix is e.g. `/stable`.
-pub fn feeds_index_page(feeds: &[(String, String)]) -> String {
+///
+/// Only feeds anyone may read are listed. A read-gated feed's name is itself
+/// something its key withholds (`internal-security-fixes` says plenty), and
+/// its users already have its address; `some_hidden` adds one line saying
+/// such feeds exist, without naming or counting them.
+pub fn feeds_index_page(feeds: &[(String, String)], some_hidden: bool) -> String {
     let urls = UrlBuilder::new("");
     let mut list = String::from("<ul class=\"rank\">");
     for (name, prefix) in feeds {
@@ -1966,10 +1971,16 @@ pub fn feeds_index_page(feeds: &[(String, String)]) -> String {
         ));
     }
     list.push_str("</ul>");
+    let hidden = if some_hidden {
+        "<p class=\"muted\">Feeds that require credentials are not listed here; \
+         ask whoever runs this server for their address.</p>"
+    } else {
+        ""
+    };
     let body = format!(
         "<h1 class=\"title\">Feeds</h1>\
          <p class=\"muted\">This server hosts several NuGet feeds. Pick one:</p>\
-         <div class=\"card\">{list}</div>"
+         <div class=\"card\">{list}</div>{hidden}"
     );
     layout_with_chrome(
         &urls,
@@ -2943,10 +2954,13 @@ mod tests {
         // else — every feed route lives under `/{name}`. The shared chrome
         // pointed the search form and three footer links at feed routes, so the
         // first page a visitor saw had a search box returning a bare 404.
-        let html = feeds_index_page(&[
-            ("stable".into(), "/stable".into()),
-            ("dev".into(), "/dev".into()),
-        ]);
+        let html = feeds_index_page(
+            &[
+                ("stable".into(), "/stable".into()),
+                ("dev".into(), "/dev".into()),
+            ],
+            false,
+        );
         assert!(
             !html.contains("<form"),
             "no search form at the root: {html}"
@@ -4057,12 +4071,17 @@ mod tests {
 
     #[test]
     fn feeds_index_lists_feeds() {
-        let html = feeds_index_page(&[
-            ("stable".into(), "/stable".into()),
-            ("dev".into(), "/dev".into()),
-        ]);
+        let html = feeds_index_page(
+            &[
+                ("stable".into(), "/stable".into()),
+                ("dev".into(), "/dev".into()),
+            ],
+            false,
+        );
         assert!(html.contains("href=\"/stable\""));
         assert!(html.contains("/dev/v3/index.json"));
+        assert!(!html.contains("require credentials"));
+        assert!(feeds_index_page(&[], true).contains("require credentials"));
     }
 
     fn sample() -> Package {

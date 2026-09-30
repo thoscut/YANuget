@@ -536,6 +536,47 @@ async fn a_browser_write_from_another_site_is_refused() {
     assert_eq!(read.status(), StatusCode::OK);
 }
 
+#[tokio::test]
+async fn the_plain_index_page_escapes_the_host() {
+    let server = spawn_with(|c| c.enable_web_ui = false).await;
+    let resp = server
+        .client
+        .get(server.url("/"))
+        .header("Host", "h\"><b>x</b>")
+        .send()
+        .await
+        .unwrap();
+    let html = resp.text().await.unwrap();
+    assert!(!html.contains("<b>x</b>"), "{html}");
+    assert!(html.contains("&lt;b&gt;"), "{html}");
+}
+
+#[tokio::test]
+async fn the_feed_index_does_not_name_gated_feeds() {
+    let server = spawn_feeds(|c| {
+        c.feeds = vec![
+            feed("public-feed"),
+            FeedConfig {
+                read_api_key: Some("reader".into()),
+                ..feed("secret-project")
+            },
+        ];
+    })
+    .await;
+    let html = server
+        .client
+        .get(server.url("/"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(html.contains("public-feed"));
+    assert!(!html.contains("secret-project"), "{html}");
+    assert!(html.contains("require credentials"));
+}
+
 // ---------------------------------------------------------------------------
 // Ids in URLs (SEC-22)
 // ---------------------------------------------------------------------------
