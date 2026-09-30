@@ -26,10 +26,14 @@ use crate::version::NuGetVersion;
 
 /// A client for one upstream V3 feed, with its service-index resources resolved
 /// lazily on first use and cached thereafter.
-#[derive(Debug)]
 pub struct MirrorClient {
     client: reqwest::Client,
     upstream: String,
+    /// The service index's origin: the only one the credentials are sent to.
+    upstream_origin: Origin,
+    /// The configured credentials, attached per request by [`Self::send`] —
+    /// never as client-wide defaults, which go wherever a request goes.
+    credentials: reqwest::header::HeaderMap,
     /// Permit upstream resource URLs that resolve to private/loopback hosts.
     allow_private_upstream: bool,
     /// Cap on a single mirrored `.nupkg`, in bytes.
@@ -44,6 +48,43 @@ pub struct MirrorClient {
     download_deadline: Option<std::time::Duration>,
     resources: OnceCell<MirrorResources>,
 }
+
+impl std::fmt::Debug for MirrorClient {
+    /// The upstream without its userinfo, and the credentials by header name
+    /// only: a `{:?}` in a log line must not print the secrets.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MirrorClient")
+            .field("upstream", &redact_url(&self.upstream))
+            .field("credentials", &self.credentials.keys().collect::<Vec<_>>())
+            .field("allow_private_upstream", &self.allow_private_upstream)
+            .field("max_package_size_bytes", &self.max_package_size_bytes)
+            .field("max_versions_per_package", &self.max_versions_per_package)
+            .field("timeout", &self.timeout)
+            .field("download_deadline", &self.download_deadline)
+            .finish_non_exhaustive()
+    }
+}
+
+/// `(scheme, host, port)`: what two URLs must share for a credential meant for
+/// one to be sent to the other.
+type Origin = (String, String, u16);
+
+fn origin(url: &reqwest::Url) -> Option<Origin> {
+    Some((
+        url.scheme().to_string(),
+        url.host_str()?.to_ascii_lowercase(),
+        url.port_or_known_default()?,
+    ))
+}
+
+/// How many redirects one upstream request may follow.
+const MAX_REDIRECTS: usize = 5;
+
+/// Cap on one upstream JSON document (service index, version list, search,
+/// catalog or registration page). The largest real ones — catalog pages — are
+/// well under a megabyte; the cap only stops an upstream from streaming an
+/// endless body into memory.
+const MAX_JSON_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 struct MirrorResources {
@@ -147,6 +188,10 @@ impl MirrorClient {
     }
 
     fn build(config: &MirrorConfig, env_proxy: bool) -> Option<Self> {
+        let upstream_origin = reqwest::Url::parse(&config.upstream)
+            .ok()
+            .as_ref()
+            .and_then(origin)?;
         // Connecting and every read are bounded on the client. A read timeout
         // restarts with each chunk received, so it limits how long the upstream
         // may go silent, not how long a transfer may take; each request adds a
@@ -156,7 +201,9 @@ impl MirrorClient {
             .connect_timeout(timeout)
             .read_timeout(timeout)
             .user_agent(concat!("yanuget/", env!("CARGO_PKG_VERSION")))
-            .default_headers(auth_headers(&config.auth));
+            // Redirects are followed by `send`, which knows which hops may
+            // carry the credentials; reqwest's policy cannot be told.
+            .redirect(reqwest::redirect::Policy::none());
         // reqwest honours `HTTP(S)_PROXY` from the environment by default. For
         // a server that is a surprise egress path chosen by whoever set up the
         // process environment, and a proxy resolves names itself, past the
@@ -175,47 +222,11 @@ impl MirrorClient {
         if !config.allow_private_upstream {
             builder = builder.dns_resolver(std::sync::Arc::new(GuardedResolver { proxy_host }));
         }
-        // Upstream credentials ride on every request as default headers. reqwest
-        // drops `Authorization` on a cross-host redirect, but it cannot know that
-        // an operator's custom `headers` entry (`X-Feed-Key: …`) is a secret too
-        // — so when any credential is configured, redirects may not leave the
-        // host they started on. An upstream cannot then bounce the mirror at a
-        // collector and harvest the feed token.
-        //
-        // Every hop is re-checked, not just the URL we started with. `check_url`
-        // vets a resource URL before the request, but a redirect chooses a new
-        // one *after* it — so a `302` to `http://169.254.169.254/…` or an
-        // address on the server's own network walked straight past the guard,
-        // and the read path that triggers a mirror fetch is reachable without
-        // authentication.
-        let credentialed = config.auth.is_set();
-        let allow_private = config.allow_private_upstream;
-        builder = builder.redirect(reqwest::redirect::Policy::custom(move |attempt| {
-            if attempt.previous().len() > 5 {
-                return attempt.error("too many redirects");
-            }
-            if !matches!(attempt.url().scheme(), "http" | "https") {
-                return attempt.error("redirect to a non-HTTP scheme");
-            }
-            if !allow_private {
-                if let Some(host) = attempt.url().host_str() {
-                    if crate::proxy::is_private_host(host) {
-                        return attempt.error("redirect to a private address");
-                    }
-                }
-            }
-            if credentialed {
-                let same_host = attempt.previous().last().and_then(|p| p.host_str())
-                    == attempt.url().host_str();
-                if !same_host {
-                    return attempt.stop();
-                }
-            }
-            attempt.follow()
-        }));
         Some(Self {
             client: builder.build().ok()?,
             upstream: config.upstream.clone(),
+            upstream_origin,
+            credentials: auth_headers(&config.auth),
             allow_private_upstream: config.allow_private_upstream,
             max_package_size_bytes: config.max_package_size_bytes,
             max_versions_per_package: config.max_versions_per_package,
@@ -254,14 +265,18 @@ impl MirrorClient {
     fn check_url(&self, url: &str, what: &str) -> Result<()> {
         let parsed = reqwest::Url::parse(url)
             .map_err(|e| Error::Other(anyhow::anyhow!("upstream {what} url is invalid: {e}")))?;
-        if !matches!(parsed.scheme(), "http" | "https") {
+        self.check_parsed(&parsed, what)
+    }
+
+    fn check_parsed(&self, url: &reqwest::Url, what: &str) -> Result<()> {
+        if !matches!(url.scheme(), "http" | "https") {
             return Err(Error::Other(anyhow::anyhow!(
                 "upstream {what} url uses unsupported scheme {:?}",
-                parsed.scheme()
+                url.scheme()
             )));
         }
         if !self.allow_private_upstream {
-            if let Some(host) = parsed.host_str() {
+            if let Some(host) = url.host_str() {
                 if crate::proxy::is_private_host(host) {
                     return Err(Error::Other(anyhow::anyhow!(
                         "upstream {what} url points at the private address {host}; \
@@ -278,10 +293,170 @@ impl MirrorClient {
         match self.check_url(url, what) {
             Ok(()) => true,
             Err(e) => {
-                tracing::warn!(%url, error = %e, "ignoring upstream resource");
+                tracing::warn!(url = %redact_url(url), error = %e, "ignoring upstream resource");
                 false
             }
         }
+    }
+
+    /// Whether a request to `url` may carry the configured credentials: only
+    /// when it goes to the upstream's own scheme, host and port.
+    ///
+    /// Every other URL the mirror fetches was named by the upstream — the
+    /// `PackageBaseAddress`, the search and catalog resources, catalog pages,
+    /// redirect targets — and a credential sent wherever those point is one a
+    /// hostile or compromised upstream can collect by pointing them at itself.
+    fn carries_credentials(&self, url: &reqwest::Url) -> bool {
+        origin(url).as_ref() == Some(&self.upstream_origin)
+    }
+
+    /// GET `url`, following redirects here rather than in reqwest.
+    ///
+    /// reqwest's own redirect handling cannot be told which headers are
+    /// secret: it drops `Authorization` when the host or port changes, but
+    /// not an operator's `X-Feed-Key`, and not on a downgrade from https to
+    /// http on the same host. So each hop is a request of its own. Every hop
+    /// is vetted like the first URL (a `302` to `http://169.254.169.254/`
+    /// otherwise walks past the check), a hop from https to http is refused,
+    /// and the credentials go only on a hop whose origin is the upstream's.
+    /// A download a credentialed upstream hands off to a CDN or blob store is
+    /// therefore followed *without* them — which is what such signed links
+    /// are for — instead of being stored as the redirect's body.
+    ///
+    /// `deadline` bounds the whole exchange, every hop and the body included.
+    async fn send(
+        &self,
+        url: &str,
+        what: &str,
+        deadline: Option<std::time::Duration>,
+    ) -> Result<reqwest::Response> {
+        let started = tokio::time::Instant::now();
+        let mut current = reqwest::Url::parse(url)
+            .map_err(|e| Error::Other(anyhow::anyhow!("upstream {what} url is invalid: {e}")))?;
+        self.check_parsed(&current, what)?;
+        for _ in 0..=MAX_REDIRECTS {
+            let mut request = self.client.get(current.clone());
+            if self.carries_credentials(&current) {
+                request = request.headers(self.credentials.clone());
+            }
+            if let Some(deadline) = deadline {
+                let left = deadline.saturating_sub(started.elapsed());
+                if left.is_zero() {
+                    return Err(Error::Other(anyhow::anyhow!(
+                        "upstream {what} {} timed out",
+                        redact_url(current.as_str())
+                    )));
+                }
+                request = request.timeout(left);
+            }
+            let resp = request
+                .send()
+                .await
+                .map_err(|e| request_error(&current, e))?;
+            if !resp.status().is_redirection() {
+                return Ok(resp);
+            }
+            let location = resp
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .ok_or_else(|| {
+                    Error::Other(anyhow::anyhow!(
+                        "upstream {what} {} answered {} without a usable Location",
+                        redact_url(current.as_str()),
+                        resp.status()
+                    ))
+                })?;
+            current = self.redirect_target(&current, location, what)?;
+        }
+        Err(Error::Other(anyhow::anyhow!(
+            "upstream {what} {} redirected more than {MAX_REDIRECTS} times",
+            redact_url(url)
+        )))
+    }
+
+    /// Where a redirect from `current` to `location` leads, if it may be
+    /// followed at all.
+    fn redirect_target(
+        &self,
+        current: &reqwest::Url,
+        location: &str,
+        what: &str,
+    ) -> Result<reqwest::Url> {
+        let next = current.join(location).map_err(|e| {
+            Error::Other(anyhow::anyhow!(
+                "upstream {what} {} redirected to an invalid url: {e}",
+                redact_url(current.as_str())
+            ))
+        })?;
+        if current.scheme() == "https" && next.scheme() == "http" {
+            return Err(Error::Other(anyhow::anyhow!(
+                "upstream {what} {} redirected from https to http ({}); refusing the downgrade",
+                redact_url(current.as_str()),
+                redact_url(next.as_str())
+            )));
+        }
+        self.check_parsed(&next, what)?;
+        Ok(next)
+    }
+
+    /// Turn a non-success status into an error that says where it came from,
+    /// and why, when the likely cause is that credentials were withheld.
+    fn check_status(&self, resp: reqwest::Response, what: &str) -> Result<reqwest::Response> {
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(resp);
+        }
+        let hint = if matches!(status.as_u16(), 401 | 403)
+            && !self.credentials.is_empty()
+            && !self.carries_credentials(resp.url())
+        {
+            let (scheme, host, port) = &self.upstream_origin;
+            format!("; credentials are only sent to {scheme}://{host}:{port}")
+        } else {
+            String::new()
+        };
+        Err(Error::Other(anyhow::anyhow!(
+            "upstream {what} {} answered {status}{hint}",
+            redact_url(resp.url().as_str())
+        )))
+    }
+
+    /// Fetch and parse one upstream JSON document: the single path every
+    /// metadata request takes, so each is vetted ([`Self::send`]), carries the
+    /// credentials only where they belong, is bounded in time by
+    /// `timeout_secs` and in size by [`MAX_JSON_BYTES`]. `None` is a 404.
+    async fn get_json(&self, url: &str, what: &str) -> Result<Option<serde_json::Value>> {
+        let resp = self.send(url, what, Some(self.timeout)).await?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let resp = self.check_status(resp, what)?;
+        let too_large = || {
+            Error::Other(anyhow::anyhow!(
+                "upstream {what} {} is larger than {MAX_JSON_BYTES} bytes",
+                redact_url(url)
+            ))
+        };
+        if resp.content_length().is_some_and(|n| n > MAX_JSON_BYTES) {
+            return Err(too_large());
+        }
+        let final_url = resp.url().clone();
+        let mut body = Vec::new();
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| request_error(&final_url, e))?;
+            if (body.len() + chunk.len()) as u64 > MAX_JSON_BYTES {
+                return Err(too_large());
+            }
+            body.extend_from_slice(&chunk);
+        }
+        serde_json::from_slice(&body).map(Some).map_err(|e| {
+            Error::Other(anyhow::anyhow!(
+                "upstream {what} {} is not valid JSON: {e}",
+                redact_url(url)
+            ))
+        })
     }
 
     /// The upstream service-index URL this client mirrors from.
@@ -312,24 +487,15 @@ impl MirrorClient {
     async fn resources(&self) -> Result<&MirrorResources> {
         self.resources
             .get_or_try_init(|| async {
-                self.check_url(&self.upstream, "service index")?;
-                let index: serde_json::Value = self
-                    .client
-                    .get(&self.upstream)
-                    .timeout(self.timeout)
-                    .send()
-                    .await
-                    .map_err(mirror_err)?
-                    .error_for_status()
-                    .map_err(mirror_err)?
-                    .json()
-                    .await
-                    .map_err(mirror_err)?;
+                let index = self
+                    .get_json(&self.upstream, "service index")
+                    .await?
+                    .ok_or_else(|| not_found("service index", &self.upstream))?;
                 let package_base =
                     find_resource(&index, "PackageBaseAddress/3.0.0").ok_or_else(|| {
                         Error::Other(anyhow::anyhow!(
                             "upstream {} has no PackageBaseAddress resource",
-                            self.upstream
+                            redact_url(&self.upstream)
                         ))
                     })?;
                 // Search service type names are versioned; accept whichever the
@@ -362,18 +528,9 @@ impl MirrorClient {
     pub async fn upstream_versions(&self, lower_id: &str) -> Result<Vec<String>> {
         let base = &self.resources().await?.package_base;
         let url = format!("{base}{lower_id}/index.json");
-        let resp = self
-            .client
-            .get(&url)
-            .timeout(self.timeout)
-            .send()
-            .await
-            .map_err(mirror_err)?;
-        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        let Some(doc) = self.get_json(&url, "version list").await? else {
             return Ok(Vec::new());
-        }
-        let resp = resp.error_for_status().map_err(mirror_err)?;
-        let doc: serde_json::Value = resp.json().await.map_err(mirror_err)?;
+        };
         Ok(doc
             .get("versions")
             .and_then(|v| v.as_array())
@@ -397,16 +554,8 @@ impl MirrorClient {
     ) -> Result<streaming::StreamSummary> {
         let base = &self.resources().await?.package_base;
         let url = format!("{base}{lower_id}/{version}/{lower_id}.{version}.nupkg");
-        let mut request = self.client.get(&url);
-        if let Some(deadline) = self.download_deadline {
-            request = request.timeout(deadline);
-        }
-        let resp = request
-            .send()
-            .await
-            .map_err(mirror_err)?
-            .error_for_status()
-            .map_err(mirror_err)?;
+        let resp = self.send(&url, "package", self.download_deadline).await?;
+        let resp = self.check_status(resp, "package")?;
         // Reject an over-sized package before a single byte hits the disk when
         // the upstream is honest about its length; the streaming cap below is
         // the real enforcement for when it is not.
@@ -420,7 +569,7 @@ impl MirrorClient {
         let mut file = tokio::fs::File::create(dest).await?;
         let stream = resp
             .bytes_stream()
-            .map(|r| r.map_err(|e| std::io::Error::other(e.to_string())));
+            .map(|r| r.map_err(|e| std::io::Error::other(error_chain(&e.without_url()))));
         // A mirror fetch is triggered by an ordinary (possibly anonymous) read,
         // so an unbounded copy here would let anyone fill the disk by naming
         // packages upstream happens to host. The push path is capped; so is this.
@@ -467,7 +616,7 @@ impl MirrorClient {
         }
         Err(Error::Other(anyhow::anyhow!(
             "upstream {} exposes neither SearchQueryService nor Catalog/3.0.0; cannot enumerate packages",
-            self.upstream
+            redact_url(&self.upstream)
         )))
     }
 
@@ -493,18 +642,10 @@ impl MirrorClient {
             let url = format!(
                 "{search}{sep}q=&skip={skip}&take={PAGE}&prerelease=true&semVerLevel=2.0.0"
             );
-            let doc: serde_json::Value = self
-                .client
-                .get(&url)
-                .timeout(self.timeout)
-                .send()
-                .await
-                .map_err(mirror_err)?
-                .error_for_status()
-                .map_err(mirror_err)?
-                .json()
-                .await
-                .map_err(mirror_err)?;
+            let doc = self
+                .get_json(&url, "search page")
+                .await?
+                .ok_or_else(|| not_found("search page", &url))?;
 
             let page_len = doc
                 .get("data")
@@ -522,7 +663,7 @@ impl MirrorClient {
             // honouring `skip` — it would answer every later page the same way.
             if ids.len() == known {
                 tracing::warn!(
-                    upstream = %self.upstream,
+                    upstream = %redact_url(&self.upstream),
                     skip,
                     "search page repeated earlier results; stopping enumeration"
                 );
@@ -531,7 +672,7 @@ impl MirrorClient {
             skip += page_len;
         }
         tracing::warn!(
-            upstream = %self.upstream,
+            upstream = %redact_url(&self.upstream),
             pages = MAX_PAGES,
             "search enumeration hit its page limit; the id list may be incomplete"
         );
@@ -541,18 +682,10 @@ impl MirrorClient {
     /// Walk the upstream `Catalog/3.0.0` (index → pages → items), collecting
     /// every package id. Best-effort: a page that fails to load is skipped.
     async fn enumerate_via_catalog(&self, catalog: &str) -> Result<Vec<String>> {
-        let index: serde_json::Value = self
-            .client
-            .get(catalog)
-            .timeout(self.timeout)
-            .send()
-            .await
-            .map_err(mirror_err)?
-            .error_for_status()
-            .map_err(mirror_err)?
-            .json()
-            .await
-            .map_err(mirror_err)?;
+        let index = self
+            .get_json(catalog, "catalog index")
+            .await?
+            .ok_or_else(|| not_found("catalog index", catalog))?;
 
         let pages: Vec<String> = index
             .get("items")
@@ -566,23 +699,16 @@ impl MirrorClient {
 
         let mut ids = DedupIds::new();
         for page_url in pages {
-            let page: serde_json::Value = match self
-                .client
-                .get(&page_url)
-                .timeout(self.timeout)
-                .send()
-                .await
-                .and_then(|r| r.error_for_status())
-            {
-                Ok(resp) => match resp.json().await {
-                    Ok(json) => json,
-                    Err(e) => {
-                        tracing::warn!(page = %page_url, error = %e, "catalog page parse failed");
-                        continue;
-                    }
-                },
+            // Page URLs come from the catalog index, so `get_json` vets each
+            // one like any other upstream-chosen URL.
+            let page = match self.get_json(&page_url, "catalog page").await {
+                Ok(Some(page)) => page,
+                Ok(None) => {
+                    tracing::warn!(page = %redact_url(&page_url), "catalog page not found");
+                    continue;
+                }
                 Err(e) => {
-                    tracing::warn!(page = %page_url, error = %e, "catalog page fetch failed");
+                    tracing::warn!(page = %redact_url(&page_url), error = %e, "catalog page fetch failed");
                     continue;
                 }
             };
@@ -596,6 +722,14 @@ impl MirrorClient {
         }
         Ok(ids.into_vec())
     }
+}
+
+/// The error for a document the upstream said does not exist.
+fn not_found(what: &str, url: &str) -> Error {
+    Error::Other(anyhow::anyhow!(
+        "upstream {what} {} answered 404 Not Found",
+        redact_url(url)
+    ))
 }
 
 /// Extract the package ids from one `SearchQueryService` response page.
@@ -786,11 +920,52 @@ fn ensure_trailing_slash(s: &str) -> String {
     }
 }
 
-fn mirror_err(e: reqwest::Error) -> Error {
-    Error::Other(anyhow::anyhow!("upstream request failed: {e}"))
+/// An error from sending an upstream request, without the URL reqwest would
+/// put in it (it can carry userinfo or a token in the query) but with the
+/// cause chain, which is where "timed out" or "resolves to the private
+/// address" lives.
+fn request_error(url: &reqwest::Url, e: reqwest::Error) -> Error {
+    Error::Other(anyhow::anyhow!(
+        "upstream request to {} failed: {}",
+        redact_url(url.as_str()),
+        error_chain(&e.without_url())
+    ))
 }
 
-/// Build the default header map a mirror client sends on every upstream request
+/// An error's message followed by each distinct cause's.
+fn error_chain(e: &dyn std::error::Error) -> String {
+    let mut out = e.to_string();
+    let mut source = e.source();
+    while let Some(cause) = source {
+        let msg = cause.to_string();
+        if !out.contains(&msg) {
+            out.push_str(": ");
+            out.push_str(&msg);
+        }
+        source = cause.source();
+    }
+    out
+}
+
+/// A URL as it may appear in a log line or on screen: without userinfo, and
+/// with any query replaced, since both are where feeds put credentials
+/// (`https://user:token@host/…`, a signed `?sig=…` download link).
+pub fn redact_url(url: &str) -> String {
+    match reqwest::Url::parse(url) {
+        Ok(mut parsed) => {
+            let _ = parsed.set_username("");
+            let _ = parsed.set_password(None);
+            if parsed.query().is_some() {
+                parsed.set_query(Some("redacted"));
+            }
+            parsed.set_fragment(None);
+            parsed.to_string()
+        }
+        Err(_) => "<unparseable url>".to_string(),
+    }
+}
+
+/// Build the header map a mirror client sends to the upstream's own origin
 /// from its configured credentials. Basic and Bearer both populate
 /// `Authorization` (Basic wins if both are set); custom headers are added as-is.
 /// Malformed header names/values are skipped with a warning rather than failing
@@ -988,6 +1163,85 @@ mod tests {
             .is_ok());
         // ...but that opt-in still does not enable other schemes.
         assert!(private_ok.check_url("file:///etc/passwd", "index").is_err());
+    }
+
+    fn url(s: &str) -> reqwest::Url {
+        reqwest::Url::parse(s).unwrap()
+    }
+
+    #[test]
+    fn credentials_go_to_the_upstreams_own_origin_only() {
+        let client = MirrorClient::from_config(&MirrorConfig {
+            enabled: true,
+            upstream: "https://Feed.Example/v3/index.json".into(),
+            auth: MirrorAuthConfig {
+                token: Some("secret".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .unwrap();
+        for same in [
+            "https://feed.example/v3/flat/",
+            "https://feed.example:443/v3/flat/x/index.json",
+            "https://FEED.example/other",
+        ] {
+            assert!(client.carries_credentials(&url(same)), "{same}");
+        }
+        for other in [
+            "https://cdn.example/v3/flat/",       // another host
+            "https://feed.example:8443/v3/flat/", // another port
+            "http://feed.example/v3/flat/",       // another scheme
+            "https://feed.example.evil/v3/flat/",
+        ] {
+            assert!(!client.carries_credentials(&url(other)), "{other}");
+        }
+    }
+
+    #[test]
+    fn redirects_are_vetted_like_the_first_url_and_never_downgrade() {
+        let client = MirrorClient::from_config(&MirrorConfig {
+            enabled: true,
+            ..Default::default()
+        })
+        .unwrap();
+        let from = url("https://feed.example/flat/a/1.0.0/a.1.0.0.nupkg");
+        // Relative and cross-host redirects are fine in themselves.
+        assert_eq!(
+            client
+                .redirect_target(&from, "/blobs/a.nupkg", "package")
+                .unwrap()
+                .as_str(),
+            "https://feed.example/blobs/a.nupkg"
+        );
+        assert!(client
+            .redirect_target(&from, "https://cdn.example/a.nupkg?sig=x", "package")
+            .is_ok());
+        for refused in [
+            "http://feed.example/a.nupkg", // https → http
+            "http://169.254.169.254/latest/meta-data/",
+            "https://127.0.0.1/a.nupkg",
+            "https://localhost./a.nupkg",
+            "file:///etc/passwd",
+        ] {
+            assert!(
+                client.redirect_target(&from, refused, "package").is_err(),
+                "{refused} should be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn urls_are_redacted_for_logs() {
+        assert_eq!(
+            redact_url("https://user:pa55@feed.example/v3/index.json"),
+            "https://feed.example/v3/index.json"
+        );
+        assert_eq!(
+            redact_url("https://cdn.example/a.nupkg?sig=secret&se=2026#frag"),
+            "https://cdn.example/a.nupkg?redacted"
+        );
+        assert_eq!(redact_url("not a url with a token"), "<unparseable url>");
     }
 
     #[tokio::test]
