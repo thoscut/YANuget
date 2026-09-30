@@ -625,6 +625,104 @@ async fn an_id_no_package_could_have_reaches_nothing() {
 }
 
 // ---------------------------------------------------------------------------
+// Read-gated feeds (TEST-02)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_read_key_gates_every_read_route_in_both_forms() {
+    let server = spawn_feeds(|c| {
+        // Every route is tried with a wrong key too; that is not what this
+        // test is about.
+        c.rate_limit.max_failed_auth = 0;
+        c.feeds = vec![FeedConfig {
+            read_api_key: Some("reader".into()),
+            ..feed("g")
+        }];
+    })
+    .await;
+    assert_eq!(
+        push(&server, "/g", API_KEY, build_nupkg("Read.Pkg", "1.0.0")).await,
+        StatusCode::CREATED
+    );
+    let routes = [
+        "/g/v3/package/read.pkg/index.json",
+        "/g/v3/package/read.pkg/1.0.0/read.pkg.1.0.0.nupkg",
+        "/g/v3/package/read.pkg/1.0.0/read.pkg.nuspec",
+        "/g/v3/registration/read.pkg/index.json",
+        "/g/v3/registration/read.pkg/page/1.0.0/1.0.0.json",
+        "/g/v3/registration/read.pkg/1.0.0.json",
+        "/g/v3/registration-semver2/read.pkg/index.json",
+        "/g/v3/registration-semver2/read.pkg/page/1.0.0/1.0.0.json",
+        "/g/v3/registration-semver2/read.pkg/1.0.0.json",
+        "/g/v3/search?q=read",
+        "/g/v3/autocomplete?q=read",
+        "/g/v3/autocomplete?id=read.pkg",
+        "/g",
+        "/g/packages",
+        "/g/packages/read.pkg",
+        "/g/packages/read.pkg/1.0.0",
+        "/g/packages/read.pkg/1.0.0/icon",
+        "/g/stats",
+        "/g/tags",
+        "/g/settings",
+        "/g/files/read.pkg/1.0.0/index.json",
+        "/g/download/symbols/lib.pdb/0123456789abcdef0123456789abcdefffffffff/lib.pdb",
+    ];
+    for route in routes {
+        let anonymous = server.client.get(server.url(route)).send().await.unwrap();
+        assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED, "{route}");
+        // The challenge is what makes a NuGet client send its credentials.
+        assert!(
+            anonymous.headers().contains_key("www-authenticate"),
+            "{route}"
+        );
+
+        let wrong = server
+            .client
+            .get(server.url(route))
+            .basic_auth("dotnet", Some("not-the-key"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED, "{route}");
+
+        // The key as a header, and as the password of HTTP Basic — which is
+        // what `dotnet` and `nuget` send. The symbol key names nothing, so a
+        // 404 there still proves the gate let the request through.
+        let with_header = server
+            .client
+            .get(server.url(route))
+            .header("X-NuGet-ApiKey", "reader")
+            .send()
+            .await
+            .unwrap();
+        let with_basic = server
+            .client
+            .get(server.url(route))
+            .basic_auth("anyone", Some("reader"))
+            .send()
+            .await
+            .unwrap();
+        for resp in [with_header, with_basic] {
+            let status = resp.status();
+            if route.contains("/download/symbols/") {
+                assert_eq!(status, StatusCode::NOT_FOUND, "{route}");
+            } else {
+                assert!(status.is_success(), "{route}: {status}");
+            }
+        }
+    }
+    // Discovery stays open, so a client can find out it needs a key.
+    let index = server
+        .client
+        .get(server.url("/g/v3/index.json"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(index.status(), StatusCode::OK);
+}
+
+// ---------------------------------------------------------------------------
 // Caching (SEC-04, COR-12, SEC-25, COR-25)
 // ---------------------------------------------------------------------------
 
