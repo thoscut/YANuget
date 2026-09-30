@@ -175,6 +175,19 @@ async fn index_inner(
     let mut overwriting = false;
     if db.exists(feed, &id, &version).await? {
         if options.overwrite.allows(version.is_prerelease()) {
+            // Another feed holding this version pins its payload: the stored
+            // bytes cannot be replaced from here, so only an identical
+            // re-push can succeed. Checked *before* anything is removed — the
+            // check further down used to run after this feed's membership was
+            // already gone, so a refused overwrite silently took the version
+            // out of the feed.
+            if db.feed_count(&id, &version).await? > 1 {
+                if let Some(existing) = db.get_package_data(&id, &version).await? {
+                    if existing.package_hash != package.package_hash {
+                        return Err(Error::PackageAlreadyExists);
+                    }
+                }
+            }
             db.remove_membership(feed, &id, &version).await?;
             // If no other feed references the version, drop the orphaned global
             // metadata so the re-push records its own.

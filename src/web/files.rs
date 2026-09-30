@@ -7,23 +7,39 @@
 use axum::body::Body;
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::Response;
+use chrono::{DateTime, Utc};
 use std::path::PathBuf;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
 
 use crate::error::{Error, Result};
 
+/// What a served file is, beyond its bytes.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct FileMeta<'a> {
+    /// Offered as the `Content-Disposition: attachment` filename.
+    pub download_name: Option<&'a str>,
+    /// A strong validator (a content hash). Served as `ETag`, answers a
+    /// matching `If-None-Match` with `304`, and marks the file immutable.
+    pub etag: Option<&'a str>,
+    /// When the file was published. Served as `Last-Modified`, which BITS
+    /// compares between the requests of one transfer to notice a changed file.
+    pub last_modified: Option<DateTime<Utc>>,
+    /// The base64 SHA-256 of the whole file, served as `Repr-Digest`
+    /// (RFC 9530) so a client can check what it assembled from ranges.
+    pub sha256_base64: Option<&'a str>,
+}
+
 /// Serve a local file as a streamed response, honouring a `Range` header.
 ///
-/// `download_name`, when set, is offered as a `Content-Disposition` filename.
-/// `etag`, when set, is served as a strong `ETag` and answers a matching
-/// `If-None-Match` with `304 Not Modified`.
+/// A `Range` is honoured only while an `If-Range` the client sent still
+/// matches: a resume against a file that changed underneath it must get the
+/// whole new file (`200`), not a splice of old and new bytes.
 pub async fn serve_local_file(
     path: PathBuf,
     headers: &HeaderMap,
     content_type: &'static str,
-    download_name: Option<&str>,
-    etag: Option<&str>,
+    meta: FileMeta<'_>,
 ) -> Result<Response> {
     let mut file = tokio::fs::File::open(&path)
         .await
@@ -33,18 +49,25 @@ pub async fn serve_local_file(
     let mut builder = Response::builder()
         .header(header::CONTENT_TYPE, content_type)
         .header(header::ACCEPT_RANGES, "bytes");
-    if let Some(name) = download_name {
+    if let Some(name) = meta.download_name {
         builder = builder.header(header::CONTENT_DISPOSITION, content_disposition(name));
+    }
+    let last_modified = meta.last_modified.map(http_date);
+    if let Some(date) = &last_modified {
+        builder = builder.header(header::LAST_MODIFIED, date);
+    }
+    if let Some(digest) = meta.sha256_base64 {
+        builder = builder.header("repr-digest", format!("sha-256=:{digest}:"));
     }
     // A published id/version is immutable in NuGet, so its bytes can be cached
     // for as long as the client likes. Telling it so turns repeat restores of a
     // multi-gigabyte package into a conditional request.
-    if let Some(tag) = etag {
-        let quoted = format!("\"{tag}\"");
-        if if_none_match_hits(headers, &quoted) {
+    let quoted = meta.etag.map(|tag| format!("\"{tag}\""));
+    if let Some(quoted) = &quoted {
+        if if_none_match_hits(headers, quoted) {
             return Response::builder()
                 .status(StatusCode::NOT_MODIFIED)
-                .header(header::ETAG, &quoted)
+                .header(header::ETAG, quoted)
                 .header(header::CACHE_CONTROL, IMMUTABLE)
                 .body(Body::empty())
                 .map_err(internal);
@@ -54,7 +77,12 @@ pub async fn serve_local_file(
             .header(header::CACHE_CONTROL, IMMUTABLE);
     }
 
-    match parse_range(headers, total) {
+    let range = if if_range_holds(headers, quoted.as_deref(), last_modified.as_deref()) {
+        parse_range(headers, total)
+    } else {
+        RangeResult::None
+    };
+    match range {
         RangeResult::None => {
             let stream = ReaderStream::new(file);
             builder
@@ -149,6 +177,50 @@ fn parse_range(headers: &HeaderMap, total: u64) -> RangeResult {
 
 /// `Cache-Control` for content that can never change under a given URL.
 const IMMUTABLE: &str = "public, max-age=31536000, immutable";
+
+/// An IMF-fixdate (`Sun, 06 Nov 1994 08:49:37 GMT`), the form HTTP dates take.
+fn http_date(when: DateTime<Utc>) -> String {
+    when.format("%a, %d %b %Y %H:%M:%S GMT").to_string()
+}
+
+/// Whether a `Range` may be honoured given the request's `If-Range`.
+///
+/// Absent, it always may. An entity tag must match the current one exactly
+/// (a weak tag never matches, RFC 9110 §13.1.5), and a date must equal the
+/// current `Last-Modified`. Anything else means the client holds bytes of a
+/// different file, so it gets the whole current one instead.
+fn if_range_holds(headers: &HeaderMap, etag: Option<&str>, last_modified: Option<&str>) -> bool {
+    let Some(value) = headers.get(header::IF_RANGE).and_then(|v| v.to_str().ok()) else {
+        return true;
+    };
+    let value = value.trim();
+    if value.starts_with('"') {
+        etag == Some(value)
+    } else if value.starts_with("W/") {
+        false
+    } else {
+        last_modified == Some(value)
+    }
+}
+
+/// Whether a request for a file counts as one download.
+///
+/// A resumable client fetches one file in many ranged requests, and BITS
+/// starts every transfer with a `HEAD`. Only a `GET` for the whole file, or
+/// for a range from its first byte, is a download starting; the rest are the
+/// same download continuing.
+pub fn counts_as_download(method: &axum::http::Method, headers: &HeaderMap) -> bool {
+    if method != axum::http::Method::GET {
+        return false;
+    }
+    match headers.get(header::RANGE).and_then(|v| v.to_str().ok()) {
+        None => true,
+        Some(range) => range
+            .trim()
+            .strip_prefix("bytes=")
+            .is_some_and(|spec| spec.trim_start().starts_with("0-")),
+    }
+}
 
 /// Whether `If-None-Match` names `quoted` (or is the `*` wildcard).
 fn if_none_match_hits(headers: &HeaderMap, quoted: &str) -> bool {
@@ -295,6 +367,47 @@ mod tests {
         assert!(if_none_match_hits(&h, "\"anything\""));
 
         assert!(!if_none_match_hits(&HeaderMap::new(), "\"abc\""));
+    }
+
+    #[test]
+    fn if_range_honours_only_the_current_file() {
+        let date = http_date(
+            DateTime::parse_from_rfc3339("2026-09-24T10:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        );
+        assert_eq!(date, "Thu, 24 Sep 2026 10:00:00 GMT");
+        let with = |v: &str| {
+            let mut h = HeaderMap::new();
+            h.insert(header::IF_RANGE, HeaderValue::from_str(v).unwrap());
+            h
+        };
+        let (etag, lm) = (Some("\"abc\""), Some(date.as_str()));
+        assert!(if_range_holds(&HeaderMap::new(), etag, lm));
+        assert!(if_range_holds(&with("\"abc\""), etag, lm));
+        assert!(!if_range_holds(&with("\"old\""), etag, lm));
+        // A weak tag is never good enough to splice bytes together.
+        assert!(!if_range_holds(&with("W/\"abc\""), etag, lm));
+        assert!(if_range_holds(&with(&date), etag, lm));
+        assert!(!if_range_holds(
+            &with("Wed, 23 Sep 2026 10:00:00 GMT"),
+            etag,
+            lm
+        ));
+        // Nothing to compare against: the client's bytes cannot be vouched for.
+        assert!(!if_range_holds(&with("\"abc\""), None, None));
+    }
+
+    #[test]
+    fn only_the_start_of_a_transfer_counts_as_a_download() {
+        use axum::http::Method;
+        let range = |v: &str| headers_with_range(v);
+        assert!(counts_as_download(&Method::GET, &HeaderMap::new()));
+        assert!(counts_as_download(&Method::GET, &range("bytes=0-")));
+        assert!(counts_as_download(&Method::GET, &range("bytes=0-1048575")));
+        assert!(!counts_as_download(&Method::GET, &range("bytes=1048576-")));
+        assert!(!counts_as_download(&Method::GET, &range("bytes=-500")));
+        assert!(!counts_as_download(&Method::HEAD, &HeaderMap::new()));
     }
 
     #[test]

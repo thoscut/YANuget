@@ -146,6 +146,13 @@ pub struct Config {
     /// Maximum accepted upload size in bytes. `None` means unlimited, which is
     /// the point of YANuget — it streams 25 GiB+ packages straight to disk.
     pub max_package_size_bytes: Option<u64>,
+    /// Abort an upload after this many seconds without a single byte arriving.
+    /// `0` waits forever. Only silence counts: a slow but moving transfer of a
+    /// 25 GiB package is never cut off.
+    pub upload_idle_timeout_secs: u64,
+    /// Refuse an upload that would leave less than this many bytes free on the
+    /// storage volume (`507 Insufficient Storage`). `0` turns the check off.
+    pub min_free_disk_bytes: u64,
     /// Whether (and which) pushes may overwrite an existing id/version. Off by
     /// default to preserve NuGet's immutability guarantee.
     pub allow_overwrite: OverwriteMode,
@@ -476,6 +483,8 @@ impl Default for Config {
             admin_api_key: None,
             gallery_page_size: 20,
             max_package_size_bytes: None,
+            upload_idle_timeout_secs: 300,
+            min_free_disk_bytes: 2 * 1024 * 1024 * 1024,
             allow_overwrite: OverwriteMode::Disabled,
             hard_delete_enabled: false,
             tls_enabled: true,
@@ -494,6 +503,12 @@ impl Default for Config {
 }
 
 impl Config {
+    /// The upload idle limit, or `None` when it is turned off.
+    pub fn upload_idle_timeout(&self) -> Option<std::time::Duration> {
+        (self.upload_idle_timeout_secs > 0)
+            .then(|| std::time::Duration::from_secs(self.upload_idle_timeout_secs))
+    }
+
     /// Load configuration: defaults, overlaid by an optional TOML file, overlaid
     /// by `YANUGET_*` environment variables.
     pub fn load(path: Option<&str>) -> Result<Self> {
@@ -556,6 +571,16 @@ impl Config {
         }
         if let Ok(v) = std::env::var("YANUGET_MAX_PACKAGE_SIZE_BYTES") {
             self.max_package_size_bytes = v.parse().ok();
+        }
+        if let Ok(v) = std::env::var("YANUGET_UPLOAD_IDLE_TIMEOUT_SECS") {
+            if let Ok(n) = v.trim().parse() {
+                self.upload_idle_timeout_secs = n;
+            }
+        }
+        if let Ok(v) = std::env::var("YANUGET_MIN_FREE_DISK_BYTES") {
+            if let Ok(n) = v.trim().parse() {
+                self.min_free_disk_bytes = n;
+            }
         }
         if let Ok(v) = std::env::var("YANUGET_ALLOW_OVERWRITE") {
             self.allow_overwrite = OverwriteMode::parse_lenient(&v);

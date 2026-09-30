@@ -1812,12 +1812,17 @@ fn truncate_bytes(s: &str, max: usize) -> (&str, bool) {
     (&s[..end], true)
 }
 
+/// The most tags a package shows on a page.
+const MAX_RENDERED_TAGS: usize = 32;
+
 fn render_tags(tags: &[String]) -> String {
     if tags.is_empty() {
         return String::new();
     }
     let mut out = String::from("<div class=\"tags\">");
-    for t in tags {
+    // Tags are capped when a package is pushed; this bounds what rows stored
+    // before that cap can put on a page.
+    for t in tags.iter().take(MAX_RENDERED_TAGS) {
         out.push_str(&format!("<span class=\"tag\">{}</span>", escape_html(t)));
     }
     out.push_str("</div>");

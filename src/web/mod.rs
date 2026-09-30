@@ -211,6 +211,38 @@ impl AppState {
         UrlBuilder::with_prefix(root, &self.feed.prefix)
     }
 
+    /// Refuse an upload of `incoming` bytes (when the client declared a size)
+    /// that would leave the storage volume with less than
+    /// `min_free_disk_bytes` free.
+    ///
+    /// A full disk does not fail cleanly: the database, the temp file and every
+    /// other writer on the volume run out together, mid-write. Saying no up
+    /// front costs one `statvfs`. With no declared size (a chunked body) only
+    /// the reserve itself is checked; the size limit and the idle timeout bound
+    /// the rest. When free space cannot be measured the upload is let through,
+    /// since a guard that fails closed would take the feed down with it.
+    fn ensure_disk_space(&self, incoming: Option<u64>) -> Result<()> {
+        let reserve = self.config.min_free_disk_bytes;
+        if reserve == 0 {
+            return Ok(());
+        }
+        let available = match fs4::available_space(&self.temp_dir) {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::warn!(error = %e, "could not measure free disk space");
+                return Ok(());
+            }
+        };
+        let needed = incoming.unwrap_or(0).saturating_add(reserve);
+        if available < needed {
+            return Err(Error::InsufficientStorage(format!(
+                "{available} bytes free on the storage volume, {needed} needed \
+                 (the upload plus the configured reserve)"
+            )));
+        }
+        Ok(())
+    }
+
     /// Create a fresh temp file for an incoming upload.
     async fn create_temp(&self) -> Result<(PathBuf, tokio::fs::File)> {
         let path = self.temp_dir.join(format!("{}.tmp", uuid::Uuid::new_v4()));
@@ -798,6 +830,7 @@ async fn push_package(State(state): State<AppState>, request: Request) -> Result
         .map(|s| s.starts_with("multipart/"))
         .unwrap_or(false);
 
+    state.ensure_disk_space(content_length(&headers))?;
     let (temp_path, mut file) = state.create_temp().await?;
     let limit = state.config.max_package_size_bytes;
 
@@ -875,7 +908,7 @@ async fn write_upload(
             .map_err(|e| Error::BadRequest(format!("invalid multipart field: {e}")))?
             .ok_or_else(|| Error::BadRequest("multipart body contained no file".into()))?;
         let stream = Box::pin(field.map(|r| r.map_err(to_io_err)));
-        streaming::stream_to_writer_limited(stream, file, limit)
+        streaming::stream_to_writer_limited(stream, file, limit, state.config.upload_idle_timeout())
             .await
             .map_err(map_upload_err)
     } else {
@@ -885,10 +918,18 @@ async fn write_upload(
                 .into_data_stream()
                 .map(|r| r.map_err(to_io_err)),
         );
-        streaming::stream_to_writer_limited(stream, file, limit)
+        streaming::stream_to_writer_limited(stream, file, limit, state.config.upload_idle_timeout())
             .await
             .map_err(map_upload_err)
     }
+}
+
+/// The declared size of a request body, when the client sent one.
+fn content_length(headers: &HeaderMap) -> Option<u64> {
+    headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse().ok())
 }
 
 async fn delete_package(
@@ -993,6 +1034,7 @@ async fn package_versions(
 
 async fn download_package(
     State(state): State<AppState>,
+    method: axum::http::Method,
     headers: HeaderMap,
     Path((id, version, filename)): Path<(String, String, String)>,
 ) -> Result<Response> {
@@ -1050,20 +1092,23 @@ async fn download_package(
 
     // The stored SHA-512 is a content hash of exactly these bytes, which makes
     // it a correct strong validator: a client that already holds this package
-    // gets a 304 instead of re-downloading gigabytes.
-    let etag = state
+    // gets a 304 instead of re-downloading gigabytes. The publish time is the
+    // matching `Last-Modified`.
+    let package = state
         .db
         .find(state.feed(), &id, &version)
         .await
         .ok()
-        .flatten()
-        .map(|p| p.package_hash);
+        .flatten();
 
-    // Count the download (best effort — never block the response on it).
-    let _ = state
-        .db
-        .increment_downloads(state.feed(), &id, &version)
-        .await;
+    // Count the download (best effort — never block the response on it), once
+    // per transfer rather than once per ranged request of it.
+    if files::counts_as_download(&method, &headers) {
+        let _ = state
+            .db
+            .increment_downloads(state.feed(), &id, &version)
+            .await;
+    }
 
     match content {
         PackageContent::LocalPath(path) => {
@@ -1072,8 +1117,12 @@ async fn download_package(
                 path,
                 &headers,
                 NUPKG_CONTENT_TYPE,
-                Some(&name),
-                etag.as_deref(),
+                files::FileMeta {
+                    download_name: Some(&name),
+                    etag: package.as_ref().map(|p| p.package_hash.as_str()),
+                    last_modified: package.as_ref().map(|p| p.published),
+                    sha256_base64: None,
+                },
             )
             .await
         }
@@ -1332,6 +1381,7 @@ async fn push_symbol_package(State(state): State<AppState>, request: Request) ->
         .map(|s| s.starts_with("multipart/"))
         .unwrap_or(false);
 
+    state.ensure_disk_space(content_length(&headers))?;
     let (temp_path, mut file) = state.create_temp().await?;
     let limit = state.config.max_package_size_bytes;
 
@@ -1413,7 +1463,16 @@ async fn download_symbol(
         // A symbol is addressed by its own content signature, so the key itself
         // is a sound validator.
         PackageContent::LocalPath(path) => {
-            files::serve_local_file(path, &headers, NUPKG_CONTENT_TYPE, None, Some(&key)).await
+            files::serve_local_file(
+                path,
+                &headers,
+                NUPKG_CONTENT_TYPE,
+                files::FileMeta {
+                    etag: Some(&key),
+                    ..Default::default()
+                },
+            )
+            .await
         }
     }
 }
@@ -2192,6 +2251,8 @@ fn to_io_err<E: std::fmt::Display>(e: E) -> std::io::Error {
 fn map_upload_err(e: std::io::Error) -> Error {
     if e.kind() == std::io::ErrorKind::InvalidData {
         Error::PayloadTooLarge(e.to_string())
+    } else if e.kind() == std::io::ErrorKind::TimedOut {
+        Error::UploadTimeout(e.to_string())
     } else {
         Error::Io(e)
     }

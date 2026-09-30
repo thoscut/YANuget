@@ -39,17 +39,27 @@ pub struct Nuspec {
 }
 
 impl Nuspec {
-    /// Split the `tags` field into individual, non-empty tags.
+    /// Split the `tags` field into individual tags: whitespace-separated,
+    /// de-duplicated case-insensitively (the first spelling wins), each cut to
+    /// [`MAX_TAG_CHARS`], and at most [`MAX_TAGS`] of them.
+    ///
+    /// Nothing else bounds this field but the 16 MiB manifest cap, and a
+    /// manifest of `a a a …` is some eight million tags — each rendered on every
+    /// gallery row, returned in every search result and indexed for the tag
+    /// filter. nuget.org's own limits are tighter than these.
     pub fn tag_list(&self) -> Vec<String> {
-        self.tags
-            .as_deref()
-            .map(|t| {
-                t.split_whitespace()
-                    .filter(|s| !s.is_empty())
-                    .map(|s| s.to_string())
-                    .collect()
-            })
-            .unwrap_or_default()
+        let mut seen = std::collections::HashSet::new();
+        let mut tags = Vec::new();
+        for tag in self.tags.as_deref().unwrap_or("").split_whitespace() {
+            if tags.len() == MAX_TAGS {
+                break;
+            }
+            let tag: String = tag.chars().take(MAX_TAG_CHARS).collect();
+            if seen.insert(tag.to_lowercase()) {
+                tags.push(tag);
+            }
+        }
+        tags
     }
 
     /// Split `authors` (comma-separated) into individual authors.
@@ -74,6 +84,9 @@ const MAX_ELEMENT_DEPTH: usize = 64;
 const MAX_DEPENDENCY_GROUPS: usize = 512;
 const MAX_DEPENDENCIES: usize = 10_000;
 const MAX_PACKAGE_TYPES: usize = 64;
+/// Tags kept per package, and characters kept per tag (see [`Nuspec::tag_list`]).
+pub const MAX_TAGS: usize = 64;
+pub const MAX_TAG_CHARS: usize = 64;
 
 /// Parse a `.nuspec` document. Returns [`Error::InvalidPackage`] when the XML is
 /// malformed, exceeds the structural limits above, or is missing the mandatory
@@ -456,6 +469,28 @@ mod tests {
         assert_eq!(n.author_list(), vec!["Alice & Bob", "Carol"]);
         assert_eq!(n.title.as_deref(), Some(r#"A "quoted" title"#));
         assert_eq!(n.tag_list(), vec!["a&b", "c"]);
+    }
+
+    #[test]
+    fn tags_are_deduplicated_cut_and_capped() {
+        let long = "x".repeat(MAX_TAG_CHARS + 10);
+        let many: String = (0..MAX_TAGS * 3).map(|i| format!("t{i} ")).collect();
+        let n = Nuspec {
+            tags: Some(format!("Logging logging  LOGGING {long} {many}")),
+            ..Default::default()
+        };
+        let tags = n.tag_list();
+        assert_eq!(tags.len(), MAX_TAGS);
+        // The first spelling wins; later case variants are the same tag.
+        assert_eq!(tags[0], "Logging");
+        assert_eq!(tags[1], "x".repeat(MAX_TAG_CHARS));
+        assert!(!tags[2..].iter().any(|t| t.eq_ignore_ascii_case("logging")));
+        // Cutting counts characters, never splitting one.
+        let n = Nuspec {
+            tags: Some("é".repeat(MAX_TAG_CHARS + 1)),
+            ..Default::default()
+        };
+        assert_eq!(n.tag_list()[0].chars().count(), MAX_TAG_CHARS);
     }
 
     #[test]

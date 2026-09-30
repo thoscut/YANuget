@@ -185,19 +185,40 @@ impl PackageStorage for FilesystemStorage {
 }
 
 /// Validate a path segment, rejecting anything that could escape the root.
+///
+/// Separators and `..` are the portable part. The rest is Windows: a `:` makes
+/// `c:x` a drive-relative path, which `PathBuf::join` lets *replace* the base
+/// instead of extending it, and turns `name:stream` into an NTFS alternate data
+/// stream. Device names (`NUL`, `COM1.pdb`) open devices rather than files, and
+/// Windows silently strips a trailing dot or space, so `a.` and `a` would be
+/// two names for one file. They are refused on every platform, so a store
+/// written on one system stays valid on the other.
 fn safe_segment(segment: &str) -> Result<String> {
-    if segment.is_empty()
+    let invalid = segment.is_empty()
         || segment == "."
         || segment == ".."
-        || segment.contains('/')
-        || segment.contains('\\')
-        || segment.contains('\0')
-    {
+        || segment
+            .chars()
+            .any(|c| matches!(c, '/' | '\\' | ':') || c.is_control())
+        || segment.ends_with(['.', ' '])
+        || is_windows_device_name(segment);
+    if invalid {
         return Err(Error::BadRequest(format!(
             "invalid storage path segment: {segment:?}"
         )));
     }
     Ok(segment.to_string())
+}
+
+/// Whether `segment` names a Windows device, with or without an extension
+/// (`nul`, `COM1.pdb`, `lpt9.txt`).
+pub(crate) fn is_windows_device_name(segment: &str) -> bool {
+    let stem = segment.split('.').next().unwrap_or("").trim_end();
+    let stem = stem.to_ascii_uppercase();
+    matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || ((stem.starts_with("COM") || stem.starts_with("LPT"))
+            && stem.len() == 4
+            && matches!(stem.as_bytes()[3], b'1'..=b'9'))
 }
 
 #[cfg(test)]
@@ -215,6 +236,35 @@ mod tests {
         let path = dir.path().join("upload.tmp");
         tokio::fs::write(&path, content).await.unwrap();
         (dir, path)
+    }
+
+    #[test]
+    fn path_segments_that_would_leave_the_store_on_windows_are_refused() {
+        for bad in [
+            "c:evil.pdb", // drive-relative: replaces the base when joined
+            "a:b",        // an NTFS alternate data stream
+            "nul.pdb",    // a device, whatever the extension
+            "COM1",
+            "lpt9.txt",
+            "name.",     // Windows drops the trailing dot…
+            "name ",     // …and the trailing space
+            "tab\there", // control characters
+            "..",
+            "a/b",
+            "a\\b",
+            "",
+        ] {
+            assert!(safe_segment(bad).is_err(), "{bad:?} was accepted");
+        }
+        for good in [
+            "contoso.utils",
+            "1.0.0-beta.2",
+            "com10",
+            "console.pdb",
+            "nullable.pdb",
+        ] {
+            assert!(safe_segment(good).is_ok(), "{good:?} was refused");
+        }
     }
 
     #[tokio::test]

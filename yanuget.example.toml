@@ -38,6 +38,15 @@ gallery_page_size = 20     # YANUGET_GALLERY_PAGE_SIZE
 # 26843545600 = 25 GiB.
 # max_package_size_bytes = 26843545600    # YANUGET_MAX_PACKAGE_SIZE_BYTES
 
+# Abort an upload once no byte has arrived for this many seconds (408). Only
+# silence counts: a slow but moving 25 GiB transfer is never cut off. 0 = never.
+upload_idle_timeout_secs = 300            # YANUGET_UPLOAD_IDLE_TIMEOUT_SECS
+
+# Refuse an upload (507) that would leave less than this many bytes free on the
+# storage volume — a full disk fails the database and every other writer at
+# once. Checked against the declared size when the client sends one. 0 = off.
+min_free_disk_bytes = 2147483648          # YANUGET_MIN_FREE_DISK_BYTES
+
 # Whether re-pushing an existing id/version overwrites it. Off by default to
 # preserve NuGet's immutability guarantee. Accepts a bool or a string:
 #   false  — never overwrite (default)

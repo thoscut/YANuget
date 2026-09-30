@@ -57,6 +57,35 @@ expected to change incompatibly at any version.
 - A feed can no longer be named `_assets`: that is where the font is served.
 - `web::FeedMeta` carries the feed's admin key and has a
   `FeedMeta::from_resolved` constructor.
+- Downloads now carry `Last-Modified` (the publish time) and honour `If-Range`,
+  so a resuming client — BITS compares both between the requests of one
+  transfer — never splices bytes of two different builds together: a resume
+  whose validator no longer matches gets the whole current file. A download is
+  counted once per transfer, for a `GET` of the whole file or of a range from
+  its first byte, rather than once per ranged request and `HEAD`.
+- An upload is aborted (`408`) once no byte has arrived for
+  `upload_idle_timeout_secs` (default 300). Only silence counts; a slow but
+  moving transfer is never cut off. Nothing timed a request body out before, so
+  a stalled client held its connection and temp file open indefinitely.
+- An upload is refused (`507`) when it would leave less than
+  `min_free_disk_bytes` (default 2 GiB) free on the storage volume, checked
+  against the declared size when the client sends one.
+- A package keeps at most 64 tags of at most 64 characters, de-duplicated
+  case-insensitively, and a gallery row shows at most 32. Nothing bounded the
+  field but the 16 MiB manifest cap, so one push could put millions of tags on
+  every page and search result.
+
+### Fixed
+
+- An overwrite that had to be refused — another feed holds the version, with
+  different bytes — no longer takes the version out of the feed it was pushed
+  to. The feed's membership was removed before the check that refused the push.
+- Storage path segments are refused when Windows would read them as something
+  other than a file name: a `:` (a drive-relative path, which escaped the store
+  when joined, or an NTFS alternate data stream), a device name such as `NUL`
+  or `COM1.pdb`, a trailing dot or space, or a control character. A symbol file
+  named `c:x.pdb` inside a `.snupkg` could otherwise be written outside the
+  store on a Windows host.
 
 ## [0.5.1] — 2026-09-24
 

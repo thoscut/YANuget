@@ -3734,3 +3734,161 @@ async fn the_defaults_do_not_trust_the_network_around_them() {
     assert!(config.rate_limit.enabled);
     assert!(config.rate_limit.max_requests >= 5_000);
 }
+
+// ---------------------------------------------------------------------------
+// Hardening: overwrites, resumable downloads, stalled uploads, a full disk
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_refused_overwrite_leaves_the_version_in_its_feed() {
+    // `dev` may overwrite; `stable` holds the same version, which pins its
+    // payload. A different build under that id/version must be refused — and
+    // refused *without* first taking the version out of `dev`.
+    let server = spawn_feeds(|c| {
+        c.api_key = Some(API_KEY.into());
+        let mut dev = feed("dev");
+        dev.allow_overwrite = Some(yanuget::config::OverwriteMode::Enabled);
+        c.feeds = vec![dev, feed("stable")];
+    })
+    .await;
+    let original = build_nupkg("Shared.Pkg", "1.0.0", b"first build");
+    for path in ["/dev/api/v2/package", "/stable/api/v2/package"] {
+        assert_eq!(
+            push_to(&server, path, API_KEY, original.clone())
+                .await
+                .status(),
+            reqwest::StatusCode::CREATED
+        );
+    }
+    let rebuilt = build_nupkg("Shared.Pkg", "1.0.0", b"second build, other bytes");
+    assert_eq!(
+        push_to(&server, "/dev/api/v2/package", API_KEY, rebuilt)
+            .await
+            .status(),
+        reqwest::StatusCode::CONFLICT
+    );
+    assert!(status_of(&server, "/dev/v3/package/shared.pkg/index.json")
+        .await
+        .is_success());
+    // An identical re-push is still an overwrite dev allows.
+    assert_eq!(
+        push_to(&server, "/dev/api/v2/package", API_KEY, original)
+            .await
+            .status(),
+        reqwest::StatusCode::CREATED
+    );
+}
+
+#[tokio::test]
+async fn downloads_resume_safely_and_count_once() {
+    let server = spawn().await;
+    push_multipart(
+        &server,
+        API_KEY,
+        build_nupkg("Resume.Pkg", "1.0.0", &[7u8; 4096]),
+    )
+    .await;
+    let url = server.url("/v3/package/resume.pkg/1.0.0/resume.pkg.1.0.0.nupkg");
+
+    // BITS opens with a HEAD: the size, validators and range support, no body.
+    let head = server.client.head(&url).send().await.unwrap();
+    assert_eq!(head.status(), reqwest::StatusCode::OK);
+    let total: u64 = head.headers()["content-length"]
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(total > 0);
+    assert_eq!(head.headers()["accept-ranges"], "bytes");
+    let etag = head.headers()["etag"].to_str().unwrap().to_string();
+    let last_modified = head.headers()["last-modified"]
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(last_modified.ends_with(" GMT"), "{last_modified}");
+
+    // The first chunk, then a resume that proves it is the same file.
+    let first = server
+        .client
+        .get(&url)
+        .header("range", "bytes=0-99")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+    for validator in [etag.as_str(), last_modified.as_str()] {
+        let rest = server
+            .client
+            .get(&url)
+            .header("range", "bytes=100-")
+            .header("if-range", validator)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(rest.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            rest.headers()["content-range"],
+            format!("bytes 100-{}/{total}", total - 1).as_str()
+        );
+    }
+    // A resume against a different file gets the whole current one.
+    let stale = server
+        .client
+        .get(&url)
+        .header("range", "bytes=100-")
+        .header("if-range", "\"some-other-build\"")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stale.status(), reqwest::StatusCode::OK);
+    assert_eq!(stale.bytes().await.unwrap().len() as u64, total);
+
+    // HEAD, the continuations and the refused resume are one download.
+    let search: serde_json::Value = server
+        .client
+        .get(server.url("/v3/search?q=resume.pkg"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(search["data"][0]["totalDownloads"], 1);
+}
+
+#[tokio::test]
+async fn a_stalled_upload_is_cut_off() {
+    use futures::StreamExt;
+    let server = spawn_with(|c| c.upload_idle_timeout_secs = 1).await;
+    // A few bytes, then nothing for longer than the limit.
+    let stream =
+        futures::stream::once(async { Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"PK")) })
+            .chain(futures::stream::once(async {
+                tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+                Ok(bytes::Bytes::from_static(b"never mind"))
+            }));
+    let result = server
+        .client
+        .put(server.url("/api/v2/package"))
+        .header("X-NuGet-ApiKey", API_KEY)
+        .body(reqwest::Body::wrap_stream(stream))
+        .send()
+        .await;
+    // The server answers 408 and drops the connection; depending on timing the
+    // client sees the answer or only the dropped connection. Either way,
+    // nothing was published.
+    if let Ok(resp) = result {
+        assert_eq!(resp.status(), reqwest::StatusCode::REQUEST_TIMEOUT);
+    }
+}
+
+#[tokio::test]
+async fn an_upload_that_would_fill_the_disk_is_refused() {
+    let server = spawn_with(|c| c.min_free_disk_bytes = u64::MAX / 2).await;
+    let resp = push_multipart(&server, API_KEY, build_nupkg("Full.Disk", "1.0.0", b"x")).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::INSUFFICIENT_STORAGE);
+    assert_eq!(
+        status_of(&server, "/v3/package/full.disk/index.json").await,
+        reqwest::StatusCode::NOT_FOUND
+    );
+}

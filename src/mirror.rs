@@ -384,6 +384,8 @@ impl MirrorClient {
             Box::pin(stream),
             &mut file,
             self.max_package_size_bytes,
+            // The mirror's own silence timeout already bounds a stalled upstream.
+            None,
         )
         .await
         .map_err(|e| {
