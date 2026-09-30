@@ -261,6 +261,16 @@ Three things bound a read-through miss, because it is started by an
 | `feeds[].license_policy.action` | string | `warn` | `warn` (accept + flag) or `block` (reject). |
 | `feeds[].retention` | table | *(global `[retention]`)* | Per-feed retention overrides. |
 
+The license policy reads SPDX expressions the way SPDX means them. Case, the
+`+` suffix and the deprecated ids are normalised on both sides, so a rule for
+`GPL-2.0` matches `GPL-2.0+`, `GPL-2.0-only` and `GPL-2.0-or-later` alike.
+Against an allow list, `A OR B` needs one side allowed and `A AND B` both;
+`X WITH exception` passes a rule allowing `X` only when the exception is one
+the SPDX list defines (name the whole pair in a rule to accept any other).
+**A deny list on its own is advisory**: a package that declares its license as
+a file, or as a `licenseUrl` the list does not name, passes it. To control
+what comes in, set `allowed`.
+
 ### Read authentication
 
 When a feed sets `read_api_key`, downloads/restore **and** the HTML gallery
