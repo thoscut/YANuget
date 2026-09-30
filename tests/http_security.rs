@@ -383,6 +383,11 @@ async fn one_feeds_admin_key_does_not_open_another_admin_area() {
     let wrong = admin("/b/admin/packages/adm.pkg", "admin-a").await.unwrap();
     assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
 
+    // The sign-in page asks for the key the admin area actually wants.
+    let page = wrong.text().await.unwrap();
+    assert!(page.contains("admin key"), "{page}");
+    assert!(!page.contains("for reading"), "{page}");
+
     let right = admin("/b/admin/packages/adm.pkg", "admin-b").await.unwrap();
     assert_eq!(right.status(), StatusCode::OK);
     // The page embeds a CSRF token: it must not be kept by any cache.

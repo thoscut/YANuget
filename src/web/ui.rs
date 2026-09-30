@@ -482,16 +482,30 @@ fn layout_with_chrome(
 /// deliberately not parsed through: a 5xx message is generic on purpose (the
 /// underlying I/O, SQL or upstream detail goes to the log), and re-rendering an
 /// error string into HTML is a needless place to get escaping wrong.
-pub fn error_page(urls: &UrlBuilder, status: axum::http::StatusCode, admin: bool) -> String {
+pub fn error_page(
+    urls: &UrlBuilder,
+    status: axum::http::StatusCode,
+    admin: bool,
+    admin_login: bool,
+) -> String {
     use axum::http::StatusCode;
     let (heading, detail) = match status {
         StatusCode::NOT_FOUND => (
             "Not found",
-            "This feed does not have that package, version or page. It may never              have been published here, or it may have been deleted.",
+            "This feed does not have that package, version or page. It may never \
+             have been published here, or it may have been deleted.",
+        ),
+        // The admin area asks for the admin key, not the read key: sending an
+        // operator hunting for the wrong one is the whole failure here.
+        StatusCode::UNAUTHORIZED if admin_login => (
+            "Sign-in required",
+            "The admin area needs the admin key. Sign in with any user name and \
+             the admin key as the password.",
         ),
         StatusCode::UNAUTHORIZED => (
             "Sign-in required",
-            "This feed requires credentials to browse. Use the API key configured              for reading it.",
+            "This feed requires credentials to browse. Use the API key configured \
+             for reading it.",
         ),
         StatusCode::BAD_REQUEST => (
             "That request did not make sense",
@@ -503,16 +517,14 @@ pub fn error_page(urls: &UrlBuilder, status: axum::http::StatusCode, admin: bool
         ),
         StatusCode::SERVICE_UNAVAILABLE => (
             "Temporarily unavailable",
-            "The server cannot reach its database right now. It should recover on              its own.",
+            "The server cannot reach its database right now. It should recover on \
+             its own.",
         ),
         s if s.is_server_error() => (
             "Something went wrong",
             "The server hit an unexpected error. The details are in its log.",
         ),
-        _ => (
-            "That did not work",
-            "The request could not be completed.",
-        ),
+        _ => ("That did not work", "The request could not be completed."),
     };
     let body = format!(
         "<div class=\"empty\"><h1 class=\"title\">{heading}</h1>\
@@ -2566,6 +2578,33 @@ mod tests {
             assert_eq!(truncated, s.len() > max);
             assert!(s.starts_with(cut));
         }
+    }
+
+    #[test]
+    fn error_pages_read_as_prose_and_name_the_right_key() {
+        use axum::http::StatusCode;
+        let urls = UrlBuilder::new("https://host");
+        for status in [
+            StatusCode::NOT_FOUND,
+            StatusCode::UNAUTHORIZED,
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::BAD_REQUEST,
+        ] {
+            let html = error_page(&urls, status, false, false);
+            let text = html
+                .split("<p>")
+                .nth(1)
+                .unwrap()
+                .split("</p>")
+                .next()
+                .unwrap();
+            assert!(!text.contains("  "), "{status}: {text:?}");
+        }
+        let admin = error_page(&urls, StatusCode::UNAUTHORIZED, true, true);
+        assert!(admin.contains("admin key"), "{admin}");
+        assert!(!admin.contains("for reading"), "{admin}");
+        let read = error_page(&urls, StatusCode::UNAUTHORIZED, false, false);
+        assert!(read.contains("for reading"), "{read}");
     }
 
     #[test]

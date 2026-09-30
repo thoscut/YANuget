@@ -917,10 +917,18 @@ async fn html_errors(
     // `WWW-Authenticate` challenge on a 401, without which a browser never
     // prompts — and replace only the body and its content type.
     let (mut parts, _) = response.into_parts();
+    // The admin area's challenge names its own realm; its page must ask for
+    // the admin key, not the read key.
+    let admin_login = parts
+        .headers
+        .get(header::WWW_AUTHENTICATE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.contains("Admin"));
     let page = ui::error_page(
         &state.url_builder(&headers),
         status,
         state.feed.admin.is_enabled(),
+        admin_login,
     );
     parts.headers.remove(header::CONTENT_LENGTH);
     parts.headers.insert(
