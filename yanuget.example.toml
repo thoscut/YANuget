@@ -7,8 +7,10 @@
 host = "0.0.0.0"            # YANUGET_HOST
 port = 5000                # YANUGET_PORT
 
-# Externally visible base URL. Leave unset to derive it per-request from the
-# Host / X-Forwarded-* headers (recommended behind a reverse proxy).
+# Externally visible base URL, from which every URL handed to clients is built.
+# Set it whenever you know the public address, and always behind a reverse
+# proxy. Unset, it is derived per request from the Host header, and from
+# X-Forwarded-* only when the peer is listed in `trusted_proxies`.
 # base_url = "https://nuget.example.com"   # YANUGET_BASE_URL
 
 # Where all server data lives. The package store and SQLite database default to
@@ -205,11 +207,21 @@ inbox_scan_secs = 30                # YANUGET_FILES_INBOX_SCAN_SECS
 # hard_delete_enabled = false   # falls back to global when unset
 # requires_approval = false     # true = incoming versions are pending until approved
 # promotes_to = "stable"        # the next release ring (must name another feed)
+# # An id and version are ONE package across every feed: whoever stores a
+# # version first owns it everywhere, and different bytes are then refused in
+# # every feed. Reserve the prefixes of your own ids for the feed that
+# # publishes them, and every other feed (pushes, mirror fetches, migrations)
+# # refuses ids under them.
+# reserved_id_prefixes = []     # e.g. ["Contoso."]
 #
 #   [feeds.mirror]              # read-through cache of an upstream V3 feed
 #   enabled = true
 #   upstream = "https://api.nuget.org/v3/index.json"
-#   timeout_secs = 30
+#   timeout_secs = 30              # connect, silence, and each metadata request
+#   download_timeout_secs = 3600   # one whole .nupkg download; 0 = no deadline
+#   # How long a package's upstream version list is trusted before a read lists
+#   # it again (and how long an id the upstream lacks is not asked for again).
+#   refresh_secs = 600
 #   # A mirror fetch is triggered by an ordinary (possibly anonymous) read, so
 #   # it is bounded by default: at most this many versions of one package per
 #   # miss, newest first. Set to a large number, or omit, to fetch everything.
@@ -221,10 +233,17 @@ inbox_scan_secs = 30                # YANUGET_FILES_INBOX_SCAN_SECS
 #   # metadata endpoint. Private/loopback targets are refused unless you opt in
 #   # because your upstream really is on the private network.
 #   allow_private_upstream = false
+#   # Outbound proxy for upstream requests. Unset, the mirror connects directly:
+#   # HTTP(S)_PROXY in the environment is ignored.
+#   # proxy = "http://proxy.internal:3128"
+#   # Extra CA certificates (PEM) for an upstream behind an internal CA. The
+#   # system store and the bundled Mozilla roots are trusted either way.
+#   # ca_cert_path = "/etc/yanuget/internal-ca.pem"
 #
 #     # Credentials for an authenticated upstream (all optional). Set the
-#     # username/password pair for HTTP Basic, token for a Bearer token, and/or
-#     # headers for a custom header (e.g. a private-feed API key).
+#     # username/password pair for HTTP Basic OR token for a Bearer token, plus
+#     # headers for a custom header (e.g. a private-feed API key). They are sent
+#     # only to the upstream's own scheme, host and port.
 #     [feeds.mirror.auth]
 #     # username = "ci"
 #     # password = "secret"

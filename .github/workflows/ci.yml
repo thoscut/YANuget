@@ -5,25 +5,52 @@ on:
     branches: [main, "claude/**"]
   pull_request:
     branches: [main]
+  # Weekly, so an advisory published against something already in Cargo.lock
+  # is reported in a week nobody pushes, and a new stable toolchain that breaks
+  # the build is found before the next change is blamed for it.
+  schedule:
+    - cron: "23 5 * * 1"
+  workflow_dispatch:
+
+# Nothing here writes to the repository. Every job runs code from the pull
+# request (build scripts, proc macros, the docs toolchain), so the token it
+# holds should be able to read and nothing more.
+permissions:
+  contents: read
+
+# A newer push to the same pull request makes the older run moot. Pushes to
+# `main` are left to finish, so every commit there keeps a result.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
 
+# Every action is pinned to a full commit SHA, with the release it corresponds
+# to in a comment: a tag can be moved to other code, a SHA cannot. Dependabot
+# (github-actions ecosystem) proposes the updates. `dtolnay/rust-toolchain` is
+# pinned to a commit of its master branch, which has no release tags, and names
+# the toolchain explicitly with `toolchain:`.
 jobs:
   test:
     name: Build, test & lint
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
+          toolchain: stable
           components: rustfmt, clippy
 
       - name: Cache cargo
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -33,7 +60,7 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-
 
       - name: Set up Python
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.x"
 
@@ -42,7 +69,9 @@ jobs:
       # asset hosts (fonts/CDNs). Done before any cargo step that compiles.
       - name: Build documentation site
         run: |
-          pip install -r requirements-docs.txt
+          # The lock pins and hashes every package, so this installs exactly
+          # the reviewed set rather than whatever PyPI serves today.
+          pip install --require-hashes -r requirements-docs.txt
           # `--strict` so a broken cross-reference fails here rather than 404ing
           # for someone reading the docs the binary serves.
           mkdocs build --strict
@@ -72,17 +101,22 @@ jobs:
   msrv:
     name: Minimum supported Rust (1.88)
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       # rust-toolchain.toml pins `stable`; an explicit `+1.88.0` on the command
       # line overrides it so this job really exercises the declared MSRV.
       # (1.88 is the floor required by transitive deps, e.g. time 0.3.49.)
       - name: Install Rust 1.88.0
-        uses: dtolnay/rust-toolchain@1.88.0
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: 1.88.0
 
       - name: Cache cargo
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -91,20 +125,30 @@ jobs:
           key: ${{ runner.os }}-cargo-msrv-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-msrv-
 
-      - name: Check against MSRV
-        run: cargo +1.88.0 check --all-targets --all-features
+      # The tests run here, not just a `check`: the container image is built
+      # with 1.88, so this is the compiler the image ships, and a behaviour
+      # difference between it and stable would otherwise go unnoticed.
+      - name: Test against MSRV
+        run: cargo +1.88.0 test --all-targets --all-features
 
   audit:
     name: Dependency audit
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
 
-      - name: Install cargo-audit
-        uses: taiki-e/install-action@cargo-audit
+      - name: Install cargo-audit and cargo-deny
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: cargo-audit,cargo-deny
 
       # RUSTSEC-2023-0071 (rsa, Marvin attack) has no fixed release and reaches
       # the lockfile only via sqlx-mysql, an optional driver this sqlite-only
@@ -119,6 +163,12 @@ jobs:
       - name: Audit dependencies for known vulnerabilities
         run: cargo audit --ignore RUSTSEC-2023-0071
 
+      # Licenses, sources and duplicate crates, as set out in deny.toml. A
+      # dependency under a license nobody has looked at, or from a git
+      # repository or another registry, fails here rather than in a release.
+      - name: Check licenses and sources
+        run: cargo deny check licenses bans sources
+
   package:
     # The release path is not the same as the build path: `cargo publish`
     # packages a tarball from a clean checkout and rebuilds it in isolation, and
@@ -127,14 +177,19 @@ jobs:
     # both are checked on every push rather than discovered at tag time.
     name: Packaging
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
 
       - name: Cache cargo
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -188,14 +243,19 @@ jobs:
     # only pins the version — nothing large is downloaded.
     name: NuGet client compatibility
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
 
       - name: Cache cargo
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -205,7 +265,7 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-compat-
 
       - name: Set up .NET
-        uses: actions/setup-dotnet@v6
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
         with:
           dotnet-version: "8.0.x"
 
@@ -213,4 +273,6 @@ jobs:
         run: cargo build --release
 
       - name: Push, restore, build and run with the real client
-        run: scripts/verify-with-dotnet.sh "${{ runner.temp }}/yanuget-compat"
+        env:
+          WORK_DIR: ${{ runner.temp }}/yanuget-compat
+        run: scripts/verify-with-dotnet.sh "$WORK_DIR"

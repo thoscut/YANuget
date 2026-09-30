@@ -175,7 +175,10 @@ pub fn is_private_host(host: &str) -> bool {
             .filter(|h| !h.contains(':'))
             .unwrap_or(host)
     };
+    // A fully qualified name may end in a dot (`localhost.`); it names the same
+    // host, so it must not slip past the name checks below.
     let lower = bare.to_ascii_lowercase();
+    let lower = lower.trim_end_matches('.');
     if lower == "localhost" || lower.ends_with(".localhost") || lower.ends_with(".local") {
         return true;
     }
@@ -195,6 +198,68 @@ pub fn is_private_ip_addr(ip: IpAddr) -> bool {
     is_private_ip(unmap(ip))
 }
 
+/// IPv4 ranges the mirror never fetches from, beyond what `Ipv4Addr`'s own
+/// predicates cover: "this network" (`0.0.0.0/8`, which Linux routes to the
+/// local host), CGNAT, IETF protocol assignments, the benchmarking range, and
+/// multicast plus the reserved `240.0.0.0/4` (which includes broadcast).
+const PRIVATE_V4: [([u8; 4], u8); 6] = [
+    ([0, 0, 0, 0], 8),
+    ([100, 64, 0, 0], 10),
+    ([192, 0, 0, 0], 24),
+    ([198, 18, 0, 0], 15),
+    ([224, 0, 0, 0], 4),
+    ([240, 0, 0, 0], 4),
+];
+
+/// IPv6 ranges that are private in themselves: unique-local, link-local, the
+/// deprecated site-local, multicast, and the local-use NAT64 prefix
+/// (`64:ff9b:1::/48`, RFC 8215), whose embedding is chosen by the local
+/// network and so cannot be decoded — anything under it is some local
+/// translator's idea of an IPv4 address.
+const PRIVATE_V6: [([u16; 3], u8); 5] = [
+    ([0xfc00, 0, 0], 7),
+    ([0xfe80, 0, 0], 10),
+    ([0xfec0, 0, 0], 10),
+    ([0xff00, 0, 0], 8),
+    ([0x0064, 0xff9b, 0x0001], 48),
+];
+
+fn in_v4(ip: Ipv4Addr, (net, bits): ([u8; 4], u8)) -> bool {
+    prefix_eq(&net, &ip.octets(), bits)
+}
+
+fn in_v6(ip: Ipv6Addr, (net, bits): ([u16; 3], u8)) -> bool {
+    let net = Ipv6Addr::new(net[0], net[1], net[2], 0, 0, 0, 0, 0);
+    prefix_eq(&net.octets(), &ip.octets(), bits)
+}
+
+/// The IPv4 address an IPv6 address stands for, when it is one of the forms
+/// that carry one: IPv4-mapped (`::ffff:a.b.c.d`), IPv4-compatible
+/// (`::a.b.c.d`), NAT64's well-known prefix (`64:ff9b::/96`) and 6to4
+/// (`2002::/16`). A connection to any of these can end up at the embedded
+/// address, so it is what has to be classified: `[64:ff9b::a9fe:a9fe]` is the
+/// metadata service behind a NAT64 gateway.
+fn embedded_v4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
+    let o = v6.octets();
+    let s = v6.segments();
+    let tail = Ipv4Addr::new(o[12], o[13], o[14], o[15]);
+    if let Some(v4) = v6.to_ipv4_mapped() {
+        return Some(v4);
+    }
+    // `::` and `::1` are the unspecified and loopback addresses, not
+    // IPv4-compatible ones; they are classified as IPv6.
+    if s[..6] == [0; 6] && (s[6] != 0 || s[7] > 1) {
+        return Some(tail);
+    }
+    if s[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
+        return Some(tail);
+    }
+    if s[0] == 0x2002 {
+        return Some(Ipv4Addr::new(o[2], o[3], o[4], o[5]));
+    }
+    None
+}
+
 fn is_private_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
@@ -203,17 +268,13 @@ fn is_private_ip(ip: IpAddr) -> bool {
                 || v4.is_link_local()
                 || v4.is_unspecified()
                 || v4.is_broadcast()
-                // 100.64.0.0/10 (CGNAT) and 192.0.0.0/24 (IETF protocol assignments).
-                || Cidr::parse("100.64.0.0/10").is_some_and(|c| c.contains(IpAddr::V4(v4)))
-                || Cidr::parse("192.0.0.0/24").is_some_and(|c| c.contains(IpAddr::V4(v4)))
-                || v4 == Ipv4Addr::new(169, 254, 169, 254)
+                || PRIVATE_V4.iter().any(|&net| in_v4(v4, net))
         }
         IpAddr::V6(v6) => {
-            v6.is_loopback()
-                || v6.is_unspecified()
-                || Cidr::parse("fc00::/7").is_some_and(|c| c.contains(IpAddr::V6(v6)))
-                || Cidr::parse("fe80::/10").is_some_and(|c| c.contains(IpAddr::V6(v6)))
-                || v6 == Ipv6Addr::UNSPECIFIED
+            if let Some(v4) = embedded_v4(v6) {
+                return is_private_ip(IpAddr::V4(v4));
+            }
+            v6.is_loopback() || v6.is_unspecified() || PRIVATE_V6.iter().any(|&net| in_v6(v6, net))
         }
     }
 }
@@ -297,6 +358,81 @@ mod tests {
             "[2001:db8::1]",
         ] {
             assert!(!is_private_host(public), "{public} should be public");
+        }
+    }
+
+    #[test]
+    fn a_trailing_dot_does_not_hide_localhost() {
+        for name in [
+            "localhost.",
+            "LOCALHOST.:8080",
+            "api.localhost.",
+            "box.local.",
+        ] {
+            assert!(is_private_host(name), "{name} should be private");
+        }
+        assert!(!is_private_host("api.nuget.org."));
+    }
+
+    #[test]
+    fn reserved_ipv4_ranges_are_private() {
+        for private in [
+            "0.0.0.0",
+            "0.1.2.3",         // "this network", routed to the local host
+            "100.64.0.1",      // CGNAT
+            "100.127.255.254", // ...to the end of the /10
+            "192.0.0.8",       // IETF protocol assignments
+            "198.18.0.1",      // benchmarking
+            "198.19.255.254",
+            "224.0.0.1", // multicast
+            "239.255.255.250",
+            "240.0.0.1", // reserved
+            "255.255.255.255",
+            "169.254.169.254",
+        ] {
+            assert!(
+                is_private_ip_addr(ip(private)),
+                "{private} should be private"
+            );
+        }
+        for public in ["1.1.1.1", "100.128.0.1", "198.20.0.1", "223.255.255.254"] {
+            assert!(!is_private_ip_addr(ip(public)), "{public} should be public");
+        }
+    }
+
+    #[test]
+    fn ipv6_forms_that_embed_a_private_ipv4_address_are_private() {
+        for private in [
+            "::ffff:127.0.0.1",        // IPv4-mapped
+            "::127.0.0.1",             // IPv4-compatible
+            "::a9fe:a9fe",             // ...the metadata service
+            "64:ff9b::7f00:1",         // NAT64 well-known prefix
+            "64:ff9b::a9fe:a9fe",      // ...to 169.254.169.254
+            "64:ff9b:1::1",            // local-use NAT64: never decodable
+            "64:ff9b:1:ffff::8.8.8.8", // ...even around a public address
+            "2002:7f00:1::",           // 6to4 of 127.0.0.1
+            "2002:0a00:0001::1",       // 6to4 of 10.0.0.1
+            "ff02::1",                 // multicast
+            "fec0::1",                 // deprecated site-local
+            "::",
+            "::1",
+        ] {
+            assert!(
+                is_private_ip_addr(ip(private)),
+                "{private} should be private"
+            );
+            assert!(
+                is_private_host(&format!("[{private}]")),
+                "[{private}] should be private"
+            );
+        }
+        for public in [
+            "64:ff9b::808:808",  // NAT64 of 8.8.8.8
+            "2002:0808:0808::1", // 6to4 of 8.8.8.8
+            "::8.8.8.8",         // IPv4-compatible 8.8.8.8
+            "2606:4700:4700::1111",
+        ] {
+            assert!(!is_private_ip_addr(ip(public)), "{public} should be public");
         }
     }
 }

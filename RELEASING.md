@@ -3,6 +3,40 @@
 Releases are cut by pushing a `vX.Y.Z` tag. Everything after that is automated by
 [`.github/workflows/release.yml`](.github/workflows/release.yml).
 
+## One-time repository setup
+
+The workflow publishes from a protected `release` environment and to crates.io
+through trusted publishing. Both are configured outside the repository, once:
+
+1. **Create the `release` environment** (Settings → Environments → New
+   environment, named exactly `release`).
+   - *Deployment branches and tags*: **Selected branches and tags**, with one
+     rule of type *Tag* and pattern `v*`. No branch rule. The `image`,
+     `release` and `crates-io` jobs run in this environment, so they can only
+     run for a `v*` tag — a `workflow_dispatch` from a branch, or a push to
+     one, cannot reach the jobs that publish.
+   - Optionally add *Required reviewers*, so a person approves each release
+     before anything is published.
+2. **Protect the tags** (Settings → Rules → Rulesets → New tag ruleset) so
+   that only maintainers can create, move or delete `v*` tags. The environment
+   rule trusts whoever can push such a tag.
+3. **Delete the `CARGO_REGISTRY_TOKEN` repository secret** if it exists, and
+   revoke the token on crates.io. Publishing no longer uses a stored token.
+4. **Configure crates.io trusted publishing** (on crates.io: the `yanuget`
+   crate → Settings → Trusted Publishing → Add): repository owner `thoscut`,
+   repository `yanuget`, workflow filename `release.yml`, environment
+   `release`. The `crates-io` job then trades its OIDC identity for a publish
+   token that lasts minutes. Trusted publishing can only be set up for a crate
+   that already exists; if `yanuget` has never been published, do the first
+   `cargo publish` by hand with a personal token, then set it up.
+5. **Leave the repository variable `PUBLISH_TO_CRATES_IO` unset** until
+   publishing to crates.io is wanted, then set it to `true` (Settings →
+   Secrets and variables → Actions → Variables).
+6. **Allow Actions to write packages**: the `image` job pushes to
+   `ghcr.io/thoscut/yanuget` with the workflow's own token, so the package
+   (once it exists) must grant this repository *Write* access under its
+   *Manage Actions access* settings.
+
 ## Versioning
 
 Semantic versioning. While the major version is `0`:
@@ -62,15 +96,24 @@ git tag -a v0.1.0 -m "YANuget 0.1.0"
 git push origin v0.1.0
 ```
 
+To re-run a release by hand (Actions → Release → Run workflow), choose the tag
+itself under *Use workflow from*, and enter the same tag. The workflow refuses
+a run started from a branch, and never creates a tag: it builds the commit the
+existing tag points at.
+
 ## What the workflow does
 
 | Job | Result |
 | --- | --- |
-| `guard` | Refuses the release unless the tag, `Cargo.toml` and `CHANGELOG.md` agree. |
-| `build` | Compiles for five targets (Linux x86-64/aarch64, macOS x86-64/aarch64, Windows x86-64) with the rendered docs embedded, and packages each with the README, licence, changelog and example config. |
-| `image` | Publishes `ghcr.io/thoscut/yanuget` tagged `X.Y.Z`, `X.Y` and `latest`. |
-| `release` | Attaches every archive plus `SHA256SUMS` to a GitHub Release whose notes are the changelog section for this version. |
-| `crates-io` | Runs `cargo publish` — **only** when the repository variable `PUBLISH_TO_CRATES_IO` is `true` *and* a `CARGO_REGISTRY_TOKEN` secret exists. Off by default: a crates.io version can be yanked but never replaced, so having a token lying around should not be what decides it. |
+| `guard` | Refuses the release unless the tag exists, the run started from it, and the tag, `Cargo.toml` and `CHANGELOG.md` agree. Every later job builds the commit it resolved. |
+| `build` | Compiles for five targets (Linux x86-64/aarch64, macOS x86-64/aarch64, Windows x86-64) with the rendered docs embedded, and packages each with the README, licence, changelog and example config. Read-only token, no caches. |
+| `image` | Publishes `ghcr.io/thoscut/yanuget` for `linux/amd64` and `linux/arm64`, tagged `X.Y.Z`, `X.Y` and `latest`; attests its build provenance and signs it with cosign (keyless). |
+| `release` | Attests the provenance of every archive and `SHA256SUMS`, and attaches them to a GitHub Release whose notes are the changelog section for this version. |
+| `crates-io` | Runs `cargo publish` through trusted publishing — **only** when the repository variable `PUBLISH_TO_CRATES_IO` is `true`. Off by default: a crates.io version can be yanked but never replaced. |
+
+Only `image`, `release` and `crates-io` hold a write scope or an OIDC token,
+and they run in the `release` environment. Every action is pinned to a commit
+SHA, and the docs toolchain is installed from a hashed lock.
 
 Re-running a failed release is safe for everything except `crates-io`: a version
 published to crates.io can be yanked but never replaced. If that job is the one
@@ -81,6 +124,10 @@ the same one.
 
 - Check that the container image runs:
   `docker run --rm -e YANUGET_API_KEY=test -p 5000:5000 ghcr.io/thoscut/yanuget:X.Y.Z`
+- Check that the provenance and signature verify, as a user would — the
+  commands are in [SECURITY.md](SECURITY.md#verifying-a-release):
+  `gh attestation verify` on one archive and on the image, and `cosign verify`
+  on the image.
 - Download one binary and confirm `/docs` serves the real documentation rather
   than the "documentation not bundled" placeholder — that placeholder appearing
   means the docs step did not run.

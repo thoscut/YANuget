@@ -332,7 +332,7 @@ async fn store_all(
     }
 
     // Decide everything first; nothing is written unless every PDB is fine.
-    let lower_id = id.to_lowercase();
+    let lower_id = crate::database::canonical_id(id);
     let normalized = version.normalized();
     let mut plans = Vec::with_capacity(verified.len());
     for v in verified {

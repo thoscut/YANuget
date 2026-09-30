@@ -78,14 +78,23 @@ pub async fn lock_symbol(key: &str, filename: &str) -> OwnedMutexGuard<()> {
         key.to_ascii_uppercase(),
         filename.to_ascii_lowercase()
     );
-    // The registry guard must be gone before the await (it is not `Send`).
-    let mutex = {
-        let mut reg = registry()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        acquire(&mut reg, key)
-    };
-    mutex.lock_owned().await
+    locked(key).lock_owned().await
+}
+
+/// Acquire the lock for one blob of attached-file bytes, by its SHA-256.
+///
+/// A blob is shared by content, across versions, so the version lock does not
+/// cover it: an attach to one version could find the blob present and drop its
+/// own copy while a detach from another version counts no references and
+/// deletes it. Held across "store the blob, insert the row" and "count the
+/// rows, delete the blob", this makes the two exclusive.
+///
+/// Always taken *inside* a version lock, never the other way round, so the two
+/// kinds of lock cannot deadlock.
+pub async fn lock_blob(sha256_hex: &str) -> OwnedMutexGuard<()> {
+    // No `/`, unlike every version key, so the two never collide.
+    let key = format!("blob:{}", sha256_hex.to_ascii_lowercase());
+    locked(key).lock_owned().await
 }
 
 fn mutex_for(id: &str, normalized_version: &str) -> Arc<AsyncMutex<()>> {
@@ -94,6 +103,10 @@ fn mutex_for(id: &str, normalized_version: &str) -> Arc<AsyncMutex<()>> {
         id.to_ascii_lowercase(),
         normalized_version.to_ascii_lowercase()
     );
+    locked(key)
+}
+
+fn locked(key: String) -> Arc<AsyncMutex<()>> {
     // See the note in `ratelimit`: a poisoned process-global mutex on a hot
     // path is a permanent outage, and the guarded map degrades gracefully.
     let mut reg = registry()
@@ -139,6 +152,17 @@ mod tests {
         assert!(try_lock_version("busy", "2.0.0").is_some());
         drop(held);
         assert!(try_lock_version("Busy", "1.0.0").is_some());
+    }
+
+    #[tokio::test]
+    async fn blob_locks_are_their_own_keys() {
+        let sha = "ab".repeat(32);
+        let held = lock_blob(&sha).await;
+        // A version lock is unaffected, even one whose key looks alike.
+        assert!(try_lock_version("blob", &sha).is_some());
+        assert!(locked(format!("blob:{sha}")).try_lock_owned().is_err());
+        drop(held);
+        let _again = lock_blob(&sha.to_uppercase()).await;
     }
 
     #[tokio::test]

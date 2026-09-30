@@ -58,10 +58,17 @@ async-trait = "0.1"
 mime = "0.3"
 percent-encoding = "2"
 toml = "1"
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "rustls-tls-native-roots"] }
 rust-embed = { version = "8", features = ["debug-embed", "interpolate-folder-path"] }
 indicatif = "0.18"
 fs4 = "1.1.0"
+flate2 = "1"
+
+# The SSH inbox walks a directory the uploader writes to one component at a
+# time relative to open handles (openat with O_NOFOLLOW), so no link it plants
+# is ever followed. Already in the tree through fs4.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["fs"] }
 
 [dev-dependencies]
 tempfile = "3"

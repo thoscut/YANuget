@@ -67,9 +67,10 @@ pub struct Package {
 }
 
 impl Package {
-    /// The lower-cased package id used for case-insensitive lookups and URLs.
+    /// The lower-cased package id used for case-insensitive lookups and URLs
+    /// (see [`crate::database::canonical_id`]).
     pub fn lower_id(&self) -> String {
-        self.id.to_lowercase()
+        crate::database::canonical_id(&self.id)
     }
 
     /// The normalized version string used in URLs and storage paths.

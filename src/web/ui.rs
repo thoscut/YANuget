@@ -1945,7 +1945,9 @@ pub fn admin_retention_page(urls: &UrlBuilder, view: &RetentionView) -> String {
          <div class=\"card\"><h2>Rules</h2>{kv_rows}\
          <p class=\"muted\">Set in the configuration file, under <code>[retention]</code> or a \
          feed's <code>[feeds.retention]</code>. The newest version of every package is always \
-         kept, and pinned versions are kept whatever the rules say.</p>{last}</div>\
+         kept, and pinned versions are kept whatever the rules say. The rules count only what \
+         clients can download: pending and disabled versions are neither counted nor \
+         deleted.</p>{last}</div>\
          <div class=\"card\"><h2>Next cleanup</h2>{next}</div>{pinned}",
         admin = escape_html(&urls.app("/admin")),
     );
@@ -3786,6 +3788,7 @@ mod tests {
             mirror: None,
             license_policy: crate::config::LicensePolicyConfig::default(),
             retention: crate::config::RetentionConfig::default(),
+            reserved_elsewhere: Vec::new(),
             cleanup: Default::default(),
         }
     }

@@ -73,11 +73,23 @@ PUT /api/v2/package
             ├─ nuspec::parse_nuspec
             ├─ validation::validate_package_id
             ├─ build Package (size/hash from the stream summary)
-            ├─ duplicate / overwrite policy
+            ├─ reserved id prefixes, license policy
+            ├─ lock_version                (per id/version, across feeds)
+            ├─ orphan check                (finish a purge that failed part-way)
+            ├─ duplicate / overwrite policy (different bytes under a stored
+            │                                id/version → 409 in any feed)
             ├─ storage.store_package       (atomic rename into place)
             ├─ storage.store_aux           (nuspec / readme / icon sidecars)
-            └─ db.add                       (rollback storage on failure)
+            └─ db.add_version / db.replace_version
+                                           (one transaction; a new version's
+                                            payload is removed if it fails, an
+                                            overwritten one is put back)
 ```
+
+The database keeps a full-text index for search (FTS5, trigram tokenizer)
+next to `packages`, maintained by triggers. Schema changes are numbered by
+`PRAGMA user_version` and run once, inside a `BEGIN IMMEDIATE` transaction, so
+two processes opening the same file never both migrate it.
 
 ## Request flow: restore / download
 

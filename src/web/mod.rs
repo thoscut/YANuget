@@ -42,7 +42,7 @@ use crate::nuget::{self, UrlBuilder};
 use crate::proxy::{self, TrustedProxies};
 use crate::ratelimit::{self, RateLimiter};
 use crate::retention::{self, RetentionPolicy};
-use crate::storage::{AuxFile, PackageContent, PackageStorage};
+use crate::storage::{AuxFile, PackageContent, PackageStorage, TempPath};
 use crate::streaming::{self, StreamSummary};
 use crate::symbols;
 use crate::version::NuGetVersion;
@@ -76,21 +76,26 @@ pub struct FeedContext {
     pub mirror: Option<MirrorClient>,
     pub license_policy: LicensePolicyConfig,
     pub retention: RetentionConfig,
+    /// Id prefixes other feeds reserved, which this one refuses.
+    pub reserved_elsewhere: Vec<crate::config::ReservedPrefix>,
     /// The feed's cleanup lock and last report, shared with the background
     /// sweep.
     pub cleanup: Arc<retention::RetentionState>,
 }
 
 impl FeedContext {
-    /// Build a feed's serving context. `upload_limit` is the server-wide
-    /// `max_package_size_bytes`, which mirrored downloads inherit unless the
-    /// feed's mirror set a tighter one of its own.
-    fn from_resolved(feed: &ResolvedFeed, upload_limit: Option<u64>) -> Self {
-        let mut mirror = MirrorClient::from_config(&feed.mirror);
+    /// Build a feed's serving context. Mirrored downloads inherit the
+    /// server-wide `max_package_size_bytes` unless the feed's mirror set a
+    /// tighter one of its own, and are held to `min_free_disk_bytes`.
+    fn from_resolved(feed: &ResolvedFeed, config: &Config) -> Result<Self> {
+        // A mirror that cannot be built stops startup rather than quietly
+        // serving the feed without it.
+        let mut mirror = MirrorClient::try_from_config(&feed.mirror)?;
         if let Some(client) = mirror.as_mut() {
-            client.set_default_size_limit(upload_limit);
+            client.set_default_size_limit(config.max_package_size_bytes);
+            client.set_min_free_disk_bytes(config.min_free_disk_bytes);
         }
-        Self {
+        Ok(Self {
             name: feed.name.clone(),
             prefix: feed.prefix.clone(),
             auth: ApiKeyAuth::new(feed.api_keys.clone()),
@@ -103,8 +108,9 @@ impl FeedContext {
             mirror,
             license_policy: feed.license_policy.clone(),
             retention: feed.retention.clone(),
+            reserved_elsewhere: feed.reserved_elsewhere.clone(),
             cleanup: Arc::default(),
-        }
+        })
     }
 }
 
@@ -178,10 +184,7 @@ impl AppState {
         let temp_dir = config.storage_path().join(".uploads");
         tokio::fs::create_dir_all(&temp_dir).await?;
         sweep_stale_uploads(&temp_dir).await;
-        let feed = Arc::new(FeedContext::from_resolved(
-            resolved,
-            config.max_package_size_bytes,
-        ));
+        let feed = Arc::new(FeedContext::from_resolved(resolved, &config)?);
         Ok(Self {
             storage,
             db,
@@ -252,11 +255,12 @@ impl AppState {
         Ok(())
     }
 
-    /// Create a fresh temp file for an incoming upload.
-    async fn create_temp(&self) -> Result<(PathBuf, tokio::fs::File)> {
+    /// Create a fresh temp file for an incoming upload, removed again when the
+    /// returned [`TempPath`] is dropped unless it has been moved into the store.
+    async fn create_temp(&self) -> Result<(TempPath, tokio::fs::File)> {
         let path = self.temp_dir.join(format!("{}.tmp", uuid::Uuid::new_v4()));
         let file = tokio::fs::File::create(&path).await?;
-        Ok((path, file))
+        Ok((TempPath::new(path), file))
     }
 
     /// Reject the request unless valid read credentials are presented (a no-op
@@ -269,29 +273,90 @@ impl AppState {
         }
     }
 
+    fn mirror_options(&self) -> MirrorOptions {
+        MirrorOptions {
+            requires_approval: self.feed.requires_approval,
+            license_policy: self.feed.license_policy.clone(),
+            reserved_elsewhere: self.feed.reserved_elsewhere.clone(),
+        }
+    }
+
     /// Best-effort read-through mirror: when the feed has an upstream and a
     /// lookup missed, fetch the package's versions and index them. Errors are
     /// logged, never surfaced — a mirror outage degrades to a normal miss.
     async fn mirror_if_needed(&self, id: &str) {
+        if self.feed.mirror.is_none() {
+            return;
+        }
+        // Not worth a download that indexing would refuse.
+        if self.feed.reserved_elsewhere.iter().any(|r| r.covers(id)) {
+            return;
+        }
+        let options = self.mirror_options();
+        // Fetching and indexing is the same store-then-record sequence as a
+        // push, so it too finishes when the client that asked goes away.
+        let (state, owned_id) = (self.clone(), id.to_string());
+        let fetched = detached(async move {
+            let Some(client) = &state.feed.mirror else {
+                return Ok(0);
+            };
+            mirror::ensure_package(
+                client,
+                state.storage.as_ref(),
+                state.db.as_ref(),
+                state.feed(),
+                &state.temp_dir,
+                &owned_id,
+                &options,
+            )
+            .await
+        })
+        .await;
+        if let Err(e) = fetched {
+            tracing::warn!(feed = %self.feed(), id, error = %e, "mirror lookup failed");
+        }
+    }
+
+    /// A package the feed already holds: re-list it upstream in the
+    /// background once its list is older than `refresh_secs`, so new releases
+    /// appear without the read that noticed waiting for them.
+    fn mirror_refresh(&self, id: &str) {
         let Some(client) = &self.feed.mirror else {
             return;
         };
-        let options = MirrorOptions {
-            requires_approval: self.feed.requires_approval,
-            license_policy: self.feed.license_policy.clone(),
-        };
-        if let Err(e) = mirror::ensure_package(
-            client,
-            self.storage.as_ref(),
-            self.db.as_ref(),
-            self.feed(),
-            &self.temp_dir,
-            id,
-            &options,
-        )
-        .await
-        {
-            tracing::warn!(feed = %self.feed(), id, error = %e, "mirror lookup failed");
+        if !client.wants_refresh(self.feed(), id) {
+            return;
+        }
+        let (state, id) = (self.clone(), id.to_string());
+        tokio::spawn(async move { state.mirror_if_needed(&id).await });
+    }
+
+    /// A download of a version the feed does not have: fetch that version,
+    /// whether or not it is among the newest the listing keeps.
+    async fn mirror_version(&self, id: &str, version: &NuGetVersion) {
+        if self.feed.mirror.is_none() || self.feed.reserved_elsewhere.iter().any(|r| r.covers(id)) {
+            return;
+        }
+        let options = self.mirror_options();
+        // Detached for the same reason as `mirror_if_needed`.
+        let (state, owned_id, owned_version) = (self.clone(), id.to_string(), version.clone());
+        let fetched = detached(async move {
+            let Some(client) = &state.feed.mirror else {
+                return Ok(0);
+            };
+            let target = mirror::MirrorTarget {
+                client,
+                storage: state.storage.as_ref(),
+                db: state.db.as_ref(),
+                feed: state.feed(),
+                temp_dir: &state.temp_dir,
+                options: &options,
+            };
+            target.ensure_version(&owned_id, &owned_version).await
+        })
+        .await;
+        if let Err(e) = fetched {
+            tracing::warn!(feed = %self.feed(), id, version = %version.normalized(), error = %e, "mirror fetch failed");
         }
     }
 }
@@ -423,7 +488,7 @@ async fn sweep_stale_uploads(temp_dir: &std::path::Path) {
     let (mut removed, mut bytes) = (0u64, 0u64);
     while let Ok(Some(entry)) = entries.next_entry().await {
         let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("tmp") {
+        if !is_stale_temp_name(&entry.file_name().to_string_lossy()) {
             continue;
         }
         let size = entry.metadata().await.map(|m| m.len()).unwrap_or(0);
@@ -439,6 +504,14 @@ async fn sweep_stale_uploads(temp_dir: &std::path::Path) {
             "removed upload temp files left by a previous run"
         );
     }
+}
+
+/// Whether a name in the staging directory is something only a running process
+/// uses: every temp and staged file is `*.tmp`, and before those the inbox
+/// staged as `inbox-*.part`. A resumable upload's `{id}.part` is not one; it
+/// outlives restarts on purpose and goes when the upload expires.
+fn is_stale_temp_name(name: &str) -> bool {
+    name.ends_with(".tmp") || (name.starts_with("inbox-") && name.ends_with(".part"))
 }
 
 impl GlobalLayers {
@@ -870,25 +943,18 @@ async fn push_package(State(state): State<AppState>, request: Request) -> Result
         .unwrap_or(false);
 
     state.ensure_disk_space(content_length(&headers))?;
-    let (temp_path, mut file) = state.create_temp().await?;
+    // Removed on every way out that does not store it, a dropped connection
+    // included.
+    let (temp, mut file) = state.create_temp().await?;
     let limit = state.config.max_package_size_bytes;
 
-    // Stream the body to disk. On any failure, drop the temp file.
-    let summary = match write_upload(request, &mut file, is_multipart, limit, &state).await {
-        Ok(summary) => summary,
-        Err(e) => {
-            let _ = tokio::fs::remove_file(&temp_path).await;
-            return Err(e);
-        }
-    };
+    // Stream the body to disk.
+    let summary = write_upload(request, &mut file, is_multipart, limit, &state).await?;
     // Flush the OS page cache to stable storage before the payload is renamed
     // into the store. The database row that follows says the package exists; if
     // a crash lands between the rename and the kernel's own writeback, that row
     // would point at a truncated or empty file.
-    if let Err(e) = file.sync_all().await {
-        let _ = tokio::fs::remove_file(&temp_path).await;
-        return Err(Error::Io(e));
-    }
+    file.sync_all().await?;
     drop(file);
 
     let options = IndexOptions {
@@ -897,33 +963,48 @@ async fn push_package(State(state): State<AppState>, request: Request) -> Result
         license_policy: state.feed.license_policy.clone(),
         // A push is self-describing: the manifest defines the identity.
         expect: None,
+        reserved_elsewhere: state.feed.reserved_elsewhere.clone(),
     };
-    let result = indexing::index_package(
-        state.storage.as_ref(),
-        state.db.as_ref(),
-        state.feed(),
-        temp_path,
-        summary,
-        &options,
-    )
-    .await?;
-
-    // Optionally prune older versions of this id in this feed (best-effort:
-    // never fail the push because of retention).
-    if state.feed.retention.enabled && state.feed.retention.prune_on_push {
-        let policy = RetentionPolicy::from(&state.feed.retention);
-        if let Err(e) = retention::prune_package(
+    let state = state.clone();
+    detached(async move {
+        let result = indexing::index_package(
             state.storage.as_ref(),
             state.db.as_ref(),
             state.feed(),
-            &result.id,
-            &policy,
+            temp.path().to_path_buf(),
+            summary,
+            &options,
         )
-        .await
+        .await?;
+        // Pushing a deleted version back is how it is un-deleted for the
+        // mirror.
+        if let Err(e) = state
+            .db
+            .clear_tombstone(state.feed(), &result.id, &result.version)
+            .await
         {
-            tracing::error!(id = %result.id, error = %e, "prune-on-push failed");
+            tracing::warn!(id = %result.id, error = %e, "could not clear the version's tombstone");
         }
-    }
+
+        // Optionally prune older versions of this id in this feed
+        // (best-effort: never fail the push because of retention).
+        if state.feed.retention.enabled && state.feed.retention.prune_on_push {
+            let policy = RetentionPolicy::from(&state.feed.retention);
+            if let Err(e) = retention::prune_package(
+                state.storage.as_ref(),
+                state.db.as_ref(),
+                state.feed(),
+                &result.id,
+                &policy,
+            )
+            .await
+            {
+                tracing::error!(id = %result.id, error = %e, "prune-on-push failed");
+            }
+        }
+        Ok(())
+    })
+    .await?;
 
     Ok(StatusCode::CREATED.into_response())
 }
@@ -1060,6 +1141,8 @@ async fn package_versions(
             .db
             .find_versions(state.feed(), &id, INCLUDE_UNLISTED)
             .await?;
+    } else {
+        state.mirror_refresh(&id);
     }
     if packages.is_empty() {
         return Err(Error::PackageNotFound);
@@ -1084,7 +1167,7 @@ async fn download_package(
     // Admin-disabled / pending versions are withheld from clients entirely.
     // On a miss, attempt a read-through mirror before giving up.
     if !state.db.is_servable(state.feed(), &id, &version).await? {
-        state.mirror_if_needed(&id).await;
+        state.mirror_version(&id, &version).await;
         if !state.db.is_servable(state.feed(), &id, &version).await? {
             return Err(Error::PackageNotFound);
         }
@@ -1204,6 +1287,8 @@ async fn registration_index_for(
     if packages.is_empty() {
         state.mirror_if_needed(id).await;
         packages = state.db.find_versions(state.feed(), id, true).await?;
+    } else {
+        state.mirror_refresh(id);
     }
     if packages.is_empty() {
         return Err(Error::PackageNotFound);
@@ -1424,36 +1509,31 @@ async fn push_symbol_package(State(state): State<AppState>, request: Request) ->
         .unwrap_or(false);
 
     state.ensure_disk_space(content_length(&headers))?;
-    let (temp_path, mut file) = state.create_temp().await?;
+    let (temp, mut file) = state.create_temp().await?;
     let limit = state.config.max_package_size_bytes;
 
     // The size and hash are computed while the bytes stream past, so recording
     // them costs nothing. Dropping them left the one number in the log that says
     // how much a symbol push actually cost, and any later question about which
     // bytes were stored, unanswerable.
-    let summary = match write_upload(request, &mut file, is_multipart, limit, &state).await {
-        Ok(summary) => summary,
-        Err(e) => {
-            let _ = tokio::fs::remove_file(&temp_path).await;
-            return Err(e);
-        }
-    };
+    let summary = write_upload(request, &mut file, is_multipart, limit, &state).await?;
     // Flush the OS page cache to stable storage before the payload is renamed
     // into the store. The database row that follows says the package exists; if
     // a crash lands between the rename and the kernel's own writeback, that row
     // would point at a truncated or empty file.
-    if let Err(e) = file.sync_all().await {
-        let _ = tokio::fs::remove_file(&temp_path).await;
-        return Err(Error::Io(e));
-    }
+    file.sync_all().await?;
     drop(file);
 
-    let result = symbols::index_symbol_package(
-        state.storage.as_ref(),
-        state.db.as_ref(),
-        state.feed(),
-        temp_path,
-    )
+    let indexing = state.clone();
+    let result = detached(async move {
+        symbols::index_symbol_package(
+            indexing.storage.as_ref(),
+            indexing.db.as_ref(),
+            indexing.feed(),
+            temp.path().to_path_buf(),
+        )
+        .await
+    })
     .await?;
     tracing::info!(
         id = %result.id,
@@ -1967,10 +2047,14 @@ async fn admin_package(
     } else {
         Vec::new()
     };
+    // One query for the whole id rather than one per version, newest version
+    // first, and only the versions this feed holds.
     let mut files = Vec::new();
     if state.config.files.enabled {
+        let mut all = state.db.files_for_id(&id).await?;
         for fv in versions.iter().rev() {
-            files.extend(state.db.files_for(&id, &fv.package.version).await?);
+            let v = fv.package.normalized_version();
+            files.extend(all.extract_if(.., |f| f.normalized_version == v));
         }
     }
     Ok(Html(ui::admin_package_page(
@@ -2097,6 +2181,10 @@ async fn transfer_version(
     }
     if mode == Transfer::Move {
         state.db.remove_membership(state.feed(), id, v).await?;
+        // Moved out on purpose: this feed's mirror must not fetch it back.
+        if let Err(e) = state.db.add_tombstone(state.feed(), id, v).await {
+            tracing::error!(feed = %state.feed(), %id, error = %e, "could not record the move");
+        }
     }
     Ok(())
 }
@@ -2522,6 +2610,21 @@ fn forwarded(headers: &HeaderMap, name: &str) -> Option<String> {
 
 fn to_io_err<E: std::fmt::Display>(e: E) -> std::io::Error {
     std::io::Error::other(e.to_string())
+}
+
+/// Run `work` to completion in a task of its own and wait for it.
+///
+/// A client that disconnects cancels its request's future at whatever await
+/// it has reached. Work that is a sequence of store and database steps — an
+/// indexing, an attach, a mirror fetch — must not stop between two of them,
+/// leaving a payload without its row or an overwrite with its old rows gone.
+/// Spawned, it finishes either way; only the answer is lost.
+async fn detached<T: Send + 'static>(
+    work: impl std::future::Future<Output = Result<T>> + Send + 'static,
+) -> Result<T> {
+    tokio::spawn(work)
+        .await
+        .map_err(|e| Error::Other(anyhow::anyhow!("background task failed: {e}")))?
 }
 
 fn map_upload_err(e: std::io::Error) -> Error {

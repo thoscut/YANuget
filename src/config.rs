@@ -264,10 +264,11 @@ impl Default for LicensePolicyConfig {
 }
 
 /// Authentication for an upstream mirror. All fields are optional; set the
-/// `username`/`password` pair for HTTP Basic, `token` for a Bearer token, and/or
-/// `headers` for arbitrary custom headers (e.g. a private-feed API key). When
-/// more than one is set they are all sent.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// `username`/`password` pair for HTTP Basic *or* `token` for a Bearer token,
+/// and/or `headers` for arbitrary custom headers (e.g. a private-feed API key).
+/// Headers are sent alongside either. They go only to the upstream's own
+/// scheme, host and port, never to hosts its service index names.
+#[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MirrorAuthConfig {
     /// HTTP Basic username (sent with `password`).
@@ -285,18 +286,60 @@ impl MirrorAuthConfig {
     pub fn is_set(&self) -> bool {
         self.username.is_some() || self.token.is_some() || !self.headers.is_empty()
     }
+
+    /// Reject combinations that cannot all be sent. Basic and Bearer both
+    /// need `Authorization`, and one of them used to be dropped without a
+    /// word — so a token the operator believed was in use never was.
+    pub fn validate(&self) -> Result<()> {
+        if self.username.is_some() && self.token.is_some() {
+            return Err(Error::BadRequest(
+                "mirror auth sets both username (HTTP Basic) and token (Bearer); \
+                 both need the Authorization header, so set only one"
+                    .into(),
+            ));
+        }
+        if self.password.is_some() && self.username.is_none() {
+            return Err(Error::BadRequest(
+                "mirror auth sets a password without a username".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Debug for MirrorAuthConfig {
+    /// Secrets are shown only as present; custom headers by name only, since
+    /// their values are keys.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let redacted = |v: &Option<String>| v.as_ref().map(|_| "<redacted>");
+        f.debug_struct("MirrorAuthConfig")
+            .field("username", &self.username)
+            .field("password", &redacted(&self.password))
+            .field("token", &redacted(&self.token))
+            .field("headers", &self.headers.keys().collect::<Vec<_>>())
+            .finish()
+    }
 }
 
 /// Per-feed upstream mirroring (read-through caching of a public NuGet feed).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MirrorConfig {
     /// Master switch. Off by default.
     pub enabled: bool,
     /// Upstream V3 service index to mirror from.
     pub upstream: String,
-    /// Per-request timeout (seconds) when talking to the upstream.
+    /// Timeout (seconds) for connecting to the upstream, for any silence while
+    /// it answers, and for a whole metadata request.
     pub timeout_secs: u64,
+    /// Deadline (seconds) for one whole `.nupkg` download; `0` removes it. A
+    /// stalled transfer is cut off by `timeout_secs` either way; this bounds
+    /// one that trickles.
+    pub download_timeout_secs: u64,
+    /// How long (seconds) a package's upstream version list is trusted before
+    /// a read lists it again, so new upstream releases appear. It is also how
+    /// long an id the upstream does not have is not asked for again.
+    pub refresh_secs: u64,
     /// Credentials for an authenticated upstream feed (default: none).
     pub auth: MirrorAuthConfig,
     /// Allow upstream URLs that point at loopback/link-local/private addresses.
@@ -315,6 +358,42 @@ pub struct MirrorConfig {
     /// have hundreds of versions and tens of gigabytes behind it; without a
     /// bound one anonymous request for it pulls the lot.
     pub max_versions_per_package: Option<usize>,
+    /// Outbound proxy for upstream requests (`http://proxy:3128`). Unset, the
+    /// mirror connects directly and ignores `HTTP(S)_PROXY` in the environment.
+    pub proxy: Option<String>,
+    /// PEM file of extra CA certificates to trust for the upstream, on top of
+    /// the system store and the bundled Mozilla roots — for an upstream behind
+    /// an internal CA or a TLS-inspecting proxy.
+    pub ca_cert_path: Option<PathBuf>,
+}
+
+impl MirrorConfig {
+    /// Reject a mirror configuration that cannot work as written.
+    pub fn validate(&self) -> Result<()> {
+        self.auth.validate()
+    }
+}
+
+impl std::fmt::Debug for MirrorConfig {
+    /// The upstream and proxy URLs can carry credentials of their own
+    /// (`https://user:token@host/…`), so they are shown without userinfo or
+    /// query.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let redact = crate::mirror::redact_url;
+        f.debug_struct("MirrorConfig")
+            .field("enabled", &self.enabled)
+            .field("upstream", &redact(&self.upstream))
+            .field("timeout_secs", &self.timeout_secs)
+            .field("download_timeout_secs", &self.download_timeout_secs)
+            .field("refresh_secs", &self.refresh_secs)
+            .field("auth", &self.auth)
+            .field("allow_private_upstream", &self.allow_private_upstream)
+            .field("max_package_size_bytes", &self.max_package_size_bytes)
+            .field("max_versions_per_package", &self.max_versions_per_package)
+            .field("proxy", &self.proxy.as_deref().map(redact))
+            .field("ca_cert_path", &self.ca_cert_path)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for MirrorConfig {
@@ -323,10 +402,14 @@ impl Default for MirrorConfig {
             enabled: false,
             upstream: "https://api.nuget.org/v3/index.json".to_string(),
             timeout_secs: 30,
+            download_timeout_secs: 3600,
+            refresh_secs: 600,
             auth: MirrorAuthConfig::default(),
             allow_private_upstream: false,
             max_package_size_bytes: None,
             max_versions_per_package: Some(50),
+            proxy: None,
+            ca_cert_path: None,
         }
     }
 }
@@ -368,6 +451,11 @@ pub struct FeedConfig {
     pub license_policy: LicensePolicyConfig,
     /// Retention for this feed; falls back to the global `[retention]`.
     pub retention: Option<RetentionConfig>,
+    /// Package-id prefixes only this feed may bring in (`Contoso.`): every
+    /// other feed refuses to push, mirror or migrate an id under one. An id and
+    /// version are one namespace across every feed, so without this whoever
+    /// stores a version first claims it in all of them.
+    pub reserved_id_prefixes: Vec<String>,
 }
 
 /// The default feed name used when no `[[feeds]]` are configured.
@@ -392,6 +480,33 @@ pub struct ResolvedFeed {
     pub mirror: MirrorConfig,
     pub license_policy: LicensePolicyConfig,
     pub retention: RetentionConfig,
+    /// This feed's own `reserved_id_prefixes`.
+    pub reserved_id_prefixes: Vec<String>,
+    /// The prefixes every *other* feed reserved, which this one must refuse.
+    pub reserved_elsewhere: Vec<ReservedPrefix>,
+}
+
+/// A package-id prefix reserved by one feed (`reserved_id_prefixes`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReservedPrefix {
+    pub prefix: String,
+    /// The feed it is reserved for.
+    pub feed: String,
+}
+
+impl ReservedPrefix {
+    /// Whether `id` falls under the prefix, ignoring ASCII case. A prefix
+    /// ending in `.` also covers the bare id before it (`Contoso.` covers
+    /// `Contoso` as well as `Contoso.Utils`).
+    pub fn covers(&self, id: &str) -> bool {
+        let id = id.as_bytes();
+        let prefix = self.prefix.as_bytes();
+        let starts = id.len() >= prefix.len() && id[..prefix.len()].eq_ignore_ascii_case(prefix);
+        starts
+            || prefix
+                .strip_suffix(b".")
+                .is_some_and(|bare| id.eq_ignore_ascii_case(bare))
+    }
 }
 
 /// Configuration for the package retention sweep.
@@ -805,6 +920,9 @@ impl Config {
                 mirror: MirrorConfig::default(),
                 license_policy: LicensePolicyConfig::default(),
                 retention: self.retention.clone(),
+                // A single feed has no other feed to reserve anything from.
+                reserved_id_prefixes: Vec::new(),
+                reserved_elsewhere: Vec::new(),
             }]);
         }
 
@@ -818,6 +936,9 @@ impl Config {
                     f.name
                 )));
             }
+            f.mirror
+                .validate()
+                .map_err(|e| Error::BadRequest(format!("feed {:?}: {e}", f.name)))?;
             // A feed that sets any push key of its own uses only those; otherwise
             // it falls back to the global keys.
             let feed_keys = combine_keys(&f.api_key, &f.api_keys);
@@ -845,7 +966,38 @@ impl Config {
                     .retention
                     .clone()
                     .unwrap_or_else(|| self.retention.clone()),
+                reserved_id_prefixes: reserved_prefixes(f)?,
+                reserved_elsewhere: Vec::new(),
             });
+        }
+
+        // Each feed refuses what the others reserved. Two reservations that
+        // overlap would leave the ids under the narrower one to nobody.
+        let all: Vec<ReservedPrefix> = resolved
+            .iter()
+            .flat_map(|f| {
+                f.reserved_id_prefixes.iter().map(|p| ReservedPrefix {
+                    prefix: p.clone(),
+                    feed: f.name.clone(),
+                })
+            })
+            .collect();
+        for (i, a) in all.iter().enumerate() {
+            for b in &all[i + 1..] {
+                if a.feed != b.feed
+                    && (a.covers(&b.prefix)
+                        || b.covers(&a.prefix)
+                        || a.prefix.eq_ignore_ascii_case(&b.prefix))
+                {
+                    return Err(Error::BadRequest(format!(
+                        "feeds {:?} and {:?} reserve overlapping id prefixes {:?} and {:?}",
+                        a.feed, b.feed, a.prefix, b.prefix
+                    )));
+                }
+            }
+        }
+        for f in &mut resolved {
+            f.reserved_elsewhere = all.iter().filter(|r| r.feed != f.name).cloned().collect();
         }
 
         // Promotion targets must reference real feeds.
@@ -861,6 +1013,30 @@ impl Config {
         }
         Ok(resolved)
     }
+}
+
+/// A feed's `reserved_id_prefixes`, checked: made of package-id characters
+/// and starting with a letter, digit or `_`, so each can match real ids.
+fn reserved_prefixes(feed: &FeedConfig) -> Result<Vec<String>> {
+    let mut prefixes = Vec::with_capacity(feed.reserved_id_prefixes.len());
+    for raw in &feed.reserved_id_prefixes {
+        let prefix = raw.trim();
+        let valid = prefix
+            .bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_alphanumeric() || b == b'_')
+            && prefix
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'));
+        if !valid || prefix.len() > crate::validation::MAX_ID_LENGTH {
+            return Err(Error::BadRequest(format!(
+                "feed {:?}: invalid reserved_id_prefixes entry {raw:?}",
+                feed.name
+            )));
+        }
+        prefixes.push(prefix.to_string());
+    }
+    Ok(prefixes)
 }
 
 /// Route path segments a feed may not shadow. A feed is mounted at `/{name}`,
@@ -946,6 +1122,56 @@ mod tests {
             max_request = 5
         "#;
         assert!(toml::from_str::<Config>(nested).is_err());
+    }
+
+    #[test]
+    fn reserved_id_prefixes_are_refused_by_every_other_feed() {
+        let feed = |name: &str, prefixes: &[&str]| FeedConfig {
+            name: name.into(),
+            reserved_id_prefixes: prefixes.iter().map(|p| p.to_string()).collect(),
+            ..Default::default()
+        };
+        let config = Config {
+            feeds: vec![
+                feed("internal", &["Contoso."]),
+                feed("public", &[]),
+                feed("tools", &["Fabrikam.Tools."]),
+            ],
+            ..Default::default()
+        };
+        let feeds = config.resolved_feeds().unwrap();
+        let elsewhere = |name: &str| {
+            let f = feeds.iter().find(|f| f.name == name).unwrap();
+            f.reserved_elsewhere
+                .iter()
+                .map(|r| r.prefix.as_str())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(elsewhere("internal"), ["Fabrikam.Tools."]);
+        assert_eq!(elsewhere("public"), ["Contoso.", "Fabrikam.Tools."]);
+
+        let contoso = ReservedPrefix {
+            prefix: "Contoso.".into(),
+            feed: "internal".into(),
+        };
+        for covered in ["Contoso.Utils", "contoso.utils", "CONTOSO", "contoso.a.b"] {
+            assert!(contoso.covers(covered), "{covered:?}");
+        }
+        for free in ["ContosoUtils", "Contos", "My.Contoso.Utils"] {
+            assert!(!contoso.covers(free), "{free:?}");
+        }
+
+        // Overlapping reservations would leave the narrower ids to nobody.
+        let overlapping = Config {
+            feeds: vec![feed("a", &["Contoso."]), feed("b", &["contoso.internal."])],
+            ..Default::default()
+        };
+        assert!(overlapping.resolved_feeds().is_err());
+        let invalid = Config {
+            feeds: vec![feed("a", &[".Contoso"])],
+            ..Default::default()
+        };
+        assert!(invalid.resolved_feeds().is_err());
     }
 
     #[test]
@@ -1125,5 +1351,25 @@ mod tests {
         };
         assert_eq!(overridden.storage_path(), PathBuf::from("/mnt/pkgs"));
         assert_eq!(overridden.database_path(), "/mnt/db.sqlite");
+    }
+
+    #[test]
+    fn a_mirror_with_basic_and_bearer_credentials_is_rejected() {
+        // Both need `Authorization`; one used to be dropped without a word.
+        let config: Config = toml::from_str(
+            r#"
+            [[feeds]]
+            name = "up"
+              [feeds.mirror]
+              enabled = true
+                [feeds.mirror.auth]
+                username = "ci"
+                password = "pw"
+                token = "tok"
+            "#,
+        )
+        .unwrap();
+        let err = config.resolved_feeds().unwrap_err().to_string();
+        assert!(err.contains("\"up\"") && err.contains("token"), "{err}");
     }
 }
