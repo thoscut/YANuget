@@ -601,3 +601,70 @@ async fn an_unreadable_ca_file_is_a_configuration_error() {
     config.ca_cert_path = Some(empty);
     assert!(yanuget::mirror::MirrorClient::try_from_config(&config).is_err());
 }
+
+// ---------------------------------------------------------------------------
+// Disk reserve
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_download_that_would_eat_the_disk_reserve_is_refused() {
+    // Pushes keep `min_free_disk_bytes` free; an anonymous read that starts a
+    // mirror fetch has to as well.
+    let upstream = Upstream::start().await;
+    upstream.publish("Big.Pkg", "1.0.0");
+    let mut client = yanuget::mirror::MirrorClient::from_config(&mirror_config(&upstream)).unwrap();
+    client.set_min_free_disk_bytes(u64::MAX / 2);
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("big.nupkg");
+    let err = client
+        .download_nupkg("big.pkg", "1.0.0", &dest)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, yanuget::Error::InsufficientStorage(_)),
+        "{err}"
+    );
+    assert!(!dest.exists(), "nothing may be written");
+
+    // A reserve the volume can meet lets it through.
+    client.set_min_free_disk_bytes(1);
+    client
+        .download_nupkg("big.pkg", "1.0.0", &dest)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn migrate_holds_downloads_to_the_disk_reserve() {
+    let upstream = Upstream::start().await;
+    upstream.publish("Big.Pkg", "1.0.0");
+    let dir = tempfile::tempdir().unwrap();
+    let storage = FilesystemStorage::new(dir.path().join("packages"))
+        .await
+        .unwrap();
+    let db = SqliteDatabase::in_memory().await.unwrap();
+    let temp = dir.path().join("packages").join(".migrate");
+    std::fs::create_dir_all(&temp).unwrap();
+    let feeds = Config::default().resolved_feeds().unwrap();
+    let summary = yanuget::migrate::run(
+        &storage,
+        &db,
+        &feeds[0],
+        &temp,
+        mirror_config(&upstream),
+        yanuget::migrate::MigrateOptions {
+            quiet: true,
+            min_free_disk_bytes: u64::MAX / 2,
+            ..Default::default()
+        },
+        indicatif::ProgressDrawTarget::hidden(),
+    )
+    .await
+    .unwrap();
+    assert_eq!((summary.imported, summary.failed), (0, 1));
+    assert!(
+        summary.failures[0].error.contains("free"),
+        "{:?}",
+        summary.failures
+    );
+}

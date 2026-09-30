@@ -82,15 +82,16 @@ pub struct FeedContext {
 }
 
 impl FeedContext {
-    /// Build a feed's serving context. `upload_limit` is the server-wide
-    /// `max_package_size_bytes`, which mirrored downloads inherit unless the
-    /// feed's mirror set a tighter one of its own.
-    fn from_resolved(feed: &ResolvedFeed, upload_limit: Option<u64>) -> Result<Self> {
+    /// Build a feed's serving context. Mirrored downloads inherit the
+    /// server-wide `max_package_size_bytes` unless the feed's mirror set a
+    /// tighter one of its own, and are held to `min_free_disk_bytes`.
+    fn from_resolved(feed: &ResolvedFeed, config: &Config) -> Result<Self> {
         // A mirror that cannot be built stops startup rather than quietly
         // serving the feed without it.
         let mut mirror = MirrorClient::try_from_config(&feed.mirror)?;
         if let Some(client) = mirror.as_mut() {
-            client.set_default_size_limit(upload_limit);
+            client.set_default_size_limit(config.max_package_size_bytes);
+            client.set_min_free_disk_bytes(config.min_free_disk_bytes);
         }
         Ok(Self {
             name: feed.name.clone(),
@@ -180,10 +181,7 @@ impl AppState {
         let temp_dir = config.storage_path().join(".uploads");
         tokio::fs::create_dir_all(&temp_dir).await?;
         sweep_stale_uploads(&temp_dir).await;
-        let feed = Arc::new(FeedContext::from_resolved(
-            resolved,
-            config.max_package_size_bytes,
-        )?);
+        let feed = Arc::new(FeedContext::from_resolved(resolved, &config)?);
         Ok(Self {
             storage,
             db,

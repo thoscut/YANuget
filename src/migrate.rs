@@ -46,6 +46,9 @@ pub struct MigrateOptions {
     pub dry_run: bool,
     /// Suppress the human-facing header/summary prints (used by tests).
     pub quiet: bool,
+    /// Free space each download must leave on the storage volume (the
+    /// server's `min_free_disk_bytes`); 0 checks nothing.
+    pub min_free_disk_bytes: u64,
 }
 
 impl Default for MigrateOptions {
@@ -56,6 +59,7 @@ impl Default for MigrateOptions {
             overwrite: OverwriteMode::Disabled,
             dry_run: false,
             quiet: false,
+            min_free_disk_bytes: 0,
         }
     }
 }
@@ -140,7 +144,8 @@ pub async fn run(
     // long the source goes silent, not by how long it takes. A deadline on the
     // whole transfer failed everything the source could not send within
     // `timeout_secs`: at ~2 MiB/s and the default 60 s, anything past ~120 MB.
-    let client = MirrorClient::for_migration(&source)?;
+    let mut client = MirrorClient::for_migration(&source)?;
+    client.set_min_free_disk_bytes(opts.min_free_disk_bytes);
 
     if !opts.quiet {
         println!(

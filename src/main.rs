@@ -412,6 +412,7 @@ async fn run_migrate(config_path: Option<&str>, args: MigrateArgs) -> anyhow::Re
         },
         dry_run: args.dry_run,
         quiet: false,
+        min_free_disk_bytes: config.min_free_disk_bytes,
     };
 
     let summary = yanuget::migrate::run(
