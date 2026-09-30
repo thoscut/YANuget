@@ -598,9 +598,10 @@ async fn ensure_column(
 /// it. The index on `lower_id` alone duplicated the primary key's, and 0.1's
 /// index over `listed` goes with the table.
 ///
-/// A rebuild rather than `ALTER TABLE … DROP COLUMN`: the columns 0.1 and
-/// 0.4 added with `ADD COLUMN` sit at the end of their table, so only a
-/// rebuild gives every database the same `packages`. Nothing references the
+/// A rebuild rather than `ALTER TABLE … DROP COLUMN`: in a database from
+/// before 0.5.0 the columns later builds added with `ADD COLUMN` sit at the
+/// end of the table, so only a rebuild gives every database the same
+/// `packages`. Nothing references the
 /// table yet (foreign keys come in step 7), so dropping it is safe with
 /// enforcement on; its search triggers go with it and are created again.
 async fn drop_dead_columns(c: &mut SqliteConnection) -> Result<()> {
