@@ -1135,6 +1135,147 @@ async fn the_gallery_font_is_served_once_for_every_feed_and_cached() {
     assert!(resp.bytes().await.unwrap().starts_with(b"wOF2"));
 }
 
+/// The retention page, fetched as the admin.
+async fn retention_page(server: &TestServer) -> String {
+    server
+        .client
+        .get(server.url("/admin/retention"))
+        .basic_auth("admin", Some(ADMIN_KEY))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap()
+}
+
+/// The plan fingerprint the retention page's delete button would send.
+fn plan_of(page: &str) -> String {
+    page.split("name=\"plan\" value=\"")
+        .nth(1)
+        .and_then(|s| s.split('"').next())
+        .unwrap_or_else(|| panic!("no delete button: {page}"))
+        .to_string()
+}
+
+async fn run_retention(server: &TestServer, fields: &str) -> reqwest::Response {
+    no_redirect()
+        .post(server.url("/admin/retention/run"))
+        .basic_auth("admin", Some(ADMIN_KEY))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(format!("{}&{fields}", admin_body(ADMIN_KEY)))
+        .send()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_cleanup_deletes_what_it_showed_and_keeps_pins() {
+    let server = spawn_with(|c| {
+        c.admin_api_key = Some(ADMIN_KEY.to_string());
+        // Manual cleanups only: no schedule, nothing on push.
+        c.retention.enabled = true;
+        c.retention.interval_hours = 0;
+        c.retention.keep_latest_stable = Some(1);
+    })
+    .await;
+    for v in ["1.0.0", "2.0.0", "3.0.0"] {
+        push_multipart(&server, API_KEY, build_nupkg("Clean.Pkg", v, b"x")).await;
+    }
+    // Pin the oldest: an LTS line that would otherwise go.
+    let pin = admin_bulk(&server, "", "clean.pkg", ADMIN_KEY, "op=pin&v=1.0.0").await;
+    assert_eq!(pin.status(), reqwest::StatusCode::SEE_OTHER);
+
+    let page = retention_page(&server).await;
+    assert!(page.contains("1 version would be deleted"), "{page}");
+    assert!(
+        page.contains("beyond the newest 1 stable version"),
+        "{page}"
+    );
+    let plan = plan_of(&page);
+
+    // A stale plan deletes nothing, and says so.
+    let stale = run_retention(&server, "plan=not-what-was-shown").await;
+    assert_eq!(stale.status(), reqwest::StatusCode::SEE_OTHER);
+    assert_eq!(stale.headers()["location"], "/admin/retention?changed=1");
+    let flat = |v: &str| format!("/v3/package/clean.pkg/{v}/clean.pkg.{v}.nupkg");
+    assert!(status_of(&server, &flat("2.0.0")).await.is_success());
+
+    // Without the CSRF token, nothing either.
+    let forged = no_redirect()
+        .post(server.url("/admin/retention/run"))
+        .basic_auth("admin", Some(ADMIN_KEY))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(format!("plan={plan}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(forged.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    // The plan as shown: 2.0.0 goes; the pinned 1.0.0 and the newest stay.
+    let run = run_retention(&server, &format!("plan={plan}")).await;
+    assert_eq!(run.status(), reqwest::StatusCode::SEE_OTHER);
+    let location = run.headers()["location"].to_str().unwrap().to_string();
+    assert!(
+        location.starts_with("/admin/retention?deleted=1&"),
+        "{location}"
+    );
+    assert_eq!(
+        status_of(&server, &flat("2.0.0")).await,
+        reqwest::StatusCode::NOT_FOUND
+    );
+    for kept in ["1.0.0", "3.0.0"] {
+        assert!(status_of(&server, &flat(kept)).await.is_success(), "{kept}");
+    }
+    let after = retention_page(&server).await;
+    assert!(after.contains("Nothing to delete"), "{after}");
+    assert!(after.contains("Last cleanup"), "{after}");
+    assert!(after.contains("Pinned, kept regardless"), "{after}");
+}
+
+#[tokio::test]
+async fn pruning_on_push_keeps_pinned_versions_and_an_overwrite_keeps_the_pin() {
+    let server = spawn_with(|c| {
+        c.admin_api_key = Some(ADMIN_KEY.to_string());
+        c.allow_overwrite = yanuget::config::OverwriteMode::Enabled;
+        c.retention.enabled = true;
+        c.retention.interval_hours = 0;
+        c.retention.prune_on_push = true;
+        c.retention.keep_latest_stable = Some(1);
+    })
+    .await;
+    push_multipart(&server, API_KEY, build_nupkg("Lts.Pkg", "1.0.0", b"x")).await;
+    let pin = no_redirect()
+        .post(server.url("/admin/packages/lts.pkg/1.0.0/pin"))
+        .basic_auth("admin", Some(ADMIN_KEY))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(admin_body(ADMIN_KEY))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(pin.status(), reqwest::StatusCode::SEE_OTHER);
+    // Re-pushing the pinned version replaces its bytes, not the pin.
+    push_multipart(
+        &server,
+        API_KEY,
+        build_nupkg("Lts.Pkg", "1.0.0", b"rebuilt"),
+    )
+    .await;
+    for v in ["2.0.0", "3.0.0"] {
+        push_multipart(&server, API_KEY, build_nupkg("Lts.Pkg", v, b"x")).await;
+    }
+    let versions: serde_json::Value = server
+        .client
+        .get(server.url("/v3/package/lts.pkg/index.json"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(versions["versions"], serde_json::json!(["1.0.0", "3.0.0"]));
+}
+
 #[tokio::test]
 async fn admin_requires_authentication() {
     let server = spawn_admin().await;

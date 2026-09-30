@@ -9,7 +9,7 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 use yanuget::config::{Config, MirrorAuthConfig, MirrorConfig, OverwriteMode};
 use yanuget::database::SqliteDatabase;
 use yanuget::migrate::MigrateOptions;
-use yanuget::retention::{self, RetentionPolicy};
+use yanuget::retention::RetentionPolicy;
 use yanuget::storage::FilesystemStorage;
 use yanuget::web::{self, AppState, FeedMeta};
 
@@ -142,6 +142,9 @@ async fn run_server(config_path: Option<&str>) -> anyhow::Result<()> {
             feeds_meta.clone(),
         )
         .await?;
+        // Shared with the admin page, so a sweep and a manual cleanup never
+        // run at once and the page can say when the last one ran.
+        let cleanup = state.feed.cleanup.clone();
         states.push(state);
 
         // Background retention sweep per feed, when enabled.
@@ -166,13 +169,9 @@ async fn run_server(config_path: Option<&str>) -> anyhow::Result<()> {
                 loop {
                     tokio::select! {
                         _ = tick.tick() => {
-                            if let Err(e) = retention::prune_all(
-                                storage.as_ref(),
-                                db.as_ref(),
-                                &feed_name,
-                                &policy,
-                            )
-                            .await
+                            if let Err(e) = cleanup
+                                .sweep(storage.as_ref(), db.as_ref(), &feed_name, &policy)
+                                .await
                             {
                                 tracing::error!(feed = %feed_name, error = %e, "retention sweep failed");
                             }

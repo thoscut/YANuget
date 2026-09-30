@@ -86,6 +86,7 @@ CREATE TABLE IF NOT EXISTS feed_packages (
     flag_reason        TEXT,
     added              TEXT    NOT NULL,
     downloads          INTEGER NOT NULL DEFAULT 0,
+    pinned             INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (feed, lower_id, normalized_version)
 );
 -- Covers the search ranking: the (feed, lower_id) prefix scopes a feed and
@@ -140,7 +141,7 @@ macro_rules! feed_select {
     () => {
         "SELECT p.*, fp.listed AS m_listed, fp.enabled AS m_enabled, \
          fp.pending AS m_pending, fp.flagged AS m_flagged, fp.flag_reason AS m_flag_reason, \
-         fp.downloads AS m_downloads \
+         fp.downloads AS m_downloads, fp.pinned AS m_pinned \
          FROM packages p \
          JOIN feed_packages fp \
            ON fp.lower_id = p.lower_id AND fp.normalized_version = p.normalized_version"
@@ -195,6 +196,14 @@ impl SqliteDatabase {
             &pool,
             "packages",
             "require_license_acceptance",
+            "INTEGER NOT NULL DEFAULT 0",
+        )
+        .await?;
+        // Databases predating pins: nothing was pinned.
+        ensure_column(
+            &pool,
+            "feed_packages",
+            "pinned",
             "INTEGER NOT NULL DEFAULT 0",
         )
         .await?;
@@ -508,8 +517,8 @@ impl PackageDatabase for SqliteDatabase {
         let result = sqlx::query(
             r#"INSERT INTO feed_packages
                    (feed, lower_id, normalized_version, listed, enabled, pending,
-                    flagged, flag_reason, added, downloads)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0)"#,
+                    flagged, flag_reason, added, downloads, pinned)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10)"#,
         )
         .bind(&m.feed)
         .bind(m.lower_id.to_lowercase())
@@ -520,6 +529,7 @@ impl PackageDatabase for SqliteDatabase {
         .bind(i64::from(m.flagged))
         .bind(&m.flag_reason)
         .bind(Utc::now().to_rfc3339())
+        .bind(i64::from(m.pinned))
         .execute(&self.pool)
         .await;
         match result {
@@ -569,6 +579,7 @@ impl PackageDatabase for SqliteDatabase {
             pending: r.get::<i64, _>("pending") != 0,
             flagged: r.get::<i64, _>("flagged") != 0,
             flag_reason: r.get("flag_reason"),
+            pinned: r.get::<i64, _>("pinned") != 0,
         }))
     }
 
@@ -660,6 +671,25 @@ impl PackageDatabase for SqliteDatabase {
         .bind(id.to_lowercase())
         .bind(version.normalized())
         .bind(i64::from(enabled))
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn set_pinned(
+        &self,
+        feed: &str,
+        id: &str,
+        version: &NuGetVersion,
+        pinned: bool,
+    ) -> Result<bool> {
+        let result = sqlx::query(
+            "UPDATE feed_packages SET pinned = ?4 WHERE feed = ?1 AND lower_id = ?2 AND normalized_version = ?3",
+        )
+        .bind(feed)
+        .bind(id.to_lowercase())
+        .bind(version.normalized())
+        .bind(i64::from(pinned))
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() > 0)
@@ -1188,6 +1218,7 @@ fn row_to_feed_package(row: &SqliteRow) -> Result<FeedVersion> {
         pending: row.try_get::<i64, _>("m_pending")? != 0,
         flagged: row.try_get::<i64, _>("m_flagged")? != 0,
         flag_reason: row.try_get("m_flag_reason")?,
+        pinned: row.try_get::<i64, _>("m_pinned")? != 0,
     })
 }
 

@@ -165,6 +165,9 @@ pub struct Membership {
     pub flagged: bool,
     /// Human-readable reason for [`Membership::flagged`].
     pub flag_reason: Option<String>,
+    /// Kept by retention whatever its rules say. Affects nothing else: an
+    /// explicit delete still removes a pinned version.
+    pub pinned: bool,
 }
 
 impl Membership {
@@ -180,6 +183,7 @@ impl Membership {
             pending: false,
             flagged: false,
             flag_reason: None,
+            pinned: false,
         }
     }
 }
@@ -192,6 +196,8 @@ pub struct FeedVersion {
     pub pending: bool,
     pub flagged: bool,
     pub flag_reason: Option<String>,
+    /// Exempt from retention (see [`Membership::pinned`]).
+    pub pinned: bool,
 }
 
 /// Metadata store for indexed packages.
@@ -293,6 +299,16 @@ pub trait PackageDatabase: Send + Sync {
         id: &str,
         version: &NuGetVersion,
         enabled: bool,
+    ) -> Result<bool>;
+
+    /// Set the retention pin on a membership. Returns `true` if a row was
+    /// updated.
+    async fn set_pinned(
+        &self,
+        feed: &str,
+        id: &str,
+        version: &NuGetVersion,
+        pinned: bool,
     ) -> Result<bool>;
 
     /// Whether a version may be served from `feed`: present, enabled and not

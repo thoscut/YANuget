@@ -346,8 +346,11 @@ downloadable — which is stronger than NuGet's *unlist* (an unlisted version
 stays downloadable for restore). Delete is a hard delete (payload, sidecars and
 symbols) once no feed holds the version any more. With several feeds, ticked
 versions can also be **copied** or **moved** to another feed the same admin
-credentials cover; the files stay where they are. The area is only mounted when
-an admin key is configured, and the settings page says how to turn it on.
+credentials cover; the files stay where they are. A version can be **pinned**,
+so retention never deletes it, and `/admin/retention` shows exactly what the next
+cleanup would delete and why — with a button that deletes that list and nothing
+else. The area is only mounted when an admin key is configured, and the settings
+page says how to turn it on.
 
 ## Package retention
 

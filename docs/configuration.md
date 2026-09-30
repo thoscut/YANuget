@@ -126,6 +126,16 @@ package can never be pruned out of existence.
 
 With no limit set, the sweep does nothing even when `enabled`.
 
+An admin can **pin** a version in `/admin`; retention then keeps it whatever
+the rules say, and it does not use up one of the "newest *N*" either — a pin is
+kept in addition to what the rules keep. A pin survives an overwriting push and
+moves with a version to another feed; it does not stop an explicit delete.
+
+`/admin/retention` shows these rules, what the last cleanup did, and exactly
+what the next one would delete and why, with a button that deletes that list
+and nothing else (it is refused if the feed changed in the meantime). To clean
+up only from that page, set `enabled = true` and `interval_hours = 0`.
+
 ## Feeds
 
 By default YANuget serves a single feed at the root (the implicit `default`

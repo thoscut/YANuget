@@ -280,6 +280,10 @@ POST /admin/packages/{id}/{version}/enable         # restore a disabled version
 POST /admin/packages/{id}/{version}/delete         # remove from this feed
 POST /admin/packages/{id}/{version}/approve        # clear the pending gate
 POST /admin/packages/{id}/{version}/promote        # add to the next ring
+POST /admin/packages/{id}/{version}/pin            # keep it from retention
+POST /admin/packages/{id}/{version}/unpin          # let retention decide again
+GET  /admin/retention                              # rules, last run, next cleanup's plan
+POST /admin/retention/run                          # delete exactly the plan shown
 ```
 
 A **disabled** version is withheld from clients entirely — hidden from search,
@@ -300,8 +304,8 @@ with a `WWW-Authenticate: Basic` challenge.
 
 `POST /admin/packages/{id}` applies one action to every version it names — how a
 whole package is disabled, deleted or moved. The form fields are `op` (`enable`,
-`disable`, `approve`, `delete`, `copy` or `move`), one `v` per version, and for
-`copy`/`move` a `target` feed:
+`disable`, `approve`, `pin`, `unpin`, `delete`, `copy` or `move`), one `v` per
+version, and for `copy`/`move` a `target` feed:
 
 ```
 curl -u admin:$ADMIN_KEY -X POST -H "X-CSRF-Token: $TOKEN" \
@@ -323,6 +327,20 @@ this feed's `promotes_to`, which the configuration already trusts this feed's
 admin to fill. Otherwise it returns `400`. Feeds that share one admin key (the
 global `admin_api_key`) can therefore hand versions to each other; feeds with
 keys of their own cannot, without both.
+
+`pin` keeps a version from retention: it is never pruned, and it does not use
+up one of the "newest *N*" the rules keep. It survives an overwriting push and
+a move, and does not stop an explicit delete.
+
+`/admin/retention` shows the feed's rules, the last cleanup since the server
+started, and every version the next cleanup would delete, with the reason and
+the space it frees. Its button posts `plan`, a fingerprint of that list, to
+`/admin/retention/run`. The plan is recomputed and applied only if the
+fingerprint still matches: otherwise nothing is deleted and the page shows the
+new list (`?changed=1`), so a push between looking and clicking cannot widen
+what the click deletes. A cleanup already running — the scheduled sweep, or
+another admin — is not queued behind (`?busy=1`). The run is refused (`400`)
+unless `retention.enabled` is on and a limit is set.
 
 ### CSRF
 

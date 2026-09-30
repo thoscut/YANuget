@@ -118,6 +118,11 @@ a.tag{text-decoration:none}a.tag:hover{border-color:var(--ink)}\
 .badge{display:inline-block;margin-left:2px;padding:0 6px;border:1.5px solid currentColor;border-radius:4px;\
 color:var(--pencil);font-size:12px;font-weight:700;line-height:18px;vertical-align:.15em;white-space:nowrap}\
 .badge.pre{color:var(--warn);border-style:dashed}\
+.badge.pin{color:var(--ink)}\
+.doomed{color:var(--dangerfg)}\
+.notice{margin:0 0 24px;padding:12px 16px;background:var(--stock);border:2px solid var(--ink);border-radius:8px;font-weight:600}\
+.notice.warn{border-color:var(--warn)}\
+.run{margin:18px 0 0}\
 .badge.ok{color:var(--ok)}\
 .grid{display:grid;grid-template-columns:minmax(0,1fr) 340px;gap:0 40px}\
 .detail{grid-template-areas:\"main side\" \"readme side\";grid-template-rows:auto 1fr}\
@@ -220,13 +225,16 @@ background:var(--stock);border:2px solid var(--ink);border-radius:10px}\
 .bulk [role=status]{flex-basis:100%;color:var(--dangerfg);font-weight:700}.bulk [role=status]:empty{display:none}\
 .bulk .to{display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding-left:12px;border-left:1px solid var(--rule)}\
 .bulk select{min-height:38px;font-size:15px}\
-@media(max-width:640px){.atbl,.atbl tbody{display:block}\
-.atbl thead tr{display:flex;align-items:center;padding:8px 0;border-bottom:1px solid var(--rule)}\
-.atbl thead th{padding:0 0 0 6px;border:0}.atbl thead th:not(.pick){display:none}\
-.atbl tbody tr{display:grid;grid-template-columns:2.75em minmax(0,1fr) auto auto;align-items:center;gap:10px 10px;\
+@media(max-width:640px){.vers,.vers tbody,.plan,.plan tbody{display:block}\
+.vers thead tr{display:flex;align-items:center;padding:8px 0;border-bottom:1px solid var(--rule)}\
+.vers thead th{padding:0 0 0 6px;border:0}.vers thead th:not(.pick){display:none}\
+.vers tbody tr{display:grid;grid-template-columns:2.75em minmax(0,1fr) auto auto;align-items:center;gap:10px 10px;\
 padding:12px 0;border-bottom:1px solid var(--rule)}\
-.atbl td{padding:0;border:0}.atbl td:last-child{grid-column:2/-1}\
+.vers td{padding:0;border:0}.vers td:last-child{grid-column:2/-1}\
+.plan thead{display:none}.plan tbody tr{display:block;padding:10px 0;border-bottom:1px solid var(--rule)}\
+.plan td{display:inline;padding:0 10px 0 0;border:0}.plan td:nth-child(4){display:block;padding:2px 0}\
 .bulk .to{flex-basis:100%;padding-left:0;border-left:0}.bulk .danger{margin-left:0}}\
+.title+.card{margin-top:22px}\
 .bulk .danger{margin-left:auto}\
 footer{padding:20px 0 32px;border-top:1px solid var(--rule);color:var(--pencil);font-size:14px}\
 footer .wrap{display:flex;flex-wrap:wrap;justify-content:space-between;gap:6px 24px}\
@@ -892,9 +900,11 @@ pub fn tags_page(urls: &UrlBuilder, tags: &[TagCount], admin: bool) -> String {
             .to_string()
     } else {
         let most = tags.iter().map(|t| t.packages).max().unwrap_or(1).max(1);
+        // While counts are small, a step per package reads truer than a log
+        // scale: with counts of 1 and 2 the log puts the 2 at the largest size.
         let step = |n: i64| -> usize {
-            if most <= 1 {
-                return 1;
+            if most <= 5 {
+                return n.clamp(1, 5) as usize;
             }
             let ratio = (n.max(1) as f64).ln() / (most as f64).ln();
             1 + (ratio * 4.0).round().clamp(0.0, 4.0) as usize
@@ -1299,6 +1309,12 @@ pub fn settings_page(urls: &UrlBuilder, config: &Config, feed: &super::FeedConte
         ));
     }
     retention.push_str("</div>");
+    if feed.admin.is_enabled() {
+        retention.push_str(&format!(
+            "<p><a href=\"{}\">See what the next cleanup would delete</a></p>",
+            escape_html(&urls.app("/admin/retention"))
+        ));
+    }
 
     // Said even when the admin area is off: otherwise nothing on any page
     // tells an operator that disabling, deleting and moving versions exist.
@@ -1361,9 +1377,15 @@ const ADMIN_NAV: Nav<'static> = Nav {
 
 /// The admin dashboard: every package id, linking to its management page.
 pub fn admin_dashboard_page(urls: &UrlBuilder, ids: &[String]) -> String {
+    let retention = format!(
+        "<a href=\"{}\">Retention: preview and clean up</a>",
+        escape_html(&urls.app("/admin/retention"))
+    );
     let body = if ids.is_empty() {
-        "<h1 class=\"title\">Admin</h1><p class=\"muted\">No packages published yet.</p>"
-            .to_string()
+        format!(
+            "<div class=\"bar\"><h1 class=\"title\">Admin</h1>{retention}</div>\
+             <p class=\"muted\">No packages published yet.</p>"
+        )
     } else {
         let mut list = String::from("<ul class=\"rank\">");
         for id in ids {
@@ -1377,13 +1399,25 @@ pub fn admin_dashboard_page(urls: &UrlBuilder, ids: &[String]) -> String {
         }
         list.push_str("</ul>");
         format!(
-            "<h1 class=\"title\">Admin</h1>\
-             <p class=\"muted\">Pick a package to approve, disable, delete or move its \
+            "<div class=\"bar\"><h1 class=\"title\">Admin</h1>{retention}</div>\
+             <p class=\"muted\">Pick a package to approve, disable, pin, delete or move its \
              versions.</p>\
              <div class=\"card\">{list}</div>"
         )
     };
     layout(urls, "Admin \u{2014} YANuget", ADMIN_NAV, &body)
+}
+
+/// What the per-package admin page offers besides the versions themselves.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct AdminPackageExtras<'a> {
+    /// The next release ring, when this feed has one.
+    pub promote_target: Option<&'a str>,
+    /// The other feeds this admin may copy or move versions into; with none,
+    /// the page offers neither.
+    pub transfer_targets: &'a [String],
+    /// What the next retention cleanup would delete of this package.
+    pub retention_plan: &'a [crate::retention::Pruned],
 }
 
 /// The per-package admin page: every version (incl. disabled, pending and
@@ -1394,16 +1428,11 @@ pub fn admin_dashboard_page(urls: &UrlBuilder, ids: &[String]) -> String {
 /// whole package is disabled, deleted or moved: tick them all. The boxes sit
 /// in the table but belong to that form through their `form` attribute,
 /// because a form cannot wrap the rows' own forms.
-///
-/// `promote_target`, when set, names the next release ring. `transfer_targets`
-/// are the other feeds this admin may copy or move versions into; with none,
-/// the page offers neither.
 pub fn admin_package_page(
     urls: &UrlBuilder,
     id: &str,
     versions: &[crate::database::FeedVersion],
-    promote_target: Option<&str>,
-    transfer_targets: &[String],
+    extras: &AdminPackageExtras,
     csrf_token: &str,
 ) -> String {
     let mut ordered: Vec<&crate::database::FeedVersion> = versions.iter().collect();
@@ -1425,6 +1454,12 @@ pub fn admin_package_page(
         "<input type=\"hidden\" name=\"{CSRF_FIELD}\" value=\"{}\">",
         escape_html(csrf_token)
     );
+    let button = |v: &str, op: &str, label: &str| {
+        format!(
+            "<form method=\"post\" action=\"{}\">{csrf}<button type=\"submit\">{label}</button></form>",
+            action(v, op)
+        )
+    };
 
     let mut rows = String::new();
     for fv in &ordered {
@@ -1443,6 +1478,9 @@ pub fn admin_package_page(
         if fv.flagged {
             status.push_str(" <span class=\"badge\" title=\"policy\">flagged</span>");
         }
+        if fv.pinned {
+            status.push_str(" <span class=\"badge pin\">pinned</span>");
+        }
 
         let mut actions = String::new();
         // Only what clients could fetch too: a disabled or pending version is
@@ -1454,47 +1492,63 @@ pub fn admin_package_page(
             ));
         }
         if fv.pending {
-            actions.push_str(&format!(
-                "<form method=\"post\" action=\"{}\">{csrf}<button type=\"submit\">Approve</button></form>",
-                action(&v, "approve")
+            actions.push_str(&button(&v, "approve", "Approve"));
+        }
+        if let Some(target) = extras.promote_target {
+            actions.push_str(&button(
+                &v,
+                "promote",
+                &format!("Promote \u{2192} {}", escape_html(target)),
             ));
         }
-        if let Some(target) = promote_target {
-            actions.push_str(&format!(
-                "<form method=\"post\" action=\"{}\">{csrf}<button type=\"submit\">Promote \u{2192} {}</button></form>",
-                action(&v, "promote"),
-                escape_html(target),
-            ));
-        }
-        // Enable/disable toggle depending on current state.
+        // Enable/disable and pin/unpin toggle with the current state.
         if p.enabled {
-            actions.push_str(&format!(
-                "<form method=\"post\" action=\"{}\">{csrf}<button type=\"submit\">Disable</button></form>",
-                action(&v, "disable")
-            ));
+            actions.push_str(&button(&v, "disable", "Disable"));
         } else {
-            actions.push_str(&format!(
-                "<form method=\"post\" action=\"{}\">{csrf}<button type=\"submit\">Enable</button></form>",
-                action(&v, "enable")
-            ));
+            actions.push_str(&button(&v, "enable", "Enable"));
         }
+        if fv.pinned {
+            actions.push_str(&button(&v, "unpin", "Unpin"));
+        } else {
+            actions.push_str(&button(&v, "pin", "Pin"));
+        }
+        // A pin keeps a version from retention, not from an admin: say so
+        // before deleting one.
+        let confirm = if fv.pinned {
+            format!(
+                "{id} {v} is pinned, which only keeps it from retention. Remove it from this \
+                 feed anyway? If no other feed uses it, the files are deleted."
+            )
+        } else {
+            format!(
+                "Remove {id} {v} from this feed? If no other feed uses it, the files are deleted."
+            )
+        };
         actions.push_str(&format!(
             "<form method=\"post\" action=\"{a}\" data-confirm=\"{confirm}\">{csrf}\
              <button type=\"submit\" class=\"danger\">Delete</button></form>",
             a = action(&v, "delete"),
-            confirm = escape_html(&format!(
-                "Remove {id} {v} from this feed? If no other feed uses it, the files are deleted."
-            )),
+            confirm = escape_html(&confirm),
         ));
 
-        let reason = match (fv.flagged, fv.flag_reason.as_deref()) {
+        let mut notes = match (fv.flagged, fv.flag_reason.as_deref()) {
             (true, Some(r)) => format!("<div class=\"meta\">{}</div>", escape_html(r)),
             _ => String::new(),
         };
+        if let Some(planned) = extras
+            .retention_plan
+            .iter()
+            .find(|planned| planned.version == p.version)
+        {
+            notes.push_str(&format!(
+                "<div class=\"meta doomed\">The next cleanup deletes this: {}.</div>",
+                escape_html(&planned.reason.describe())
+            ));
+        }
         rows.push_str(&format!(
             "<tr><td class=\"pick\"><input type=\"checkbox\" name=\"v\" value=\"{dv}\" \
              form=\"bulk\" aria-label=\"Select {dv}\"></td>\
-             <td>{pre}<span class=\"nw\">{dv}</span>{reason}</td><td>{status}</td>\
+             <td>{pre}<span class=\"nw\">{dv}</span>{notes}</td><td>{status}</td>\
              <td class=\"muted\">{dl}</td>\
              <td><div class=\"actions\">{actions}</div></td></tr>",
             pre = if p.is_prerelease() {
@@ -1513,10 +1567,11 @@ pub fn admin_package_page(
     } else {
         ""
     };
-    let transfer = if transfer_targets.is_empty() {
+    let transfer = if extras.transfer_targets.is_empty() {
         String::new()
     } else {
-        let options: String = transfer_targets
+        let options: String = extras
+            .transfer_targets
             .iter()
             .map(|t| format!("<option value=\"{t}\">{t}</option>", t = escape_html(t)))
             .collect();
@@ -1532,13 +1587,15 @@ pub fn admin_package_page(
          aria-labelledby=\"bulk-l\">{csrf}\
          <span id=\"bulk-l\"><b>With the selected versions</b></span>\
          <button type=\"submit\" name=\"op\" value=\"enable\">Enable</button>\
-         <button type=\"submit\" name=\"op\" value=\"disable\">Disable</button>{approve}{transfer}\
+         <button type=\"submit\" name=\"op\" value=\"disable\">Disable</button>{approve}\
+         <button type=\"submit\" name=\"op\" value=\"pin\">Pin</button>\
+         <button type=\"submit\" name=\"op\" value=\"unpin\">Unpin</button>{transfer}\
          <button type=\"submit\" name=\"op\" value=\"delete\" class=\"danger\" \
          data-confirm=\"{confirm}\">Delete</button>\
          <span id=\"bulk-note\" role=\"status\"></span></form>",
         act = escape_html(&urls.app(&format!("/admin/packages/{}", enc_path(&lower)))),
         confirm = escape_html(&format!(
-            "Remove the selected versions of {id} from this feed? \
+            "Remove the selected versions of {id} from this feed, pinned or not? \
              Versions no other feed holds are deleted for good."
         )),
     );
@@ -1549,9 +1606,9 @@ pub fn admin_package_page(
          <div class=\"bar\"><h1 class=\"title\">{eid}</h1>\
          <a href=\"{gallery}\">Open in the gallery</a></div>\
          <p class=\"muted\">Disabled and pending versions are hidden from clients and not \
-         downloadable. Delete removes this feed's membership; moving keeps the files, since \
-         the other feed then holds them.</p>\
-         <div class=\"card\"><div class=\"scroll\"><table class=\"atbl\">\
+         downloadable. A pinned version is never deleted by retention. Delete removes this \
+         feed's membership; moving keeps the files, since the other feed then holds them.</p>\
+         <div class=\"card\"><div class=\"scroll\"><table class=\"atbl vers\">\
          <thead><tr><th class=\"pick\"><input type=\"checkbox\" class=\"all\" \
          aria-label=\"Select every version\" hidden></th>\
          <th>Version</th><th>Status</th><th>Downloads</th><th>Actions</th></tr></thead>\
@@ -1561,6 +1618,231 @@ pub fn admin_package_page(
         eid = escape_html(id),
     );
     layout(urls, &format!("Admin \u{2014} {id}"), ADMIN_NAV, &body)
+}
+
+/// What the retention page says after a cleanup it was asked for.
+#[derive(Debug, Clone, Copy)]
+pub enum RetentionNotice {
+    None,
+    /// A cleanup ran and did this.
+    Done(crate::retention::Outcome),
+    /// The plan changed between looking and clicking; nothing was deleted.
+    Changed,
+    /// A cleanup was already running; nothing was deleted.
+    Busy,
+}
+
+/// Everything the retention page shows.
+pub struct RetentionView<'a> {
+    pub rules: &'a crate::config::RetentionConfig,
+    pub last: Option<crate::retention::Report>,
+    pub running: bool,
+    /// The next cleanup's plan, when there are rules to plan with.
+    pub preview: Option<&'a crate::retention::Preview>,
+    pub csrf_token: &'a str,
+    pub notice: RetentionNotice,
+}
+
+/// How many planned deletions the retention page lists before summarising.
+const MAX_PREVIEW_ROWS: usize = 500;
+
+/// The retention page: the rules as configured, what the last cleanup did,
+/// and exactly what the next one would delete — with a button that deletes
+/// that and nothing else.
+pub fn admin_retention_page(urls: &UrlBuilder, view: &RetentionView) -> String {
+    use crate::retention::Trigger;
+    let rules = view.rules;
+    let on_off = |b: bool| if b { "On" } else { "Off" };
+    let limit = |n: Option<usize>| match n {
+        Some(n) => format!("{n} per package"),
+        None => "No limit".to_string(),
+    };
+    let notice = match view.notice {
+        RetentionNotice::None => String::new(),
+        RetentionNotice::Done(o) => {
+            let errors = if o.errors > 0 {
+                format!(
+                    " {} could not be deleted; the details are in the server log.",
+                    o.errors
+                )
+            } else {
+                String::new()
+            };
+            format!(
+                "<p class=\"notice\" role=\"status\">Deleted {} version{}, freeing {}.{errors}</p>",
+                o.deleted,
+                plural(o.deleted as i64),
+                human_size(o.freed),
+            )
+        }
+        RetentionNotice::Changed => "<p class=\"notice warn\" role=\"status\">The feed changed \
+            since you looked, so nothing was deleted. Below is the list as it is now.</p>"
+            .to_string(),
+        RetentionNotice::Busy => "<p class=\"notice warn\" role=\"status\">A cleanup was already \
+            running, so nothing was deleted. Look again once it has finished.</p>"
+            .to_string(),
+    };
+
+    let mut kv_rows = String::from("<div class=\"kv wide\">");
+    kv_rows.push_str(&kv("Retention", on_off(rules.enabled)));
+    kv_rows.push_str(&kv(
+        "Newest stable versions kept",
+        &limit(rules.keep_latest_stable),
+    ));
+    kv_rows.push_str(&kv(
+        "Newest pre-release versions kept",
+        &limit(rules.keep_latest_prerelease),
+    ));
+    kv_rows.push_str(&kv(
+        "Maximum age",
+        &match rules.max_age_days {
+            Some(d) => format!("{d} day{}", plural(d as i64)),
+            None => "No limit".to_string(),
+        },
+    ));
+    kv_rows.push_str(&kv(
+        "Scheduled cleanup",
+        &if rules.enabled && rules.interval_hours > 0 {
+            format!("Every {} h", rules.interval_hours)
+        } else {
+            "Off".to_string()
+        },
+    ));
+    kv_rows.push_str(&kv(
+        "After each push",
+        on_off(rules.enabled && rules.prune_on_push),
+    ));
+    kv_rows.push_str("</div>");
+
+    let last = if view.running {
+        "<p>A cleanup is running right now.</p>".to_string()
+    } else {
+        match view.last {
+            None => {
+                "<p class=\"muted\">No cleanup has run since the server started.</p>".to_string()
+            }
+            Some(r) => format!(
+                "<p>Last cleanup {when} ({how}): deleted {n} version{s}, freed {freed}.</p>",
+                when = escape_html(&r.finished.format("%Y-%m-%d %H:%M UTC").to_string()),
+                how = match r.trigger {
+                    Trigger::Schedule => "scheduled",
+                    Trigger::Manual => "from this page",
+                },
+                n = r.outcome.deleted,
+                s = plural(r.outcome.deleted as i64),
+                freed = human_size(r.outcome.freed),
+            ),
+        }
+    };
+
+    let next = match view.preview {
+        None => "<p>No rules are set, so a cleanup deletes nothing. Set \
+                 <code>keep_latest_stable</code>, <code>keep_latest_prerelease</code> or \
+                 <code>max_age_days</code> to give it some.</p>"
+            .to_string(),
+        Some(plan) if plan.planned.is_empty() => {
+            "<p>Nothing to delete: every version is within the rules.</p>".to_string()
+        }
+        Some(plan) => {
+            let mut table = String::from(
+                "<div class=\"scroll\"><table class=\"atbl plan\"><thead><tr><th>Package</th>\
+                 <th>Version</th><th>Published</th><th>Why</th><th>Frees</th></tr></thead><tbody>",
+            );
+            for p in plan.planned.iter().take(MAX_PREVIEW_ROWS) {
+                table.push_str(&format!(
+                    "<tr><td><a class=\"id\" href=\"{href}\">{id}</a></td>\
+                     <td><span class=\"nw\">{v}</span></td><td class=\"muted\">{when}</td>\
+                     <td>{why}</td><td class=\"muted\">{frees}</td></tr>",
+                    href = escape_html(&urls.app(&format!(
+                        "/admin/packages/{}",
+                        enc_path(&p.id.to_lowercase())
+                    ))),
+                    id = escape_html(&p.id),
+                    v = escape_html(&p.version.normalized()),
+                    when = escape_html(&p.published.format("%Y-%m-%d").to_string()),
+                    why = escape_html(&p.reason.describe()),
+                    frees = if p.frees > 0 {
+                        human_size(p.frees)
+                    } else {
+                        "Kept by another feed".to_string()
+                    },
+                ));
+            }
+            table.push_str("</tbody></table></div>");
+            let more = plan.planned.len().saturating_sub(MAX_PREVIEW_ROWS);
+            let more = if more > 0 {
+                format!("<p class=\"muted\">And {more} more not listed here.</p>")
+            } else {
+                String::new()
+            };
+            let n = plan.planned.len();
+            let action = if rules.enabled {
+                format!(
+                    "<form class=\"run\" method=\"post\" action=\"{act}\" data-confirm=\"{confirm}\">\
+                     <input type=\"hidden\" name=\"{CSRF_FIELD}\" value=\"{csrf}\">\
+                     <input type=\"hidden\" name=\"plan\" value=\"{fp}\">\
+                     <button type=\"submit\" class=\"danger\">{label}</button>\
+                     </form>",
+                    label = if n == 1 {
+                        "Delete this version now".to_string()
+                    } else {
+                        format!("Delete these {n} versions now")
+                    },
+                    act = escape_html(&urls.app("/admin/retention/run")),
+                    confirm = escape_html(&format!(
+                        "Delete {n} version{} from this feed now? Versions no other feed \
+                         holds are deleted for good.",
+                        plural(n as i64)
+                    )),
+                    csrf = escape_html(view.csrf_token),
+                    fp = escape_html(&plan.fingerprint()),
+                )
+            } else {
+                "<p class=\"muted\">Retention is off (<code>enabled = false</code>), so nothing \
+                 is deleted. To clean up only from this page, set <code>enabled = true</code> \
+                 and <code>interval_hours = 0</code>.</p>"
+                    .to_string()
+            };
+            format!(
+                "<p>{n} version{s} would be deleted, freeing {freed}.</p>{table}{more}{action}",
+                s = plural(n as i64),
+                freed = human_size(plan.frees()),
+            )
+        }
+    };
+
+    let pinned = match view.preview {
+        Some(plan) if !plan.pinned.is_empty() => {
+            let mut list = String::from("<ul class=\"rank\">");
+            for (id, v) in &plan.pinned {
+                list.push_str(&format!(
+                    "<li><span><a class=\"id\" href=\"{href}\">{eid}</a> \
+                     <span class=\"muted\">{v}</span></span></li>",
+                    href = escape_html(
+                        &urls.app(&format!("/admin/packages/{}", enc_path(&id.to_lowercase())))
+                    ),
+                    eid = escape_html(id),
+                    v = escape_html(&v.normalized()),
+                ));
+            }
+            list.push_str("</ul>");
+            format!("<div class=\"card\"><h2>Pinned, kept regardless</h2>{list}</div>")
+        }
+        _ => String::new(),
+    };
+
+    let body = format!(
+        "<nav class=\"crumbs\" aria-label=\"Breadcrumb\">\
+         <a href=\"{admin}\">Admin</a> <span aria-hidden=\"true\">/</span> <span>Retention</span></nav>\
+         <h1 class=\"title\">Retention</h1>{notice}\
+         <div class=\"card\"><h2>Rules</h2>{kv_rows}\
+         <p class=\"muted\">Set in the configuration file, under <code>[retention]</code> or a \
+         feed's <code>[feeds.retention]</code>. The newest version of every package is always \
+         kept, and pinned versions are kept whatever the rules say.</p>{last}</div>\
+         <div class=\"card\"><h2>Next cleanup</h2>{next}</div>{pinned}",
+        admin = escape_html(&urls.app("/admin")),
+    );
+    layout(urls, "Retention \u{2014} YANuget", ADMIN_NAV, &body)
 }
 
 /// The root feed index, shown when more than one feed is hosted. Each entry is
@@ -3040,6 +3322,30 @@ mod tests {
         assert!(cloud.contains("<span class=\"n\">1<span class=\"vh\"> package</span></span>"));
         assert!(cloud.contains("<a href=\"/tags\" aria-current=\"page\">Tags</a>"));
 
+        // Small counts step once per package instead of jumping to the top.
+        let small = tags_page(
+            &urls,
+            &[
+                TagCount {
+                    tag: "a".into(),
+                    packages: 2,
+                },
+                TagCount {
+                    tag: "b".into(),
+                    packages: 1,
+                },
+            ],
+            false,
+        );
+        assert!(
+            small.contains("<a class=\"t2\" href=\"/packages?tag=a\">"),
+            "{small}"
+        );
+        assert!(
+            small.contains("<a class=\"t1\" href=\"/packages?tag=b\">"),
+            "{small}"
+        );
+
         let empty = tags_page(&urls, &[], false);
         assert!(empty.contains("No tags yet"), "{empty}");
     }
@@ -3053,7 +3359,13 @@ mod tests {
             feed_version(sample(), false, false),
             feed_version(beta, false, false),
         ];
-        let html = admin_package_page(&urls, "Contoso.Utils", &versions, None, &[], "tok");
+        let html = admin_package_page(
+            &urls,
+            "Contoso.Utils",
+            &versions,
+            &AdminPackageExtras::default(),
+            "tok",
+        );
         // One box per version, belonging to the form below the table.
         for v in ["1.0.0", "2.0.0-beta"] {
             assert!(
@@ -3088,12 +3400,15 @@ mod tests {
             "{html}"
         );
 
+        let targets = ["stable".to_string()];
         let html = admin_package_page(
             &urls,
             "Contoso.Utils",
             &versions,
-            None,
-            &["stable".to_string()],
+            &AdminPackageExtras {
+                transfer_targets: &targets,
+                ..Default::default()
+            },
             "tok",
         );
         assert!(
@@ -3265,6 +3580,7 @@ mod tests {
             mirror: None,
             license_policy: crate::config::LicensePolicyConfig::default(),
             retention: crate::config::RetentionConfig::default(),
+            cleanup: Default::default(),
         }
     }
 
@@ -3274,6 +3590,7 @@ mod tests {
             pending,
             flagged,
             flag_reason: flagged.then(|| "license MIT is blocked".to_string()),
+            pinned: false,
         }
     }
 
@@ -3304,12 +3621,139 @@ mod tests {
             feed_version(sample(), false, false),
             feed_version(disabled, false, false),
         ];
-        let pkg = admin_package_page(&urls, "Contoso.Utils", &versions, None, &[], "tok");
+        let pkg = admin_package_page(
+            &urls,
+            "Contoso.Utils",
+            &versions,
+            &AdminPackageExtras::default(),
+            "tok",
+        );
         assert!(pkg.contains("/disable"));
         assert!(pkg.contains("/enable"));
         assert!(pkg.contains("/delete"));
         assert!(pkg.contains("badge un")); // the disabled one
         assert!(pkg.contains("badge ok")); // the active one
+    }
+
+    #[test]
+    fn the_admin_page_pins_and_says_what_the_next_cleanup_deletes() {
+        let urls = UrlBuilder::new("https://host");
+        let mut old = sample();
+        old.version = crate::version::NuGetVersion::parse("0.9.0").unwrap();
+        let mut pinned = feed_version(sample(), false, false);
+        pinned.pinned = true;
+        let versions = vec![pinned, feed_version(old.clone(), false, false)];
+        let plan = [crate::retention::Pruned {
+            version: old.version.clone(),
+            reason: crate::retention::PruneReason {
+                beyond_newest: None,
+                older_than_days: Some(30),
+            },
+        }];
+        let html = admin_package_page(
+            &urls,
+            "Contoso.Utils",
+            &versions,
+            &AdminPackageExtras {
+                retention_plan: &plan,
+                ..Default::default()
+            },
+            "tok",
+        );
+        assert!(
+            html.contains("<span class=\"badge pin\">pinned</span>"),
+            "{html}"
+        );
+        assert!(
+            html.contains("/admin/packages/contoso.utils/1.0.0/unpin"),
+            "{html}"
+        );
+        assert!(
+            html.contains("/admin/packages/contoso.utils/0.9.0/pin"),
+            "{html}"
+        );
+        assert!(
+            html.contains("The next cleanup deletes this: older than 30 days."),
+            "{html}"
+        );
+        // Deleting a pinned version says what a pin does and does not do.
+        assert!(
+            html.contains("is pinned, which only keeps it from retention"),
+            "{html}"
+        );
+        assert!(html.contains("name=\"op\" value=\"pin\""), "{html}");
+    }
+
+    #[test]
+    fn the_retention_page_shows_the_plan_and_deletes_only_when_enabled() {
+        use crate::retention::{Planned, Preview, PruneReason};
+        let urls = UrlBuilder::new("https://host");
+        let plan = Preview {
+            planned: vec![Planned {
+                id: "Old.Pkg".into(),
+                version: crate::version::NuGetVersion::parse("1.0.0").unwrap(),
+                published: chrono::Utc::now(),
+                reason: PruneReason {
+                    beyond_newest: Some((2, false)),
+                    older_than_days: None,
+                },
+                frees: 2048,
+            }],
+            pinned: vec![(
+                "Lts.Pkg".into(),
+                crate::version::NuGetVersion::parse("3.1.0").unwrap(),
+            )],
+        };
+        let mut rules = crate::config::RetentionConfig {
+            keep_latest_stable: Some(2),
+            ..Default::default()
+        };
+        let page = |rules: &crate::config::RetentionConfig, notice| {
+            admin_retention_page(
+                &urls,
+                &RetentionView {
+                    rules,
+                    last: None,
+                    running: false,
+                    preview: Some(&plan),
+                    csrf_token: "tok",
+                    notice,
+                },
+            )
+        };
+        let off = page(&rules, RetentionNotice::None);
+        assert!(off.contains("beyond the newest 2 stable versions"), "{off}");
+        assert!(
+            off.contains("1 version would be deleted, freeing 2.0 KB."),
+            "{off}"
+        );
+        assert!(off.contains(">Lts.Pkg</a>"), "{off}");
+        // Off: the plan is shown, but there is nothing to press.
+        assert!(!off.contains("/admin/retention/run"), "{off}");
+
+        rules.enabled = true;
+        let on = page(&rules, RetentionNotice::None);
+        assert!(on.contains("action=\"/admin/retention/run\""), "{on}");
+        assert!(
+            on.contains(&format!("name=\"plan\" value=\"{}\"", plan.fingerprint())),
+            "{on}"
+        );
+        assert!(on.contains("<input type=\"hidden\" name=\"_csrf\" value=\"tok\">"));
+
+        let changed = page(&rules, RetentionNotice::Changed);
+        assert!(changed.contains("nothing was deleted"), "{changed}");
+        let done = page(
+            &rules,
+            RetentionNotice::Done(crate::retention::Outcome {
+                deleted: 3,
+                freed: 1024,
+                errors: 0,
+            }),
+        );
+        assert!(
+            done.contains("Deleted 3 versions, freeing 1.0 KB."),
+            "{done}"
+        );
     }
 
     #[test]
@@ -3320,8 +3764,10 @@ mod tests {
             &urls,
             "Contoso.Utils",
             &versions,
-            Some("stable"),
-            &[],
+            &AdminPackageExtras {
+                promote_target: Some("stable"),
+                ..Default::default()
+            },
             "tok",
         );
         assert!(pkg.contains("/approve"));

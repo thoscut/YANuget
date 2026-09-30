@@ -173,6 +173,10 @@ async fn index_inner(
     // and the caller saw a 500. The old bytes now stay in place until the new
     // ones have landed on top of them.
     let mut overwriting = false;
+    // This feed's membership before an overwrite. A pin is an operator's
+    // decision about the id/version, not about one build of it, so it
+    // outlives the replacement.
+    let mut previous: Option<Membership> = None;
     if db.exists(feed, &id, &version).await? {
         if options.overwrite.allows(version.is_prerelease()) {
             // Another feed holding this version pins its payload: the stored
@@ -188,6 +192,7 @@ async fn index_inner(
                     }
                 }
             }
+            previous = db.get_membership(feed, &id, &version).await?;
             db.remove_membership(feed, &id, &version).await?;
             // If no other feed references the version, drop the orphaned global
             // metadata so the re-push records its own.
@@ -265,6 +270,7 @@ async fn index_inner(
         pending: options.pending,
         flagged: outcome.violation.is_some(),
         flag_reason: outcome.violation.clone(),
+        pinned: previous.is_some_and(|m| m.pinned),
     };
     if let Err(e) = db.add_membership(&membership).await {
         if stored_now && db.feed_count(&id, &version).await.unwrap_or(0) == 0 {

@@ -1,20 +1,22 @@
 //! Package retention: automatic pruning of old versions.
 //!
 //! The decision of *which* versions to drop is a pure, side-effect-free
-//! function ([`versions_to_prune`]) so it can be exhaustively unit-tested; the
-//! I/O that acts on that decision ([`prune_package`], [`prune_all`]) is a thin
-//! wrapper over the existing storage/database primitives.
+//! function ([`prune_plan`]) so it can be exhaustively unit-tested; the I/O
+//! that acts on that decision ([`prune_package`], [`prune_all`], [`preview`])
+//! is a thin wrapper over the existing storage/database primitives.
 //!
 //! A version is pruned when it is **excess by count** (beyond the newest N of
 //! its release channel) **or** **too old** (published before the age cutoff).
 //! As a safety floor the newest stable version is always kept — or, when a
 //! package has no stable version, its newest pre-release — so retention can
-//! never make a package disappear entirely.
+//! never make a package disappear entirely. A **pinned** version is never
+//! pruned, and does not use up one of the "newest N" either: a pin is kept in
+//! addition to what the rules keep.
 
 use chrono::{DateTime, Duration, Utc};
 
 use crate::config::RetentionConfig;
-use crate::database::PackageDatabase;
+use crate::database::{FeedVersion, PackageDatabase};
 use crate::error::Result;
 use crate::models::Package;
 use crate::storage::PackageStorage;
@@ -47,30 +49,78 @@ impl From<&RetentionConfig> for RetentionPolicy {
     }
 }
 
-/// Decide which versions of a single package id to prune.
+/// Why a version is pruned. Both halves can hold at once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PruneReason {
+    /// Beyond the newest `keep` of its channel; `prerelease` names the channel.
+    pub beyond_newest: Option<(usize, bool)>,
+    /// Published more than this many days ago.
+    pub older_than_days: Option<u64>,
+}
+
+impl PruneReason {
+    /// The reason in words, e.g. "beyond the newest 5 stable versions, and
+    /// older than 90 days".
+    pub fn describe(&self) -> String {
+        let count = self.beyond_newest.map(|(keep, prerelease)| {
+            let channel = if prerelease { "pre-release" } else { "stable" };
+            let noun = if keep == 1 { "version" } else { "versions" };
+            format!("beyond the newest {keep} {channel} {noun}")
+        });
+        let age = self
+            .older_than_days
+            .map(|days| format!("older than {days} day{}", if days == 1 { "" } else { "s" }));
+        match (count, age) {
+            (Some(c), Some(a)) => format!("{c}, and {a}"),
+            (Some(c), None) => c,
+            (None, Some(a)) => a,
+            (None, None) => String::new(),
+        }
+    }
+}
+
+/// One version a policy would prune, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pruned {
+    pub version: NuGetVersion,
+    pub reason: PruneReason,
+}
+
+/// Decide which versions of a single package id to prune, and why.
 ///
-/// `packages` may be in any order; the returned versions are those that should
-/// be removed. `now` is injected for deterministic testing.
-pub fn versions_to_prune(
-    packages: &[Package],
+/// `versions` pairs each version with whether it is pinned, in any order.
+/// Pinned versions are set aside *before* ranking, so they are never pruned
+/// and never count towards "the newest N". `now` is injected for
+/// deterministic testing.
+pub fn prune_plan(
+    versions: &[(&Package, bool)],
     policy: &RetentionPolicy,
     now: DateTime<Utc>,
-) -> Vec<NuGetVersion> {
-    if packages.is_empty() || !policy.has_limits() {
+) -> Vec<Pruned> {
+    if versions.is_empty() || !policy.has_limits() {
         return Vec::new();
     }
 
+    // The single version that must survive no matter what, chosen among all
+    // versions: pinned or not, the package keeps its newest.
+    let newest = |pre: bool| {
+        versions
+            .iter()
+            .filter(|(p, _)| p.is_prerelease() == pre)
+            .map(|(p, _)| &p.version)
+            .max()
+    };
+    let protected: Option<&NuGetVersion> = newest(false).or_else(|| newest(true));
+
     // Newest-first within each channel so "rank" is an index from the top.
-    let mut stable: Vec<&Package> = packages.iter().filter(|p| !p.is_prerelease()).collect();
-    let mut prerelease: Vec<&Package> = packages.iter().filter(|p| p.is_prerelease()).collect();
+    let unpinned = versions
+        .iter()
+        .filter(|(_, pinned)| !pinned)
+        .map(|(p, _)| *p);
+    let mut stable: Vec<&Package> = unpinned.clone().filter(|p| !p.is_prerelease()).collect();
+    let mut prerelease: Vec<&Package> = unpinned.filter(|p| p.is_prerelease()).collect();
     stable.sort_by(|a, b| b.version.cmp(&a.version));
     prerelease.sort_by(|a, b| b.version.cmp(&a.version));
-
-    // The single version that must survive no matter what.
-    let protected: Option<&NuGetVersion> = stable
-        .first()
-        .or_else(|| prerelease.first())
-        .map(|p| &p.version);
 
     // `Duration::days` panics outside its representable range, and a `u64` day
     // count from configuration can easily exceed it — so build the cutoff with
@@ -84,22 +134,55 @@ pub fn versions_to_prune(
         .and_then(|d| now.checked_sub_signed(d));
 
     let mut prune = Vec::new();
-    for (channel, keep) in [
-        (&stable, policy.keep_latest_stable),
-        (&prerelease, policy.keep_latest_prerelease),
+    for (channel, keep, is_pre) in [
+        (&stable, policy.keep_latest_stable, false),
+        (&prerelease, policy.keep_latest_prerelease, true),
     ] {
         for (rank, pkg) in channel.iter().enumerate() {
             if protected.is_some_and(|v| *v == pkg.version) {
                 continue;
             }
-            let excess_by_count = keep.is_some_and(|n| rank >= n);
-            let too_old = cutoff.is_some_and(|c| pkg.published < c);
-            if excess_by_count || too_old {
-                prune.push(pkg.version.clone());
+            let reason = PruneReason {
+                beyond_newest: keep.filter(|n| rank >= *n).map(|n| (n, is_pre)),
+                older_than_days: cutoff
+                    .filter(|c| pkg.published < *c)
+                    .and(policy.max_age_days),
+            };
+            if reason.beyond_newest.is_some() || reason.older_than_days.is_some() {
+                prune.push(Pruned {
+                    version: pkg.version.clone(),
+                    reason,
+                });
             }
         }
     }
     prune
+}
+
+/// Decide which versions of a single package id to prune, none pinned.
+///
+/// `packages` may be in any order; the returned versions are those that should
+/// be removed. `now` is injected for deterministic testing.
+pub fn versions_to_prune(
+    packages: &[Package],
+    policy: &RetentionPolicy,
+    now: DateTime<Utc>,
+) -> Vec<NuGetVersion> {
+    let versions: Vec<(&Package, bool)> = packages.iter().map(|p| (p, false)).collect();
+    prune_plan(&versions, policy, now)
+        .into_iter()
+        .map(|p| p.version)
+        .collect()
+}
+
+/// [`prune_plan`] over a feed's versions of one package, pins included.
+pub fn plan_for(
+    versions: &[FeedVersion],
+    policy: &RetentionPolicy,
+    now: DateTime<Utc>,
+) -> Vec<Pruned> {
+    let pairs: Vec<(&Package, bool)> = versions.iter().map(|v| (&v.package, v.pinned)).collect();
+    prune_plan(&pairs, policy, now)
 }
 
 /// Remove one package version from a single feed.
@@ -178,6 +261,49 @@ pub(crate) async fn purge_symbols(
     Ok(())
 }
 
+/// What deleting some versions achieved.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Outcome {
+    /// Versions removed from the feed.
+    pub deleted: usize,
+    /// Bytes of storage freed: only versions no other feed still holds.
+    pub freed: u64,
+    /// Versions whose removal failed (logged).
+    pub errors: usize,
+}
+
+/// Delete one planned version from `feed`, counting what it freed.
+async fn delete_planned(
+    storage: &dyn PackageStorage,
+    db: &dyn PackageDatabase,
+    feed: &str,
+    id: &str,
+    version: &NuGetVersion,
+    outcome: &mut Outcome,
+) {
+    let size = db
+        .get_package_data(id, version)
+        .await
+        .ok()
+        .flatten()
+        .map(|p| p.package_size)
+        .unwrap_or(0);
+    match purge_version(storage, db, feed, id, version).await {
+        Ok(true) => {
+            outcome.deleted += 1;
+            if !db.package_data_exists(id, version).await.unwrap_or(true) {
+                outcome.freed += size;
+            }
+            tracing::info!(%feed, %id, version = %version.normalized(), "retention pruned version");
+        }
+        Ok(false) => {}
+        Err(e) => {
+            outcome.errors += 1;
+            tracing::error!(%feed, %id, version = %version.normalized(), error = %e, "retention failed to prune version");
+        }
+    }
+}
+
 /// Apply the policy to a single package id within `feed`. Returns the number of
 /// versions pruned from that feed.
 pub async fn prune_package(
@@ -187,24 +313,27 @@ pub async fn prune_package(
     id: &str,
     policy: &RetentionPolicy,
 ) -> Result<usize> {
-    if !policy.has_limits() {
-        return Ok(0);
-    }
-    let packages: Vec<Package> = db
-        .find_all_versions(feed, id)
+    Ok(prune_package_outcome(storage, db, feed, id, policy)
         .await?
-        .into_iter()
-        .map(|fv| fv.package)
-        .collect();
-    let to_prune = versions_to_prune(&packages, policy, Utc::now());
-    let mut pruned = 0;
-    for version in &to_prune {
-        if purge_version(storage, db, feed, id, version).await? {
-            pruned += 1;
-            tracing::info!(%feed, %id, version = %version.normalized(), "retention pruned version");
-        }
+        .deleted)
+}
+
+async fn prune_package_outcome(
+    storage: &dyn PackageStorage,
+    db: &dyn PackageDatabase,
+    feed: &str,
+    id: &str,
+    policy: &RetentionPolicy,
+) -> Result<Outcome> {
+    let mut outcome = Outcome::default();
+    if !policy.has_limits() {
+        return Ok(outcome);
     }
-    Ok(pruned)
+    let versions = db.find_all_versions(feed, id).await?;
+    for planned in plan_for(&versions, policy, Utc::now()) {
+        delete_planned(storage, db, feed, id, &planned.version, &mut outcome).await;
+    }
+    Ok(outcome)
 }
 
 /// Apply the policy to every package id in `feed`. Returns the total pruned.
@@ -214,21 +343,220 @@ pub async fn prune_all(
     feed: &str,
     policy: &RetentionPolicy,
 ) -> Result<usize> {
+    Ok(prune_all_outcome(storage, db, feed, policy).await?.deleted)
+}
+
+async fn prune_all_outcome(
+    storage: &dyn PackageStorage,
+    db: &dyn PackageDatabase,
+    feed: &str,
+    policy: &RetentionPolicy,
+) -> Result<Outcome> {
+    let mut total = Outcome::default();
     if !policy.has_limits() {
-        return Ok(0);
+        return Ok(total);
     }
-    let ids = db.all_package_ids(feed).await?;
-    let mut total = 0;
-    for id in ids {
-        match prune_package(storage, db, feed, &id, policy).await {
-            Ok(n) => total += n,
-            Err(e) => tracing::error!(%feed, %id, error = %e, "retention sweep failed for package"),
+    for id in db.all_package_ids(feed).await? {
+        match prune_package_outcome(storage, db, feed, &id, policy).await {
+            Ok(o) => {
+                total.deleted += o.deleted;
+                total.freed += o.freed;
+                total.errors += o.errors;
+            }
+            Err(e) => {
+                total.errors += 1;
+                tracing::error!(%feed, %id, error = %e, "retention sweep failed for package");
+            }
         }
     }
-    if total > 0 {
-        tracing::info!(%feed, pruned = total, "retention sweep complete");
+    if total.deleted > 0 {
+        tracing::info!(%feed, pruned = total.deleted, freed = total.freed, "retention sweep complete");
     }
     Ok(total)
+}
+
+/// One version the next cleanup would delete, as the admin page shows it.
+#[derive(Debug, Clone)]
+pub struct Planned {
+    /// The package id as published.
+    pub id: String,
+    pub version: NuGetVersion,
+    pub published: DateTime<Utc>,
+    pub reason: PruneReason,
+    /// Bytes deleting it frees: its size when no other feed holds it, else 0.
+    pub frees: u64,
+}
+
+/// What the next cleanup of a feed would do, computed without doing it.
+#[derive(Debug, Clone, Default)]
+pub struct Preview {
+    /// Every version it would delete, by package id then version.
+    pub planned: Vec<Planned>,
+    /// The pinned versions it keeps regardless: `(id, version)`.
+    pub pinned: Vec<(String, NuGetVersion)>,
+}
+
+impl Preview {
+    /// A short, stable fingerprint of exactly which versions would go.
+    ///
+    /// The page shows the plan, and the "delete" button sends this back. The
+    /// server recomputes the plan and deletes only if the fingerprint still
+    /// matches — so a push landing between looking and clicking can never make
+    /// the click delete something the operator was not shown.
+    pub fn fingerprint(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let mut keys: Vec<String> = self
+            .planned
+            .iter()
+            .map(|p| format!("{}\0{}", p.id.to_lowercase(), p.version.normalized()))
+            .collect();
+        keys.sort();
+        let mut hasher = Sha256::new();
+        for key in keys {
+            hasher.update(key.as_bytes());
+            hasher.update(b"\n");
+        }
+        hex::encode(&hasher.finalize()[..16])
+    }
+
+    /// Bytes the whole plan frees.
+    pub fn frees(&self) -> u64 {
+        self.planned.iter().map(|p| p.frees).sum()
+    }
+}
+
+/// What the next cleanup of `feed` would delete under `policy`, and why.
+pub async fn preview(
+    db: &dyn PackageDatabase,
+    feed: &str,
+    policy: &RetentionPolicy,
+    now: DateTime<Utc>,
+) -> Result<Preview> {
+    let mut out = Preview::default();
+    for id in db.all_package_ids(feed).await? {
+        let versions = db.find_all_versions(feed, &id).await?;
+        for v in versions.iter().filter(|v| v.pinned) {
+            out.pinned
+                .push((v.package.id.clone(), v.package.version.clone()));
+        }
+        for planned in plan_for(&versions, policy, now) {
+            let Some(fv) = versions
+                .iter()
+                .find(|v| v.package.version == planned.version)
+            else {
+                continue;
+            };
+            let only_here = db.feed_count(&id, &planned.version).await? <= 1;
+            out.planned.push(Planned {
+                id: fv.package.id.clone(),
+                version: planned.version,
+                published: fv.package.published,
+                reason: planned.reason,
+                frees: if only_here {
+                    fv.package.package_size
+                } else {
+                    0
+                },
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Delete exactly the versions of a [`Preview`].
+pub async fn apply(
+    storage: &dyn PackageStorage,
+    db: &dyn PackageDatabase,
+    feed: &str,
+    plan: &Preview,
+) -> Outcome {
+    let mut outcome = Outcome::default();
+    for p in &plan.planned {
+        delete_planned(storage, db, feed, &p.id, &p.version, &mut outcome).await;
+    }
+    outcome
+}
+
+/// What started a cleanup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Trigger {
+    /// The background sweep.
+    Schedule,
+    /// An admin's "delete now".
+    Manual,
+}
+
+/// The report of a finished cleanup.
+#[derive(Debug, Clone, Copy)]
+pub struct Report {
+    pub finished: DateTime<Utc>,
+    pub trigger: Trigger,
+    pub outcome: Outcome,
+}
+
+/// One feed's cleanup state, shared by the background sweep and the admin
+/// page: at most one cleanup runs at a time, and the last one is remembered.
+#[derive(Debug, Default)]
+pub struct RetentionState {
+    running: tokio::sync::Mutex<()>,
+    last: std::sync::Mutex<Option<Report>>,
+}
+
+impl RetentionState {
+    /// The last finished cleanup, if any ran since the server started.
+    pub fn last(&self) -> Option<Report> {
+        *self.last.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Whether a cleanup is running right now.
+    pub fn is_running(&self) -> bool {
+        self.running.try_lock().is_err()
+    }
+
+    fn record(&self, trigger: Trigger, outcome: Outcome) {
+        *self.last.lock().unwrap_or_else(|e| e.into_inner()) = Some(Report {
+            finished: Utc::now(),
+            trigger,
+            outcome,
+        });
+    }
+
+    /// The scheduled sweep: waits for a manual cleanup to finish, then runs.
+    pub async fn sweep(
+        &self,
+        storage: &dyn PackageStorage,
+        db: &dyn PackageDatabase,
+        feed: &str,
+        policy: &RetentionPolicy,
+    ) -> Result<Outcome> {
+        let _running = self.running.lock().await;
+        let outcome = prune_all_outcome(storage, db, feed, policy).await?;
+        self.record(Trigger::Schedule, outcome);
+        Ok(outcome)
+    }
+
+    /// An admin's cleanup of exactly what they were shown. Returns `None`
+    /// when a cleanup is already running, and `Some(Err(plan))` — deleting
+    /// nothing — when the plan no longer has `fingerprint`.
+    pub async fn run_shown(
+        &self,
+        storage: &dyn PackageStorage,
+        db: &dyn PackageDatabase,
+        feed: &str,
+        policy: &RetentionPolicy,
+        fingerprint: &str,
+    ) -> Result<Option<std::result::Result<Outcome, Preview>>> {
+        let Ok(_running) = self.running.try_lock() else {
+            return Ok(None);
+        };
+        let plan = preview(db, feed, policy, Utc::now()).await?;
+        if plan.fingerprint() != fingerprint {
+            return Ok(Some(Err(plan)));
+        }
+        let outcome = apply(storage, db, feed, &plan).await;
+        self.record(Trigger::Manual, outcome);
+        Ok(Some(Ok(outcome)))
+    }
 }
 
 #[cfg(test)]
@@ -305,6 +633,114 @@ mod tests {
     fn names(mut v: Vec<NuGetVersion>) -> Vec<String> {
         v.sort();
         v.iter().map(|x| x.normalized()).collect()
+    }
+
+    fn plan_names(plan: &[Pruned]) -> Vec<String> {
+        names(plan.iter().map(|p| p.version.clone()).collect())
+    }
+
+    #[test]
+    fn a_pin_is_kept_and_uses_up_no_slot() {
+        let packages = [
+            pkg("1.0.0", 0),
+            pkg("2.0.0", 0),
+            pkg("3.0.0", 0),
+            pkg("4.0.0", 0),
+        ];
+        let policy = RetentionPolicy {
+            keep_latest_stable: Some(2),
+            ..Default::default()
+        };
+        let with_pins = |pinned: &[&str]| {
+            let versions: Vec<(&Package, bool)> = packages
+                .iter()
+                .map(|p| (p, pinned.contains(&p.version.normalized().as_str())))
+                .collect();
+            plan_names(&prune_plan(&versions, &policy, Utc::now()))
+        };
+        assert_eq!(with_pins(&[]), vec!["1.0.0", "2.0.0"]);
+        // 3.0.0 pinned: it stays, and the newest two *unpinned* stay with it.
+        assert_eq!(with_pins(&["3.0.0"]), vec!["1.0.0"]);
+        assert_eq!(with_pins(&["1.0.0", "2.0.0"]), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_pin_outlives_the_age_limit_and_the_newest_is_still_kept() {
+        let packages = [pkg("1.0.0", 900), pkg("2.0.0", 800), pkg("3.0.0", 700)];
+        let policy = RetentionPolicy {
+            max_age_days: Some(90),
+            ..Default::default()
+        };
+        let versions: Vec<(&Package, bool)> = packages
+            .iter()
+            .map(|p| (p, p.version.normalized() == "1.0.0"))
+            .collect();
+        let plan = prune_plan(&versions, &policy, Utc::now());
+        // 3.0.0 is the protected newest, 1.0.0 is pinned: only 2.0.0 goes.
+        assert_eq!(plan_names(&plan), vec!["2.0.0"]);
+        assert_eq!(
+            plan[0].reason,
+            PruneReason {
+                beyond_newest: None,
+                older_than_days: Some(90)
+            }
+        );
+    }
+
+    #[test]
+    fn reasons_read_as_words() {
+        let both = PruneReason {
+            beyond_newest: Some((5, false)),
+            older_than_days: Some(90),
+        };
+        assert_eq!(
+            both.describe(),
+            "beyond the newest 5 stable versions, and older than 90 days"
+        );
+        let one = PruneReason {
+            beyond_newest: Some((1, true)),
+            older_than_days: None,
+        };
+        assert_eq!(one.describe(), "beyond the newest 1 pre-release version");
+        let packages = [pkg("1.0.0-rc.1", 0), pkg("1.0.0-rc.2", 0), pkg("0.9.0", 0)];
+        let versions: Vec<(&Package, bool)> = packages.iter().map(|p| (p, false)).collect();
+        let policy = RetentionPolicy {
+            keep_latest_prerelease: Some(1),
+            ..Default::default()
+        };
+        let plan = prune_plan(&versions, &policy, Utc::now());
+        assert_eq!(plan_names(&plan), vec!["1.0.0-rc.1"]);
+        assert_eq!(plan[0].reason.beyond_newest, Some((1, true)));
+    }
+
+    #[test]
+    fn the_fingerprint_names_exactly_the_planned_versions() {
+        let planned = |id: &str, v: &str| Planned {
+            id: id.into(),
+            version: NuGetVersion::parse(v).unwrap(),
+            published: Utc::now(),
+            reason: PruneReason {
+                beyond_newest: Some((1, false)),
+                older_than_days: None,
+            },
+            frees: 1,
+        };
+        let a = Preview {
+            planned: vec![planned("A", "1.0.0"), planned("B", "2.0.0")],
+            pinned: vec![],
+        };
+        // Order and id casing do not matter; the set of versions does.
+        let b = Preview {
+            planned: vec![planned("b", "2.0.0"), planned("a", "1.0.0")],
+            pinned: vec![],
+        };
+        assert_eq!(a.fingerprint(), b.fingerprint());
+        let c = Preview {
+            planned: vec![planned("A", "1.0.0")],
+            pinned: vec![],
+        };
+        assert_ne!(a.fingerprint(), c.fingerprint());
+        assert_ne!(Preview::default().fingerprint(), c.fingerprint());
     }
 
     #[test]

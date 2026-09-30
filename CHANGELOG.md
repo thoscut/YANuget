@@ -42,6 +42,20 @@ expected to change incompatibly at any version.
   links each servable version's, both from the flat-container endpoint clients
   restore from.
 - A feed can no longer be named `tags`.
+- Versions can be **pinned** in the admin area, one at a time or as a
+  selection. Retention never deletes a pinned version, and a pin does not use up
+  one of the "newest N" the rules keep. A pin survives an overwriting push and a
+  move to another feed; it does not stop an explicit delete, whose confirmation
+  says the version is pinned. Stored in a new `feed_packages.pinned` column,
+  added to existing databases on startup.
+- `/admin/retention` shows the feed's retention rules as configured, what the
+  last cleanup did, and every version the next one would delete, with the
+  reason ("beyond the newest 5 stable versions", "older than 90 days") and the
+  space it frees. Its button deletes exactly that list: it sends a fingerprint
+  of the plan it showed, and the server recomputes the plan and deletes only if
+  it still matches, so a push between looking and clicking cannot widen what is
+  deleted. A cleanup and the scheduled sweep never run at once. The admin
+  package page marks the versions the next cleanup would delete.
 
 ### Changed
 

@@ -73,6 +73,9 @@ pub struct FeedContext {
     pub mirror: Option<MirrorClient>,
     pub license_policy: LicensePolicyConfig,
     pub retention: RetentionConfig,
+    /// The feed's cleanup lock and last report, shared with the background
+    /// sweep.
+    pub cleanup: Arc<retention::RetentionState>,
 }
 
 impl FeedContext {
@@ -97,6 +100,7 @@ impl FeedContext {
             mirror,
             license_policy: feed.license_policy.clone(),
             retention: feed.retention.clone(),
+            cleanup: Arc::default(),
         }
     }
 }
@@ -699,7 +703,14 @@ fn feed_routes(state: AppState) -> Router {
                 .route(
                     "/admin/packages/{id}/{version}/promote",
                     admin_post(admin_promote),
-                );
+                )
+                .route("/admin/packages/{id}/{version}/pin", admin_post(admin_pin))
+                .route(
+                    "/admin/packages/{id}/{version}/unpin",
+                    admin_post(admin_unpin),
+                )
+                .route("/admin/retention", get(admin_retention))
+                .route("/admin/retention/run", admin_post(admin_retention_run));
         }
         router = router.merge(ui.layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -1911,12 +1922,22 @@ async fn admin_package(
         .collect();
     // The id as published, not as typed into the address.
     let display_id = &versions[0].package.id;
+    // What the next cleanup would do to this package, when one will run.
+    let policy = RetentionPolicy::from(&state.feed.retention);
+    let plan = if state.feed.retention.enabled {
+        retention::plan_for(&versions, &policy, chrono::Utc::now())
+    } else {
+        Vec::new()
+    };
     Ok(Html(ui::admin_package_page(
         &urls,
         display_id,
         &versions,
-        state.feed.promotes_to.as_deref(),
-        &targets,
+        &ui::AdminPackageExtras {
+            promote_target: state.feed.promotes_to.as_deref(),
+            transfer_targets: &targets,
+            retention_plan: &plan,
+        },
         &state.feed.admin.csrf_token().unwrap_or_default(),
     )))
 }
@@ -2009,6 +2030,7 @@ async fn transfer_version(
     if mode == Transfer::Move {
         membership.listed = here.listed;
         membership.enabled = here.enabled;
+        membership.pinned = here.pinned;
     }
     match state.db.add_membership(&membership).await {
         Ok(()) | Err(Error::PackageAlreadyExists) => {}
@@ -2026,6 +2048,8 @@ enum BulkOp {
     Enable,
     Disable,
     Approve,
+    Pin,
+    Unpin,
     Delete,
     Copy,
     Move,
@@ -2037,6 +2061,8 @@ impl BulkOp {
             "enable" => Self::Enable,
             "disable" => Self::Disable,
             "approve" => Self::Approve,
+            "pin" => Self::Pin,
+            "unpin" => Self::Unpin,
             "delete" => Self::Delete,
             "copy" => Self::Copy,
             "move" => Self::Move,
@@ -2086,6 +2112,12 @@ async fn admin_bulk(
         BulkOp::Approve => {
             for v in &versions {
                 state.db.approve_membership(state.feed(), &id, v).await?;
+            }
+        }
+        BulkOp::Pin | BulkOp::Unpin => {
+            let pinned = matches!(op, BulkOp::Pin);
+            for v in &versions {
+                state.db.set_pinned(state.feed(), &id, v, pinned).await?;
             }
         }
         BulkOp::Delete => {
@@ -2256,6 +2288,145 @@ async fn admin_delete(
         format!("{}/admin", state.feed.prefix)
     } else {
         admin_package_url(&state.feed.prefix, &id)
+    };
+    Ok(Redirect::to(&target).into_response())
+}
+
+async fn admin_pin(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((id, version)): Path<(String, String)>,
+    body: String,
+) -> Result<Response> {
+    admin_set_pinned(&state, &headers, &body, &id, &version, true).await
+}
+
+async fn admin_unpin(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((id, version)): Path<(String, String)>,
+    body: String,
+) -> Result<Response> {
+    admin_set_pinned(&state, &headers, &body, &id, &version, false).await
+}
+
+async fn admin_set_pinned(
+    state: &AppState,
+    headers: &HeaderMap,
+    body: &str,
+    id: &str,
+    version: &str,
+    pinned: bool,
+) -> Result<Response> {
+    require_admin_action(state, headers, body)?;
+    let v = parse_version(version)?;
+    if !state.db.set_pinned(state.feed(), id, &v, pinned).await? {
+        return Err(Error::PackageNotFound);
+    }
+    Ok(Redirect::to(&admin_package_url(&state.feed.prefix, id)).into_response())
+}
+
+/// What the retention page reports after a cleanup it was asked for: numbers
+/// only, parsed, never echoed text.
+#[derive(Debug, Deserialize)]
+struct RetentionQuery {
+    #[serde(default)]
+    deleted: Option<String>,
+    #[serde(default)]
+    freed: Option<String>,
+    #[serde(default)]
+    errors: Option<String>,
+    #[serde(default)]
+    changed: Option<String>,
+    #[serde(default)]
+    busy: Option<String>,
+}
+
+async fn admin_retention(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<RetentionQuery>,
+) -> Result<Html<String>> {
+    require_admin(&state, &headers)?;
+    let rules = &state.feed.retention;
+    let policy = RetentionPolicy::from(rules);
+    let preview = if policy.has_limits() {
+        Some(
+            retention::preview(state.db.as_ref(), state.feed(), &policy, chrono::Utc::now())
+                .await?,
+        )
+    } else {
+        None
+    };
+    let notice = if q.busy.is_some() {
+        ui::RetentionNotice::Busy
+    } else if q.changed.is_some() {
+        ui::RetentionNotice::Changed
+    } else if let Some(deleted) = lenient::<usize>(q.deleted.as_deref()) {
+        ui::RetentionNotice::Done(retention::Outcome {
+            deleted,
+            freed: lenient(q.freed.as_deref()).unwrap_or(0),
+            errors: lenient(q.errors.as_deref()).unwrap_or(0),
+        })
+    } else {
+        ui::RetentionNotice::None
+    };
+    let urls = state.url_builder(&headers);
+    Ok(Html(ui::admin_retention_page(
+        &urls,
+        &ui::RetentionView {
+            rules,
+            last: state.feed.cleanup.last(),
+            running: state.feed.cleanup.is_running(),
+            preview: preview.as_ref(),
+            csrf_token: &state.feed.admin.csrf_token().unwrap_or_default(),
+            notice,
+        },
+    )))
+}
+
+/// Delete what the retention page showed — and only that.
+///
+/// The form carries the fingerprint of the plan it displayed. The plan is
+/// recomputed here and applied only when it still matches, so a push landing
+/// between looking and clicking can never widen what the click deletes. A
+/// cleanup already running (the background sweep, or another admin) turns
+/// this away rather than queueing a second one behind it.
+async fn admin_retention_run(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: String,
+) -> Result<Response> {
+    require_admin_action(&state, &headers, &body)?;
+    let policy = RetentionPolicy::from(&state.feed.retention);
+    if !state.feed.retention.enabled || !policy.has_limits() {
+        return Err(Error::BadRequest(
+            "retention is not enabled for this feed".into(),
+        ));
+    }
+    let fingerprint = form_field(&body, "plan").unwrap_or_default();
+    let page = format!("{}/admin/retention", state.feed.prefix);
+    let result = state
+        .feed
+        .cleanup
+        .run_shown(
+            state.storage.as_ref(),
+            state.db.as_ref(),
+            state.feed(),
+            &policy,
+            &fingerprint,
+        )
+        .await?;
+    let target = match result {
+        None => format!("{page}?busy=1"),
+        Some(Err(_)) => format!("{page}?changed=1"),
+        Some(Ok(o)) => {
+            tracing::info!(feed = %state.feed(), deleted = o.deleted, freed = o.freed, "manual retention cleanup");
+            format!(
+                "{page}?deleted={}&freed={}&errors={}",
+                o.deleted, o.freed, o.errors
+            )
+        }
     };
     Ok(Redirect::to(&target).into_response())
 }
