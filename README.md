@@ -87,6 +87,13 @@ Download the archive for your platform from the
 against `SHA256SUMS`, unpack and run. Release binaries ship the full offline
 documentation.
 
+From the first release after 0.5.1, the archives and the container image
+(`linux/amd64` and `linux/arm64`) come with signed build provenance, and the
+image is also signed with cosign. `gh attestation verify <archive> --repo
+thoscut/yanuget` checks that a download was built by this repository's release
+workflow; [SECURITY.md](SECURITY.md#verifying-a-release) has the commands for
+the image.
+
 ### From source
 
 ```bash

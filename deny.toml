@@ -1,0 +1,49 @@
+# cargo-deny policy, checked in CI (`cargo deny check licenses bans sources`).
+#
+# Advisories are left to `cargo audit`, which runs next to it and carries the
+# one deliberate ignore with its reasoning; two lists of exceptions for the
+# same thing would drift apart.
+
+[graph]
+# The shipped binary is built for these; a dependency that only appears on
+# some other platform is not something the release ships.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+]
+all-features = true
+
+[licenses]
+# Everything the dependency tree uses today, and nothing else: a new license
+# fails CI and gets looked at rather than arriving unnoticed in a release.
+# All are permissive except MPL-2.0 (`option-ext`, via `dirs`), whose
+# file-level copyleft covers that crate's own files, which are unmodified.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "CDLA-Permissive-2.0",
+    "MPL-2.0",
+]
+confidence-threshold = 0.9
+
+[bans]
+# Several versions of one crate are common in a tree this size (the
+# ecosystem's majors move at different speeds), so they are reported, not
+# failed.
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+# crates.io only: no git dependencies, no other registries.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

@@ -91,3 +91,24 @@ Configuration choices that matter most:
   to the internet.
 - **Review `[feeds.mirror]` upstreams.** A mirror makes your server fetch
   from, and republish under your name, whatever that upstream serves.
+
+## Verifying a release
+
+Release archives, `SHA256SUMS` and the container image of every release after
+0.5.1 carry signed build provenance from the release workflow, and the image is
+also signed with cosign (keyless). Check them before you run them:
+
+```bash
+# An archive (or SHA256SUMS) downloaded from the GitHub Release.
+gh attestation verify yanuget-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz \
+  --repo thoscut/yanuget
+
+# The container image: provenance, then the cosign signature.
+gh attestation verify oci://ghcr.io/thoscut/yanuget:X.Y.Z --repo thoscut/yanuget
+cosign verify ghcr.io/thoscut/yanuget:X.Y.Z \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  --certificate-identity-regexp '^https://github\.com/thoscut/yanuget/\.github/workflows/release\.yml@refs/tags/v'
+```
+
+Either check failing means the file or image did not come from this
+repository's release workflow run for a tag; do not use it.

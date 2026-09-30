@@ -44,6 +44,14 @@ cargo test --all-features
 mkdocs build --strict                       # if you touched docs/
 ```
 
+CI also runs `cargo audit` and `cargo deny check licenses bans sources`
+(policy in `deny.toml`): a new dependency under a license not on the list
+there fails the build until someone has looked at it.
+
+Every action in `.github/workflows/` is pinned to a full commit SHA with the
+release in a comment (`uses: actions/checkout@<sha> # v7.0.1`). Keep it that
+way when adding one; Dependabot keeps the pins current.
+
 If you changed anything that a NuGet client can observe — the service index, the
 flat container, registration, search, download URLs, or symbol keys — also run
 the real client:
