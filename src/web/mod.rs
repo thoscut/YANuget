@@ -1035,6 +1035,7 @@ async fn delete_package(
     headers: HeaderMap,
     Path((id, version)): Path<(String, String)>,
 ) -> Result<StatusCode> {
+    check_id(&id)?;
     if !state.feed.auth.check_headers(&headers) {
         return Err(Error::Unauthorized);
     }
@@ -1075,6 +1076,7 @@ async fn relist_package(
     headers: HeaderMap,
     Path((id, version)): Path<(String, String)>,
 ) -> Result<StatusCode> {
+    check_id(&id)?;
     if !state.feed.auth.check_headers(&headers) {
         return Err(Error::Unauthorized);
     }
@@ -1099,6 +1101,7 @@ async fn package_versions(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>> {
+    check_id(&id)?;
     state.require_read(&headers)?;
     // The flat container is how a client resolves a version it is *about to
     // restore*, so it must include unlisted versions. Unlisting means "hide
@@ -1136,6 +1139,7 @@ async fn download_package(
     headers: HeaderMap,
     Path((id, version, filename)): Path<(String, String, String)>,
 ) -> Result<Response> {
+    check_id(&id)?;
     state.require_read(&headers)?;
     let version = parse_version(&version)?;
     let normalized = version.normalized();
@@ -1300,6 +1304,7 @@ async fn registration_index_for(
     id: &str,
     semver2: bool,
 ) -> Result<Json<serde_json::Value>> {
+    check_id(id)?;
     state.require_read(headers)?;
     // Registration includes unlisted versions (flagged listed=false).
     let mut packages = state.db.find_versions(state.feed(), id, true).await?;
@@ -1342,6 +1347,7 @@ async fn registration_page_for(
     upper: &str,
     semver2: bool,
 ) -> Result<Json<serde_json::Value>> {
+    check_id(id)?;
     state.require_read(headers)?;
     let upper = upper.strip_suffix(".json").unwrap_or(upper);
     let lower = parse_version(lower)?;
@@ -1380,6 +1386,7 @@ async fn registration_leaf_for(
     version: &str,
     semver2: bool,
 ) -> Result<Json<serde_json::Value>> {
+    check_id(id)?;
     state.require_read(headers)?;
     let version = version.strip_suffix(".json").unwrap_or(version);
     let version = parse_version(version)?;
@@ -1481,7 +1488,12 @@ async fn autocomplete(
 
     // `id` present => enumerate that package's versions.
     if let Some(id) = params.id.filter(|s| !s.is_empty()) {
-        let packages = state.db.find_versions(state.feed(), &id, false).await?;
+        // An id no package can have has no versions.
+        let packages = if check_id(&id).is_ok() {
+            state.db.find_versions(state.feed(), &id, false).await?
+        } else {
+            Vec::new()
+        };
         let versions: Vec<String> = packages
             .iter()
             .filter(|p| include_prerelease || !p.is_prerelease())
@@ -1815,6 +1827,7 @@ async fn package_icon(
     headers: HeaderMap,
     Path((id, version)): Path<(String, String)>,
 ) -> Result<Response> {
+    check_id(&id)?;
     state.require_read(&headers)?;
     let version = parse_version(&version)?;
     let Some(package) = state.db.find(state.feed(), &id, &version).await? else {
@@ -1893,6 +1906,7 @@ async fn render_detail(
     id: &str,
     version: Option<&str>,
 ) -> Result<Html<String>> {
+    check_id(id)?;
     state.require_read(headers)?;
     let packages = state.db.find_versions(state.feed(), id, true).await?;
     if packages.is_empty() {
@@ -2074,6 +2088,7 @@ async fn admin_package(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Html<String>> {
+    check_id(&id)?;
     let versions = state.db.find_all_versions(state.feed(), &id).await?;
     if versions.is_empty() {
         return Err(Error::PackageNotFound);
@@ -2119,6 +2134,7 @@ async fn admin_file_delete(
     Path((id, version, name)): Path<(String, String, String)>,
     body: String,
 ) -> Result<Response> {
+    check_id(&id)?;
     require_admin_action(&state, &headers, &body)?;
     let v = parse_version(&version)?;
     hosted::detach(&state, &id, &v, &name).await?;
@@ -2266,6 +2282,7 @@ async fn admin_bulk(
     Path(id): Path<String>,
     body: String,
 ) -> Result<Response> {
+    check_id(&id)?;
     require_admin_action(&state, &headers, &body)?;
     let back = Redirect::to(&admin_package_url(&state.feed.prefix, &id)).into_response();
     let op = form_field(&body, "op")
@@ -2400,6 +2417,7 @@ async fn admin_set_enabled(
     version: &str,
     enabled: bool,
 ) -> Result<Response> {
+    check_id(id)?;
     require_admin_action(state, headers, body)?;
     let v = parse_version(version)?;
     if !state.db.set_enabled(state.feed(), id, &v, enabled).await? {
@@ -2414,6 +2432,7 @@ async fn admin_approve(
     Path((id, version)): Path<(String, String)>,
     body: String,
 ) -> Result<Response> {
+    check_id(&id)?;
     require_admin_action(&state, &headers, &body)?;
     let v = parse_version(&version)?;
     if !state.db.approve_membership(state.feed(), &id, &v).await? {
@@ -2428,6 +2447,7 @@ async fn admin_promote(
     Path((id, version)): Path<(String, String)>,
     body: String,
 ) -> Result<Response> {
+    check_id(&id)?;
     require_admin_action(&state, &headers, &body)?;
     let Some(target) = &state.feed.promotes_to else {
         return Err(Error::BadRequest(
@@ -2452,6 +2472,7 @@ async fn admin_delete(
     Path((id, version)): Path<(String, String)>,
     body: String,
 ) -> Result<Response> {
+    check_id(&id)?;
     require_admin_action(&state, &headers, &body)?;
     let v = parse_version(&version)?;
     if !retention::purge_version(
@@ -2501,6 +2522,7 @@ async fn admin_set_pinned(
     version: &str,
     pinned: bool,
 ) -> Result<Response> {
+    check_id(id)?;
     require_admin_action(state, headers, body)?;
     let v = parse_version(version)?;
     if !state.db.set_pinned(state.feed(), id, &v, pinned).await? {
@@ -2620,6 +2642,19 @@ fn admin_package_url(prefix: &str, id: &str) -> String {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Refuse a package id taken from a URL unless it is one a package could
+/// have, before it reaches the database, the store or a lock.
+///
+/// The layers do not fold case the same way: the database uses Unicode
+/// `to_lowercase()`, storage paths and the version lock ASCII. An id no push
+/// could create — `\u{212A}` (the Kelvin sign) folds to `k` in one and not in
+/// the other — could match a database row while missing its directory and its
+/// lock: a delete then removed the rows, orphaned the payload, and did not
+/// serialise with a concurrent push. Such an id names nothing, so it is a 404.
+fn check_id(id: &str) -> Result<()> {
+    crate::validation::validate_package_id(id).map_err(|_| Error::PackageNotFound)
+}
 
 fn parse_version(raw: &str) -> Result<NuGetVersion> {
     NuGetVersion::parse(raw).map_err(|e| Error::InvalidVersion(e.to_string()))

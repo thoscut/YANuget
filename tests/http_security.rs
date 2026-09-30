@@ -415,6 +415,48 @@ async fn one_feeds_admin_key_does_not_open_another_admin_area() {
 }
 
 // ---------------------------------------------------------------------------
+// Ids in URLs (SEC-22)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn an_id_no_package_could_have_reaches_nothing() {
+    let server = spawn_with(|c| c.hard_delete_enabled = true).await;
+    assert_eq!(
+        push(&server, "", API_KEY, build_nupkg("Kit.Pkg", "1.0.0")).await,
+        StatusCode::CREATED
+    );
+    // U+212A KELVIN SIGN lower-cases to `k` in Unicode but not in ASCII, so it
+    // used to match the database row and miss the directory and the lock.
+    let kelvin = "%E2%84%AAit.Pkg";
+    let del = server
+        .client
+        .delete(server.url(&format!("/api/v2/package/{kelvin}/1.0.0")))
+        .header("X-NuGet-ApiKey", API_KEY)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(del.status(), StatusCode::NOT_FOUND);
+    for path in [
+        format!("/v3/package/{kelvin}/index.json"),
+        format!("/v3/package/{kelvin}/1.0.0/kit.pkg.1.0.0.nupkg"),
+        format!("/v3/registration/{kelvin}/index.json"),
+        format!("/packages/{kelvin}"),
+        "/v3/package/..%2F..%2Fetc/index.json".to_string(),
+    ] {
+        let resp = server.client.get(server.url(&path)).send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{path}");
+    }
+    // The real package is untouched.
+    let ok = server
+        .client
+        .get(server.url("/v3/package/kit.pkg/1.0.0/kit.pkg.1.0.0.nupkg"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), StatusCode::OK);
+}
+
+// ---------------------------------------------------------------------------
 // Caching (SEC-04, COR-12, SEC-25, COR-25)
 // ---------------------------------------------------------------------------
 

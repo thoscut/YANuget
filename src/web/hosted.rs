@@ -56,6 +56,7 @@ pub(super) async fn download(
     headers: HeaderMap,
     Path((id, version, name)): Path<(String, String, String)>,
 ) -> Result<Response> {
+    super::check_id(&id)?;
     state.require_read(&headers)?;
     if !state.config.files.enabled {
         return Err(Error::PackageNotFound);
@@ -338,6 +339,7 @@ pub(super) async fn put(
     Path((id, version, name)): Path<(String, String, String)>,
     request: Request,
 ) -> Result<Response> {
+    super::check_id(&id)?;
     let headers = request.headers().clone();
     authorize_upload(&state, &headers)?;
     let v = parse_version(&version)?;
@@ -396,6 +398,7 @@ pub(super) async fn delete(
     headers: HeaderMap,
     Path((id, version, name)): Path<(String, String, String)>,
 ) -> Result<StatusCode> {
+    super::check_id(&id)?;
     authorize_upload(&state, &headers)?;
     let v = parse_version(&version)?;
     detach(&state, &id, &v, &name).await?;
@@ -533,6 +536,7 @@ pub(super) async fn tus_create(
             .ok_or_else(|| Error::BadRequest(format!("Upload-Metadata needs {k:?}")))
     };
     let id = field("id")?;
+    super::check_id(id)?;
     let v = parse_version(field("version")?)?;
     let name = field("filename")?;
     crate::validation::validate_file_name(name, &state.config.files)?;
