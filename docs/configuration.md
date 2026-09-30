@@ -15,7 +15,7 @@ A fully commented template lives in
 | --- | --- | --- | --- | --- |
 | `host` | `YANUGET_HOST` | IP | `0.0.0.0` | Interface to bind. |
 | `port` | `YANUGET_PORT` | int | `5000` | TCP port. |
-| `base_url` | `YANUGET_BASE_URL` | string | *(per-request)* | External base URL. If unset, derived from `Host`/`X-Forwarded-*`. |
+| `base_url` | `YANUGET_BASE_URL` | string | *(per-request)* | External base URL. Set it whenever you know the public address, and always behind a proxy. If unset, derived from `Host`, and from `X-Forwarded-*` only when the peer is in `trusted_proxies`. |
 | `data_dir` | `YANUGET_DATA_DIR` | path | `./data` | Root for all data. |
 | `storage_path` | `YANUGET_STORAGE_PATH` | path | `{data_dir}/packages` | Package store. |
 | `database_path` | `YANUGET_DATABASE_PATH` | path | `{data_dir}/yanuget.db` | SQLite file. |
@@ -115,6 +115,14 @@ version is pruned when it is beyond the newest *N* of its release channel
 version — or newest pre-release when no stable exists — is always kept, so a
 package can never be pruned out of existence.
 
+The rules count only what clients can download. **Pending** and **disabled**
+versions are outside them: they are never deleted by retention, never use up
+one of the "newest *N*", and are never the newest version that is kept — so
+pushing builds into a gated feed cannot prune the approved ones, and disabling
+a broken release does not make it the version retention protects. Unlisted
+versions still count, because a client restoring that exact version still gets
+it.
+
 | TOML key | Env var | Type | Default | Description |
 | --- | --- | --- | --- | --- |
 | `retention.enabled` | `YANUGET_RETENTION_ENABLED` | bool | `false` | Master switch. |
@@ -129,7 +137,9 @@ With no limit set, the sweep does nothing even when `enabled`.
 An admin can **pin** a version in `/admin`; retention then keeps it whatever
 the rules say, and it does not use up one of the "newest *N*" either — a pin is
 kept in addition to what the rules keep. A pin survives an overwriting push and
-moves with a version to another feed; it does not stop an explicit delete.
+moves with a version to another feed; it does not stop an explicit delete. A
+cleanup re-checks each version just before deleting it, so a pin set while one
+is running is honoured.
 
 `/admin/retention` shows these rules, what the last cleanup did, and exactly
 what the next one would delete and why, with a button that deletes that list
@@ -168,10 +178,16 @@ receives the files and YANuget imports them from that directory:
 The feed directories are created on startup (`default` without `[[feeds]]`).
 A file is imported once its `.sha256` file is there, so upload the file first
 and the checksum last; `rsync --partial --append-verify` resumes a broken
-transfer. The importer moves the file out of the inbox before it checks it,
-then attaches it to the version, which the feed must already hold, and removes
-both files. When a file cannot be imported, a `{name}.error` next to it says
-why; the file stays, and removing the `.error` retries it.
+transfer. The importer copies the file into the server's own staging area
+while it checks it, so what is verified is what is stored, then attaches it to
+the version, which the feed must already hold, and removes both files. The
+copy needs as much free space again on the store's volume while it runs. When
+a file cannot be imported, a `{name}.error` next to it says why; the file
+stays, and removing the `.error` retries it.
+
+Nothing in the inbox is reached through a symbolic link: a linked directory or
+file is ignored, a file with other hard links is refused, and anything at a
+`.error` name that is not a report is replaced rather than written through.
 
 ```bash
 sha256sum base.wim > base.wim.sha256
@@ -209,6 +225,20 @@ with its own mutable state (listed / enabled / pending / flagged / downloads).
 Removing a version from a feed drops that membership; the shared payload is
 deleted only when the **last** feed referencing it lets go.
 
+That makes an id and version **one namespace across every feed**. Whoever
+stores a version first owns it everywhere: pushing different bytes under the
+same id and version is refused (`409`, logged as a failure) in every feed,
+and a mirror fetch of it fails the same way. Package metadata, readmes,
+icons and attached files are shared too, so detaching a file in one feed
+detaches it in all of them. A push key on a low-trust feed, or an anonymous
+read that fills a mirror feed, can therefore claim a version another feed
+meant to publish. `reserved_id_prefixes` closes that for your own ids: a feed
+that reserves `Contoso.` is the only one that may push, mirror or migrate
+`Contoso` or any `Contoso.*` id (matched ignoring case); every other feed
+answers `403`. Reservations of different feeds may not overlap. Copying or
+promoting an existing version into another feed is an admin action and is not
+affected.
+
 | TOML key | Type | Default | Description |
 | --- | --- | --- | --- |
 | `feeds[].name` | string | *(required)* | URL slug + DB key; `[A-Za-z0-9._-]+`, unique. |
@@ -220,6 +250,7 @@ deleted only when the **last** feed referencing it lets go.
 | `feeds[].hard_delete_enabled` | bool | *(global)* | DELETE removes vs. unlists. |
 | `feeds[].requires_approval` | bool | `false` | Incoming versions are pending until approved. |
 | `feeds[].promotes_to` | string | *(none)* | Next release ring (must name another feed). |
+| `feeds[].reserved_id_prefixes` | string[] | `[]` | Id prefixes (e.g. `"Contoso."`) only this feed may bring in; every other feed refuses them. See below. |
 | `feeds[].mirror.enabled` | bool | `false` | Read-through cache of an upstream V3 feed. |
 | `feeds[].mirror.upstream` | string | `https://api.nuget.org/v3/index.json` | Upstream service index. |
 | `feeds[].mirror.timeout_secs` | int | `30` | Connect timeout, the longest the upstream may go silent, and the deadline for one metadata request. |
@@ -229,17 +260,24 @@ deleted only when the **last** feed referencing it lets go.
 | `feeds[].mirror.auth.token` | string | *(none)* | Bearer token for the upstream (`Authorization: Bearer …`). Set this *or* `username`, not both. |
 | `feeds[].mirror.auth.headers` | table | `{}` | Arbitrary extra request headers (e.g. a private-feed API key). |
 
+| `feeds[].mirror.max_versions_per_package` | int | `50` | Newest-first cap on how many versions one read-through miss fetches. |
+| `feeds[].mirror.max_package_size_bytes` | int | *(server-wide cap, else 2 GiB)* | Cap on a single mirrored `.nupkg`. |
+| `feeds[].mirror.allow_private_upstream` | bool | `false` | Permit an upstream on a private/loopback address. |
+| `feeds[].mirror.proxy` | string | *(none)* | Outbound proxy for upstream requests. Unset, the mirror connects directly and ignores `HTTP(S)_PROXY`. |
+| `feeds[].mirror.ca_cert_path` | path | *(none)* | PEM file of extra CA certificates to trust for the upstream, on top of the system store and the bundled Mozilla roots. |
+| `feeds[].license_policy.enabled` | bool | `false` | Evaluate the offline license policy. |
+| `feeds[].license_policy.allowed` | string[] | `[]` | If non-empty, license must match one. |
+| `feeds[].license_policy.blocked` | string[] | `[]` | Always rejected (even if also allowed). |
+| `feeds[].license_policy.allow_unlicensed` | bool | `true` | Allow packages with no declared license. |
+| `feeds[].license_policy.action` | string | `warn` | `warn` (accept + flag) or `block` (reject). |
+| `feeds[].retention` | table | *(global `[retention]`)* | Per-feed retention overrides. |
+
 Upstream credentials are sent only to the service index's own scheme, host and
 port. The resource URLs inside the service index are the upstream's choice, so
 a `PackageBaseAddress`, search or catalog URL on another host — or a redirect
 to one, such as a download handed off to a CDN — is fetched without them. A
 redirect from `https` to `http` is refused. Setting both `username` and `token`,
 or a header that cannot be sent, is a startup error.
-| `feeds[].mirror.max_versions_per_package` | int | `50` | Newest-first cap on how many versions one read-through miss fetches. |
-| `feeds[].mirror.max_package_size_bytes` | int | *(server-wide cap, else 2 GiB)* | Cap on a single mirrored `.nupkg`. |
-| `feeds[].mirror.allow_private_upstream` | bool | `false` | Permit an upstream on a private/loopback address. |
-| `feeds[].mirror.proxy` | string | *(none)* | Outbound proxy for upstream requests. Unset, the mirror connects directly and ignores `HTTP(S)_PROXY`. |
-| `feeds[].mirror.ca_cert_path` | path | *(none)* | PEM file of extra CA certificates to trust for the upstream, on top of the system store and the bundled Mozilla roots. |
 
 Three things bound a read-through miss, because it is started by an
 *unauthenticated read* and writes what it fetches to your disk:
@@ -282,12 +320,16 @@ tombstone for that feed, id and version, and the mirror never fetches a
 tombstoned version again — so a package pulled as malicious does not come back
 on the next read, and retention and the mirror do not fight over old versions.
 Pushing the version to the feed again clears its tombstone.
-| `feeds[].license_policy.enabled` | bool | `false` | Evaluate the offline license policy. |
-| `feeds[].license_policy.allowed` | string[] | `[]` | If non-empty, license must match one. |
-| `feeds[].license_policy.blocked` | string[] | `[]` | Always rejected (even if also allowed). |
-| `feeds[].license_policy.allow_unlicensed` | bool | `true` | Allow packages with no declared license. |
-| `feeds[].license_policy.action` | string | `warn` | `warn` (accept + flag) or `block` (reject). |
-| `feeds[].retention` | table | *(global `[retention]`)* | Per-feed retention overrides. |
+
+The license policy reads SPDX expressions the way SPDX means them. Case, the
+`+` suffix and the deprecated ids are normalised on both sides, so a rule for
+`GPL-2.0` matches `GPL-2.0+`, `GPL-2.0-only` and `GPL-2.0-or-later` alike.
+Against an allow list, `A OR B` needs one side allowed and `A AND B` both;
+`X WITH exception` passes a rule allowing `X` only when the exception is one
+the SPDX list defines (name the whole pair in a rule to accept any other).
+**A deny list on its own is advisory**: a package that declares its license as
+a file, or as a `licenseUrl` the list does not name, passes it. To control
+what comes in, set `allowed`.
 
 ### Read authentication
 
@@ -295,6 +337,13 @@ When a feed sets `read_api_key`, downloads/restore **and** the HTML gallery
 require a credential, supplied either as an `X-NuGet-ApiKey` header or as the
 password of HTTP Basic credentials (what `dotnet`/`nuget` send). The
 `/v3/index.json` service index stays open so clients can discover the feed.
+
+`read_api_key` exists only on a `[[feeds]]` entry. **The implicit single feed
+served at the root has no read key: with no `[[feeds]]` configured, anyone who
+can reach the server can restore from it.** To require a key for reads,
+configure the feed explicitly — which mounts it at `/{name}/v3/index.json`
+rather than at the root — or keep the server off networks whose clients should
+not read it.
 
 ### Release rings & approval
 
@@ -327,8 +376,9 @@ YANuget serves **HTTPS by default**. Behaviour:
   reject untrusted certificates). For a public feed, supply a real certificate.
 - Set `tls_enabled = false` to serve plain HTTP — appropriate when a reverse
   proxy (nginx, Caddy, Traefik) terminates TLS in front of YANuget. In that
-  case forward `X-Forwarded-Proto`/`X-Forwarded-Host` so generated URLs use the
-  right scheme/host.
+  case set `base_url` to the public address, or forward
+  `X-Forwarded-Proto`/`X-Forwarded-Host` and list the proxy in
+  [`trusted_proxies`](#trusted-proxies) so they are honoured.
 
 When TLS is on and no base URL is configured, generated URLs default to the
 `https` scheme (still overridable by `X-Forwarded-Proto`). With TLS enabled,
@@ -379,6 +429,11 @@ location / {
     proxy_set_header Host $host;
     proxy_set_header X-Forwarded-Proto $scheme;
     proxy_set_header X-Forwarded-Host $host;
+    # The client's address, for the rate limiter and the logs. Set, not
+    # appended: `$proxy_add_x_forwarded_for` would pass on whatever the client
+    # sent in its own X-Forwarded-For.
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $remote_addr;
 
     client_max_body_size 0;          # no upload size cap at the proxy
     proxy_request_buffering off;     # stream uploads through
@@ -387,7 +442,8 @@ location / {
 }
 ```
 
-The `X-Forwarded-*` headers above are only honoured if this proxy's address is
-covered by `trusted_proxies`. A proxy on the same host or a private network is
-covered by the `private` default; one reaching YANuget from a public address
-needs listing explicitly.
+The forwarding headers above are only honoured if this proxy's address is
+covered by `trusted_proxies`, which is empty by default. List the proxy's
+address (`127.0.0.1` for one on the same host), or `private` if it reaches
+YANuget over a private network that no untrusted client shares. Setting
+`base_url` as well pins the generated URLs regardless of any header.

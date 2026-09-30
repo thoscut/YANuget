@@ -41,8 +41,20 @@ if [ -x "$LOCAL_DOTNET/dotnet" ]; then
     export DOTNET_ROOT="$LOCAL_DOTNET"
     export PATH="$LOCAL_DOTNET:$PATH"
 elif ! command -v dotnet >/dev/null 2>&1; then
+    # The installer is fetched from a fixed commit of dotnet/install-scripts
+    # (release v2026.07.21) and checked against its SHA-256 before it runs.
+    # `dot.net/v1/dotnet-install.sh` is a moving redirect, and piping whatever
+    # it serves today into bash is running unreviewed code. To move to a newer
+    # installer, update both values together from a reviewed release. A
+    # distribution package (`apt install dotnet-sdk-8.0`) works just as well
+    # and makes this block a no-op.
+    INSTALLER_COMMIT=da3ce11ba63f3dbb0fb835d41bda2665d5c48e84
+    INSTALLER_SHA256=082f7685e156738a1b2e2ed8381a621870d4ce8e8c59278034556f05c186eb2e
     echo "==> no .NET SDK found; installing one into $LOCAL_DOTNET"
-    curl -sSL -o dotnet-install.sh https://dot.net/v1/dotnet-install.sh
+    curl -sSfL --proto '=https' -o dotnet-install.sh \
+        "https://raw.githubusercontent.com/dotnet/install-scripts/$INSTALLER_COMMIT/src/dotnet-install.sh"
+    echo "$INSTALLER_SHA256  dotnet-install.sh" | sha256sum -c --quiet - \
+        || { echo "dotnet-install.sh does not match its pinned SHA-256; refusing to run it" >&2; exit 1; }
     bash dotnet-install.sh --channel 8.0 --install-dir "$LOCAL_DOTNET" --no-path >/dev/null
     export DOTNET_ROOT="$LOCAL_DOTNET"
     export PATH="$LOCAL_DOTNET:$PATH"

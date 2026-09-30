@@ -38,8 +38,9 @@ Three settings do most of the work:
   deriving it per-request from headers, which is correct only when
   `trusted_proxies` is also right.
 - **`trusted_proxies`** — see [Trusted proxies](configuration.md#trusted-proxies).
-  The default trusts private ranges. If YANuget is directly reachable from the
-  internet, set it to `[]`.
+  The default is empty: nobody is trusted and forwarding headers are ignored,
+  which is right when clients connect to YANuget directly. Behind a reverse
+  proxy, list that proxy's address — and only that.
 
 Also set **`max_package_size_bytes`** on any feed open to more than a handful of
 people, and keep **`admin_api_key`** distinct from the push key.
@@ -56,13 +57,18 @@ data/
 │   ├── <id>/<version>/<id>.<version>.snupkg
 │   ├── <id>/<version>/<sidecars: nuspec, readme, icon>
 │   ├── .symbols/<ssqp-key>/<file.pdb>
-│   └── .uploads/        in-flight uploads, renamed into place when complete
+│   ├── .blobs/sha256/<ab>/<sha256>   attached files, stored once by content hash
+│   ├── .uploads/        in-flight uploads (and resumable ones), renamed into
+│   │                    place when complete
+│   └── .migrate/        scratch space of a running `yanuget migrate`
 └── tls/                 cert.pem and key.pem — only the self-signed pair
 ```
 
 Package ids and versions are lower-cased and normalized, so the layout is
-predictable and case-insensitively unique. Nothing else on the filesystem is
-written to at runtime.
+predictable and case-insensitively unique. The one other directory written to
+at runtime is the SSH inbox, when `files.inbox_dir` is set: it lives wherever
+you point it (never inside the package store), and files leave it as they are
+imported.
 
 Size it for the packages you expect plus room for one in-flight upload per
 concurrent push. An upload is streamed into `packages/.uploads/` and then
@@ -84,15 +90,32 @@ capture a torn state. Either stop the server, or use SQLite's online backup:
 # Consistent database snapshot without stopping the server.
 sqlite3 /var/lib/yanuget/yanuget.db ".backup '/backup/yanuget.db'"
 
-# Then the payloads. Package files are immutable once written, so copying them
-# after the database snapshot can only ever include extra files, never miss one
-# the snapshot references.
+# Then the payloads, and the certificate pair.
 rsync -a /var/lib/yanuget/packages/ /backup/packages/
+rsync -a /var/lib/yanuget/tls/ /backup/tls/
 ```
 
-Restore by putting both back and starting the server; no import step is needed.
-`tls/` does not need backing up — a self-signed pair is regenerated on first
-start if it is missing.
+Taking the database first and the files second is the right order, but it is
+not airtight while the server runs. New pushes only add files, so they can only
+leave extra files in the backup. Anything that *removes* a file between the two
+steps — a delete, an overwrite of an existing version (`allow_overwrite`), a
+retention run, a file detached from a version — takes away a payload the
+snapshot still references, and the backup has a database row whose file is
+missing. For a backup that is consistent by construction, either stop the
+server for the duration, or copy from a filesystem snapshot (LVM, ZFS, btrfs)
+of the whole data directory taken at one instant — with the database inside it
+copied by `.backup` from that snapshot, or the server stopped when it is taken.
+`.uploads/` and `.migrate/` hold only work in progress and can be left out
+(a resumable upload that was unfinished at backup time then starts over).
+
+Restore by putting everything back and starting the server; no import step is
+needed.
+
+Back up `tls/` too if the server uses its self-signed pair. A missing pair is
+regenerated on start, but as a *new* certificate: every client that was told to
+trust the old one stops connecting until it is told again. (With
+`tls_cert_path`/`tls_key_path` the certificate lives wherever those point —
+back that up instead.)
 
 ## systemd
 
@@ -125,7 +148,10 @@ ProtectHome=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
-RestrictAddressFamilies=AF_INET AF_INET6
+# AF_UNIX because glibc resolves names through local services (nscd,
+# systemd-resolved) over Unix sockets; without it, looking up a mirror
+# upstream or a migration source can fail.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 LockPersonality=yes
 
 # Large uploads and downloads keep many file descriptors open.
@@ -150,7 +176,6 @@ services:
       - "5000:5000"
     environment:
       YANUGET_BASE_URL: https://nuget.example.com
-      YANUGET_TRUSTED_PROXIES: "private"
     env_file:
       - secrets.env          # YANUGET_API_KEY, YANUGET_ADMIN_API_KEY
     volumes:
@@ -160,9 +185,20 @@ volumes:
   yanuget-data:
 ```
 
+Clients reach the container directly here, so `trusted_proxies` stays at its
+empty default. Setting it to `private` in this setup would let any machine on
+the network send its own `X-Forwarded-For` and `X-Forwarded-Host`. When a
+reverse proxy runs in front — another service in the same Compose file, say —
+set `YANUGET_TRUSTED_PROXIES` to that proxy's address, or to the Compose
+network's subnet if nothing else can reach the container.
+
 The image runs as an unprivileged user (uid 10001) and declares a `HEALTHCHECK`
-against `/health`, so `docker ps` reports whether the server can actually reach
-its database rather than merely that the process is alive.
+(`yanuget healthcheck`, which probes `/health/ready`), so `docker ps` reports
+whether the server can actually reach its database rather than merely that the
+process is alive. The probe reads the same configuration as the server, so
+point a mounted TOML file at it with `YANUGET_CONFIG=/path/in/container`
+rather than with `--config`: the health check does not see the container's
+arguments.
 
 To mount a host directory instead of a named volume, make sure it is writable by
 uid 10001.
@@ -224,4 +260,7 @@ to roll back the database.
   it against a copy first.
 - **Mirroring** makes your server fetch from an upstream and republish under
   your own name. Review the upstream, and prefer a feed dedicated to it over
-  mirroring into the feed your own packages live in.
+  mirroring into the feed your own packages live in. To pull a mirrored version
+  (one found to be malicious, say), delete or disable it in `/admin`: a
+  deleted version is recorded, and the mirror never fetches it back (pushing
+  it again undoes that). See [Feeds](configuration.md#feeds).

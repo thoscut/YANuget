@@ -1039,6 +1039,8 @@ pub struct MirrorOptions {
     pub requires_approval: bool,
     /// The feed's license policy, applied to each mirrored version.
     pub license_policy: LicensePolicyConfig,
+    /// Id prefixes other feeds reserved, which this feed refuses to mirror.
+    pub reserved_elsewhere: Vec<crate::config::ReservedPrefix>,
 }
 
 /// How long a request waits for another request's fetch of the same package
@@ -1307,6 +1309,11 @@ impl MirrorTarget<'_> {
         // upstream's PackageBaseAddress path when interpolated into the
         // request URL.
         if crate::validation::validate_package_id(id).is_err() {
+            return Ok(0);
+        }
+        // Reserved for another feed: indexing would refuse every version, so
+        // nothing is worth downloading.
+        if self.options.reserved_elsewhere.iter().any(|r| r.covers(id)) {
             return Ok(0);
         }
         let client = self.client;
@@ -1599,6 +1606,7 @@ impl MirrorTarget<'_> {
                 id: lower_id.to_string(),
                 version: version.clone(),
             }),
+            reserved_elsewhere: options.reserved_elsewhere.clone(),
         };
         match indexing::index_package(self.storage, self.db, feed, temp_path, summary, &opts).await
         {

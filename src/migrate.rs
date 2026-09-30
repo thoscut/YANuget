@@ -239,6 +239,7 @@ pub async fn run(
         feed: &feed.name,
         include_prerelease,
         skip_existing,
+        reserved_elsewhere: &feed.reserved_elsewhere,
     };
     let id_results: Vec<IdResult> = stream::iter(ids.iter().cloned())
         .map(|id| {
@@ -305,6 +306,7 @@ pub async fn run(
         // Pinned per item in `migrate_one` — the source is asked for a specific
         // id/version and must not be able to answer with a different package.
         expect: None,
+        reserved_elsewhere: feed.reserved_elsewhere.clone(),
     };
 
     let outcomes: Vec<Outcome> = stream::iter(work)
@@ -369,11 +371,24 @@ struct Lister<'a> {
     feed: &'a str,
     include_prerelease: bool,
     skip_existing: bool,
+    /// Id prefixes another feed owns; the target would refuse them.
+    reserved_elsewhere: &'a [crate::config::ReservedPrefix],
 }
 
 impl Lister<'_> {
     async fn list(&self, id: String) -> IdResult {
         let (db, feed) = (self.db, self.feed);
+        // Indexing would refuse every version, so report the package once
+        // instead of downloading each version to be refused.
+        if let Some(reserved) = self.reserved_elsewhere.iter().find(|r| r.covers(&id)) {
+            return IdResult::Failed {
+                error: format!(
+                    "under the prefix {:?}, reserved for feed {:?}",
+                    reserved.prefix, reserved.feed
+                ),
+                id,
+            };
+        }
         let lower = id.to_lowercase();
         let versions = match self.client.upstream_versions(&lower).await {
             Ok(versions) => versions,

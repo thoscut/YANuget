@@ -3,18 +3,33 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  # A manual run must be started *from the tag* ("Use workflow from" → the
+  # tag), so the workflow file that runs is the tagged one and the `release`
+  # environment's tag rule applies to it; `guard` refuses anything else.
   workflow_dispatch:
     inputs:
       tag:
-        description: "Tag to release (e.g. v0.1.0)"
+        description: "Existing tag to release, the same one selected under 'Use workflow from' (e.g. v0.1.0)"
         required: true
 
 env:
   CARGO_TERM_COLOR: always
 
-permissions:
-  contents: write
+# Nothing by default. The build jobs run crate build scripts, proc macros and
+# the docs toolchain — third-party code — so they get a read-only token; only
+# the jobs that publish get the scope they publish with, and those run in the
+# protected `release` environment (see RELEASING.md for its settings).
+permissions: {}
 
+# One release of a tag at a time; a second run waits instead of racing the
+# first to the registry.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+# Actions are pinned to full commit SHAs (see ci.yml). No job restores a cache:
+# caches are written by jobs on `main`, including ones that run npm, pip and a
+# browser, and a release is built from a clean state instead.
 jobs:
   # Nothing is built before the tag and the manifest agree. A release whose
   # binaries report a different version than the tag they are attached to is
@@ -22,39 +37,78 @@ jobs:
   guard:
     name: Check tag matches Cargo.toml
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
     outputs:
-      tag: ${{ steps.check.outputs.tag }}
+      tag: ${{ steps.tag.outputs.tag }}
+      sha: ${{ steps.check.outputs.sha }}
       version: ${{ steps.check.outputs.version }}
     steps:
-      - uses: actions/checkout@v7
+      - id: tag
+        name: Resolve the tag being released
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = workflow_dispatch ]; then
+            tag="$INPUT_TAG"
+          else
+            tag="${REF#refs/tags/}"
+          fi
+          if ! [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::'$tag' is not a release tag (vX.Y.Z or vX.Y.Z-pre)"
+            exit 1
+          fi
+          # A manual run from a branch would run that branch's copy of this
+          # workflow against the tag's code; refuse it rather than guess.
+          if [ "$REF" != "refs/tags/$tag" ]; then
+            echo "::error::run this workflow from the tag itself: 'Use workflow from' → Tags → $tag (it ran from $REF)"
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      # `refs/tags/…` rather than a bare name, so a branch that happens to
+      # share the tag's name cannot be what gets built, and a tag that does not
+      # exist fails here instead of being created later at some other commit.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # A manual dispatch names a tag; without this every job would
-          # check out the default branch and release whatever is on it.
-          ref: ${{ github.event.inputs.tag || github.ref }}
+          ref: refs/tags/${{ steps.tag.outputs.tag }}
+          persist-credentials: false
 
       - id: check
         shell: bash
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
         run: |
           set -euo pipefail
-          tag="${{ github.event.inputs.tag || github.ref_name }}"
           version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          # Every later job builds exactly this commit, even if the tag is
+          # moved while the release is running.
+          sha=$(git rev-parse HEAD)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          if [ "$tag" != "v$version" ]; then
-            echo "::error::tag $tag does not match Cargo.toml version $version (expected v$version)"
+          if [ "$TAG" != "v$version" ]; then
+            echo "::error::tag $TAG does not match Cargo.toml version $version (expected v$version)"
             exit 1
           fi
           if ! grep -qF "## [$version]" CHANGELOG.md; then
             echo "::error::CHANGELOG.md has no '## [$version]' section"
             exit 1
           fi
-          echo "releasing $tag from Cargo.toml version $version"
+          echo "releasing $TAG ($sha) from Cargo.toml version $version"
 
   # Build a release binary per target and upload it as an artifact.
   build:
     name: Build ${{ matrix.target }}
     needs: guard
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -72,45 +126,38 @@ jobs:
             os: windows-latest
             ext: .exe
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # A manual dispatch names a tag; without this every job would
-          # check out the default branch and release whatever is on it.
-          ref: ${{ github.event.inputs.tag || github.ref }}
+          ref: ${{ needs.guard.outputs.sha }}
+          persist-credentials: false
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
+          toolchain: stable
           targets: ${{ matrix.target }}
 
       - name: Install cross linker (aarch64 linux)
         if: matrix.linker != ''
+        env:
+          LINKER_PACKAGE: ${{ matrix.linker }}
         run: |
           sudo apt-get update
-          sudo apt-get install -y ${{ matrix.linker }}
+          sudo apt-get install -y "$LINKER_PACKAGE"
           echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
 
-      - name: Cache cargo
-        uses: actions/cache@v6
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ matrix.target }}-cargo-
-
       - name: Set up Python
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.x"
 
       # Render and embed the offline documentation site before compiling, so the
-      # release binary ships the full docs at /docs on every target.
+      # release binary ships the full docs at /docs on every target. The lock is
+      # installed with `--require-hashes`, so only the reviewed packages run here.
       - name: Build documentation site
         shell: bash
         run: |
-          pip install -r requirements-docs.txt
+          pip install --require-hashes -r requirements-docs.txt
           mkdocs build --strict
           # HTML/CSS must reference no external asset hosts (offline guarantee).
           if grep -rEiq --include="*.html" --include="*.css" \
@@ -122,59 +169,77 @@ jobs:
       # `--locked` so the released binary is built from the dependency versions
       # in Cargo.lock, not from whatever resolved that morning.
       - name: Build release
-        run: cargo build --release --locked --target ${{ matrix.target }}
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo build --release --locked --target "$TARGET"
 
       - name: Package artifact
         shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          EXT: ${{ matrix.ext }}
+          TAG: ${{ needs.guard.outputs.tag }}
+          RUNNER: ${{ matrix.os }}
         run: |
           set -euo pipefail
-          bin="yanuget${{ matrix.ext }}"
-          name="yanuget-${{ github.event.inputs.tag || github.ref_name }}-${{ matrix.target }}"
+          bin="yanuget${EXT}"
+          name="yanuget-${TAG}-${TARGET}"
           mkdir -p dist "staging/$name"
           # Stage everything first so the archive has one flat directory in it,
           # rather than the build tree's path. `7z` in particular stores paths
           # exactly as given.
-          cp "target/${{ matrix.target }}/release/$bin" "staging/$name/"
+          cp "target/$TARGET/release/$bin" "staging/$name/"
           cp README.md LICENSE CHANGELOG.md yanuget.example.toml "staging/$name/"
-          if [[ "${{ matrix.os }}" == windows-latest ]]; then
+          if [[ "$RUNNER" == windows-latest ]]; then
             (cd staging && 7z a "../dist/$name.zip" "$name")
           else
             tar -czf "dist/$name.tar.gz" -C staging "$name"
           fi
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: yanuget-${{ matrix.target }}
           path: dist/*
 
-  # Publish a container image to the GitHub Container Registry. Gated on the
-  # binary builds so a release that falls over on one target does not leave a
-  # published image with no release to go with it.
+  # Publish a multi-arch container image to the GitHub Container Registry,
+  # attest its provenance and sign it. Gated on the binary builds so a release
+  # that falls over on one target does not leave a published image with no
+  # release to go with it.
   image:
     name: Publish container image
     needs: [guard, build]
     runs-on: ubuntu-latest
+    timeout-minutes: 90
+    environment: release
     permissions:
       contents: read
       packages: write
+      # Keyless signing and the provenance attestation both authenticate with
+      # the workflow's OIDC identity rather than a stored key.
+      id-token: write
+      attestations: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # A manual dispatch names a tag; without this every job would
-          # check out the default branch and release whatever is on it.
-          ref: ${{ github.event.inputs.tag || github.ref }}
+          ref: ${{ needs.guard.outputs.sha }}
+          persist-credentials: false
 
-      - uses: docker/setup-buildx-action@v4
+      # QEMU runs the arm64 image's few `RUN` steps (user creation, CA
+      # certificates); the Rust build itself cross-compiles natively.
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
 
-      - uses: docker/login-action@v4
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - id: meta
-        uses: docker/metadata-action@v6
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ghcr.io/${{ github.repository }}
           tags: |
@@ -184,9 +249,13 @@ jobs:
             # starts handing people a release candidate.
             type=raw,value=latest,enable=${{ !contains(needs.guard.outputs.version, '-') }}
 
-      - uses: docker/build-push-action@v7
+      # No `cache-from`/`cache-to`: the image is built from the pinned base
+      # images and the lockfiles alone.
+      - id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
+          platforms: linux/amd64,linux/arm64
           push: true
           # A released image must carry the real documentation, not the
           # placeholder — which is indistinguishable from success until someone
@@ -194,23 +263,45 @@ jobs:
           build-args: REQUIRE_DOCS=1
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
 
-  # Collect all built artifacts and publish a GitHub Release.
+      - name: Attest the image's provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/${{ github.repository }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      # Keyless: the signature binds the image digest to this workflow run's
+      # identity (repository, workflow file, tag), recorded in the public
+      # Rekor log. Signing the digest, not a tag, is what makes it mean
+      # something — tags move.
+      - name: Sign the image
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: cosign sign --yes "${IMAGE}@${DIGEST}"
+
+  # Collect all built artifacts, attest them and publish a GitHub Release.
   release:
     name: Publish GitHub Release
     needs: [guard, build]
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: release
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # A manual dispatch names a tag; without this every job would
-          # check out the default branch and release whatever is on it.
-          ref: ${{ github.event.inputs.tag || github.ref }}
+          ref: ${{ needs.guard.outputs.sha }}
+          persist-credentials: false
 
       - name: Download artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: dist
           merge-multiple: true
@@ -219,15 +310,28 @@ jobs:
         working-directory: dist
         run: sha256sum yanuget-* > SHA256SUMS
 
+      # Signed build provenance for every archive and the checksum file,
+      # verifiable with `gh attestation verify` (see RELEASING.md). It is
+      # issued here rather than in the build jobs, so the jobs that run crate
+      # build scripts never hold a token that can mint one.
+      - name: Attest the archives' provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/yanuget-*
+            dist/SHA256SUMS
+
       # The changelog section for this version becomes the top of the release
       # notes; GitHub's generated commit list is appended below it.
       - name: Extract changelog section
         shell: bash
+        env:
+          VERSION: ${{ needs.guard.outputs.version }}
         run: |
           set -euo pipefail
           # Stop at the next version heading, or at the link definitions that
           # close the file when this is the oldest section.
-          awk -v v="${{ needs.guard.outputs.version }}" '
+          awk -v v="$VERSION" '
             $0 ~ "^## \\[" v "\\]" { inside = 1; next }
             inside && /^## / { exit }
             inside && /^\[[^]]+\]: / { exit }
@@ -235,48 +339,57 @@ jobs:
           ' CHANGELOG.md > RELEASE_NOTES.md
           test -s RELEASE_NOTES.md
 
+      # The tag already exists (`guard` checked it out), so this attaches to it
+      # and never creates one at some other commit.
       - name: Create release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           tag_name: ${{ needs.guard.outputs.tag }}
           body_path: RELEASE_NOTES.md
           generate_release_notes: true
+          fail_on_unmatched_files: true
           files: dist/*
 
-  # Publish to crates.io, if the repository has a token configured. Without one
-  # the step is skipped, so the rest of the release still completes.
-  # Publishing to crates.io is opt-in, and off.
+  # Publish to crates.io. Opt-in, and off.
   #
   # A version published there can be yanked but never replaced or re-uploaded,
-  # so it is the one step of a release that cannot be redone. Having the token
-  # present should not be what decides it: set the repository variable
-  # `PUBLISH_TO_CRATES_IO` to `true` when the crate name and contents have
-  # settled and you mean it.
+  # so it is the one step of a release that cannot be redone. Set the
+  # repository variable `PUBLISH_TO_CRATES_IO` to `true` when the crate name
+  # and contents have settled and you mean it.
+  #
+  # Authentication is crates.io trusted publishing: the job exchanges its OIDC
+  # token for a publish token that lives for minutes, so no long-lived
+  # `CARGO_REGISTRY_TOKEN` is stored anywhere. crates.io must list this
+  # repository, `release.yml` and the `release` environment as a trusted
+  # publisher (see RELEASING.md).
   crates-io:
     name: Publish to crates.io
     needs: [guard, release]
     if: vars.PUBLISH_TO_CRATES_IO == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # A manual dispatch names a tag; without this every job would
-          # check out the default branch and release whatever is on it.
-          ref: ${{ github.event.inputs.tag || github.ref }}
+          ref: ${{ needs.guard.outputs.sha }}
+          persist-credentials: false
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
 
-      # `secrets` is not available to a job-level `if`, so the gate lives here.
-      # Note the published crate embeds the placeholder docs page rather than the
+      - id: auth
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+
+      # The published crate embeds the placeholder docs page rather than the
       # rendered site: `site/` is generated, so it is not part of the package,
       # and `/docs` on a `cargo install`ed binary links to the online copy.
       - name: Publish
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: |
-          if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
-            echo "::notice::CARGO_REGISTRY_TOKEN is not set; skipping crates.io publish"
-            exit 0
-          fi
-          cargo publish --locked
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: cargo publish --locked

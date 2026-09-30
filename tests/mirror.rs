@@ -1260,3 +1260,48 @@ async fn migrate_does_not_bring_back_a_deleted_version() {
     assert_eq!((summary.imported, summary.skipped), (2, 1));
     assert!(local.membership("beta.pkg", "1.0.0").await.is_none());
 }
+
+#[tokio::test]
+async fn an_id_reserved_for_another_feed_is_not_downloaded() {
+    let upstream = Upstream::start().await;
+    upstream.publish("Contoso.Core", "1.0.0");
+    let reserved = vec![yanuget::config::ReservedPrefix {
+        prefix: "Contoso.".into(),
+        feed: "internal".into(),
+    }];
+
+    // The mirror does not fetch what indexing would refuse.
+    let local = local_feed().await;
+    let options = MirrorOptions {
+        reserved_elsewhere: reserved.clone(),
+        ..Default::default()
+    };
+    assert_eq!(local.mirror(&upstream, "Contoso.Core", options).await, 0);
+    assert_eq!(upstream.hits("/flat/contoso.core/index.json"), 0);
+
+    // Migrate reports the package once instead of downloading each version.
+    let mut feed = Config::default().resolved_feeds().unwrap().remove(0);
+    feed.name = "mirror".into();
+    feed.reserved_elsewhere = reserved;
+    let summary = yanuget::migrate::run(
+        &local.storage,
+        &local.db,
+        &feed,
+        &local.temp,
+        mirror_config(&upstream),
+        yanuget::migrate::MigrateOptions {
+            quiet: true,
+            ..Default::default()
+        },
+        indicatif::ProgressDrawTarget::hidden(),
+    )
+    .await
+    .unwrap();
+    assert_eq!((summary.failed_ids, summary.imported), (1, 0));
+    assert!(
+        summary.failures[0].error.contains("reserved"),
+        "{:?}",
+        summary.failures
+    );
+    assert_eq!(upstream.hits(".nupkg"), 0);
+}

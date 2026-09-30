@@ -7,8 +7,10 @@
 host = "0.0.0.0"            # YANUGET_HOST
 port = 5000                # YANUGET_PORT
 
-# Externally visible base URL. Leave unset to derive it per-request from the
-# Host / X-Forwarded-* headers (recommended behind a reverse proxy).
+# Externally visible base URL, from which every URL handed to clients is built.
+# Set it whenever you know the public address, and always behind a reverse
+# proxy. Unset, it is derived per request from the Host header, and from
+# X-Forwarded-* only when the peer is listed in `trusted_proxies`.
 # base_url = "https://nuget.example.com"   # YANUGET_BASE_URL
 
 # Where all server data lives. The package store and SQLite database default to
@@ -205,6 +207,12 @@ inbox_scan_secs = 30                # YANUGET_FILES_INBOX_SCAN_SECS
 # hard_delete_enabled = false   # falls back to global when unset
 # requires_approval = false     # true = incoming versions are pending until approved
 # promotes_to = "stable"        # the next release ring (must name another feed)
+# # An id and version are ONE package across every feed: whoever stores a
+# # version first owns it everywhere, and different bytes are then refused in
+# # every feed. Reserve the prefixes of your own ids for the feed that
+# # publishes them, and every other feed (pushes, mirror fetches, migrations)
+# # refuses ids under them.
+# reserved_id_prefixes = []     # e.g. ["Contoso."]
 #
 #   [feeds.mirror]              # read-through cache of an upstream V3 feed
 #   enabled = true

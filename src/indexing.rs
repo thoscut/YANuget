@@ -5,17 +5,17 @@
 //! its sidecars, and records the metadata — rolling storage back if the
 //! database write fails so no orphaned files are left behind.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use chrono::Utc;
 
-use crate::config::{LicensePolicyConfig, OverwriteMode};
+use crate::config::{LicensePolicyConfig, OverwriteMode, ReservedPrefix};
 use crate::database::{Membership, PackageDatabase};
 use crate::error::{Error, Result};
 use crate::models::Package;
 use crate::nuspec::{self, Nuspec};
 use crate::policy;
-use crate::storage::{AuxFile, PackageStorage};
+use crate::storage::{AuxFile, PackageContent, PackageStorage};
 use crate::streaming::StreamSummary;
 use crate::version::NuGetVersion;
 use crate::{nupkg, validation};
@@ -49,6 +49,8 @@ pub struct IndexOptions {
     /// compromised upstream cannot substitute a different package under a name
     /// local clients already trust.
     pub expect: Option<ExpectedIdentity>,
+    /// Id prefixes other feeds reserved: an id under one is refused here.
+    pub reserved_elsewhere: Vec<ReservedPrefix>,
 }
 
 /// The id/version a caller requires the indexed manifest to declare.
@@ -111,6 +113,17 @@ async fn index_inner(
     let id = manifest.id.clone();
     let normalized = version.normalized();
 
+    // Before anything is stored: the first feed to store an id+version owns
+    // it everywhere, so a reserved prefix is only worth anything if no other
+    // feed can get there first.
+    if let Some(reserved) = options.reserved_elsewhere.iter().find(|r| r.covers(&id)) {
+        tracing::warn!(%feed, %id, version = %normalized, owner = %reserved.feed, "refused: id prefix reserved for another feed");
+        return Err(Error::Forbidden(format!(
+            "package id {id} is under the prefix {:?}, reserved for feed {:?}",
+            reserved.prefix, reserved.feed
+        )));
+    }
+
     // The caller pinned an identity (mirror/migrate): the fetched payload must
     // be the package that was requested, not merely a valid package.
     if let Some(want) = &options.expect {
@@ -162,130 +175,301 @@ async fn index_inner(
     // feeds), so a racing purge can never delete a payload we just adopted.
     let _guard = crate::locks::lock_version(&id, &normalized).await;
 
-    // 4. Honour immutability / overwrite policy *within this feed*.
-    //
-    // An overwrite drops the metadata rows so the store below runs, but it must
-    // **not** delete the payload first. `store_package` finishes with a rename,
-    // which replaces the file atomically — so deleting up front bought nothing
-    // and cost the version: if the store then failed (a full disk, a permission
-    // change, a cross-device fallback erroring mid-copy), the previously
-    // published package was already gone from disk with nothing to put back,
-    // and the caller saw a 500. The old bytes now stay in place until the new
-    // ones have landed on top of them.
-    let mut overwriting = false;
-    // This feed's membership before an overwrite. A pin is an operator's
-    // decision about the id/version, not about one build of it, so it
-    // outlives the replacement.
-    let mut previous: Option<Membership> = None;
-    if db.exists(feed, &id, &version).await? {
-        if options.overwrite.allows(version.is_prerelease()) {
-            // Another feed holding this version pins its payload: the stored
-            // bytes cannot be replaced from here, so only an identical
-            // re-push can succeed. Checked *before* anything is removed — the
-            // check further down used to run after this feed's membership was
-            // already gone, so a refused overwrite silently took the version
-            // out of the feed.
-            if db.feed_count(&id, &version).await? > 1 {
-                if let Some(existing) = db.get_package_data(&id, &version).await? {
-                    if existing.package_hash != package.package_hash {
-                        return Err(Error::PackageAlreadyExists);
-                    }
-                }
-            }
-            previous = db.get_membership(feed, &id, &version).await?;
-            db.remove_membership(feed, &id, &version).await?;
-            // If no other feed references the version, drop the orphaned global
-            // metadata so the re-push records its own.
-            if db.feed_count(&id, &version).await? == 0 {
-                let _ = db.delete_package_data(&id, &version).await;
-                overwriting = true;
-            }
-        } else {
-            return Err(Error::PackageAlreadyExists);
-        }
-    }
-
-    // 5. Store the payload + sidecars once. If another feed already holds this
-    //    version, the bytes are present — drop our temp copy instead.
-    let stored_now = !db.package_data_exists(&id, &version).await?;
-    if stored_now {
-        storage
-            .store_package(&id, &normalized, temp_path.clone())
-            .await?;
-        storage
-            .store_aux(
-                &id,
-                &normalized,
-                AuxFile::Nuspec,
-                archive.nuspec_xml.as_bytes(),
-            )
-            .await?;
-        if let Some(bytes) = &readme_bytes {
-            storage
-                .store_aux(&id, &normalized, AuxFile::Readme, bytes)
-                .await?;
-        }
-        if let Some(bytes) = &icon_bytes {
-            storage
-                .store_aux(&id, &normalized, AuxFile::Icon, bytes)
-                .await?;
-        }
-        // Only once the replacement is safely on disk: the previous build's
-        // PDBs have different SSQP keys, so leaving their mappings behind would
-        // keep serving them to anyone debugging the new build — the mappings
-        // still resolve to an id/version that exists. Doing this before the
-        // store would throw the symbols away even when the store then failed.
-        if overwriting {
-            crate::retention::purge_symbols(storage, db, &id, &version).await?;
-        }
-    } else {
-        // Another feed already holds this exact id/version, so its payload — not
-        // ours — is what every client will download. Publishing our metadata
-        // over it would advertise a hash and size that do not describe those
-        // bytes, and a NuGet client verifying `packageHash` would reject the
-        // restore. Only adopt the existing payload when it really is the same
-        // content; otherwise this push is a different package wearing a taken
-        // name, and it is refused.
-        if let Some(existing) = db.get_package_data(&id, &version).await? {
-            if existing.package_hash != package.package_hash {
-                return Err(Error::PackageAlreadyExists);
-            }
-        }
-        let _ = tokio::fs::remove_file(temp_path).await;
-    }
-
-    // 6. Record global metadata (idempotent) and this feed's membership; roll
-    //    freshly stored payload back on failure. The global per-version lock
-    //    above plus the `feed_count == 0` guard mean a concurrent push that won
-    //    the same-feed race (or another feed) keeps the shared payload alive —
-    //    deleting it on a duplicate would yank the version directory out from
-    //    under the winner.
-    db.upsert_package_data(&package).await?;
-    let membership = Membership {
-        feed: feed.to_string(),
-        lower_id: package.lower_id(),
-        normalized_version: normalized.clone(),
-        listed: true,
-        enabled: true,
-        pending: options.pending,
-        flagged: outcome.violation.is_some(),
-        flag_reason: outcome.violation.clone(),
-        pinned: previous.is_some_and(|m| m.pinned),
+    let sidecars = Sidecars {
+        nuspec: archive.nuspec_xml.as_bytes(),
+        readme: readme_bytes.as_deref(),
+        icon: icon_bytes.as_deref(),
     };
-    if let Err(e) = db.add_membership(&membership).await {
-        if stored_now && db.feed_count(&id, &version).await.unwrap_or(0) == 0 {
-            let _ = db.delete_package_data(&id, &version).await;
-            let _ = storage.delete(&id, &normalized).await;
+    let mut existing = db.get_package_data(&id, &version).await?;
+    let mut previous = db.get_membership(feed, &id, &version).await?;
+
+    // 4. Whatever a failed purge left behind is finished off first, so this
+    //    push starts from a clean slate instead of inheriting it.
+    //
+    //    Global data that no feed holds any more is an orphan: nothing serves
+    //    it, and adopting it would adopt a payload that may already be gone —
+    //    every download of the new membership would then 404, and different
+    //    bytes would be refused in every feed for the rest of time.
+    if existing.is_some() && db.feed_count(&id, &version).await? == 0 {
+        tracing::warn!(%feed, %id, version = %normalized, "replacing the remains of an unfinished purge");
+        crate::retention::purge_global_data(storage, db, &id, &version).await?;
+        existing = None;
+    }
+    //    The reverse, a membership without data, cannot serve anything either.
+    if existing.is_none() && previous.is_some() {
+        tracing::warn!(%feed, %id, version = %normalized, "dropping a membership that has no package data");
+        db.remove_membership(feed, &id, &version).await?;
+        previous = None;
+    }
+
+    let flagged = outcome.violation.is_some();
+    let result = IndexResult {
+        id: id.clone(),
+        version: version.clone(),
+        pending: options.pending,
+        flag_reason: outcome.violation.clone(),
+    };
+
+    let Some(existing) = existing else {
+        // 5a. A version new to the server: store the payload and sidecars, then
+        //     record the data and the membership together, removing the
+        //     payload again if that fails.
+        store_payload(storage, &id, &normalized, temp_path, &sidecars).await?;
+        let membership = Membership {
+            pending: options.pending,
+            flagged,
+            flag_reason: outcome.violation.clone(),
+            ..Membership::active(feed, &package)
+        };
+        if let Err(e) = db.add_version(&package, &membership).await {
+            if db.feed_count(&id, &version).await.unwrap_or(0) == 0 {
+                let _ = db.delete_package_data(&id, &version).await;
+                let _ = storage.delete(&id, &normalized).await;
+            }
+            return Err(e);
+        }
+        return Ok(result);
+    };
+
+    // The bytes the rows describe are not on disk: a purge or a store failed
+    // part-way. Any push of the same content may put them back.
+    let payload_present = storage.package_exists(&id, &normalized).await;
+    let same_content = existing.package_hash == package.package_hash;
+
+    let Some(previous) = previous else {
+        // 5b. Another feed already holds this exact id/version, so its payload
+        //     is what every client downloads. Publishing our metadata over it
+        //     would advertise a hash and size that do not describe those bytes,
+        //     so only the same content may join.
+        if !same_content {
+            return Err(taken(feed, &id, &normalized));
+        }
+        if payload_present {
+            let _ = tokio::fs::remove_file(temp_path).await;
+        } else {
+            tracing::warn!(%feed, %id, version = %normalized, "restoring a missing payload from an identical push");
+            store_payload(storage, &id, &normalized, temp_path, &sidecars).await?;
+        }
+        let membership = Membership {
+            pending: options.pending,
+            flagged,
+            flag_reason: outcome.violation.clone(),
+            ..Membership::active(feed, &package)
+        };
+        db.add_version(&existing, &membership).await?;
+        return Ok(result);
+    };
+
+    // 5c. The version is already in this feed: honour the overwrite policy.
+    if !options.overwrite.allows(version.is_prerelease()) {
+        return Err(Error::PackageAlreadyExists);
+    }
+    // Another feed holding this version pins its payload: the stored bytes
+    // cannot be replaced from here, so only an identical re-push can succeed.
+    if !same_content && db.feed_count(&id, &version).await? > 1 {
+        return Err(taken(feed, &id, &normalized));
+    }
+    // An overwrite replaces the build, not the operator's decisions about the
+    // version: a push key must not be able to undo an admin's disable or
+    // unlist, and a pin outlives the replacement. New bytes need approval
+    // again where the feed gates; the same bytes do not.
+    let membership = Membership {
+        listed: previous.listed,
+        enabled: previous.enabled,
+        pending: previous.pending || (options.pending && !same_content),
+        flagged,
+        flag_reason: outcome.violation.clone(),
+        pinned: previous.pinned,
+        ..Membership::active(feed, &package)
+    };
+    let result = IndexResult {
+        pending: membership.pending,
+        ..result
+    };
+    if same_content && payload_present {
+        // Nothing to store: the bytes on disk are these bytes.
+        let _ = tokio::fs::remove_file(temp_path).await;
+        db.replace_version(&existing, &membership).await?;
+        return Ok(result);
+    }
+    overwrite(
+        storage,
+        db,
+        temp_path,
+        &package,
+        &existing,
+        &membership,
+        &sidecars,
+    )
+    .await?;
+    // Only once the replacement is recorded: the previous build's PDBs have
+    // different SSQP keys, so leaving their mappings behind would keep serving
+    // them to anyone debugging the new build — the mappings still resolve to an
+    // id/version that exists.
+    if !same_content {
+        crate::retention::purge_symbols(storage, db, &id, &version).await?;
+    }
+    Ok(result)
+}
+
+/// The small files stored next to a payload.
+struct Sidecars<'a> {
+    nuspec: &'a [u8],
+    readme: Option<&'a [u8]>,
+    icon: Option<&'a [u8]>,
+}
+
+/// Move the payload into storage and write its sidecars.
+async fn store_payload(
+    storage: &dyn PackageStorage,
+    id: &str,
+    normalized: &str,
+    temp_path: &Path,
+    sidecars: &Sidecars<'_>,
+) -> Result<()> {
+    storage
+        .store_package(id, normalized, temp_path.to_path_buf())
+        .await?;
+    store_sidecars(storage, id, normalized, sidecars).await
+}
+
+async fn store_sidecars(
+    storage: &dyn PackageStorage,
+    id: &str,
+    normalized: &str,
+    sidecars: &Sidecars<'_>,
+) -> Result<()> {
+    storage
+        .store_aux(id, normalized, AuxFile::Nuspec, sidecars.nuspec)
+        .await?;
+    if let Some(bytes) = sidecars.readme {
+        storage
+            .store_aux(id, normalized, AuxFile::Readme, bytes)
+            .await?;
+    }
+    if let Some(bytes) = sidecars.icon {
+        storage
+            .store_aux(id, normalized, AuxFile::Icon, bytes)
+            .await?;
+    }
+    Ok(())
+}
+
+/// Replace a stored build with a new one, keeping the version in the feed
+/// throughout.
+///
+/// The new payload is stored first and the rows are swapped after it in one
+/// transaction, so until the swap every row still describes the bytes on disk.
+/// The previous payload is hard-linked aside (and the sidecars read) first, so
+/// when anything after the store fails the previous build is put back rather
+/// than leaving rows that describe one build over the bytes of another. On a
+/// filesystem without hard links the previous bytes cannot be kept aside
+/// without copying them; the store is still an atomic rename, so only a
+/// failure after it can leave the two out of step, and that is logged.
+async fn overwrite(
+    storage: &dyn PackageStorage,
+    db: &dyn PackageDatabase,
+    temp_path: &Path,
+    package: &Package,
+    existing: &Package,
+    membership: &Membership,
+    sidecars: &Sidecars<'_>,
+) -> Result<()> {
+    let id = &package.id;
+    let normalized = package.normalized_version();
+    let backup = keep_aside(storage, id, &normalized, temp_path).await;
+    let old_nuspec = storage.get_aux(id, &normalized, AuxFile::Nuspec).await.ok();
+    let old_readme = match existing.has_readme {
+        true => storage.get_aux(id, &normalized, AuxFile::Readme).await.ok(),
+        false => None,
+    };
+    let old_icon = match existing.has_embedded_icon {
+        true => storage.get_aux(id, &normalized, AuxFile::Icon).await.ok(),
+        false => None,
+    };
+
+    // The store is an atomic rename: when it fails, the previous build is
+    // still in place and nothing else has been touched.
+    if let Err(e) = storage
+        .store_package(id, &normalized, temp_path.to_path_buf())
+        .await
+    {
+        if let Some(backup) = backup {
+            let _ = tokio::fs::remove_file(backup).await;
         }
         return Err(e);
     }
+    let swapped = async {
+        store_sidecars(storage, id, &normalized, sidecars).await?;
+        db.replace_version(package, membership).await
+    }
+    .await;
+    let Err(e) = swapped else {
+        if let Some(backup) = backup {
+            let _ = tokio::fs::remove_file(backup).await;
+        }
+        return Ok(());
+    };
 
-    Ok(IndexResult {
-        id,
-        version,
-        pending: options.pending,
-        flag_reason: outcome.violation,
-    })
+    // Put the previous build back, so the rows (which the failed swap left
+    // as they were) describe the bytes on disk again.
+    let restored = match &backup {
+        Some(backup) => storage
+            .store_package(id, &normalized, backup.clone())
+            .await
+            .map_err(|e| e.to_string()),
+        None => Err("it could not be kept aside".to_string()),
+    };
+    if let Err(why) = restored {
+        if let Some(backup) = backup {
+            let _ = tokio::fs::remove_file(backup).await;
+        }
+        tracing::error!(%id, version = %normalized, error = %why, "an overwrite failed after replacing the payload, and the previous payload could not be restored");
+    }
+    let previous = Sidecars {
+        nuspec: old_nuspec.as_deref().unwrap_or(sidecars.nuspec),
+        readme: old_readme.as_deref(),
+        icon: old_icon.as_deref(),
+    };
+    if old_nuspec.is_some() {
+        let _ = store_sidecars(storage, id, &normalized, &previous).await;
+    }
+    Err(e)
+}
+
+/// Hard-link a version's stored payload next to `temp_path`, returning the
+/// link, or `None` when it cannot be (no payload, not a local file, or a
+/// filesystem without links).
+async fn keep_aside(
+    storage: &dyn PackageStorage,
+    id: &str,
+    normalized: &str,
+    temp_path: &Path,
+) -> Option<PathBuf> {
+    let PackageContent::LocalPath(current) = storage.get_package(id, normalized).await.ok()?;
+    let backup = temp_path.with_file_name(format!("previous-{}.tmp", uuid::Uuid::new_v4()));
+    match tokio::fs::hard_link(&current, &backup).await {
+        Ok(()) => Some(backup),
+        Err(e) => {
+            tracing::debug!(%id, version = %normalized, error = %e, "cannot keep the previous payload aside");
+            None
+        }
+    }
+}
+
+/// The refusal for different bytes under an id/version the server already
+/// stores. An id and version are one namespace across every feed, so this is
+/// logged as the failure it is rather than mistaken for a benign race (a
+/// mirror fetch that loses to a concurrent one gets `PackageAlreadyExists`).
+fn taken(feed: &str, id: &str, normalized: &str) -> Error {
+    tracing::warn!(
+        %feed, %id, version = %normalized,
+        "refused: different content is already stored under this id and version"
+    );
+    Error::Conflict(format!(
+        "{id} {normalized} is already stored with different content; an id and \
+         version name one package across every feed"
+    ))
 }
 
 fn build_package(
@@ -578,5 +762,265 @@ mod tests {
         let all = db.find_all_versions(FEED, "contoso.utils").await.unwrap();
         assert_eq!(all.len(), 1);
         assert!(all[0].flagged);
+    }
+    // --- overwrites, orphans and the shared namespace ---
+
+    use crate::database::PackageFile;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn overwriting() -> IndexOptions {
+        IndexOptions {
+            overwrite: OverwriteMode::Enabled,
+            ..Default::default()
+        }
+    }
+
+    /// Index a fresh build of [`NUSPEC`]; the readme makes the bytes differ.
+    async fn push(
+        storage: &dyn PackageStorage,
+        db: &dyn PackageDatabase,
+        feed: &str,
+        with_readme: bool,
+        opts: &IndexOptions,
+    ) -> Result<IndexResult> {
+        let (_d, temp) = make_package(NUSPEC, with_readme).await;
+        let s = summary_for(&temp).await;
+        index_package(storage, db, feed, temp, s, opts).await
+    }
+
+    fn v123() -> NuGetVersion {
+        NuGetVersion::parse("1.2.3").unwrap()
+    }
+
+    async fn stored_bytes(storage: &FilesystemStorage) -> Vec<u8> {
+        let PackageContent::LocalPath(path) =
+            storage.get_package("contoso.utils", "1.2.3").await.unwrap();
+        tokio::fs::read(path).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_overwrite_keeps_admin_state_and_attached_files() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let storage = FilesystemStorage::new(store_dir.path()).await.unwrap();
+        let db = SqliteDatabase::in_memory().await.unwrap();
+        push(&storage, &db, FEED, false, &overwriting())
+            .await
+            .unwrap();
+        let v = v123();
+        db.set_enabled(FEED, "contoso.utils", &v, false)
+            .await
+            .unwrap();
+        db.set_listed(FEED, "contoso.utils", &v, false)
+            .await
+            .unwrap();
+        db.set_pinned(FEED, "contoso.utils", &v, true)
+            .await
+            .unwrap();
+        db.increment_downloads(FEED, "contoso.utils", &v)
+            .await
+            .unwrap();
+        db.add_file(&PackageFile {
+            lower_id: "contoso.utils".into(),
+            normalized_version: "1.2.3".into(),
+            name: "disk.iso".into(),
+            sha256: "ab".repeat(32),
+            size: 3,
+            uploaded: Utc::now(),
+            downloads: 0,
+        })
+        .await
+        .unwrap();
+
+        push(&storage, &db, FEED, true, &overwriting())
+            .await
+            .unwrap();
+
+        let all = db.find_all_versions(FEED, "contoso.utils").await.unwrap();
+        assert_eq!(all.len(), 1);
+        let fv = &all[0];
+        assert!(
+            fv.package.has_readme,
+            "the new build's metadata is recorded"
+        );
+        assert!(
+            !fv.package.enabled,
+            "a push must not undo an admin's disable"
+        );
+        assert!(!fv.package.listed);
+        assert!(fv.pinned);
+        assert_eq!(fv.package.downloads, 1);
+        assert_eq!(db.files_for("contoso.utils", &v).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn new_bytes_wait_for_approval_again_and_the_same_bytes_do_not() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let storage = FilesystemStorage::new(store_dir.path()).await.unwrap();
+        let db = SqliteDatabase::in_memory().await.unwrap();
+        let gated = IndexOptions {
+            pending: true,
+            ..overwriting()
+        };
+        push(&storage, &db, FEED, false, &gated).await.unwrap();
+        let v = v123();
+        db.approve_membership(FEED, "contoso.utils", &v)
+            .await
+            .unwrap();
+
+        let same = push(&storage, &db, FEED, false, &gated).await.unwrap();
+        assert!(!same.pending);
+        assert!(db.is_servable(FEED, "contoso.utils", &v).await.unwrap());
+
+        let rebuilt = push(&storage, &db, FEED, true, &gated).await.unwrap();
+        assert!(rebuilt.pending);
+        assert!(!db.is_servable(FEED, "contoso.utils", &v).await.unwrap());
+    }
+
+    /// Storage whose sidecar writes fail on demand, to fail an overwrite after
+    /// its payload has already been replaced.
+    struct FailingSidecars {
+        inner: FilesystemStorage,
+        fail: AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl PackageStorage for FailingSidecars {
+        async fn store_package(&self, id: &str, version: &str, temp: PathBuf) -> Result<u64> {
+            self.inner.store_package(id, version, temp).await
+        }
+        async fn get_package(&self, id: &str, version: &str) -> Result<PackageContent> {
+            self.inner.get_package(id, version).await
+        }
+        async fn package_exists(&self, id: &str, version: &str) -> bool {
+            self.inner.package_exists(id, version).await
+        }
+        async fn store_symbol_package(&self, id: &str, v: &str, temp: PathBuf) -> Result<u64> {
+            self.inner.store_symbol_package(id, v, temp).await
+        }
+        async fn store_symbol(&self, key: &str, filename: &str, bytes: &[u8]) -> Result<()> {
+            self.inner.store_symbol(key, filename, bytes).await
+        }
+        async fn get_symbol(&self, key: &str, filename: &str) -> Result<PackageContent> {
+            self.inner.get_symbol(key, filename).await
+        }
+        async fn delete_symbol(&self, key: &str, filename: &str) -> Result<()> {
+            self.inner.delete_symbol(key, filename).await
+        }
+        async fn store_aux(&self, id: &str, v: &str, kind: AuxFile, bytes: &[u8]) -> Result<()> {
+            if self.fail.load(Ordering::SeqCst) {
+                return Err(Error::Storage("disk full".into()));
+            }
+            self.inner.store_aux(id, v, kind, bytes).await
+        }
+        async fn get_aux(&self, id: &str, version: &str, kind: AuxFile) -> Result<Vec<u8>> {
+            self.inner.get_aux(id, version, kind).await
+        }
+        async fn delete(&self, id: &str, version: &str) -> Result<()> {
+            self.inner.delete(id, version).await
+        }
+        async fn store_blob(&self, sha256_hex: &str, temp: PathBuf) -> Result<u64> {
+            self.inner.store_blob(sha256_hex, temp).await
+        }
+        async fn get_blob(&self, sha256_hex: &str) -> Result<PackageContent> {
+            self.inner.get_blob(sha256_hex).await
+        }
+        async fn delete_blob(&self, sha256_hex: &str) -> Result<()> {
+            self.inner.delete_blob(sha256_hex).await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_overwrite_puts_the_previous_build_back() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let storage = FailingSidecars {
+            inner: FilesystemStorage::new(store_dir.path()).await.unwrap(),
+            fail: AtomicBool::new(false),
+        };
+        let db = SqliteDatabase::in_memory().await.unwrap();
+        push(&storage, &db, FEED, false, &overwriting())
+            .await
+            .unwrap();
+        let before = stored_bytes(&storage.inner).await;
+        let v = v123();
+        let hash = db
+            .get_package_data("contoso.utils", &v)
+            .await
+            .unwrap()
+            .unwrap()
+            .package_hash;
+
+        storage.fail.store(true, Ordering::SeqCst);
+        push(&storage, &db, FEED, true, &overwriting())
+            .await
+            .unwrap_err();
+
+        // Still in the feed, and the rows still describe the bytes served.
+        let found = db.find(FEED, "contoso.utils", &v).await.unwrap().unwrap();
+        assert_eq!(found.package_hash, hash);
+        assert!(!found.has_readme);
+        assert_eq!(stored_bytes(&storage.inner).await, before);
+    }
+
+    #[tokio::test]
+    async fn the_remains_of_a_failed_purge_are_replaced_not_adopted() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let storage = FilesystemStorage::new(store_dir.path()).await.unwrap();
+        let db = SqliteDatabase::in_memory().await.unwrap();
+        push(&storage, &db, FEED, false, &IndexOptions::default())
+            .await
+            .unwrap();
+        // A purge that removed the membership and the payload, then failed.
+        let v = v123();
+        db.remove_membership(FEED, "contoso.utils", &v)
+            .await
+            .unwrap();
+        storage.delete("contoso.utils", "1.2.3").await.unwrap();
+
+        // Different bytes are not refused in every feed for ever...
+        push(&storage, &db, "other", true, &IndexOptions::default())
+            .await
+            .unwrap();
+        // ...and what is advertised is what is stored.
+        let found = db
+            .find("other", "contoso.utils", &v)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(found.has_readme);
+        assert!(storage.package_exists("contoso.utils", "1.2.3").await);
+    }
+
+    #[tokio::test]
+    async fn an_identical_push_restores_a_missing_payload() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let storage = FilesystemStorage::new(store_dir.path()).await.unwrap();
+        let db = SqliteDatabase::in_memory().await.unwrap();
+        push(&storage, &db, "dev", false, &IndexOptions::default())
+            .await
+            .unwrap();
+        storage.delete("contoso.utils", "1.2.3").await.unwrap();
+
+        push(&storage, &db, "stable", false, &IndexOptions::default())
+            .await
+            .unwrap();
+        assert!(storage.package_exists("contoso.utils", "1.2.3").await);
+        assert_eq!(db.feed_count("contoso.utils", &v123()).await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn different_bytes_under_a_stored_version_are_a_conflict() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let storage = FilesystemStorage::new(store_dir.path()).await.unwrap();
+        let db = SqliteDatabase::in_memory().await.unwrap();
+        push(&storage, &db, "dev", false, &IndexOptions::default())
+            .await
+            .unwrap();
+        // Not the benign `PackageAlreadyExists` a lost race gets, which a
+        // mirror or a migration would skip without a word.
+        let err = push(&storage, &db, "stable", true, &IndexOptions::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Conflict(_)), "{err:?}");
+        assert_eq!(err.status(), axum::http::StatusCode::CONFLICT);
     }
 }
