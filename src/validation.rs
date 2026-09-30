@@ -8,6 +8,12 @@ pub const MAX_ID_LENGTH: usize = 100;
 /// Validate a package id against NuGet's rule `^\w+([.\-_]\w+)*$` with a length
 /// cap. In short: word runs (`A-Za-z0-9_`) separated by single `.` or `-`,
 /// never starting/ending with a separator and never with two in a row.
+///
+/// On top of NuGet's rule, an id whose first dotted part is a Windows device
+/// name (`Aux.Core`, `Con.Utils`, `COM1.Sdk`) is refused: the store keeps each
+/// id in a directory of that name, which Windows opens as the device, so the
+/// store refuses it on every system. Saying so here gives the pusher a clear
+/// reason up front instead of a late error from the store.
 pub fn validate_package_id(id: &str) -> Result<()> {
     if id.is_empty() {
         return Err(Error::InvalidPackage("package id is empty".into()));
@@ -39,6 +45,13 @@ pub fn validate_package_id(id: &str) -> Result<()> {
     // Must not end on a separator.
     if prev_sep {
         return Err(invalid(id));
+    }
+    if crate::storage::filesystem::is_windows_device_name(id) {
+        let device = id.split('.').next().unwrap_or(id);
+        return Err(Error::InvalidPackage(format!(
+            "invalid package id: {id:?} starts with {device:?}, a Windows device name, \
+             which cannot be stored"
+        )));
     }
     Ok(())
 }
@@ -163,6 +176,18 @@ mod tests {
             "slash/in/id",
         ] {
             assert!(validate_package_id(id).is_err(), "{id} should be invalid");
+        }
+    }
+
+    #[test]
+    fn rejects_ids_that_are_windows_device_names() {
+        for id in ["Aux.Core", "Con.Utils", "COM1.Sdk", "nul", "LPT9", "prn.x"] {
+            let err = validate_package_id(id).unwrap_err().to_string();
+            assert!(err.contains("Windows device name"), "{id}: {err}");
+        }
+        // Only the whole first part counts, as in the store.
+        for id in ["Console.Utils", "Contoso.Aux", "Com10.Sdk", "Nullable", "Con-Utils"] {
+            assert!(validate_package_id(id).is_ok(), "{id} should be valid");
         }
     }
 
