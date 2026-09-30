@@ -147,6 +147,61 @@ CREATE TABLE IF NOT EXISTS uploads (
     created            TEXT    NOT NULL,
     expires            TEXT    NOT NULL
 );
+-- The search index: one row per version in an FTS5 table with the trigram
+-- tokenizer, so a query is a substring match (what search has always done)
+-- answered from an index instead of `LIKE '%q%'` over every version's full
+-- description. The description is indexed only up to 4000 characters, as long
+-- as nuget.org allows one to be; a longer one is stored and served in full.
+--
+-- FTS rows are addressed by rowid, and `packages` has no stable one (VACUUM
+-- may renumber a table without an INTEGER PRIMARY KEY), so `search_keys` maps
+-- each version to the rowid of its FTS row. Triggers keep both in step with
+-- `packages`, whatever writes it.
+CREATE TABLE IF NOT EXISTS search_keys (
+    id                 INTEGER PRIMARY KEY,
+    lower_id           TEXT NOT NULL,
+    normalized_version TEXT NOT NULL,
+    UNIQUE (lower_id, normalized_version)
+);
+CREATE VIRTUAL TABLE IF NOT EXISTS search_text USING fts5(
+    lower_id, title, tags, description, tokenize = 'trigram'
+);
+CREATE TRIGGER IF NOT EXISTS packages_search_insert AFTER INSERT ON packages BEGIN
+    INSERT OR IGNORE INTO search_keys (lower_id, normalized_version)
+        VALUES (new.lower_id, new.normalized_version);
+    DELETE FROM search_text WHERE rowid = (
+        SELECT id FROM search_keys
+        WHERE lower_id = new.lower_id AND normalized_version = new.normalized_version);
+    INSERT INTO search_text (rowid, lower_id, title, tags, description)
+        SELECT id, new.lower_id, IFNULL(new.title, ''),
+               (SELECT IFNULL(group_concat(value, ' '), '') FROM json_each(new.tags)),
+               substr(new.description, 1, 4000)
+        FROM search_keys
+        WHERE lower_id = new.lower_id AND normalized_version = new.normalized_version;
+END;
+CREATE TRIGGER IF NOT EXISTS packages_search_delete AFTER DELETE ON packages BEGIN
+    DELETE FROM search_text WHERE rowid = (
+        SELECT id FROM search_keys
+        WHERE lower_id = old.lower_id AND normalized_version = old.normalized_version);
+    DELETE FROM search_keys
+        WHERE lower_id = old.lower_id AND normalized_version = old.normalized_version;
+END;
+CREATE TRIGGER IF NOT EXISTS packages_search_update
+AFTER UPDATE OF lower_id, normalized_version, title, tags, description ON packages BEGIN
+    DELETE FROM search_text WHERE rowid = (
+        SELECT id FROM search_keys
+        WHERE lower_id = old.lower_id AND normalized_version = old.normalized_version);
+    DELETE FROM search_keys
+        WHERE lower_id = old.lower_id AND normalized_version = old.normalized_version;
+    INSERT OR IGNORE INTO search_keys (lower_id, normalized_version)
+        VALUES (new.lower_id, new.normalized_version);
+    INSERT INTO search_text (rowid, lower_id, title, tags, description)
+        SELECT id, new.lower_id, IFNULL(new.title, ''),
+               (SELECT IFNULL(group_concat(value, ' '), '') FROM json_each(new.tags)),
+               substr(new.description, 1, 4000)
+        FROM search_keys
+        WHERE lower_id = new.lower_id AND normalized_version = new.normalized_version;
+END;
 "#;
 
 /// Fill `package_tags` for one version from its JSON tag array (`?3`),
@@ -343,8 +398,39 @@ impl SqliteDatabase {
                 .execute(&mut *tx)
                 .await?;
         }
+        // Version 4: fill the search index for the versions stored before it
+        // existed. Rebuilt from scratch, so it is a no-op to re-run.
+        if schema_version < 4 {
+            for step in [
+                "DELETE FROM search_text",
+                "DELETE FROM search_keys",
+                "INSERT INTO search_keys (lower_id, normalized_version) \
+                 SELECT lower_id, normalized_version FROM packages",
+                "INSERT INTO search_text (rowid, lower_id, title, tags, description) \
+                 SELECT k.id, p.lower_id, IFNULL(p.title, ''), \
+                        (SELECT IFNULL(group_concat(value, ' '), '') FROM json_each(p.tags)), \
+                        substr(p.description, 1, 4000) \
+                 FROM packages p JOIN search_keys k \
+                   ON k.lower_id = p.lower_id AND k.normalized_version = p.normalized_version",
+                "PRAGMA user_version = 4",
+            ] {
+                sqlx::query(step).execute(&mut *tx).await?;
+            }
+        }
         tx.commit().await?;
         Ok(Self { pool })
+    }
+
+    /// Begin a transaction that writes, holding the write lock from the start.
+    ///
+    /// A deferred `BEGIN` takes a read snapshot at its first statement and
+    /// upgrades it to a write lock only when it writes, and SQLite refuses that
+    /// upgrade outright (`SQLITE_BUSY_SNAPSHOT`, no busy wait) if another
+    /// connection committed in between. Preparing a statement that touches the
+    /// FTS5 search index reads the index's own tables first, so concurrent
+    /// pushes failed that way; `BEGIN IMMEDIATE` waits its turn instead.
+    async fn write_tx(&self) -> Result<sqlx::Transaction<'static, sqlx::Sqlite>> {
+        Ok(self.pool.begin_with("BEGIN IMMEDIATE").await?)
     }
 
     /// Load every visible version for a set of lower-cased ids in `feed`,
@@ -462,14 +548,14 @@ impl PackageDatabase for SqliteDatabase {
         // The row and its tag index in one transaction: as two autocommit
         // statements, a failed tag insert left a package the tag filter and
         // the tag cloud never saw, and nothing ever retried it.
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.write_tx().await?;
         let inserted = insert_package(&mut tx, p).await?;
         tx.commit().await?;
         Ok(inserted)
     }
 
     async fn add_version(&self, p: &Package, m: &Membership) -> Result<bool> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.write_tx().await?;
         let inserted = insert_package(&mut tx, p).await?;
         insert_membership(&mut tx, m).await?;
         tx.commit().await?;
@@ -477,7 +563,7 @@ impl PackageDatabase for SqliteDatabase {
     }
 
     async fn replace_version(&self, p: &Package, m: &Membership) -> Result<()> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.write_tx().await?;
         bind_package(
             sqlx::query(package_insert!(
                 "ON CONFLICT(lower_id, normalized_version) DO UPDATE SET \
@@ -576,7 +662,7 @@ impl PackageDatabase for SqliteDatabase {
         // All or nothing. As separate statements, a failure after the
         // memberships went left a `packages` row that no feed held and nothing
         // would ever revisit; a later push then adopted its missing payload.
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.write_tx().await?;
         //
         // The file blobs are the caller's to delete (see
         // `retention::purge_global_data`), which it does before this, while
@@ -882,8 +968,18 @@ impl PackageDatabase for SqliteDatabase {
     }
 
     async fn search(&self, feed: &str, request: &SearchRequest) -> Result<SearchPage> {
-        let query = request.query.trim().to_lowercase();
-        let pattern = like_pattern(&query);
+        let query = search_terms(&request.query);
+        // Two or more characters... three, in fact: a trigram index can only
+        // answer a query that has at least one trigram. Shorter ones scan the
+        // (capped) indexed text instead, which is cheap for what they are.
+        let short = query.chars().count() < 3;
+        let needle = if short {
+            like_pattern(&query)
+        } else {
+            // An FTS5 phrase: the whole query, quotes doubled, matched as a
+            // substring of any indexed column.
+            format!("\"{}\"", query.replace('"', "\"\""))
+        };
 
         // An optional package-type filter, applied in SQL so the page and the
         // total count stay consistent. `''` (no filter) makes the predicate a
@@ -896,16 +992,18 @@ impl PackageDatabase for SqliteDatabase {
         let tag = request.tag.as_deref().unwrap_or("").trim().to_lowercase();
 
         // Phase 1: pick the page of matching package ids, ranked by downloads.
+        //
+        // `$how` names the `matcher!` that selects the rowids of the matching
+        // FTS rows (`?5`).
         macro_rules! filter {
-            () => {
+            ($how:ident) => {
+                concat!(
                 "fp.feed = ?1 AND fp.listed = 1 AND fp.enabled = 1 AND fp.pending = 0 \
                  AND (?2 = 1 OR p.is_prerelease = 0) \
                  AND (?3 = 1 OR p.is_semver2 = 0) \
-                 AND (?4 = '' \
-                      OR p.lower_id LIKE ?5 ESCAPE '\\' \
-                      OR lower(p.description) LIKE ?5 ESCAPE '\\' \
-                      OR lower(p.tags) LIKE ?5 ESCAPE '\\' \
-                      OR lower(IFNULL(p.title, '')) LIKE ?5 ESCAPE '\\') \
+                 AND (?4 = '' OR (p.lower_id, p.normalized_version) IN ( \
+                      SELECT k.lower_id, k.normalized_version FROM search_keys k \
+                      WHERE k.id IN (", matcher!($how), "))) \
                  AND (?6 = '' OR EXISTS ( \
                       SELECT 1 FROM json_each(p.package_types) je \
                       WHERE lower(json_extract(je.value, '$.name')) = ?6)) \
@@ -913,6 +1011,17 @@ impl PackageDatabase for SqliteDatabase {
                       SELECT 1 FROM package_tags pt \
                       WHERE pt.lower_id = p.lower_id \
                         AND pt.normalized_version = p.normalized_version AND pt.tag = ?7))"
+                )
+            };
+        }
+        macro_rules! matcher {
+            (phrase) => {
+                "SELECT rowid FROM search_text WHERE search_text MATCH ?5"
+            };
+            (scan) => {
+                "SELECT rowid FROM search_text WHERE lower_id LIKE ?5 ESCAPE '\\' \
+                 OR title LIKE ?5 ESCAPE '\\' OR tags LIKE ?5 ESCAPE '\\' \
+                 OR description LIKE ?5 ESCAPE '\\'"
             };
         }
 
@@ -920,14 +1029,14 @@ impl PackageDatabase for SqliteDatabase {
         // is the last key of every order, so a page boundary never falls
         // between two packages that tie.
         macro_rules! page_of_ids {
-            ($order:literal) => {
+            ($order:literal, $how:ident) => {
                 concat!(
                     "SELECT p.lower_id AS lower_id, SUM(fp.downloads) AS total, \
                      MAX(p.published) AS updated \
                      FROM packages p JOIN feed_packages fp \
                        ON fp.lower_id = p.lower_id AND fp.normalized_version = p.normalized_version \
                      WHERE ",
-                    filter!(),
+                    filter!($how),
                     " GROUP BY p.lower_id ORDER BY ",
                     $order,
                     " LIMIT ?8 OFFSET ?9"
@@ -935,10 +1044,15 @@ impl PackageDatabase for SqliteDatabase {
             };
         }
         // `published` is stored as RFC 3339 in UTC, so it orders as text.
-        let page_sql = match request.sort {
-            SearchSort::Downloads => page_of_ids!("total DESC, p.lower_id ASC"),
-            SearchSort::Name => page_of_ids!("p.lower_id ASC"),
-            SearchSort::Updated => page_of_ids!("updated DESC, p.lower_id ASC"),
+        let page_sql = match (request.sort, short) {
+            (SearchSort::Downloads, false) => page_of_ids!("total DESC, p.lower_id ASC", phrase),
+            (SearchSort::Downloads, true) => page_of_ids!("total DESC, p.lower_id ASC", scan),
+            (SearchSort::Name, false) => page_of_ids!("p.lower_id ASC", phrase),
+            (SearchSort::Name, true) => page_of_ids!("p.lower_id ASC", scan),
+            (SearchSort::Updated, false) => {
+                page_of_ids!("updated DESC, p.lower_id ASC", phrase)
+            }
+            (SearchSort::Updated, true) => page_of_ids!("updated DESC, p.lower_id ASC", scan),
         };
 
         let id_rows = sqlx::query(page_sql)
@@ -946,7 +1060,7 @@ impl PackageDatabase for SqliteDatabase {
             .bind(i64::from(request.include_prerelease))
             .bind(i64::from(request.include_semver2))
             .bind(&query)
-            .bind(&pattern)
+            .bind(&needle)
             .bind(&package_type)
             .bind(&tag)
             .bind(request.take.max(0))
@@ -959,23 +1073,30 @@ impl PackageDatabase for SqliteDatabase {
             .map(|r| r.get::<String, _>("lower_id"))
             .collect();
 
-        let total_hits: i64 = sqlx::query_scalar(concat!(
-            "SELECT COUNT(*) FROM ( \
-                 SELECT p.lower_id FROM packages p JOIN feed_packages fp \
-                   ON fp.lower_id = p.lower_id AND fp.normalized_version = p.normalized_version \
-                 WHERE ",
-            filter!(),
-            " GROUP BY p.lower_id )"
-        ))
-        .bind(feed)
-        .bind(i64::from(request.include_prerelease))
-        .bind(i64::from(request.include_semver2))
-        .bind(&query)
-        .bind(&pattern)
-        .bind(&package_type)
-        .bind(&tag)
-        .fetch_one(&self.pool)
-        .await?;
+        macro_rules! count {
+            ($how:ident) => {
+                concat!(
+                    "SELECT COUNT(*) FROM ( \
+                         SELECT p.lower_id FROM packages p JOIN feed_packages fp \
+                           ON fp.lower_id = p.lower_id \
+                          AND fp.normalized_version = p.normalized_version \
+                         WHERE ",
+                    filter!($how),
+                    " GROUP BY p.lower_id )"
+                )
+            };
+        }
+        let count_sql = if short { count!(scan) } else { count!(phrase) };
+        let total_hits: i64 = sqlx::query_scalar(count_sql)
+            .bind(feed)
+            .bind(i64::from(request.include_prerelease))
+            .bind(i64::from(request.include_semver2))
+            .bind(&query)
+            .bind(&needle)
+            .bind(&package_type)
+            .bind(&tag)
+            .fetch_one(&self.pool)
+            .await?;
 
         // Phase 2: load every visible version for the chosen ids.
         let groups = self
@@ -1000,7 +1121,7 @@ impl PackageDatabase for SqliteDatabase {
         skip: i64,
         take: i64,
     ) -> Result<(Vec<String>, i64)> {
-        let q = canonical_id(query.trim());
+        let q = canonical_id(&search_terms(query));
         let pattern = like_pattern(&q);
         // The version predicates sit inside the grouped scan, so an id survives
         // only if it still has at least one version the caller would accept.
@@ -1587,6 +1708,22 @@ fn placeholders(first: usize, count: usize) -> String {
         .join(",")
 }
 
+/// The longest search query acted on, in characters. Longer ones are cut:
+/// no package id, title or tag is anywhere near it, and every character
+/// makes an anonymous request's matching dearer.
+pub const MAX_QUERY_CHARS: usize = 256;
+
+/// A search or autocomplete query as matched: trimmed, lower-cased and cut at
+/// [`MAX_QUERY_CHARS`].
+fn search_terms(query: &str) -> String {
+    query
+        .trim()
+        .chars()
+        .take(MAX_QUERY_CHARS)
+        .collect::<String>()
+        .to_lowercase()
+}
+
 /// Build a `%...%` LIKE pattern, escaping the LIKE metacharacters in `query`.
 fn like_pattern(query: &str) -> String {
     let mut escaped = String::with_capacity(query.len() + 2);
@@ -2073,7 +2210,7 @@ mod tests {
             .fetch_one(&db.pool)
             .await
             .unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
     }
 
     /// Give every row of one version the key a pre-0.5.0 server wrote: the
@@ -2192,7 +2329,7 @@ mod tests {
             .fetch_one(&db.pool)
             .await
             .unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
     }
 
     #[tokio::test]
@@ -2219,6 +2356,86 @@ mod tests {
         let v = NuGetVersion::parse("1.0.0-beta").unwrap();
         assert!(a.find(FEED, "race.pkg", &v).await.unwrap().is_some());
         assert_eq!(b.feed_count("race.pkg", &v).await.unwrap(), 1);
+    }
+
+    fn query(q: &str) -> SearchRequest {
+        SearchRequest {
+            query: q.into(),
+            ..Default::default()
+        }
+    }
+
+    async fn hits(db: &SqliteDatabase, q: &str) -> Vec<String> {
+        let page = db.search(FEED, &query(q)).await.unwrap();
+        assert_eq!(page.total_hits as usize, page.groups.len(), "{q:?}");
+        page.groups.iter().map(|g| g.latest().id.clone()).collect()
+    }
+
+    #[tokio::test]
+    async fn search_matches_substrings_from_the_index() {
+        let db = SqliteDatabase::in_memory().await.unwrap();
+        let mut long = tagged("Long.Text", "1.0.0", &["Parsing", "json"]);
+        long.title = Some("The Title Here".into());
+        // Past the indexed 4000 characters: stored, served, not searched.
+        long.description = format!("{} needle-at-the-end", "x".repeat(5000));
+        db.add_to_feed(FEED, &long).await.unwrap();
+        db.add_to_feed(FEED, &tagged("Other.Pkg", "1.0.0", &["tools"]))
+            .await
+            .unwrap();
+
+        assert_eq!(hits(&db, "ng.te").await, ["Long.Text"], "id substring");
+        assert_eq!(
+            hits(&db, "TITLE HE").await,
+            ["Long.Text"],
+            "title, any case"
+        );
+        assert_eq!(hits(&db, "arsin").await, ["Long.Text"], "a tag");
+        assert_eq!(hits(&db, "description for oth").await, ["Other.Pkg"]);
+        assert!(hits(&db, "needle-at-the-end").await.is_empty());
+        let stored = db
+            .find(FEED, "long.text", &NuGetVersion::parse("1.0.0").unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.description.len(), 5018, "stored in full");
+
+        // Short queries, and characters that mean something to FTS or LIKE.
+        assert_eq!(hits(&db, "g.").await, ["Long.Text"]);
+        assert_eq!(hits(&db, "x").await, ["Long.Text"]);
+        assert!(hits(&db, "%").await.is_empty());
+        assert!(hits(&db, "\"x").await.is_empty());
+        assert!(hits(&db, "x\" OR \"o").await.is_empty());
+        // The tags are words, not the JSON they are stored as.
+        assert!(hits(&db, "\",\"").await.is_empty());
+        // An absurd query is cut, not refused or run in full.
+        assert!(hits(&db, &"xy".repeat(10_000)).await.is_empty());
+
+        // Deleting a version takes it out of the index.
+        db.delete_package_data("Other.Pkg", &NuGetVersion::parse("1.0.0").unwrap())
+            .await
+            .unwrap();
+        assert!(hits(&db, "description for oth").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn versions_stored_before_the_search_index_are_indexed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.db").to_string_lossy().into_owned();
+        {
+            let db = SqliteDatabase::connect(&path).await.unwrap();
+            db.add_to_feed(FEED, &sample("Before.Index", "1.0.0"))
+                .await
+                .unwrap();
+            for step in [
+                "DELETE FROM search_text",
+                "DELETE FROM search_keys",
+                "PRAGMA user_version = 3",
+            ] {
+                sqlx::query(step).execute(&db.pool).await.unwrap();
+            }
+        }
+        let db = SqliteDatabase::connect(&path).await.unwrap();
+        assert_eq!(hits(&db, "before.ind").await, ["Before.Index"]);
     }
 
     #[tokio::test]

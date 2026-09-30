@@ -186,7 +186,7 @@ GET /v3/search?q=&skip=&take=&prerelease=&semVerLevel=&packageType=
 
 | Param | Default | Notes |
 | --- | --- | --- |
-| `q` | *(empty = all)* | Matches id, description, tags, title. |
+| `q` | *(empty = all)* | A case-insensitive substring of the id, title, a tag or the first 4000 characters of the description. Only the first 256 characters are used. |
 | `skip` | `0` | Pagination offset (over package ids). |
 | `take` | `20` | Clamped to `1000`. |
 | `prerelease` | `false` | Include pre-release versions. |
