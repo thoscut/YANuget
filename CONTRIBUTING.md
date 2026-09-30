@@ -14,9 +14,15 @@ cargo build
 
 # The docs site is optional for building — a placeholder page is embedded when
 # MkDocs has not run — but you need it to work on the /docs endpoint.
-pip install -r requirements-docs.txt
+# The lock is hashed; after editing requirements-docs.in, regenerate it as
+# described at the top of that file.
+pip install --require-hashes -r requirements-docs.txt
 mkdocs build
 ```
+
+Cargo notices a new or changed `site/` on the next build, with one exception:
+if the first `mkdocs build` comes after a `cargo build` and the docs sources
+have not changed since, run `touch build.rs` so the site is picked up.
 
 Run the server:
 
