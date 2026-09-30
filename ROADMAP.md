@@ -34,15 +34,14 @@ How to read the entries:
 
 ### Status
 
-Every finding below but `MNT-03` (in progress) has been fixed on the review
-branch, with tests, and is
+Every finding below has been fixed on the review branch, with tests, and is
 described in the *Unreleased* section of the [changelog](CHANGELOG.md). That
 includes the release blockers (`SEC-01`–`SEC-03`, `COR-06`, `COR-07`) and the
 data migration for pre-0.5.0 databases (`COR-02`). The file and line
 references below are from the reviewed commit; many files have since been
 split or moved (`src/web/`, `src/database/`).
 
-After the fixes: 511 tests (from 321), `clippy -D warnings` clean,
+After the fixes: 522 tests (from 321), `clippy -D warnings` clean,
 `mkdocs build --strict` clean, and `cargo audit` / `cargo deny` in CI.
 
 #### Left open on purpose
@@ -68,6 +67,11 @@ What a fix deliberately did not do, and why:
   applied one version at a time, because they move files and take a lock per
   version; bulk flag changes are one transaction.
 - `CI-04`: `cargo auditable` is not used.
+- `MNT-03`: schema migration 7 logs, but does not delete, the blobs and PDBs
+  of rows it drops as orphans; deleting stored bytes belongs in a storage
+  sweep, not a schema step. The migrations stay on `user_version` rather than
+  `sqlx::migrate!` (the reasons are at the top of
+  `src/database/sqlite/schema.rs`).
 - `MNT-01`: no template engine and no `serde_urlencoded`. Both would change
   behaviour, and the inline style and script must stay byte-identical to their
   CSP hashes. The escaping rule is documented in `src/web/ui/escape.rs`.
@@ -721,7 +725,7 @@ Security claims made in the README and SECURITY.md that have no test yet:
 - [x] **`MNT-02` Enforce admin auth with a `route_layer`**, not as the first line
   of each handler, so a new handler cannot forget it. Deduplicate
   `push_package` and `push_symbol_package`.
-- [ ] **`MNT-03` Split the database layer.** `src/database/sqlite.rs` is about
+- [x] **`MNT-03` Split the database layer.** `src/database/sqlite.rs` is about
   1.5k lines plus tests behind a 45-method trait covering packages,
   memberships, files, uploads and symbols. Split by concern; add foreign keys
   (`feed_packages` → `packages`); drop the dead legacy

@@ -33,9 +33,15 @@ lenient:
   target feed's `allow_overwrite`.
 - `scripts/Send-YanugetFile.ps1` takes the key as a `SecureString` or from
   `YANUGET_API_KEY`, and requires https unless `-AllowHttp` is given.
-- The database is migrated on first start (schema versions 3 and 4: pre-release
-  keys stored before 0.5.0 are lower-cased, and a search index is built).
-  Back it up first; older releases cannot open it afterwards.
+- The database is migrated on first start, to schema version 7: pre-release
+  keys stored before 0.5.0 are lower-cased, a search index is built, the
+  unused `packages` columns are dropped, and memberships, tags, attached-file
+  rows and symbol mappings get foreign keys to their version. That rebuilds
+  `packages` and four child tables once, which takes a while on a large
+  database. **Back the database up first**: afterwards older releases refuse
+  to open it, and restoring the backup is the only way back. Rows that point at
+  a version which no longer exists are counted in the log and removed; their
+  blobs and PDBs stay on disk, unserved.
 - The container image runs `yanuget healthcheck` and no longer contains
   `curl`.
 
@@ -217,6 +223,21 @@ lenient:
   older than Visual Studio 15.9) are refused, as on nuget.org.
 - Only the manifest (and a declared readme or icon) is opened in a pushed
   archive, so an unreadable entry elsewhere no longer rejects the package.
+- Every schema change is a numbered migration, run once in its own
+  `BEGIN IMMEDIATE` transaction and recorded in `user_version`, so a changed
+  index or trigger reaches existing databases instead of being kept by
+  `IF NOT EXISTS`. A database newer than the running build is refused.
+- Memberships, tags, attached files and symbol mappings are deleted with their
+  version by foreign key; a symbol push racing a purge fails instead of leaving
+  a mapping nothing owns.
+- The web layer and the SQLite backend are split into modules by concern
+  (`src/web/{protocol,publish,gallery,admin,…}.rs`, `src/web/ui/`,
+  `src/database/sqlite/`), with no change in behaviour.
+
+### Removed
+
+- The unused `packages` columns `listed`, `enabled`, `downloads` and
+  `version_major` to `version_revision`, and two redundant indexes.
 
 ### Fixed
 
@@ -277,6 +298,8 @@ lenient:
   counts every version; dependency-group `@id`s are percent-encoded.
 - An inbox import is refused, like a push, when it would leave less than
   `min_free_disk_bytes` free.
+- A database created by the first multi-feed build failed to migrate (its
+  `feed_packages` lacked `downloads`).
 
 ### Security
 
