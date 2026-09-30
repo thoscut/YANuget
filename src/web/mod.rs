@@ -708,8 +708,13 @@ fn feed_routes(state: AppState) -> Router {
 
         // Admin area (disable/enable/delete/approve/promote versions), behind
         // HTTP Basic auth. Only mounted when an admin key is configured.
+        //
+        // Authentication is a `route_layer` over the whole group rather than
+        // the first line of each handler, so a handler added here later cannot
+        // forget it. State changes additionally check a CSRF token in the
+        // handler, since only the handler reads the form body.
         if state.feed.admin.is_enabled() {
-            ui = ui
+            let admin = Router::new()
                 .route("/admin", get(admin_dashboard))
                 .route(
                     "/admin/packages/{id}",
@@ -745,7 +750,12 @@ fn feed_routes(state: AppState) -> Router {
                     admin_post(admin_file_delete),
                 )
                 .route("/admin/retention", get(admin_retention))
-                .route("/admin/retention/run", admin_post(admin_retention_run));
+                .route("/admin/retention/run", admin_post(admin_retention_run))
+                .route_layer(axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    admin_gate,
+                ));
+            ui = ui.merge(admin);
         }
         router = router.merge(ui.layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -1863,21 +1873,33 @@ async fn render_detail(
 // Admin area (HTTP Basic auth)
 // ---------------------------------------------------------------------------
 
-/// Reject the request with a Basic-auth challenge unless valid admin
-/// credentials are presented.
-fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<()> {
-    if state.feed.admin.check_headers(headers) {
-        Ok(())
+/// Guard every admin route: valid admin credentials or a Basic-auth
+/// challenge, and never a cached copy of what is behind it.
+///
+/// Admin pages embed a CSRF token and list what an operator can see; neither
+/// belongs in a browser's disk cache or a shared cache, so every answer —
+/// the challenge included — is `no-store`.
+async fn admin_gate(
+    State(state): State<AppState>,
+    request: Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let mut response = if state.feed.admin.check_headers(request.headers()) {
+        next.run(request).await
     } else {
-        Err(Error::AdminUnauthorized)
-    }
+        Error::AdminUnauthorized.into_response()
+    };
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
 }
 
 /// Header alternative to the hidden form field, for scripted admin calls.
 const CSRF_HEADER: &str = "x-csrf-token";
 
-/// Authenticate an admin *state change*: valid credentials **and** proof the
-/// request was actually issued from the admin UI.
+/// Check that an admin *state change* was actually issued from the admin UI.
+/// The credentials themselves were already checked by [`admin_gate`].
 ///
 /// HTTP Basic credentials are replayed by the browser on every request to this
 /// origin, so authentication alone does not distinguish a click in `/admin`
@@ -1886,11 +1908,10 @@ const CSRF_HEADER: &str = "x-csrf-token";
 ///
 /// * `Sec-Fetch-Site` — browsers set it on every request; anything other than
 ///   same-origin is rejected outright. Non-browser callers omit it.
-/// * The CSRF token, derived from the admin key. An attacker who cannot read
-///   an admin page cannot produce it.
+/// * The CSRF token, an HMAC under a per-process secret (see
+///   [`crate::auth::AdminAuth::csrf_token`]). An attacker who cannot read an
+///   admin page cannot produce it.
 fn require_admin_action(state: &AppState, headers: &HeaderMap, body: &str) -> Result<()> {
-    require_admin(state, headers)?;
-
     if let Some(site) = headers.get("sec-fetch-site").and_then(|v| v.to_str().ok()) {
         if !matches!(site.trim(), "same-origin" | "none") {
             return Err(Error::BadRequest(
@@ -1909,7 +1930,7 @@ fn require_admin_action(state: &AppState, headers: &HeaderMap, body: &str) -> Re
         Ok(())
     } else {
         Err(Error::BadRequest(format!(
-            "missing or invalid {} token",
+            "missing, expired or invalid {} token (reload the page)",
             ui::CSRF_FIELD
         )))
     }
@@ -1944,7 +1965,6 @@ async fn admin_dashboard(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Html<String>> {
-    require_admin(&state, &headers)?;
     let ids = state.db.all_package_ids(state.feed()).await?;
     let urls = state.url_builder(&headers);
     Ok(Html(ui::admin_dashboard_page(&urls, &ids)))
@@ -1955,7 +1975,6 @@ async fn admin_package(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Html<String>> {
-    require_admin(&state, &headers)?;
     let versions = state.db.find_all_versions(state.feed(), &id).await?;
     if versions.is_empty() {
         return Err(Error::PackageNotFound);
@@ -2412,7 +2431,6 @@ async fn admin_retention(
     headers: HeaderMap,
     Query(q): Query<RetentionQuery>,
 ) -> Result<Html<String>> {
-    require_admin(&state, &headers)?;
     let rules = &state.feed.retention;
     let policy = RetentionPolicy::from(rules);
     let preview = if policy.has_limits() {

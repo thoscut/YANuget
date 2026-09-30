@@ -273,6 +273,147 @@ async fn a_challenge_without_credentials_is_not_a_failed_guess() {
     assert_eq!(authed.status(), StatusCode::OK);
 }
 
+// ---------------------------------------------------------------------------
+// Per-feed keys (TEST-01, SEC-18)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn one_feeds_push_key_does_not_open_another() {
+    let server = spawn_feeds(|c| {
+        c.feeds = vec![
+            FeedConfig {
+                api_key: Some("key-a".into()),
+                ..feed("a")
+            },
+            FeedConfig {
+                api_keys: vec!["key-b".into()],
+                ..feed("b")
+            },
+            // No key of its own: the global one applies.
+            feed("c"),
+        ];
+    })
+    .await;
+    let pkg = || build_nupkg("Iso.Pkg", "1.0.0");
+
+    assert_eq!(
+        push(&server, "/a", "key-b", pkg()).await,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        push(&server, "/b", "key-a", pkg()).await,
+        StatusCode::UNAUTHORIZED
+    );
+    // A feed with a key of its own no longer takes the global one.
+    assert_eq!(
+        push(&server, "/a", API_KEY, pkg()).await,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        push(&server, "/b", API_KEY, pkg()).await,
+        StatusCode::UNAUTHORIZED
+    );
+    // And a feed that falls back to the global key takes no other feed's.
+    assert_eq!(
+        push(&server, "/c", "key-a", pkg()).await,
+        StatusCode::UNAUTHORIZED
+    );
+
+    assert_eq!(
+        push(&server, "/a", "key-a", pkg()).await,
+        StatusCode::CREATED
+    );
+    assert_eq!(
+        push(&server, "/b", "key-b", pkg()).await,
+        StatusCode::CREATED
+    );
+    assert_eq!(
+        push(&server, "/c", API_KEY, pkg()).await,
+        StatusCode::CREATED
+    );
+
+    // Deleting is a push-key operation too.
+    let del = |prefix: &str, key: &str| {
+        server
+            .client
+            .delete(server.url(&format!("{prefix}/api/v2/package/Iso.Pkg/1.0.0")))
+            .header("X-NuGet-ApiKey", key.to_string())
+            .send()
+    };
+    assert_eq!(
+        del("/b", "key-a").await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        del("/b", "key-b").await.unwrap().status(),
+        StatusCode::NO_CONTENT
+    );
+}
+
+#[tokio::test]
+async fn one_feeds_admin_key_does_not_open_another_admin_area() {
+    let server = spawn_feeds(|c| {
+        c.feeds = vec![
+            FeedConfig {
+                admin_api_key: Some("admin-a".into()),
+                ..feed("a")
+            },
+            FeedConfig {
+                admin_api_key: Some("admin-b".into()),
+                ..feed("b")
+            },
+        ];
+    })
+    .await;
+    assert_eq!(
+        push(&server, "/b", API_KEY, build_nupkg("Adm.Pkg", "1.0.0")).await,
+        StatusCode::CREATED
+    );
+
+    let admin = |path: &str, key: &str| {
+        server
+            .client
+            .get(server.url(path))
+            .basic_auth("admin", Some(key.to_string()))
+            .send()
+    };
+    let wrong = admin("/b/admin", "admin-a").await.unwrap();
+    assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(wrong.headers()["cache-control"], "no-store");
+    let wrong = admin("/b/admin/packages/adm.pkg", "admin-a").await.unwrap();
+    assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+
+    let right = admin("/b/admin/packages/adm.pkg", "admin-b").await.unwrap();
+    assert_eq!(right.status(), StatusCode::OK);
+    // The page embeds a CSRF token: it must not be kept by any cache.
+    assert_eq!(right.headers()["cache-control"], "no-store");
+
+    // Feed A's CSRF token, with feed B's credentials, changes nothing.
+    let token_a = yanuget::auth::AdminAuth::new(Some("admin-a".into()))
+        .csrf_token()
+        .unwrap();
+    let token_b = yanuget::auth::AdminAuth::new(Some("admin-b".into()))
+        .csrf_token()
+        .unwrap();
+    let disable = |token: String| {
+        server
+            .client
+            .post(server.url("/b/admin/packages/adm.pkg/1.0.0/disable"))
+            .basic_auth("admin", Some("admin-b"))
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(format!("_csrf={token}"))
+            .send()
+    };
+    assert_eq!(
+        disable(token_a).await.unwrap().status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        disable(token_b).await.unwrap().status(),
+        StatusCode::SEE_OTHER
+    );
+}
+
 /// Run the real binary with `env` and return its exit status and stderr,
 /// killing it if it is still running after `timeout` (it then started, which
 /// is what these tests assert does not happen).
