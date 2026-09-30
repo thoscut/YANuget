@@ -53,6 +53,13 @@ indexed. Responses:
 | `409 Conflict` | Version already exists in this feed (unless `allow_overwrite`). |
 | `413 Payload Too Large` | Exceeds `max_package_size_bytes`. |
 
+The `<version>` must be one the NuGet client itself accepts: up to four numeric
+components of at most `2147483647`, an optional pre-release label and build
+metadata made of dot-separated `[0-9A-Za-z-]` identifiers, no leading zero on a
+numeric pre-release identifier (`1.0.0-01` is refused), no leading `v`, and at
+most 64 characters in all (as on nuget.org). Anything else is a `400`. The same
+rules apply to versions in request URLs.
+
 In a feed with `requires_approval = true`, a pushed version is still accepted
 (`201`) but lands **pending** — withheld from clients until an admin approves it.
 Under `license_policy` with `action = "warn"`, a violating package is accepted
