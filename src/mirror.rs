@@ -73,6 +73,16 @@ impl std::fmt::Debug for MirrorClient {
     }
 }
 
+/// Host names a test resolves without DNS. Empty outside tests.
+#[derive(Default)]
+struct TestDns {
+    /// Answered by reqwest itself, around the guard: a stand-in for a public
+    /// host that happens to be a loopback test server.
+    unguarded: Vec<(String, std::net::SocketAddr)>,
+    /// Answered by the guarded resolver, and filtered like real DNS answers.
+    guarded: Vec<(String, std::net::IpAddr)>,
+}
+
 /// `(scheme, host, port)`: what two URLs must share for a credential meant for
 /// one to be sent to the other.
 type Origin = (String, String, u16);
@@ -148,10 +158,14 @@ const DEFAULT_MIRROR_MAX_PACKAGE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 ///
 /// Literal IP hosts never reach a resolver; [`MirrorClient::check_url`] and
 /// the redirect handling classify those.
+#[derive(Default)]
 struct GuardedResolver {
     /// A configured outbound proxy's host, resolved without the filter: the
     /// operator named it, and it is routinely on the private network.
     proxy_host: Option<String>,
+    /// Names answered without a DNS lookup, and filtered like any other.
+    /// Empty outside tests, which need a name that resolves to loopback.
+    fixed: Vec<(String, std::net::IpAddr)>,
 }
 
 impl reqwest::dns::Resolve for GuardedResolver {
@@ -161,9 +175,16 @@ impl reqwest::dns::Resolve for GuardedResolver {
             .proxy_host
             .as_deref()
             .is_some_and(|p| p.eq_ignore_ascii_case(&host));
+        let fixed = self
+            .fixed
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(&host))
+            .map(|(_, ip)| std::net::SocketAddr::new(*ip, 0));
         Box::pin(async move {
-            let addrs: Vec<std::net::SocketAddr> =
-                tokio::net::lookup_host((host.as_str(), 0)).await?.collect();
+            let addrs: Vec<std::net::SocketAddr> = match fixed {
+                Some(addr) => vec![addr],
+                None => tokio::net::lookup_host((host.as_str(), 0)).await?.collect(),
+            };
             if exempt {
                 return Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs);
             }
@@ -227,6 +248,10 @@ impl MirrorClient {
     }
 
     fn build(config: &MirrorConfig, env_proxy: bool) -> Result<Self> {
+        Self::build_with(config, env_proxy, &TestDns::default())
+    }
+
+    fn build_with(config: &MirrorConfig, env_proxy: bool, dns: &TestDns) -> Result<Self> {
         let invalid = |msg: String| Error::BadRequest(format!("mirror: {msg}"));
         config.validate()?;
         let upstream_origin = reqwest::Url::parse(&config.upstream)
@@ -271,7 +296,13 @@ impl MirrorClient {
             None => builder = builder.no_proxy(),
         }
         if !config.allow_private_upstream {
-            builder = builder.dns_resolver(std::sync::Arc::new(GuardedResolver { proxy_host }));
+            builder = builder.dns_resolver(std::sync::Arc::new(GuardedResolver {
+                proxy_host,
+                fixed: dns.guarded.clone(),
+            }));
+        }
+        for (name, addr) in &dns.unguarded {
+            builder = builder.resolve(name, *addr);
         }
         // The system store and the bundled roots are both trusted already;
         // an internal CA the host does not carry can be named here.
@@ -2107,7 +2138,7 @@ mod tests {
 
         // `localhost` resolves to loopback on every platform, which is exactly
         // what a name with a private `A` record looks like to the mirror.
-        let guarded = GuardedResolver { proxy_host: None };
+        let guarded = GuardedResolver::default();
         match guarded.resolve("localhost".parse().unwrap()).await {
             Ok(_) => panic!("a name resolving to loopback must not connect"),
             Err(e) => assert!(e.to_string().contains("private address"), "{e}"),
@@ -2117,12 +2148,103 @@ mod tests {
         // network, and the operator named it.
         let proxied = GuardedResolver {
             proxy_host: Some("LOCALHOST".into()),
+            ..Default::default()
         };
         let addrs = proxied
             .resolve("localhost".parse().unwrap())
             .await
             .unwrap_or_else(|e| panic!("{e}"));
         assert!(addrs.count() > 0);
+    }
+
+    #[tokio::test]
+    async fn a_redirect_or_resource_that_resolves_to_a_private_address_is_refused() {
+        use axum::http::{header, StatusCode};
+        use axum::response::IntoResponse;
+        use axum::routing::get;
+
+        // One loopback server plays every host. `upstream.test` stands for a
+        // public upstream (reqwest resolves it, around the guard);
+        // `internal.test` is a name whose DNS answer is a private address, as
+        // `metadata.evil.example` pointing at 169.254.169.254 would be.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let port = addr.port();
+        let public = format!("http://upstream.test:{port}");
+        let redirect = |to: String| {
+            move || {
+                let to = to.clone();
+                async move { (StatusCode::FOUND, [(header::LOCATION, to)]).into_response() }
+            }
+        };
+        let index = serde_json::json!({
+            "resources": [{"@id": format!("{public}/flat/"), "@type": "PackageBaseAddress/3.0.0"}]
+        });
+        let app = axum::Router::new()
+            .route(
+                "/v3/index.json",
+                get(move || async move { axum::Json(index) }),
+            )
+            .route(
+                "/versions.json",
+                get(|| async { axum::Json(serde_json::json!({"versions": ["1.0.0"]})) }),
+            )
+            .route(
+                "/flat/ok/index.json",
+                get(redirect(format!("{public}/versions.json"))),
+            )
+            .route(
+                "/flat/by-name/index.json",
+                get(redirect(format!(
+                    "http://internal.test:{port}/versions.json"
+                ))),
+            )
+            .route(
+                "/flat/by-literal/index.json",
+                get(redirect(format!("http://127.0.0.1:{port}/versions.json"))),
+            )
+            .route(
+                "/flat/rebound/index.json",
+                get(redirect(format!(
+                    "http://[::ffff:127.0.0.1]:{port}/versions.json"
+                ))),
+            );
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let config = MirrorConfig {
+            enabled: true,
+            upstream: format!("{public}/v3/index.json"),
+            timeout_secs: 5,
+            ..Default::default()
+        };
+        let dns = TestDns {
+            unguarded: vec![("upstream.test".into(), addr)],
+            guarded: vec![("internal.test".into(), addr.ip())],
+        };
+        let client = MirrorClient::build_with(&config, false, &dns).unwrap();
+
+        // The control: a redirect within the public upstream is followed.
+        assert_eq!(client.upstream_versions("ok").await.unwrap(), ["1.0.0"]);
+        for refused in ["by-name", "by-literal", "rebound"] {
+            let err = client.upstream_versions(refused).await.unwrap_err();
+            assert!(
+                err.to_string().contains("private address"),
+                "{refused}: {err}"
+            );
+        }
+
+        // The same name as a resource URL, not a redirect, is refused too.
+        let direct = MirrorClient::build_with(
+            &MirrorConfig {
+                upstream: format!("http://internal.test:{port}/v3/index.json"),
+                ..config.clone()
+            },
+            false,
+            &dns,
+        )
+        .unwrap();
+        let err = direct.upstream_versions("ok").await.unwrap_err();
+        assert!(err.to_string().contains("private address"), "{err}");
     }
 
     #[test]
