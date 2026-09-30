@@ -60,6 +60,14 @@ numeric pre-release identifier (`1.0.0-01` is refused), no leading `v`, and at
 most 64 characters in all (as on nuget.org). Anything else is a `400`. The same
 rules apply to versions in request URLs.
 
+The archive itself is refused (`400`) when two readers could see different
+contents in it: an entry name that appears twice, more than one `.nuspec` at the
+root, or a central directory whose record counts, ZIP64 record or end record
+disagree with each other or with the records actually present. More than 100,000
+entries is refused too. Only the `.nuspec` (and a declared readme or icon) is
+ever opened, so an entry the server cannot decompress elsewhere in the package
+does not matter.
+
 In a feed with `requires_approval = true`, a pushed version is still accepted
 (`201`) but lands **pending** — withheld from clients until an admin approves it.
 Under `license_policy` with `action = "warn"`, a violating package is accepted
