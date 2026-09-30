@@ -471,17 +471,25 @@ pub async fn prune_package(
     id: &str,
     policy: &RetentionPolicy,
 ) -> Result<usize> {
-    Ok(prune_package_outcome(storage, db, feed, id, policy)
+    Ok(prune_package_outcome(storage, db, feed, id, policy, &never)
         .await?
         .deleted)
 }
 
+/// A stop signal that never fires, for runs nothing can cancel.
+fn never() -> bool {
+    false
+}
+
+/// Prune one id, checking `stop` before each version: a sweep interrupted
+/// by shutdown ends between two deletes, never inside one.
 async fn prune_package_outcome(
     storage: &dyn PackageStorage,
     db: &dyn PackageDatabase,
     feed: &str,
     id: &str,
     policy: &RetentionPolicy,
+    stop: &(dyn Fn() -> bool + Sync),
 ) -> Result<Outcome> {
     let mut outcome = Outcome::default();
     if !policy.has_limits() {
@@ -489,6 +497,9 @@ async fn prune_package_outcome(
     }
     let versions = db.find_all_versions(feed, id).await?;
     for planned in plan_for(&versions, policy, Utc::now()) {
+        if stop() {
+            break;
+        }
         delete_planned(storage, db, feed, id, &planned.version, &mut outcome).await;
     }
     Ok(outcome)
@@ -501,7 +512,9 @@ pub async fn prune_all(
     feed: &str,
     policy: &RetentionPolicy,
 ) -> Result<usize> {
-    Ok(prune_all_outcome(storage, db, feed, policy).await?.deleted)
+    Ok(prune_all_outcome(storage, db, feed, policy, &never)
+        .await?
+        .deleted)
 }
 
 async fn prune_all_outcome(
@@ -509,13 +522,18 @@ async fn prune_all_outcome(
     db: &dyn PackageDatabase,
     feed: &str,
     policy: &RetentionPolicy,
+    stop: &(dyn Fn() -> bool + Sync),
 ) -> Result<Outcome> {
     let mut total = Outcome::default();
     if !policy.has_limits() {
         return Ok(total);
     }
     for id in db.all_package_ids(feed).await? {
-        match prune_package_outcome(storage, db, feed, &id, policy).await {
+        if stop() {
+            tracing::info!(%feed, "retention sweep stopped early for shutdown");
+            break;
+        }
+        match prune_package_outcome(storage, db, feed, &id, policy, stop).await {
             Ok(o) => {
                 total.deleted += o.deleted;
                 total.freed += o.freed;
@@ -706,15 +724,20 @@ impl RetentionState {
     }
 
     /// The scheduled sweep: waits for a manual cleanup to finish, then runs.
+    ///
+    /// `stop` is checked between versions, so shutdown ends a long sweep at
+    /// the next version boundary — neither abandoned inside a delete nor
+    /// holding the process until every package has been visited.
     pub async fn sweep(
         &self,
         storage: &dyn PackageStorage,
         db: &dyn PackageDatabase,
         feed: &str,
         policy: &RetentionPolicy,
+        stop: &(dyn Fn() -> bool + Sync),
     ) -> Result<Outcome> {
         let _running = self.running.lock().await;
-        let outcome = prune_all_outcome(storage, db, feed, policy).await?;
+        let outcome = prune_all_outcome(storage, db, feed, policy, stop).await?;
         self.record(Trigger::Schedule, outcome);
         Ok(outcome)
     }
@@ -1082,6 +1105,42 @@ mod tests {
             assert!(!storage.package_exists(id, "1.0.0").await);
             assert!(storage.package_exists(id, "1.2.0").await);
         }
+    }
+
+    #[tokio::test]
+    async fn a_sweep_stops_between_versions_when_asked() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FilesystemStorage::new(dir.path()).await.unwrap();
+        let db = SqliteDatabase::in_memory().await.unwrap();
+        for id in ["Stop.A", "Stop.B"] {
+            for v in ["1.0.0", "1.1.0", "1.2.0"] {
+                let mut p = pkg(v, 0);
+                p.id = id.to_string();
+                db.add_to_feed(FEED, &p).await.unwrap();
+                store_dummy(&storage, id, v).await;
+            }
+        }
+        let policy = RetentionPolicy {
+            keep_latest_stable: Some(1),
+            ..Default::default()
+        };
+        // "Shutdown" arrives after the first check lets one delete through.
+        let checks = std::sync::atomic::AtomicUsize::new(0);
+        let stop = || checks.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 2;
+        let state = RetentionState::default();
+        let outcome = state
+            .sweep(&storage, &db, FEED, &policy, &stop)
+            .await
+            .unwrap();
+        assert_eq!(outcome.deleted, 1, "went on past the stop");
+        // Whatever it did delete, it deleted whole.
+        let left: usize = [
+            db.find_all_versions(FEED, "stop.a").await.unwrap().len(),
+            db.find_all_versions(FEED, "stop.b").await.unwrap().len(),
+        ]
+        .iter()
+        .sum();
+        assert_eq!(left, 5);
     }
 
     #[tokio::test]

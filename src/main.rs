@@ -182,10 +182,12 @@ async fn run_server(config_path: Option<&str>) -> anyhow::Result<()> {
                     }
                     // Not raced against shutdown: dropping a sweep mid-way
                     // abandons it at whatever await it reached, between a
-                    // version's files and its rows. Shutdown waits for it
-                    // (up to the grace period) instead.
+                    // version's files and its rows. It checks for shutdown
+                    // between versions instead, and main waits for it.
+                    let stopping = shutdown.clone();
+                    let stop = move || *stopping.borrow();
                     if let Err(e) = cleanup
-                        .sweep(storage.as_ref(), db.as_ref(), &feed_name, &policy)
+                        .sweep(storage.as_ref(), db.as_ref(), &feed_name, &policy, &stop)
                         .await
                     {
                         tracing::error!(feed = %feed_name, error = %e, "retention sweep failed");
