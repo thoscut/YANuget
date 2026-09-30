@@ -1644,6 +1644,7 @@ async fn files_dropped_in_the_inbox_are_verified_and_attached() {
         max_file_size: None,
         feeds: &feeds,
         staging: &staging,
+        min_free_disk_bytes: 0,
     };
     let report = scan.scan().await;
     assert_eq!(

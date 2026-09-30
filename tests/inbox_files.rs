@@ -143,6 +143,7 @@ struct Inbox {
     files: yanuget::config::FilesConfig,
     feeds: Vec<String>,
     staging: PathBuf,
+    reserve: u64,
 }
 
 impl Inbox {
@@ -157,6 +158,7 @@ impl Inbox {
             files: yanuget::config::FilesConfig::default(),
             feeds: vec!["default".to_string()],
             staging: data.join("packages/.uploads"),
+            reserve: 0,
         }
     }
 
@@ -176,6 +178,7 @@ impl Inbox {
             max_file_size: None,
             feeds: &self.feeds,
             staging: &self.staging,
+            min_free_disk_bytes: self.reserve,
         }
         .scan()
         .await
@@ -251,6 +254,26 @@ async fn a_hard_linked_inbox_file_is_refused() {
     assert_eq!(inbox.scan().await, ONE_FAILED);
     let why = std::fs::read_to_string(dir.join("base.wim.error")).unwrap();
     assert!(why.contains("hard links"), "{why}");
+    let got = download(&server, "drop.pkg", "1.0.0", "base.wim").await;
+    assert_eq!(got.status(), reqwest::StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn an_import_that_would_eat_the_disk_reserve_is_refused() {
+    let server = spawn().await;
+    push(&server, build_nupkg("Drop.Pkg", "1.0.0")).await;
+    let mut inbox = Inbox::new(&server).await;
+    // No volume has this much free, so the copy must not start.
+    inbox.reserve = u64::MAX / 2;
+    let dir = inbox.version_dir("Drop.Pkg", "1.0.0");
+    std::fs::write(dir.join("base.wim"), b"image bytes").unwrap();
+    std::fs::write(dir.join("base.wim.sha256"), sha256_hex(b"image bytes")).unwrap();
+
+    assert_eq!(inbox.scan().await, ONE_FAILED);
+    assert!(dir.join("base.wim.error").exists());
+    // The uploader's file stays where it was, and nothing was staged.
+    assert!(dir.join("base.wim").exists());
+    assert!(staged(&server).is_empty(), "{:?}", staged(&server));
     let got = download(&server, "drop.pkg", "1.0.0", "base.wim").await;
     assert_eq!(got.status(), reqwest::StatusCode::NOT_FOUND);
 }

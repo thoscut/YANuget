@@ -17,8 +17,9 @@ on:
   push:
     branches: [main]
     paths:
-      - "src/web/ui.rs"
-      - "src/web/mod.rs"
+      # The page renderers (ui/) and the handlers that feed them, which
+      # live in several files beside it.
+      - "src/web/**"
       - "scripts/media/**"
       - "scripts/capture-media.sh"
       - "docs/**"
