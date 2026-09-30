@@ -515,8 +515,10 @@ before publishing it locally under a trusted name.
 
 Not yet implemented (contributions welcome): additional storage backends
 (S3/Azure Blob) and database backends (PostgreSQL/MySQL), online vulnerability
-scanning, and native (Windows) PDB indexing. These are deliberately behind trait
-boundaries so they can be added without touching the core.
+scanning, and native (Windows) PDB indexing. Databases slot in behind the
+`PackageDatabase` trait. An object store needs more than a `PackageStorage`
+implementation: the web layer, uploads and the SSH inbox serve and move local
+files today, so it also needs a streaming `PackageContent` variant.
 
 What is planned, and the open findings from the latest full review (security,
 correctness, CI, docs and test gaps, each with an id to reference in commits),

@@ -105,11 +105,14 @@ GET /v3/package/{id}/{v}/{f}.nupkg→ storage.get_package → files::serve_local
 ## Trait boundaries
 
 Two traits isolate I/O so the core is testable with in-memory fakes and so new
-backends slot in without touching handlers:
+backends have a seam to go behind:
 
 - **`PackageStorage`** — payload + sidecars. The `PackageContent::LocalPath`
-  return lets the web layer serve files with zero-copy Range support. A future
-  object-store backend adds a streaming variant.
+  return lets the web layer serve files with zero-copy Range support. It is the
+  only variant, and downloads, uploads (`TempPath` renamed into place) and the
+  SSH inbox assume local files, so an object-store backend has to add a
+  streaming variant and teach those paths to use it — not only implement the
+  trait.
 - **`PackageDatabase`** — metadata, listing, download counts, search,
   autocomplete. The SQLite backend stores nested metadata as JSON columns and
   finishes NuGet's pre-release ordering in Rust (SQL can't express it).

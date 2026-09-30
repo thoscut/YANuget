@@ -103,8 +103,10 @@ your change.
   `Vec<u8>`, or reads an archive end to end to get at a small part of it, will be
   rejected. Stream it, or seek to it.
 - **New backends go behind the existing traits.** Storage and database are
-  `PackageStorage` and `PackageDatabase`; S3, Azure Blob, PostgreSQL and MySQL
-  are all meant to be addable without touching the core.
+  `PackageStorage` and `PackageDatabase`. PostgreSQL or MySQL is a
+  `PackageDatabase` implementation; S3 or Azure Blob also needs a streaming
+  `PackageContent` variant, because downloads, uploads and the inbox work on
+  local paths and `rename` today.
 - **Comments explain why, not what.** Match the density and voice of the code
   around you.
 - **Configuration additions are documented** in `yanuget.example.toml` and
