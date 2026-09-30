@@ -137,9 +137,10 @@ pub(crate) fn entry_index(archive: &zip::ZipArchive<File>, normalized: &str) -> 
     })
 }
 
-/// Extract a single named entry (e.g. an embedded readme or icon) into memory,
-/// capped at `max_bytes`. Returns `None` if the entry is absent. Matching is
-/// case-insensitive and `\\`/`/`-insensitive.
+/// Extract a single named entry (e.g. an embedded readme or icon) into memory.
+/// Returns `None` if the entry is absent, and [`Error::InvalidPackage`] if it
+/// is larger than `max_bytes`. Matching is case-insensitive and
+/// `\\`/`/`-insensitive.
 pub async fn extract_file(
     path: impl AsRef<Path>,
     entry_name: &str,
@@ -232,11 +233,29 @@ fn extract_file_blocking(
     let entry = archive
         .by_index(idx)
         .map_err(|e| Error::InvalidPackage(format!("could not open entry: {e}")))?;
+    let name = entry.name().to_string();
+    let too_large = || {
+        Error::InvalidPackage(format!(
+            "package entry {name} is larger than the {} KiB allowed for it",
+            max_bytes / 1024
+        ))
+    };
+    // Refused rather than cut short. A truncated readme was stored and
+    // flagged as present — possibly ending part-way through a UTF-8
+    // sequence — and a truncated icon is a broken image; either way the feed
+    // served something other than what the package contains.
+    if entry.size() > max_bytes {
+        return Err(too_large());
+    }
     let mut buf = Vec::new();
+    // One byte past the cap, in case the declared size understates it.
     entry
-        .take(max_bytes)
+        .take(max_bytes.saturating_add(1))
         .read_to_end(&mut buf)
-        .map_err(Error::Io)?;
+        .map_err(|e| Error::InvalidPackage(format!("could not read {name}: {e}")))?;
+    if buf.len() as u64 > max_bytes {
+        return Err(too_large());
+    }
     Ok(Some(buf))
 }
 
@@ -731,6 +750,26 @@ mod tests {
             read_bytes(&raw_zip(&[("P.nuspec", &a)], huge)).await,
             "entries, more than",
         );
+    }
+
+    /// An embedded file over its cap is refused, not cut short: the cut used to
+    /// be stored as the readme, possibly mid-way through a UTF-8 sequence.
+    #[tokio::test]
+    async fn an_oversized_entry_is_refused_rather_than_truncated() {
+        let nuspec = r#"<package><metadata><id>Contoso.Utils</id><version>1.0.0</version></metadata></package>"#;
+        let (_dir, path) = make_nupkg(nuspec);
+        // `docs/README.md` holds 8 bytes.
+        let exact = extract_file(&path, "docs/README.md", 8).await.unwrap();
+        assert_eq!(exact.as_deref(), Some(&b"# Readme"[..]));
+        let err = extract_file(&path, "DOCS\\readme.md", 7).await.unwrap_err();
+        assert!(
+            matches!(&err, Error::InvalidPackage(m) if m.contains("docs/README.md is larger")),
+            "{err}"
+        );
+        assert!(extract_file(&path, "missing.md", 8)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]

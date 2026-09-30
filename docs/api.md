@@ -66,7 +66,8 @@ root, or a central directory whose record counts, ZIP64 record or end record
 disagree with each other or with the records actually present. More than 100,000
 entries is refused too. Only the `.nuspec` (and a declared readme or icon) is
 ever opened, so an entry the server cannot decompress elsewhere in the package
-does not matter.
+does not matter. An embedded readme or icon larger than 1 MiB (nuget.org's limit)
+is refused with a `400` naming the entry, rather than stored cut short.
 
 In a feed with `requires_approval = true`, a pushed version is still accepted
 (`201`) but lands **pending** — withheld from clients until an admin approves it.
