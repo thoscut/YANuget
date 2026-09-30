@@ -11,10 +11,13 @@
 //! and are withheld from clients until an admin approves them in `/admin` —
 //! turning the mirror into a curated, approval-gated cache.
 
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Mutex as StdMutex;
+use std::time::{Duration, Instant};
 
 use futures::StreamExt;
-use tokio::sync::OnceCell;
+use tokio::sync::{watch, OnceCell};
 
 use crate::config::{LicensePolicyConfig, MirrorAuthConfig, MirrorConfig};
 use crate::database::PackageDatabase;
@@ -42,13 +45,16 @@ pub struct MirrorClient {
     max_versions_per_package: Option<usize>,
     /// Deadline for one metadata request (service index, search or catalog
     /// page, version list), from `timeout_secs`.
-    timeout: std::time::Duration,
+    timeout: Duration,
     /// Deadline for one whole `.nupkg` download. `None` leaves only the read
     /// timeout, which bounds how long the upstream may go silent.
-    download_deadline: Option<std::time::Duration>,
+    download_deadline: Option<Duration>,
     /// Free space a download must leave on the volume (`min_free_disk_bytes`).
     min_free_disk_bytes: u64,
+    /// How long a package's upstream version list is trusted (`refresh_secs`).
+    refresh: Duration,
     resources: OnceCell<MirrorResources>,
+    tracker: Tracker,
 }
 
 impl std::fmt::Debug for MirrorClient {
@@ -109,7 +115,7 @@ struct MirrorResources {
 /// authentication, could hold a connection open for twenty-five minutes. The
 /// mirror is a cache: stopping early is not a failure, because the versions
 /// already fetched are kept and the next request continues from there.
-const MIRROR_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
+const MIRROR_BUDGET: Duration = Duration::from_secs(60);
 
 /// Default cap on a single mirrored `.nupkg` when neither the feed nor the
 /// server configured one.
@@ -224,7 +230,7 @@ impl MirrorClient {
         // restarts with each chunk received, so it limits how long the upstream
         // may go silent, not how long a transfer may take; each request adds a
         // total deadline of its own on top (`timeout`, `download_deadline`).
-        let timeout = std::time::Duration::from_secs(config.timeout_secs.max(1));
+        let timeout = Duration::from_secs(config.timeout_secs.max(1));
         let mut builder = reqwest::Client::builder()
             .connect_timeout(timeout)
             .read_timeout(timeout)
@@ -279,9 +285,14 @@ impl MirrorClient {
             max_package_size_bytes: config.max_package_size_bytes,
             max_versions_per_package: config.max_versions_per_package,
             timeout,
-            download_deadline: Some(timeout),
+            download_deadline: match config.download_timeout_secs {
+                0 => None,
+                secs => Some(Duration::from_secs(secs)),
+            },
             min_free_disk_bytes: 0,
+            refresh: Duration::from_secs(config.refresh_secs),
             resources: OnceCell::new(),
+            tracker: Tracker::default(),
         })
     }
 
@@ -289,12 +300,11 @@ impl MirrorClient {
     /// the upstream may then take as long as it needs, provided it never goes
     /// silent for longer than the read timeout.
     ///
-    /// The read-through mirror keeps its deadline, because an anonymous request
-    /// starts that fetch and an upstream that trickles bytes must not hold it
-    /// open. `migrate` removes it: an operator copying a feed wants its large
-    /// packages, and a deadline on the whole transfer fails every package the
-    /// source cannot send within `timeout_secs`.
-    pub fn set_download_deadline(&mut self, deadline: Option<std::time::Duration>) {
+    /// The read-through mirror keeps one (`download_timeout_secs`), because an
+    /// anonymous request starts that fetch and an upstream that trickles bytes
+    /// must not hold it open forever. `migrate` removes it: an operator copying
+    /// a feed wants its large packages, however long they take.
+    pub fn set_download_deadline(&mut self, deadline: Option<Duration>) {
         self.download_deadline = deadline;
     }
 
@@ -386,7 +396,7 @@ impl MirrorClient {
         &self,
         url: &str,
         what: &str,
-        deadline: Option<std::time::Duration>,
+        deadline: Option<Duration>,
     ) -> Result<reqwest::Response> {
         let started = tokio::time::Instant::now();
         let mut current = reqwest::Url::parse(url)
@@ -840,11 +850,218 @@ pub struct MirrorOptions {
     pub license_policy: LicensePolicyConfig,
 }
 
-/// Ensure every upstream version of `id` is present in `feed`, fetching and
-/// indexing any that are missing. Returns how many new versions were mirrored.
+/// How long a request waits for another request's fetch of the same package
+/// before answering with what the feed has.
+const WAIT_FOR_FETCH: Duration = MIRROR_BUDGET;
+
+/// The first retry after an upstream failure; each further failure in a row
+/// doubles it, up to [`MAX_BACKOFF`].
+const FIRST_BACKOFF: Duration = Duration::from_secs(30);
+const MAX_BACKOFF: Duration = Duration::from_secs(30 * 60);
+
+/// How long a version that failed to mirror (absent upstream, over the size
+/// cap, the wrong identity, refused by policy) is not asked for again.
+const BAD_VERSION_RETRY: Duration = Duration::from_secs(15 * 60);
+
+/// Packages whose fetch state is remembered. Past this, entries with nothing
+/// left to remember go first, then the oldest; forgetting one only costs an
+/// upstream request.
+const MAX_TRACKED: usize = 10_000;
+
+/// Consecutive upstream failures, and when asking again is allowed.
+#[derive(Debug, Default)]
+struct Backoff {
+    failures: u32,
+    until: Option<Instant>,
+}
+
+impl Backoff {
+    fn active(&self, now: Instant) -> bool {
+        self.until.is_some_and(|until| now < until)
+    }
+
+    fn fail(&mut self, now: Instant) {
+        self.failures = self.failures.saturating_add(1);
+        let factor = 1u32 << (self.failures - 1).min(10);
+        self.until = Some(now + (FIRST_BACKOFF * factor).min(MAX_BACKOFF));
+    }
+
+    fn succeed(&mut self) {
+        *self = Self::default();
+    }
+}
+
+/// What the mirror remembers about one package in one feed.
+#[derive(Default)]
+struct IdState {
+    /// When the upstream version list was last fetched *and* worked through.
+    /// A fetch the budget cut short does not count, so the next read carries
+    /// on; an empty list does, which is the negative cache for unknown ids.
+    listed_at: Option<Instant>,
+    /// Upstream failures for this package.
+    backoff: Backoff,
+    /// Versions that failed to mirror, until when.
+    bad_versions: HashMap<String, Instant>,
+    /// The fetch in progress, if any: its number and a receiver that wakes
+    /// when it ends (its sender is dropped).
+    inflight: Option<(u64, watch::Receiver<()>)>,
+    touched: Option<Instant>,
+}
+
+impl IdState {
+    /// Whether nothing about this package needs remembering any more.
+    fn is_idle(&self, now: Instant, refresh: Duration) -> bool {
+        self.inflight.is_none()
+            && !self.backoff.active(now)
+            && self.bad_versions.values().all(|until| *until <= now)
+            && self
+                .listed_at
+                .is_none_or(|at| now.duration_since(at) >= refresh)
+    }
+}
+
+/// Per-package fetch state for one mirror client: when each package was
+/// last listed, which upstream failures to back off from, and which fetches
+/// are running — keyed by (feed, id), so two feeds mirroring the same package
+/// never wait on each other.
+#[derive(Default)]
+struct Tracker {
+    ids: StdMutex<HashMap<(String, String), IdState>>,
+    /// The service index itself failing: backs off every package at once.
+    upstream: StdMutex<Backoff>,
+    next_fetch: std::sync::atomic::AtomicU64,
+}
+
+/// Either this request fetches, or it waits for the one that already is.
+enum Turn<'a> {
+    Lead(FetchGuard<'a>),
+    Wait(watch::Receiver<()>),
+}
+
+/// Held while a request fetches a package. Dropping it — when the fetch
+/// ends, or when the request is cancelled mid-way — wakes every waiter.
+struct FetchGuard<'a> {
+    tracker: &'a Tracker,
+    key: (String, String),
+    fetch: u64,
+    _done: watch::Sender<()>,
+}
+
+impl Drop for FetchGuard<'_> {
+    fn drop(&mut self) {
+        let mut ids = self.tracker.lock();
+        if let Some(state) = ids.get_mut(&self.key) {
+            if state
+                .inflight
+                .as_ref()
+                .is_some_and(|(n, _)| *n == self.fetch)
+            {
+                state.inflight = None;
+            }
+        }
+    }
+}
+
+impl Tracker {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<(String, String), IdState>> {
+        // A panic while holding the lock leaves only fetch bookkeeping behind.
+        self.ids.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn upstream(&self) -> std::sync::MutexGuard<'_, Backoff> {
+        self.upstream.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn with<T>(
+        &self,
+        key: &(String, String),
+        refresh: Duration,
+        f: impl FnOnce(&mut IdState) -> T,
+    ) -> T {
+        let now = Instant::now();
+        let mut ids = self.lock();
+        if !ids.contains_key(key) && ids.len() >= MAX_TRACKED {
+            ids.retain(|_, s| !s.is_idle(now, refresh));
+            if ids.len() >= MAX_TRACKED {
+                let mut by_age: Vec<((String, String), Option<Instant>)> = ids
+                    .iter()
+                    .filter(|(_, s)| s.inflight.is_none())
+                    .map(|(k, s)| (k.clone(), s.touched))
+                    .collect();
+                by_age.sort_by_key(|(_, touched)| *touched);
+                for (k, _) in by_age.into_iter().take(ids.len() + 1 - MAX_TRACKED * 3 / 4) {
+                    ids.remove(&k);
+                }
+            }
+        }
+        let state = ids.entry(key.clone()).or_default();
+        state.touched = Some(now);
+        f(state)
+    }
+
+    /// Take this package's fetch, or join the one in progress.
+    fn turn(&self, key: &(String, String), refresh: Duration) -> Turn<'_> {
+        let fetch = self
+            .next_fetch
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let lead = self.with(key, refresh, |state| {
+            if let Some((_, rx)) = &state.inflight {
+                return Err(rx.clone());
+            }
+            let (tx, rx) = watch::channel(());
+            state.inflight = Some((fetch, rx));
+            Ok(tx)
+        });
+        match lead {
+            Ok(tx) => Turn::Lead(FetchGuard {
+                tracker: self,
+                key: key.clone(),
+                fetch,
+                _done: tx,
+            }),
+            Err(rx) => Turn::Wait(rx),
+        }
+    }
+}
+
+impl MirrorClient {
+    fn key(feed: &str, lower_id: &str) -> (String, String) {
+        (feed.to_string(), lower_id.to_string())
+    }
+
+    /// Whether a read of `id` in `feed` should re-list it upstream: nothing is
+    /// fetching it, the upstream is not being backed off, and its version list
+    /// is older than `refresh_secs` (or was never fetched by this process).
+    pub fn wants_refresh(&self, feed: &str, id: &str) -> bool {
+        self.list_is_stale(feed, &id.to_lowercase(), true)
+    }
+
+    /// Whether the version list of `lower_id` is due to be fetched again;
+    /// with `idle`, also that no fetch of it is running right now.
+    fn list_is_stale(&self, feed: &str, lower_id: &str, idle: bool) -> bool {
+        let now = Instant::now();
+        if self.tracker.upstream().active(now) {
+            return false;
+        }
+        self.tracker
+            .with(&Self::key(feed, lower_id), self.refresh, |state| {
+                (!idle || state.inflight.is_none())
+                    && !state.backoff.active(now)
+                    && state
+                        .listed_at
+                        .is_none_or(|at| now.duration_since(at) >= self.refresh)
+            })
+    }
+}
+
+/// Bring `feed` up to date with the upstream's versions of `id`: list them
+/// (unless that was done within `refresh_secs`) and fetch and index the
+/// newest `max_versions_per_package` the feed does not have. Returns how many
+/// versions were mirrored.
 ///
 /// Best-effort: a failure for one version is logged and skipped so a single bad
-/// package never blocks the rest. Versions already in the feed are left as-is.
+/// package never blocks the rest. Versions already in the feed are left as-is,
+/// and versions deleted from it are never fetched again.
 pub async fn ensure_package(
     client: &MirrorClient,
     storage: &dyn PackageStorage,
@@ -854,92 +1071,292 @@ pub async fn ensure_package(
     id: &str,
     options: &MirrorOptions,
 ) -> Result<usize> {
-    // Only mirror well-formed package ids. This rejects anything (path
-    // traversal, slashes, control characters) that could escape the upstream's
-    // PackageBaseAddress path when interpolated into the request URL.
-    if crate::validation::validate_package_id(id).is_err() {
-        return Ok(0);
+    MirrorTarget {
+        client,
+        storage,
+        db,
+        feed,
+        temp_dir,
+        options,
     }
-    let lower_id = id.to_lowercase();
+    .ensure_package(id)
+    .await
+}
 
-    // One read-through miss per id at a time. Without this, N concurrent
-    // restores of the same missing package each start their own full download
-    // of every upstream version — N times the bandwidth and disk for one
-    // result.
-    //
-    // Declining rather than queueing matters: a fetch can run for minutes, and
-    // a waiter would hold its request open for all of it to obtain a result the
-    // winner is already producing. Losing the race is treated as a plain cache
-    // miss, which is what it is.
-    let Some(_guard) = crate::locks::try_lock_version(&lower_id, "<mirror>") else {
-        tracing::debug!(%feed, id = %lower_id, "mirror fetch already in progress; skipping");
-        return Ok(0);
-    };
+/// A feed a mirror client fills: where fetched packages are stored, indexed
+/// and staged, and how they are admitted.
+pub struct MirrorTarget<'a> {
+    pub client: &'a MirrorClient,
+    pub storage: &'a dyn PackageStorage,
+    pub db: &'a dyn PackageDatabase,
+    pub feed: &'a str,
+    /// Where downloads are staged: on the package store's filesystem, so
+    /// indexing can move them into place with a rename.
+    pub temp_dir: &'a Path,
+    pub options: &'a MirrorOptions,
+}
 
-    let versions = client.upstream_versions(&lower_id).await?;
-    let mut versions: Vec<NuGetVersion> = versions
-        .iter()
-        .filter_map(|raw| NuGetVersion::parse(raw).ok())
-        .collect();
-    // Newest first, so a bounded fetch keeps the versions clients actually want.
-    versions.sort_by(|a, b| b.cmp(a));
-    let considered = versions.len();
-    if let Some(max) = client.max_versions_per_package() {
-        versions.truncate(max);
+impl MirrorTarget<'_> {
+    /// See [`ensure_package`].
+    pub async fn ensure_package(&self, id: &str) -> Result<usize> {
+        self.ensure(id, None).await
     }
-    if versions.len() < considered {
-        tracing::info!(
-            %feed, id = %lower_id, considered, fetching = versions.len(),
-            "limiting mirrored versions (mirror.max_versions_per_package)"
-        );
-    }
-    let mut mirrored = 0;
-    let deadline = tokio::time::Instant::now() + MIRROR_BUDGET;
 
-    for version in versions {
-        // Skip versions the feed already exposes, and those removed from it
-        // on purpose (when the check itself fails, assume removed).
-        if db.exists(feed, &lower_id, &version).await.unwrap_or(false)
+    /// Fetch one version a client asked for and the feed does not have —
+    /// whether or not it is among the newest `max_versions_per_package`, since
+    /// a project pinned to an older version would otherwise never restore.
+    /// Returns 1 when it was mirrored.
+    pub async fn ensure_version(&self, id: &str, version: &NuGetVersion) -> Result<usize> {
+        self.ensure(id, Some(version)).await
+    }
+
+    async fn ensure(&self, id: &str, want: Option<&NuGetVersion>) -> Result<usize> {
+        // Only mirror well-formed package ids. This rejects anything (path
+        // traversal, slashes, control characters) that could escape the
+        // upstream's PackageBaseAddress path when interpolated into the
+        // request URL.
+        if crate::validation::validate_package_id(id).is_err() {
+            return Ok(0);
+        }
+        let client = self.client;
+        let lower_id = id.to_lowercase();
+        let key = MirrorClient::key(self.feed, &lower_id);
+
+        // One fetch per package and feed at a time. Without this, N concurrent
+        // restores of the same missing package each start their own download
+        // of every upstream version — N times the bandwidth and disk for one
+        // result. The others wait for it, a bounded while, and then answer
+        // from what it stored: answering 404 at once failed every restore
+        // that happened to lose the race for a package just being fetched.
+        let give_up = Instant::now() + WAIT_FOR_FETCH;
+        let _fetching = loop {
+            match client.tracker.turn(&key, client.refresh) {
+                Turn::Lead(guard) => break guard,
+                Turn::Wait(mut done) => {
+                    let left = give_up.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        return Ok(0);
+                    }
+                    let _ = tokio::time::timeout(left, done.changed()).await;
+                    // Whatever that fetch did, a listing waiter is served
+                    // unless the list is still stale. A version waiter may
+                    // need a fetch of its own: the one it waited on may have
+                    // been for another version, or the newest few only.
+                    let satisfied = match want {
+                        None => !client.list_is_stale(self.feed, &lower_id, false),
+                        Some(v) => self
+                            .db
+                            .exists(self.feed, &lower_id, v)
+                            .await
+                            .unwrap_or(false),
+                    };
+                    if satisfied || Instant::now() >= give_up {
+                        return Ok(0);
+                    }
+                }
+            }
+        };
+
+        match want {
+            Some(version) => self.fetch_requested(&lower_id, version).await,
+            None => self.fetch_listing(&lower_id).await,
+        }
+    }
+
+    /// Whether `version` should be fetched: the feed lacks it, it was not
+    /// deleted from the feed, and it did not just fail. A database error
+    /// counts as "no" — a mirror that cannot tell must not re-add a version
+    /// that may have been deleted.
+    async fn wanted(&self, lower_id: &str, version: &NuGetVersion) -> bool {
+        let (db, feed) = (self.db, self.feed);
+        if db.exists(feed, lower_id, version).await.unwrap_or(true)
             || db
-                .is_tombstoned(feed, &lower_id, &version)
+                .is_tombstoned(feed, lower_id, version)
                 .await
                 .unwrap_or(true)
         {
-            continue;
+            return false;
         }
-        if tokio::time::Instant::now() >= deadline {
-            tracing::info!(
-                %feed,
-                id = %lower_id,
-                mirrored,
-                "mirror budget spent; the rest of this package's versions will \
-                 be fetched on a later request"
-            );
-            break;
-        }
-
+        let now = Instant::now();
         let normalized = version.normalized().to_lowercase();
-        let temp_path = temp_dir.join(format!("mirror-{}.tmp", uuid::Uuid::new_v4()));
-        let summary = match client
-            .download_nupkg(&lower_id, &normalized, &temp_path)
+        self.client.tracker.with(
+            &MirrorClient::key(feed, lower_id),
+            self.client.refresh,
+            |state| {
+                state
+                    .bad_versions
+                    .get(&normalized)
+                    .is_none_or(|until| *until <= now)
+            },
+        )
+    }
+
+    fn remember_bad(&self, lower_id: &str, version: &NuGetVersion) {
+        let until = Instant::now() + BAD_VERSION_RETRY;
+        let normalized = version.normalized().to_lowercase();
+        self.client.tracker.with(
+            &MirrorClient::key(self.feed, lower_id),
+            self.client.refresh,
+            |state| {
+                state.bad_versions.retain(|_, u| *u > Instant::now());
+                state.bad_versions.insert(normalized, until);
+            },
+        );
+    }
+
+    fn backing_off(&self, lower_id: &str) -> bool {
+        let now = Instant::now();
+        let client = self.client;
+        client.tracker.upstream().active(now)
+            || client.tracker.with(
+                &MirrorClient::key(self.feed, lower_id),
+                client.refresh,
+                |state| state.backoff.active(now),
+            )
+    }
+
+    fn record_upstream(&self, lower_id: &str, ok: bool) {
+        let now = Instant::now();
+        self.client.tracker.with(
+            &MirrorClient::key(self.feed, lower_id),
+            self.client.refresh,
+            |state| {
+                if ok {
+                    state.backoff.succeed();
+                } else {
+                    state.backoff.fail(now);
+                }
+            },
+        );
+    }
+
+    /// The service index, or an error that backs off every package: when it
+    /// cannot be read, nothing else can be either.
+    async fn resources_ready(&self) -> Result<()> {
+        match self.client.resources().await {
+            Ok(_) => {
+                self.client.tracker.upstream().succeed();
+                Ok(())
+            }
+            Err(e) => {
+                self.client.tracker.upstream().fail(Instant::now());
+                Err(e)
+            }
+        }
+    }
+
+    async fn fetch_requested(&self, lower_id: &str, version: &NuGetVersion) -> Result<usize> {
+        if self.backing_off(lower_id) || !self.wanted(lower_id, version).await {
+            return Ok(0);
+        }
+        self.resources_ready().await?;
+        match self.fetch_one(lower_id, version).await {
+            Fetched::Mirrored => Ok(1),
+            Fetched::NotMirrored => Ok(0),
+            Fetched::DownloadFailed(e) => {
+                // It may be this version, or the upstream: back off both.
+                self.record_upstream(lower_id, false);
+                Err(e)
+            }
+        }
+    }
+
+    async fn fetch_listing(&self, lower_id: &str) -> Result<usize> {
+        let client = self.client;
+        let feed = self.feed;
+        // This request holds the fetch, so only the list's age matters.
+        if self.backing_off(lower_id) || !client.list_is_stale(feed, lower_id, false) {
+            return Ok(0);
+        }
+        self.resources_ready().await?;
+        let listed = client.upstream_versions(lower_id).await;
+        self.record_upstream(lower_id, listed.is_ok());
+        let mut versions: Vec<NuGetVersion> = listed?
+            .iter()
+            .filter_map(|raw| NuGetVersion::parse(raw).ok())
+            .collect();
+        // Newest first, so a bounded fetch keeps the versions clients actually want.
+        versions.sort_by(|a, b| b.cmp(a));
+        let considered = versions.len();
+        if let Some(max) = client.max_versions_per_package() {
+            versions.truncate(max);
+        }
+        if versions.len() < considered {
+            tracing::debug!(
+                %feed, id = %lower_id, considered, fetching = versions.len(),
+                "limiting mirrored versions (mirror.max_versions_per_package)"
+            );
+        }
+        let mut mirrored = 0;
+        let deadline = Instant::now() + MIRROR_BUDGET;
+        let mut complete = true;
+
+        for version in versions {
+            if !self.wanted(lower_id, &version).await {
+                continue;
+            }
+            if Instant::now() >= deadline {
+                tracing::info!(
+                    %feed,
+                    id = %lower_id,
+                    mirrored,
+                    "mirror budget spent; the rest of this package's versions will \
+                     be fetched on a later request"
+                );
+                complete = false;
+                break;
+            }
+            match self.fetch_one(lower_id, &version).await {
+                Fetched::Mirrored => mirrored += 1,
+                Fetched::NotMirrored => {}
+                Fetched::DownloadFailed(e) => {
+                    tracing::warn!(%feed, id = %lower_id, version = %version.normalized(), error = %e, "mirror download failed");
+                }
+            }
+        }
+        if complete {
+            client.tracker.with(
+                &MirrorClient::key(feed, lower_id),
+                client.refresh,
+                |state| {
+                    state.listed_at = Some(Instant::now());
+                },
+            );
+        }
+        Ok(mirrored)
+    }
+
+    /// Download and index one version. Every failure but the download itself
+    /// is logged here; a version that failed is not asked for again for a
+    /// while, so a broken one cannot turn each read into a fresh download.
+    async fn fetch_one(&self, lower_id: &str, version: &NuGetVersion) -> Fetched {
+        let (feed, options) = (self.feed, self.options);
+        let normalized = version.normalized().to_lowercase();
+        let temp_path = self
+            .temp_dir
+            .join(format!("mirror-{}.tmp", uuid::Uuid::new_v4()));
+        let summary = match self
+            .client
+            .download_nupkg(lower_id, &normalized, &temp_path)
             .await
         {
             Ok(summary) => summary,
             Err(e) => {
-                tracing::warn!(%feed, id = %lower_id, version = %normalized, error = %e, "mirror download failed");
                 let _ = tokio::fs::remove_file(&temp_path).await;
-                continue;
+                self.remember_bad(lower_id, version);
+                return Fetched::DownloadFailed(e);
             }
         };
 
         // A delete may have landed while the download ran.
-        if db
-            .is_tombstoned(feed, &lower_id, &version)
+        if self
+            .db
+            .is_tombstoned(feed, lower_id, version)
             .await
             .unwrap_or(true)
         {
             let _ = tokio::fs::remove_file(&temp_path).await;
-            continue;
+            return Fetched::NotMirrored;
         }
 
         let opts = IndexOptions {
@@ -951,23 +1368,42 @@ pub async fn ensure_package(
             // request for an obscure id with a manifest claiming a popular one,
             // and it lands in the local feed under that trusted name.
             expect: Some(crate::indexing::ExpectedIdentity {
-                id: lower_id.clone(),
+                id: lower_id.to_string(),
                 version: version.clone(),
             }),
         };
-        match indexing::index_package(storage, db, feed, temp_path, summary, &opts).await {
+        match indexing::index_package(self.storage, self.db, feed, temp_path, summary, &opts).await
+        {
             Ok(_) => {
-                mirrored += 1;
                 tracing::info!(%feed, id = %lower_id, version = %normalized, pending = options.requires_approval, "mirrored package");
+                Fetched::Mirrored
             }
-            // A concurrent request may have mirrored it first — not an error.
-            Err(Error::PackageAlreadyExists) => {}
+            // A concurrent fetch in another feed, or a push, got there first.
+            Err(Error::PackageAlreadyExists)
+                if self
+                    .db
+                    .exists(feed, lower_id, version)
+                    .await
+                    .unwrap_or(false) =>
+            {
+                Fetched::NotMirrored
+            }
             Err(e) => {
-                tracing::warn!(%feed, id = %lower_id, version = %normalized, error = %e, "mirror index failed")
+                tracing::warn!(%feed, id = %lower_id, version = %normalized, error = %e, "mirror index failed");
+                self.remember_bad(lower_id, version);
+                Fetched::NotMirrored
             }
         }
     }
-    Ok(mirrored)
+}
+
+/// How fetching one version went.
+enum Fetched {
+    Mirrored,
+    /// Present already, deleted meanwhile, or refused (and logged).
+    NotMirrored,
+    /// The download failed; the caller decides how loudly.
+    DownloadFailed(Error),
 }
 
 fn find_resource(index: &serde_json::Value, ty: &str) -> Option<String> {
@@ -1415,6 +1851,57 @@ mod tests {
             "https://cdn.example/a.nupkg?redacted"
         );
         assert_eq!(redact_url("not a url with a token"), "<unparseable url>");
+    }
+
+    #[test]
+    fn backoff_doubles_up_to_a_cap_and_resets_on_success() {
+        let now = Instant::now();
+        let mut backoff = Backoff::default();
+        assert!(!backoff.active(now));
+        backoff.fail(now);
+        assert_eq!(backoff.until, Some(now + FIRST_BACKOFF));
+        backoff.fail(now);
+        assert_eq!(backoff.until, Some(now + FIRST_BACKOFF * 2));
+        for _ in 0..40 {
+            backoff.fail(now);
+        }
+        assert_eq!(backoff.until, Some(now + MAX_BACKOFF));
+        assert!(backoff.active(now));
+        backoff.succeed();
+        assert!(!backoff.active(now));
+    }
+
+    #[test]
+    fn the_fetch_tracker_stays_bounded() {
+        // Every unknown id an anonymous client names gets an entry (that is
+        // the negative cache); the map must not grow without end.
+        let tracker = Tracker::default();
+        let refresh = Duration::from_secs(600);
+        for i in 0..MAX_TRACKED * 2 {
+            tracker.with(&("feed".into(), format!("pkg.{i}")), refresh, |s| {
+                s.listed_at = Some(Instant::now());
+            });
+        }
+        assert!(tracker.lock().len() <= MAX_TRACKED);
+    }
+
+    #[test]
+    fn only_one_fetch_per_package_and_feed_runs_at_once() {
+        let tracker = Tracker::default();
+        let refresh = Duration::from_secs(600);
+        let a = ("a".to_string(), "pkg".to_string());
+        let b = ("b".to_string(), "pkg".to_string());
+        let Turn::Lead(first) = tracker.turn(&a, refresh) else {
+            panic!("the first fetch leads");
+        };
+        let Turn::Wait(waiting) = tracker.turn(&a, refresh) else {
+            panic!("a second fetch of the same package waits");
+        };
+        // Another feed mirroring the same id does not wait on this one.
+        assert!(matches!(tracker.turn(&b, refresh), Turn::Lead(_)));
+        drop(first);
+        assert!(waiting.has_changed().is_err(), "the waiter is woken");
+        assert!(matches!(tracker.turn(&a, refresh), Turn::Lead(_)));
     }
 
     #[tokio::test]

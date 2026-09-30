@@ -9,9 +9,14 @@ use std::sync::{Arc, Mutex};
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
-use yanuget::config::{Config, FeedConfig, MirrorAuthConfig, MirrorConfig};
-use yanuget::database::SqliteDatabase;
+use futures::StreamExt;
+use yanuget::config::{
+    Config, FeedConfig, LicensePolicyConfig, MirrorAuthConfig, MirrorConfig, PolicyAction,
+};
+use yanuget::database::{Membership, PackageDatabase, SqliteDatabase};
+use yanuget::mirror::MirrorOptions;
 use yanuget::storage::FilesystemStorage;
+use yanuget::version::NuGetVersion;
 use yanuget::web::{self, AppState, FeedMeta};
 use zip::write::SimpleFileOptions;
 
@@ -71,6 +76,13 @@ struct Behaviour {
     package_base: Option<String>,
     /// Answer every `.nupkg` request with a 302 to this base plus the path.
     redirect_downloads: Option<String>,
+    /// Answer version lists with a 500, as an upstream in an outage does.
+    fail_listing: bool,
+    /// Hold every `.nupkg` response this long before answering.
+    download_delay: Option<std::time::Duration>,
+    /// Send every `.nupkg` body in four pieces with this pause between them:
+    /// steady, but slow.
+    trickle: Option<std::time::Duration>,
 }
 
 struct UpstreamState {
@@ -181,6 +193,14 @@ impl Upstream {
     fn seen(&self) -> Vec<Seen> {
         self.state.seen.lock().unwrap().clone()
     }
+
+    /// How many requests went to a path ending in `suffix`.
+    fn hits(&self, suffix: &str) -> usize {
+        self.seen()
+            .iter()
+            .filter(|s| s.path.ends_with(suffix))
+            .count()
+    }
 }
 
 async fn handle(State(state): State<Arc<UpstreamState>>, uri: Uri, headers: HeaderMap) -> Response {
@@ -196,6 +216,41 @@ async fn handle(State(state): State<Arc<UpstreamState>>, uri: Uri, headers: Head
         authorization: header("authorization"),
         feed_key: header("x-feed-key"),
     });
+    let (delay, trickle) = if path.ends_with(".nupkg") {
+        let b = state.behaviour.lock().unwrap();
+        (b.download_delay, b.trickle)
+    } else {
+        (None, None)
+    };
+    if let Some(delay) = delay {
+        tokio::time::sleep(delay).await;
+    }
+    let response = respond(&state, &uri);
+    match trickle {
+        Some(pause) if response.status().is_success() => {
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let len = body.len();
+            let pieces: Vec<axum::body::Bytes> = body
+                .chunks(len.div_ceil(4))
+                .map(axum::body::Bytes::copy_from_slice)
+                .collect();
+            let stream = futures::stream::iter(pieces).then(move |piece| async move {
+                tokio::time::sleep(pause).await;
+                Ok::<_, std::io::Error>(piece)
+            });
+            Response::builder()
+                .header("content-length", len)
+                .body(axum::body::Body::from_stream(stream))
+                .unwrap()
+        }
+        _ => response,
+    }
+}
+
+fn respond(state: &UpstreamState, uri: &Uri) -> Response {
+    let path = uri.path();
     let behaviour = state.behaviour.lock().unwrap();
     let base = &state.base;
 
@@ -238,6 +293,9 @@ async fn handle(State(state): State<Arc<UpstreamState>>, uri: Uri, headers: Head
     };
     let parts: Vec<&str> = rest.split('/').collect();
     match parts.as_slice() {
+        [_, "index.json"] if behaviour.fail_listing => {
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
         [id, "index.json"] => match behaviour.packages.get(*id) {
             Some(versions) => {
                 let listed: Vec<String> = versions.iter().map(|(v, _)| v.to_lowercase()).collect();
@@ -667,4 +725,268 @@ async fn migrate_holds_downloads_to_the_disk_reserve() {
         "{:?}",
         summary.failures
     );
+}
+
+// ---------------------------------------------------------------------------
+// Read-through
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_package_is_read_through_once_and_then_served_locally() {
+    let upstream = Upstream::start().await;
+    upstream.publish("Happy.Pkg", "1.0.0");
+    upstream.publish("Happy.Pkg", "2.0.0-beta.1");
+    let server = spawn_mirror(&upstream, |_| {}).await;
+
+    assert_eq!(
+        server.versions("happy.pkg").await.unwrap(),
+        ["1.0.0", "2.0.0-beta.1"]
+    );
+    let registration = server.get("/v3/registration/happy.pkg/index.json").await;
+    assert!(registration.status().is_success());
+
+    let body = server.download("happy.pkg", "1.0.0").await;
+    assert!(body.status().is_success());
+    assert_eq!(
+        body.bytes().await.unwrap().as_ref(),
+        build_nupkg("Happy.Pkg", "1.0.0").as_slice()
+    );
+    // Served from the local copy: each version was downloaded once.
+    server.download("happy.pkg", "1.0.0").await;
+    assert_eq!(upstream.hits("happy.pkg.1.0.0.nupkg"), 1);
+    assert_eq!(upstream.hits("/flat/happy.pkg/index.json"), 1);
+}
+
+#[tokio::test]
+async fn a_pinned_older_version_is_fetched_outside_the_newest_n() {
+    // Only the newest versions are fetched on a listing; a client restoring
+    // an older one used to get a 404 forever.
+    let upstream = Upstream::start().await;
+    for v in ["1.0.0", "2.0.0", "3.0.0", "4.0.0"] {
+        upstream.publish("Pinned.Pkg", v);
+    }
+    let server = spawn_mirror(&upstream, |f| {
+        f.mirror.max_versions_per_package = Some(2);
+    })
+    .await;
+    assert_eq!(
+        server.versions("pinned.pkg").await.unwrap(),
+        ["3.0.0", "4.0.0"]
+    );
+    let old = server.download("pinned.pkg", "1.0.0").await;
+    assert!(old.status().is_success(), "{}", old.status());
+    assert_eq!(upstream.hits("pinned.pkg.2.0.0.nupkg"), 0);
+}
+
+#[tokio::test]
+async fn new_upstream_releases_appear_once_the_list_is_stale() {
+    let upstream = Upstream::start().await;
+    upstream.publish("Fresh.Pkg", "1.0.0");
+
+    // Within `refresh_secs` the local list stands: no upstream request.
+    let cached = spawn_mirror(&upstream, |_| {}).await;
+    assert_eq!(cached.versions("fresh.pkg").await.unwrap(), ["1.0.0"]);
+    upstream.publish("Fresh.Pkg", "2.0.0");
+    assert_eq!(cached.versions("fresh.pkg").await.unwrap(), ["1.0.0"]);
+    assert_eq!(upstream.hits("/flat/fresh.pkg/index.json"), 1);
+
+    // Once it is stale, a read re-lists in the background, and the new
+    // release shows up without anyone deleting anything.
+    let refreshing = spawn_mirror(&upstream, |f| f.mirror.refresh_secs = 0).await;
+    assert_eq!(
+        refreshing.versions("fresh.pkg").await.unwrap(),
+        ["1.0.0", "2.0.0"]
+    );
+    upstream.publish("Fresh.Pkg", "3.0.0");
+    let mut seen = Vec::new();
+    for _ in 0..100 {
+        seen = refreshing.versions("fresh.pkg").await.unwrap();
+        if seen.len() == 3 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(seen, ["1.0.0", "2.0.0", "3.0.0"]);
+}
+
+#[tokio::test]
+async fn an_id_the_upstream_lacks_is_not_asked_for_on_every_read() {
+    let upstream = Upstream::start().await;
+    let server = spawn_mirror(&upstream, |_| {}).await;
+    for _ in 0..3 {
+        assert!(server.versions("no.such.pkg").await.is_none());
+    }
+    assert_eq!(upstream.hits("/flat/no.such.pkg/index.json"), 1);
+}
+
+#[tokio::test]
+async fn a_failing_upstream_is_backed_off() {
+    let upstream = Upstream::start().await;
+    upstream.publish("Down.Pkg", "1.0.0");
+    upstream.behave(|b| b.fail_listing = true);
+    let server = spawn_mirror(&upstream, |_| {}).await;
+    for _ in 0..3 {
+        assert!(server.versions("down.pkg").await.is_none());
+    }
+    assert_eq!(upstream.hits("/flat/down.pkg/index.json"), 1);
+}
+
+#[tokio::test]
+async fn concurrent_misses_wait_for_one_fetch_instead_of_failing() {
+    // Two restores of a package being fetched used to give the loser an
+    // immediate 404.
+    let upstream = Upstream::start().await;
+    upstream.publish("Busy.Pkg", "1.0.0");
+    upstream.behave(|b| b.download_delay = Some(std::time::Duration::from_millis(400)));
+    let server = Arc::new(spawn_mirror(&upstream, |_| {}).await);
+    let requests: Vec<_> = (0..4)
+        .map(|_| {
+            let server = server.clone();
+            tokio::spawn(async move { server.versions("busy.pkg").await })
+        })
+        .collect();
+    for request in requests {
+        assert_eq!(request.await.unwrap().unwrap(), ["1.0.0"]);
+    }
+    assert_eq!(upstream.hits("busy.pkg.1.0.0.nupkg"), 1);
+}
+
+#[tokio::test]
+async fn a_large_download_is_not_held_to_the_metadata_timeout() {
+    // `timeout_secs` bounds metadata requests and silences; the whole
+    // download has a deadline of its own, generous by default.
+    let upstream = Upstream::start().await;
+    upstream.publish("Slow.Pkg", "1.0.0");
+    // Four pieces 600 ms apart: 2.4 s in all, no silence near the 1 s timeout.
+    upstream.behave(|b| b.trickle = Some(std::time::Duration::from_millis(600)));
+    let server = spawn_mirror(&upstream, |f| f.mirror.timeout_secs = 1).await;
+    let resp = server.download("slow.pkg", "1.0.0").await;
+    assert!(resp.status().is_success(), "{}", resp.status());
+}
+
+// ---------------------------------------------------------------------------
+// What the mirror admits
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_package_that_is_not_what_was_asked_for_is_refused() {
+    // A hostile upstream answering a request for one id with a manifest that
+    // claims another would otherwise publish it under that trusted name.
+    let upstream = Upstream::start().await;
+    upstream.serve("Wanted.Pkg", "1.0.0", build_nupkg("Trusted.Pkg", "1.0.0"));
+    upstream.serve("Wanted.Pkg", "2.0.0", build_nupkg("Wanted.Pkg", "9.9.9"));
+    let server = spawn_mirror(&upstream, |_| {}).await;
+
+    assert!(server.versions("wanted.pkg").await.is_none());
+    assert_eq!(
+        server.download("wanted.pkg", "1.0.0").await.status(),
+        StatusCode::NOT_FOUND
+    );
+    // Nothing landed under the name the manifest claimed either.
+    assert!(server.versions("trusted.pkg").await.is_none());
+    // And a refused version is not downloaded again on the next read.
+    let before = upstream.hits("wanted.pkg.1.0.0.nupkg");
+    server.download("wanted.pkg", "1.0.0").await;
+    assert_eq!(upstream.hits("wanted.pkg.1.0.0.nupkg"), before);
+}
+
+/// A local package store and database a mirror client fills directly.
+struct Local {
+    storage: FilesystemStorage,
+    db: SqliteDatabase,
+    temp: std::path::PathBuf,
+    _dir: tempfile::TempDir,
+}
+
+async fn local_feed() -> Local {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = FilesystemStorage::new(dir.path().join("packages"))
+        .await
+        .unwrap();
+    let temp = dir.path().join("packages").join(".mirror");
+    std::fs::create_dir_all(&temp).unwrap();
+    Local {
+        storage,
+        db: SqliteDatabase::in_memory().await.unwrap(),
+        temp,
+        _dir: dir,
+    }
+}
+
+impl Local {
+    async fn mirror(&self, upstream: &Upstream, id: &str, options: MirrorOptions) -> usize {
+        let client = yanuget::mirror::MirrorClient::from_config(&mirror_config(upstream)).unwrap();
+        yanuget::mirror::ensure_package(
+            &client,
+            &self.storage,
+            &self.db,
+            "mirror",
+            &self.temp,
+            id,
+            &options,
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn membership(&self, id: &str, version: &str) -> Option<Membership> {
+        let v = NuGetVersion::parse(version).unwrap();
+        self.db.get_membership("mirror", id, &v).await.unwrap()
+    }
+}
+
+#[tokio::test]
+async fn mirrored_versions_wait_for_approval_on_a_gated_feed() {
+    let upstream = Upstream::start().await;
+    upstream.publish("Gated.Pkg", "1.0.0");
+    let local = local_feed().await;
+    let options = MirrorOptions {
+        requires_approval: true,
+        ..Default::default()
+    };
+    assert_eq!(local.mirror(&upstream, "Gated.Pkg", options).await, 1);
+    let membership = local.membership("gated.pkg", "1.0.0").await.unwrap();
+    assert!(membership.pending);
+    let v = NuGetVersion::parse("1.0.0").unwrap();
+    assert!(!local
+        .db
+        .is_servable("mirror", "gated.pkg", &v)
+        .await
+        .unwrap());
+}
+
+#[tokio::test]
+async fn the_feeds_license_policy_applies_to_mirrored_versions() {
+    let upstream = Upstream::start().await;
+    let gpl = r#"<license type="expression">GPL-3.0-only</license>"#;
+    upstream.serve(
+        "Copyleft.Pkg",
+        "1.0.0",
+        build_nupkg_with("Copyleft.Pkg", "1.0.0", gpl),
+    );
+    let local = local_feed().await;
+    let policy = |action| LicensePolicyConfig {
+        enabled: true,
+        blocked: vec!["GPL-3.0-only".into()],
+        action,
+        ..Default::default()
+    };
+
+    // Blocked: never admitted.
+    let blocking = MirrorOptions {
+        license_policy: policy(PolicyAction::Block),
+        ..Default::default()
+    };
+    assert_eq!(local.mirror(&upstream, "Copyleft.Pkg", blocking).await, 0);
+    assert!(local.membership("copyleft.pkg", "1.0.0").await.is_none());
+
+    // Warn: admitted, and flagged for the admin.
+    let other = local_feed().await;
+    let warning = MirrorOptions {
+        license_policy: policy(PolicyAction::Warn),
+        ..Default::default()
+    };
+    assert_eq!(other.mirror(&upstream, "Copyleft.Pkg", warning).await, 1);
+    let membership = other.membership("copyleft.pkg", "1.0.0").await.unwrap();
+    assert!(membership.flagged, "{membership:?}");
 }

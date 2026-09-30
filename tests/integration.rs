@@ -3236,6 +3236,7 @@ async fn read_through_mirror_still_gives_up_on_a_slow_download() {
         enabled: true,
         upstream,
         timeout_secs: 1,
+        download_timeout_secs: 1,
         allow_private_upstream: true,
         ..Default::default()
     })

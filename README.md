@@ -426,9 +426,11 @@ requires_approval = true        # versions are pending until approved
 A feed with `[feeds.mirror] enabled = true` becomes a read-through cache:
 on a request for a package it does not have, YANuget fetches that package's
 versions from the upstream V3 feed (default `https://api.nuget.org/v3/index.json`),
-streams each `.nupkg` to disk and indexes it locally. Mirrored versions honour
-the feed's `requires_approval` gate and `license_policy`. Mirroring is
-best-effort: an upstream outage degrades to a normal cache miss.
+streams each `.nupkg` to disk and indexes it locally, and re-lists it every
+`refresh_secs` so new upstream releases appear. Mirrored versions honour
+the feed's `requires_approval` gate and `license_policy`, and a version deleted
+from the feed is not fetched back. Mirroring is best-effort: an upstream outage
+degrades to a normal cache miss.
 
 ### Bulk migration
 

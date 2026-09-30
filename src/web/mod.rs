@@ -267,16 +267,19 @@ impl AppState {
         }
     }
 
+    fn mirror_options(&self) -> MirrorOptions {
+        MirrorOptions {
+            requires_approval: self.feed.requires_approval,
+            license_policy: self.feed.license_policy.clone(),
+        }
+    }
+
     /// Best-effort read-through mirror: when the feed has an upstream and a
     /// lookup missed, fetch the package's versions and index them. Errors are
     /// logged, never surfaced — a mirror outage degrades to a normal miss.
     async fn mirror_if_needed(&self, id: &str) {
         let Some(client) = &self.feed.mirror else {
             return;
-        };
-        let options = MirrorOptions {
-            requires_approval: self.feed.requires_approval,
-            license_policy: self.feed.license_policy.clone(),
         };
         if let Err(e) = mirror::ensure_package(
             client,
@@ -285,11 +288,44 @@ impl AppState {
             self.feed(),
             &self.temp_dir,
             id,
-            &options,
+            &self.mirror_options(),
         )
         .await
         {
             tracing::warn!(feed = %self.feed(), id, error = %e, "mirror lookup failed");
+        }
+    }
+
+    /// A package the feed already holds: re-list it upstream in the
+    /// background once its list is older than `refresh_secs`, so new releases
+    /// appear without the read that noticed waiting for them.
+    fn mirror_refresh(&self, id: &str) {
+        let Some(client) = &self.feed.mirror else {
+            return;
+        };
+        if !client.wants_refresh(self.feed(), id) {
+            return;
+        }
+        let (state, id) = (self.clone(), id.to_string());
+        tokio::spawn(async move { state.mirror_if_needed(&id).await });
+    }
+
+    /// A download of a version the feed does not have: fetch that version,
+    /// whether or not it is among the newest the listing keeps.
+    async fn mirror_version(&self, id: &str, version: &NuGetVersion) {
+        let Some(client) = &self.feed.mirror else {
+            return;
+        };
+        let target = mirror::MirrorTarget {
+            client,
+            storage: self.storage.as_ref(),
+            db: self.db.as_ref(),
+            feed: self.feed(),
+            temp_dir: &self.temp_dir,
+            options: &self.mirror_options(),
+        };
+        if let Err(e) = target.ensure_version(id, version).await {
+            tracing::warn!(feed = %self.feed(), id, version = %version.normalized(), error = %e, "mirror fetch failed");
         }
     }
 }
@@ -1066,6 +1102,8 @@ async fn package_versions(
             .db
             .find_versions(state.feed(), &id, INCLUDE_UNLISTED)
             .await?;
+    } else {
+        state.mirror_refresh(&id);
     }
     if packages.is_empty() {
         return Err(Error::PackageNotFound);
@@ -1090,7 +1128,7 @@ async fn download_package(
     // Admin-disabled / pending versions are withheld from clients entirely.
     // On a miss, attempt a read-through mirror before giving up.
     if !state.db.is_servable(state.feed(), &id, &version).await? {
-        state.mirror_if_needed(&id).await;
+        state.mirror_version(&id, &version).await;
         if !state.db.is_servable(state.feed(), &id, &version).await? {
             return Err(Error::PackageNotFound);
         }
@@ -1210,6 +1248,8 @@ async fn registration_index_for(
     if packages.is_empty() {
         state.mirror_if_needed(id).await;
         packages = state.db.find_versions(state.feed(), id, true).await?;
+    } else {
+        state.mirror_refresh(id);
     }
     if packages.is_empty() {
         return Err(Error::PackageNotFound);

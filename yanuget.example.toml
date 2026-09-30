@@ -209,7 +209,11 @@ inbox_scan_secs = 30                # YANUGET_FILES_INBOX_SCAN_SECS
 #   [feeds.mirror]              # read-through cache of an upstream V3 feed
 #   enabled = true
 #   upstream = "https://api.nuget.org/v3/index.json"
-#   timeout_secs = 30
+#   timeout_secs = 30              # connect, silence, and each metadata request
+#   download_timeout_secs = 3600   # one whole .nupkg download; 0 = no deadline
+#   # How long a package's upstream version list is trusted before a read lists
+#   # it again (and how long an id the upstream lacks is not asked for again).
+#   refresh_secs = 600
 #   # A mirror fetch is triggered by an ordinary (possibly anonymous) read, so
 #   # it is bounded by default: at most this many versions of one package per
 #   # miss, newest first. Set to a large number, or omit, to fetch everything.

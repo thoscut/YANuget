@@ -456,6 +456,10 @@ fn build_source_config(args: &MigrateArgs) -> MirrorConfig {
         enabled: true,
         upstream: args.source.clone(),
         timeout_secs: args.timeout_secs,
+        // A migration downloads without a whole-transfer deadline, and does
+        // not use the read-through mirror's refresh bookkeeping.
+        download_timeout_secs: 0,
+        refresh_secs: 0,
         auth: MirrorAuthConfig {
             username: args.source_username.clone(),
             password: args.source_password.clone(),

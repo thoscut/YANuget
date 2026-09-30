@@ -329,8 +329,17 @@ pub struct MirrorConfig {
     pub enabled: bool,
     /// Upstream V3 service index to mirror from.
     pub upstream: String,
-    /// Per-request timeout (seconds) when talking to the upstream.
+    /// Timeout (seconds) for connecting to the upstream, for any silence while
+    /// it answers, and for a whole metadata request.
     pub timeout_secs: u64,
+    /// Deadline (seconds) for one whole `.nupkg` download; `0` removes it. A
+    /// stalled transfer is cut off by `timeout_secs` either way; this bounds
+    /// one that trickles.
+    pub download_timeout_secs: u64,
+    /// How long (seconds) a package's upstream version list is trusted before
+    /// a read lists it again, so new upstream releases appear. It is also how
+    /// long an id the upstream does not have is not asked for again.
+    pub refresh_secs: u64,
     /// Credentials for an authenticated upstream feed (default: none).
     pub auth: MirrorAuthConfig,
     /// Allow upstream URLs that point at loopback/link-local/private addresses.
@@ -375,6 +384,8 @@ impl std::fmt::Debug for MirrorConfig {
             .field("enabled", &self.enabled)
             .field("upstream", &redact(&self.upstream))
             .field("timeout_secs", &self.timeout_secs)
+            .field("download_timeout_secs", &self.download_timeout_secs)
+            .field("refresh_secs", &self.refresh_secs)
             .field("auth", &self.auth)
             .field("allow_private_upstream", &self.allow_private_upstream)
             .field("max_package_size_bytes", &self.max_package_size_bytes)
@@ -391,6 +402,8 @@ impl Default for MirrorConfig {
             enabled: false,
             upstream: "https://api.nuget.org/v3/index.json".to_string(),
             timeout_secs: 30,
+            download_timeout_secs: 3600,
+            refresh_secs: 600,
             auth: MirrorAuthConfig::default(),
             allow_private_upstream: false,
             max_package_size_bytes: None,

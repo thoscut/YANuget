@@ -222,7 +222,9 @@ deleted only when the **last** feed referencing it lets go.
 | `feeds[].promotes_to` | string | *(none)* | Next release ring (must name another feed). |
 | `feeds[].mirror.enabled` | bool | `false` | Read-through cache of an upstream V3 feed. |
 | `feeds[].mirror.upstream` | string | `https://api.nuget.org/v3/index.json` | Upstream service index. |
-| `feeds[].mirror.timeout_secs` | int | `30` | Per-request upstream timeout. |
+| `feeds[].mirror.timeout_secs` | int | `30` | Connect timeout, the longest the upstream may go silent, and the deadline for one metadata request. |
+| `feeds[].mirror.download_timeout_secs` | int | `3600` | Deadline for one whole `.nupkg` download; `0` removes it. |
+| `feeds[].mirror.refresh_secs` | int | `600` | How long a package's upstream version list is trusted before a read lists it again — and how long an id the upstream lacks is not asked for again. |
 | `feeds[].mirror.auth.username` / `.password` | string | *(none)* | HTTP Basic credentials for the upstream. |
 | `feeds[].mirror.auth.token` | string | *(none)* | Bearer token for the upstream (`Authorization: Bearer …`). Set this *or* `username`, not both. |
 | `feeds[].mirror.auth.headers` | table | `{}` | Arbitrary extra request headers (e.g. a private-feed API key). |
@@ -253,6 +255,26 @@ Three things bound a read-through miss, because it is started by an
   what has been mirrored so far and the remaining versions are fetched on a
   later request. Nothing is lost — a mirror is a cache, and it warms up
   incrementally rather than holding one connection open for the whole job.
+  A single download is bounded by `download_timeout_secs` instead, and by
+  `timeout_secs` of silence.
+
+How the mirror keeps up, and what it does not repeat:
+
+* **New upstream releases appear.** A package's version list is fetched again
+  once it is older than `refresh_secs` — in the background when the feed
+  already has versions of it, so the read that noticed is not held up.
+* **The version a client asks for is fetched first**, even when it is older
+  than the newest `max_versions_per_package`, so a project pinned to an old
+  version restores.
+* **Misses are not repeated.** An id the upstream does not have is not asked
+  for again within `refresh_secs`; a version that failed (absent, over the size
+  cap, the wrong identity, refused by policy) not for 15 minutes; and an
+  upstream that fails is backed off, from 30 seconds doubling up to 30
+  minutes. A feed with `requires_approval` does not re-list on every read
+  while its mirrored versions wait for approval.
+* **Concurrent requests share one fetch.** A request for a package another
+  request is fetching waits for it (up to a minute) rather than answering
+  `404`, per feed and id.
 
 A version removed from a mirror feed stays removed. Deleting it (from `/admin`,
 a hard `DELETE`, or a retention sweep) or moving it to another feed records a
