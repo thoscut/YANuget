@@ -397,18 +397,27 @@ async fn run_migrate(config_path: Option<&str>, args: MigrateArgs) -> anyhow::Re
     let db = SqliteDatabase::connect(&config.database_path()).await?;
 
     // Temp files must share the package store's filesystem so indexing can move
-    // each download into place with an atomic rename.
-    let temp_dir = config.storage_path().join(".migrate");
+    // each download into place with an atomic rename. Each run gets its own
+    // directory, so cleaning up after one cannot delete the downloads of
+    // another running at the same time.
+    let temp_dir = config
+        .storage_path()
+        .join(".migrate")
+        .join(uuid::Uuid::new_v4().to_string());
     tokio::fs::create_dir_all(&temp_dir).await?;
 
     let source = build_source_config(&args);
     let opts = MigrateOptions {
         concurrency: args.concurrency,
         include_prerelease: !args.skip_prerelease,
+        // Only `--overwrite` replaces what the target has. Following the
+        // feed's own policy re-downloaded everything on every re-run of a
+        // feed that allows overwrites, and pushed each version through the
+        // overwrite path.
         overwrite: if args.overwrite {
             OverwriteMode::Enabled
         } else {
-            feed.allow_overwrite
+            OverwriteMode::Disabled
         },
         dry_run: args.dry_run,
         quiet: false,
@@ -424,20 +433,22 @@ async fn run_migrate(config_path: Option<&str>, args: MigrateArgs) -> anyhow::Re
         opts,
         indicatif::ProgressDrawTarget::stderr(),
     )
-    .await?;
+    .await;
 
-    // Best-effort cleanup of the scratch directory.
+    // Best-effort cleanup of this run's scratch directory, however it ended.
     let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    let summary = summary?;
 
-    // Any failure is a non-zero exit, even when everything else got through.
-    // Scripts gate on it ("stop the old server once the copy is done"), and a
-    // partial copy that exits 0 reads as a finished one. A re-run is cheap: it
-    // skips what is already there and retries only what failed.
-    if summary.failed > 0 {
+    // Any failure is a non-zero exit, even when everything else got through —
+    // a version, a package whose versions could not be listed, or a catalog
+    // page. Scripts gate on it ("stop the old server once the copy is done"),
+    // and a partial copy that exits 0 reads as a finished one. A re-run is
+    // cheap: it skips what is already there and retries only what failed.
+    if !summary.is_complete() {
         anyhow::bail!(
-            "migration incomplete: {} failed (listed above); re-run to retry them, \
+            "migration incomplete: {} failure(s) (listed above); re-run to retry them, \
              versions already migrated are skipped",
-            summary.failed
+            summary.failures.len()
         );
     }
     Ok(())

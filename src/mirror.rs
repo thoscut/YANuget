@@ -101,9 +101,23 @@ struct MirrorResources {
     /// `SearchQueryService` (any advertised version), when present. Used to
     /// enumerate the upstream's package ids for a full migration.
     search: Option<String>,
-    /// `Catalog/3.0.0`, when present. The enumeration fallback for feeds whose
-    /// search service is capped or absent.
+    /// `Catalog/3.0.0`, when present. Walked alongside search, which some
+    /// servers cap or lack.
     catalog: Option<String>,
+    /// `RegistrationsBaseUrl` (the SemVer 2.0.0 hive when advertised), with a
+    /// trailing slash. Where the upstream says which versions are unlisted.
+    registration: Option<String>,
+}
+
+/// The package ids an upstream exposes, and what could not be read while
+/// finding them.
+#[derive(Debug, Default)]
+pub struct Enumeration {
+    /// Ids in their original casing, de-duplicated case-insensitively.
+    pub ids: Vec<String>,
+    /// `(what, error)` for each part of the upstream that failed to load —
+    /// a catalog page, say. Ids it held are missing from `ids`.
+    pub failures: Vec<(String, String)>,
 }
 
 /// How long one read-through miss may spend fetching before it gives up and
@@ -510,6 +524,14 @@ impl MirrorClient {
             return Err(too_large());
         }
         let final_url = resp.url().clone();
+        // nuget.org serves its registration hives from blob storage stored
+        // gzipped, with `Content-Encoding: gzip` whether or not it was asked
+        // for; the decoded size is held to the same cap.
+        let gzipped = resp
+            .headers()
+            .get(reqwest::header::CONTENT_ENCODING)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.trim().eq_ignore_ascii_case("gzip"));
         let mut body = Vec::new();
         let mut stream = resp.bytes_stream();
         while let Some(chunk) = stream.next().await {
@@ -518,6 +540,23 @@ impl MirrorClient {
                 return Err(too_large());
             }
             body.extend_from_slice(&chunk);
+        }
+        if gzipped {
+            use std::io::Read;
+            let mut decoded = Vec::new();
+            flate2::read::GzDecoder::new(body.as_slice())
+                .take(MAX_JSON_BYTES + 1)
+                .read_to_end(&mut decoded)
+                .map_err(|e| {
+                    Error::Other(anyhow::anyhow!(
+                        "upstream {what} {} is not valid gzip: {e}",
+                        redact_url(url)
+                    ))
+                })?;
+            if decoded.len() as u64 > MAX_JSON_BYTES {
+                return Err(too_large());
+            }
+            body = decoded;
         }
         serde_json::from_slice(&body).map(Some).map_err(|e| {
             Error::Other(anyhow::anyhow!(
@@ -578,6 +617,16 @@ impl MirrorClient {
                     ],
                 );
                 let catalog = find_resource(&index, "Catalog/3.0.0");
+                let registration = find_first_resource(
+                    &index,
+                    &[
+                        "RegistrationsBaseUrl/3.6.0",
+                        "RegistrationsBaseUrl/3.4.0",
+                        "RegistrationsBaseUrl/3.0.0-rc",
+                        "RegistrationsBaseUrl/3.0.0-beta",
+                        "RegistrationsBaseUrl",
+                    ],
+                );
                 // Every one of these is a URL the *upstream* chose; vet each
                 // before it is ever fetched. A bad optional resource is dropped
                 // rather than fatal, so one odd entry cannot disable mirroring.
@@ -586,6 +635,9 @@ impl MirrorClient {
                     package_base: ensure_trailing_slash(&package_base),
                     search: search.filter(|u| self.log_check(u, "SearchQueryService")),
                     catalog: catalog.filter(|u| self.log_check(u, "Catalog")),
+                    registration: registration
+                        .filter(|u| self.log_check(u, "RegistrationsBaseUrl"))
+                        .map(|u| ensure_trailing_slash(&u)),
                 })
             })
             .await
@@ -610,6 +662,70 @@ impl MirrorClient {
             .unwrap_or_default())
     }
 
+    /// The versions of `lower_id` the upstream has unlisted, normalized and
+    /// lower-cased, from its registration. Empty when the upstream has no
+    /// registration resource or no registration for the package.
+    ///
+    /// The flat container a mirror lists versions from says nothing about
+    /// listing, so without this every copied version was listed: a version
+    /// the upstream had deliberately hidden came back into search and
+    /// "latest".
+    pub async fn upstream_unlisted(
+        &self,
+        lower_id: &str,
+    ) -> Result<std::collections::HashSet<String>> {
+        let mut unlisted = std::collections::HashSet::new();
+        let Some(base) = &self.resources().await?.registration else {
+            return Ok(unlisted);
+        };
+        let url = format!("{base}{lower_id}/index.json");
+        let Some(index) = self.get_json(&url, "registration").await? else {
+            return Ok(unlisted);
+        };
+        let pages = index
+            .get("items")
+            .and_then(|i| i.as_array())
+            .cloned()
+            .unwrap_or_default();
+        for page in pages {
+            // Small packages inline their leaves; large ones page them out.
+            let page = match page.get("items") {
+                Some(_) => page,
+                None => {
+                    let Some(page_url) = page.get("@id").and_then(|u| u.as_str()) else {
+                        continue;
+                    };
+                    self.get_json(page_url, "registration page")
+                        .await?
+                        .ok_or_else(|| not_found("registration page", page_url))?
+                }
+            };
+            for leaf in page
+                .get("items")
+                .and_then(|i| i.as_array())
+                .into_iter()
+                .flatten()
+            {
+                let entry = leaf.get("catalogEntry").unwrap_or(leaf);
+                // `listed: false` is the flag; a `published` date in 1900 is
+                // how older servers said the same thing.
+                let hidden = entry.get("listed").and_then(|l| l.as_bool()) == Some(false)
+                    || entry
+                        .get("published")
+                        .and_then(|p| p.as_str())
+                        .is_some_and(|p| p.starts_with("1900-"));
+                let version = entry
+                    .get("version")
+                    .and_then(|v| v.as_str())
+                    .and_then(|v| NuGetVersion::parse(v).ok());
+                if let (true, Some(version)) = (hidden, version) {
+                    unlisted.insert(version.normalized().to_lowercase());
+                }
+            }
+        }
+        Ok(unlisted)
+    }
+
     /// Stream the upstream's `.nupkg` for `lower_id`/`version` to `dest`,
     /// returning the [`StreamSummary`](streaming::StreamSummary) (size and
     /// SHA-512) computed while streaming — so the caller never re-reads the file
@@ -619,6 +735,19 @@ impl MirrorClient {
         lower_id: &str,
         version: &str,
         dest: &Path,
+    ) -> Result<streaming::StreamSummary> {
+        self.download_nupkg_with_progress(lower_id, version, dest, &|_| {})
+            .await
+    }
+
+    /// [`Self::download_nupkg`], calling `progress` with the size of each
+    /// chunk as it arrives.
+    pub async fn download_nupkg_with_progress(
+        &self,
+        lower_id: &str,
+        version: &str,
+        dest: &Path,
+        progress: &(dyn Fn(u64) + Send + Sync),
     ) -> Result<streaming::StreamSummary> {
         let base = &self.resources().await?.package_base;
         let url = format!("{base}{lower_id}/{version}/{lower_id}.{version}.nupkg");
@@ -636,9 +765,12 @@ impl MirrorClient {
         }
         ensure_free_space(dest, resp.content_length(), self.min_free_disk_bytes)?;
         let mut file = tokio::fs::File::create(dest).await?;
-        let stream = resp
-            .bytes_stream()
-            .map(|r| r.map_err(|e| std::io::Error::other(error_chain(&e.without_url()))));
+        let stream = resp.bytes_stream().map(|r| {
+            if let Ok(chunk) = &r {
+                progress(chunk.len() as u64);
+            }
+            r.map_err(|e| std::io::Error::other(error_chain(&e.without_url())))
+        });
         // A mirror fetch is triggered by an ordinary (possibly anonymous) read,
         // so an unbounded copy here would let anyone fill the disk by naming
         // packages upstream happens to host. The push path is capped; so is this.
@@ -662,31 +794,47 @@ impl MirrorClient {
 
     /// Discover every package id the upstream exposes.
     ///
-    /// Prefers the `SearchQueryService`, paging through it with an empty query;
-    /// falls back to walking the `Catalog/3.0.0` resource when the upstream has
-    /// no search service (or search returns nothing while a catalog exists).
-    /// Ids are returned in their original casing, de-duplicated
-    /// case-insensitively.
-    pub async fn enumerate_package_ids(&self) -> Result<Vec<String>> {
+    /// Pages through the `SearchQueryService` with an empty query *and* walks
+    /// the `Catalog/3.0.0` resource when the upstream has both, and returns
+    /// the union. Either alone can come up short: a server may cap search at
+    /// some number of results, and a catalog is only as complete as its
+    /// pages. A search that fails outright is not fatal when there is a
+    /// catalog to fall back on; a catalog page that fails is reported in
+    /// [`Enumeration::failures`], because the ids on it are then missing.
+    pub async fn enumerate_package_ids(&self) -> Result<Enumeration> {
         let res = self.resources().await?;
+        if res.search.is_none() && res.catalog.is_none() {
+            return Err(Error::Other(anyhow::anyhow!(
+                "upstream {} exposes neither SearchQueryService nor Catalog/3.0.0; cannot enumerate packages",
+                redact_url(&self.upstream)
+            )));
+        }
+        let mut ids = DedupIds::new();
+        let mut failures = Vec::new();
         if let Some(search) = &res.search {
-            let ids = self.enumerate_via_search(search).await?;
-            if !ids.is_empty() {
-                return Ok(ids);
-            }
-            // A non-empty search service that returns nothing: either a truly
-            // empty feed, or one whose contents only the catalog can reveal.
-            if res.catalog.is_none() {
-                return Ok(ids);
+            match self.enumerate_via_search(search).await {
+                Ok(found) => found.iter().for_each(|id| ids.push(id)),
+                Err(e) if res.catalog.is_some() => {
+                    tracing::warn!(error = %e, "search enumeration failed; relying on the catalog");
+                }
+                Err(e) => return Err(e),
             }
         }
         if let Some(catalog) = &res.catalog {
-            return self.enumerate_via_catalog(catalog).await;
+            match self.enumerate_via_catalog(catalog, &mut failures).await {
+                Ok(found) => found.iter().for_each(|id| ids.push(id)),
+                // Search already answered; a catalog that cannot even be
+                // opened leaves what it found.
+                Err(e) if res.search.is_some() => {
+                    failures.push(("catalog".to_string(), e.to_string()));
+                }
+                Err(e) => return Err(e),
+            }
         }
-        Err(Error::Other(anyhow::anyhow!(
-            "upstream {} exposes neither SearchQueryService nor Catalog/3.0.0; cannot enumerate packages",
-            redact_url(&self.upstream)
-        )))
+        Ok(Enumeration {
+            ids: ids.into_vec(),
+            failures,
+        })
     }
 
     /// Page through the upstream `SearchQueryService` with an empty query,
@@ -749,8 +897,13 @@ impl MirrorClient {
     }
 
     /// Walk the upstream `Catalog/3.0.0` (index → pages → items), collecting
-    /// every package id. Best-effort: a page that fails to load is skipped.
-    async fn enumerate_via_catalog(&self, catalog: &str) -> Result<Vec<String>> {
+    /// every package id. A page that fails to load is recorded in `failures`
+    /// and the walk goes on.
+    async fn enumerate_via_catalog(
+        &self,
+        catalog: &str,
+        failures: &mut Vec<(String, String)>,
+    ) -> Result<Vec<String>> {
         let index = self
             .get_json(catalog, "catalog index")
             .await?
@@ -773,11 +926,18 @@ impl MirrorClient {
             let page = match self.get_json(&page_url, "catalog page").await {
                 Ok(Some(page)) => page,
                 Ok(None) => {
-                    tracing::warn!(page = %redact_url(&page_url), "catalog page not found");
+                    let e = not_found("catalog page", &page_url);
+                    failures.push((
+                        format!("catalog page {}", redact_url(&page_url)),
+                        e.to_string(),
+                    ));
                     continue;
                 }
                 Err(e) => {
-                    tracing::warn!(page = %redact_url(&page_url), error = %e, "catalog page fetch failed");
+                    failures.push((
+                        format!("catalog page {}", redact_url(&page_url)),
+                        e.to_string(),
+                    ));
                     continue;
                 }
             };
@@ -1251,7 +1411,10 @@ impl MirrorTarget<'_> {
         }
         self.resources_ready().await?;
         match self.fetch_one(lower_id, version).await {
-            Fetched::Mirrored => Ok(1),
+            Fetched::Mirrored => {
+                self.follow_listing(lower_id, version, &mut None).await;
+                Ok(1)
+            }
             Fetched::NotMirrored => Ok(0),
             Fetched::DownloadFailed(e) => {
                 // It may be this version, or the upstream: back off both.
@@ -1290,6 +1453,7 @@ impl MirrorTarget<'_> {
         let mut mirrored = 0;
         let deadline = Instant::now() + MIRROR_BUDGET;
         let mut complete = true;
+        let mut unlisted = None;
 
         for version in versions {
             if !self.wanted(lower_id, &version).await {
@@ -1307,7 +1471,10 @@ impl MirrorTarget<'_> {
                 break;
             }
             match self.fetch_one(lower_id, &version).await {
-                Fetched::Mirrored => mirrored += 1,
+                Fetched::Mirrored => {
+                    mirrored += 1;
+                    self.follow_listing(lower_id, &version, &mut unlisted).await;
+                }
                 Fetched::NotMirrored => {}
                 Fetched::DownloadFailed(e) => {
                     tracing::warn!(%feed, id = %lower_id, version = %version.normalized(), error = %e, "mirror download failed");
@@ -1324,6 +1491,36 @@ impl MirrorTarget<'_> {
             );
         }
         Ok(mirrored)
+    }
+
+    /// Unlist a just-mirrored version when the upstream has it unlisted, so a
+    /// version hidden there stays out of search and "latest" here. Reads the
+    /// upstream's list once per fetch, into `unlisted`; best-effort, since a
+    /// registration that cannot be read must not undo the mirroring.
+    async fn follow_listing(
+        &self,
+        lower_id: &str,
+        version: &NuGetVersion,
+        unlisted: &mut Option<std::collections::HashSet<String>>,
+    ) {
+        let feed = self.feed;
+        if unlisted.is_none() {
+            *unlisted = Some(match self.client.upstream_unlisted(lower_id).await {
+                Ok(set) => set,
+                Err(e) => {
+                    tracing::warn!(%feed, id = %lower_id, error = %e, "could not read which versions the upstream unlisted");
+                    Default::default()
+                }
+            });
+        }
+        let hidden = unlisted
+            .as_ref()
+            .is_some_and(|set| set.contains(&version.normalized().to_lowercase()));
+        if hidden {
+            if let Err(e) = self.db.set_listed(feed, lower_id, version, false).await {
+                tracing::warn!(%feed, id = %lower_id, error = %e, "could not unlist a version the upstream unlisted");
+            }
+        }
     }
 
     /// Download and index one version. Every failure but the download itself
@@ -2053,6 +2250,7 @@ mod tests {
         .await
         .expect("enumeration must terminate")
         .unwrap()
+        .ids
     }
 
     #[tokio::test]

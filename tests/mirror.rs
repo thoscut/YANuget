@@ -83,6 +83,18 @@ struct Behaviour {
     /// Send every `.nupkg` body in four pieces with this pause between them:
     /// steady, but slow.
     trickle: Option<std::time::Duration>,
+    /// Search returns at most this many ids in all, as capped servers do.
+    search_cap: Option<usize>,
+    /// Search answers with a 500.
+    search_fails: bool,
+    /// Advertise a `Catalog/3.0.0` with one page per package.
+    catalog: bool,
+    /// The catalog page for the package at this index answers with a 500.
+    broken_catalog_page: Option<usize>,
+    /// Advertise a registration hive, served gzipped as nuget.org does, where
+    /// these (lower id, version) pairs are unlisted.
+    registration: bool,
+    unlisted: std::collections::BTreeSet<(String, String)>,
 }
 
 struct UpstreamState {
@@ -259,14 +271,81 @@ fn respond(state: &UpstreamState, uri: &Uri) -> Response {
             .package_base
             .clone()
             .unwrap_or_else(|| format!("{base}/flat/"));
+        let mut resources = vec![
+            serde_json::json!({"@id": package_base, "@type": "PackageBaseAddress/3.0.0"}),
+            serde_json::json!({"@id": format!("{base}/query"), "@type": "SearchQueryService"}),
+        ];
+        if behaviour.catalog {
+            resources.push(serde_json::json!({
+                "@id": format!("{base}/catalog/index.json"),
+                "@type": "Catalog/3.0.0"
+            }));
+        }
+        if behaviour.registration {
+            resources.push(serde_json::json!({
+                "@id": format!("{base}/registration/"),
+                "@type": "RegistrationsBaseUrl/3.6.0"
+            }));
+        }
+        return axum::Json(serde_json::json!({"version": "3.0.0", "resources": resources}))
+            .into_response();
+    }
+    if path == "/query" && behaviour.search_fails {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    if path == "/catalog/index.json" {
+        let pages: Vec<serde_json::Value> = (0..behaviour.packages.len())
+            .map(|i| serde_json::json!({"@id": format!("{base}/catalog/page{i}.json")}))
+            .collect();
+        return axum::Json(serde_json::json!({ "items": pages })).into_response();
+    }
+    if let Some(page) = path
+        .strip_prefix("/catalog/page")
+        .and_then(|p| p.strip_suffix(".json"))
+        .and_then(|p| p.parse::<usize>().ok())
+    {
+        if behaviour.broken_catalog_page == Some(page) {
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+        let Some(id) = behaviour.packages.keys().nth(page) else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
         return axum::Json(serde_json::json!({
-            "version": "3.0.0",
-            "resources": [
-                {"@id": package_base, "@type": "PackageBaseAddress/3.0.0"},
-                {"@id": format!("{base}/query"), "@type": "SearchQueryService"},
-            ]
+            "items": [{"nuget:id": id, "@type": "nuget:PackageDetails"}]
         }))
         .into_response();
+    }
+    if let Some(id) = path
+        .strip_prefix("/registration/")
+        .and_then(|p| p.strip_suffix("/index.json"))
+    {
+        let Some(versions) = behaviour.packages.get(id) else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        let leaves: Vec<serde_json::Value> = versions
+            .iter()
+            .map(|(v, _)| {
+                let listed = !behaviour
+                    .unlisted
+                    .contains(&(id.to_string(), v.to_lowercase()));
+                serde_json::json!({"catalogEntry": {"id": id, "version": v, "listed": listed}})
+            })
+            .collect();
+        let json = serde_json::to_vec(&serde_json::json!({
+            "count": 1,
+            "items": [{"@id": format!("{base}/registration/{id}/index.json#page"), "items": leaves}]
+        }))
+        .unwrap();
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(&json).unwrap();
+        return (
+            [
+                ("content-type", "application/json"),
+                ("content-encoding", "gzip"),
+            ],
+            gz.finish().unwrap(),
+        )
+            .into_response();
     }
     if path == "/query" {
         let skip = uri
@@ -276,9 +355,11 @@ fn respond(state: &UpstreamState, uri: &Uri) -> Response {
             .find_map(|kv| kv.strip_prefix("skip="))
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(0);
+        let cap = behaviour.search_cap.unwrap_or(usize::MAX);
         let data: Vec<serde_json::Value> = behaviour
             .packages
             .keys()
+            .take(cap)
             .skip(skip)
             .map(|id| serde_json::json!({"id": id, "version": "1.0.0"}))
             .collect();
@@ -989,4 +1070,193 @@ async fn the_feeds_license_policy_applies_to_mirrored_versions() {
     assert_eq!(other.mirror(&upstream, "Copyleft.Pkg", warning).await, 1);
     let membership = other.membership("copyleft.pkg", "1.0.0").await.unwrap();
     assert!(membership.flagged, "{membership:?}");
+}
+
+// ---------------------------------------------------------------------------
+// Migration
+// ---------------------------------------------------------------------------
+
+impl Local {
+    /// Migrate everything from `upstream` into `feed`.
+    async fn migrate_into(
+        &self,
+        feed: &str,
+        upstream: &Upstream,
+    ) -> yanuget::migrate::MigrateSummary {
+        let mut resolved = Config::default().resolved_feeds().unwrap().remove(0);
+        resolved.name = feed.to_string();
+        yanuget::migrate::run(
+            &self.storage,
+            &self.db,
+            &resolved,
+            &self.temp,
+            mirror_config(upstream),
+            yanuget::migrate::MigrateOptions {
+                quiet: true,
+                ..Default::default()
+            },
+            indicatif::ProgressDrawTarget::hidden(),
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn migrate(&self, upstream: &Upstream) -> yanuget::migrate::MigrateSummary {
+        self.migrate_into("mirror", upstream).await
+    }
+}
+
+/// An upstream with three packages, one version each.
+async fn three_packages() -> Upstream {
+    let upstream = Upstream::start().await;
+    for id in ["Alpha.Pkg", "Beta.Pkg", "Gamma.Pkg"] {
+        upstream.publish(id, "1.0.0");
+    }
+    upstream
+}
+
+#[tokio::test]
+async fn migrate_takes_the_union_of_a_capped_search_and_the_catalog() {
+    // A search that stops at a cap used to be the whole list whenever it
+    // returned anything; the catalog was only a fallback for an empty one.
+    let upstream = three_packages().await;
+    upstream.behave(|b| {
+        b.search_cap = Some(1);
+        b.catalog = true;
+    });
+    let local = local_feed().await;
+    let summary = local.migrate(&upstream).await;
+    assert_eq!(summary.discovered_ids, 3, "{summary:?}");
+    assert_eq!(summary.imported, 3);
+    assert!(summary.is_complete(), "{:?}", summary.failures);
+}
+
+#[tokio::test]
+async fn migrate_falls_back_to_the_catalog_when_search_fails() {
+    let upstream = three_packages().await;
+    upstream.behave(|b| {
+        b.search_fails = true;
+        b.catalog = true;
+    });
+    let summary = local_feed().await.migrate(&upstream).await;
+    assert_eq!(summary.imported, 3, "{:?}", summary.failures);
+}
+
+#[tokio::test]
+async fn a_catalog_page_that_fails_makes_the_migration_incomplete() {
+    // Its ids are missing from the copy; the run used to exit 0 regardless.
+    let upstream = three_packages().await;
+    upstream.behave(|b| {
+        b.search_fails = true;
+        b.catalog = true;
+        b.broken_catalog_page = Some(1);
+    });
+    let summary = local_feed().await.migrate(&upstream).await;
+    assert_eq!(summary.imported, 2);
+    assert_eq!(summary.failed_discovery, 1);
+    assert_eq!(summary.failed, 0, "no version failed");
+    assert!(!summary.is_complete());
+    assert!(
+        summary.failures[0].id.starts_with("catalog page"),
+        "{:?}",
+        summary.failures
+    );
+}
+
+#[tokio::test]
+async fn package_and_version_failures_are_counted_apart() {
+    let upstream = three_packages().await;
+    upstream.behave(|b| b.fail_listing = true);
+    let summary = local_feed().await.migrate(&upstream).await;
+    assert_eq!((summary.failed_ids, summary.failed), (3, 0));
+    assert!(summary.failures.iter().all(|f| f.version.is_none()));
+}
+
+#[tokio::test]
+async fn versions_unlisted_on_the_source_stay_unlisted() {
+    // The registration is gzipped, as nuget.org serves it.
+    let upstream = Upstream::start().await;
+    upstream.publish("Hidden.Pkg", "1.0.0");
+    upstream.publish("Hidden.Pkg", "2.0.0");
+    upstream.behave(|b| {
+        b.registration = true;
+        b.unlisted.insert(("hidden.pkg".into(), "1.0.0".into()));
+    });
+
+    let migrated = local_feed().await;
+    let summary = migrated.migrate(&upstream).await;
+    assert_eq!((summary.imported, summary.unlisted), (2, 1));
+    assert!(
+        !migrated
+            .membership("hidden.pkg", "1.0.0")
+            .await
+            .unwrap()
+            .listed
+    );
+    assert!(
+        migrated
+            .membership("hidden.pkg", "2.0.0")
+            .await
+            .unwrap()
+            .listed
+    );
+
+    // The read-through mirror follows the source the same way.
+    let mirrored = local_feed().await;
+    assert_eq!(
+        mirrored
+            .mirror(&upstream, "Hidden.Pkg", MirrorOptions::default())
+            .await,
+        2
+    );
+    assert!(
+        !mirrored
+            .membership("hidden.pkg", "1.0.0")
+            .await
+            .unwrap()
+            .listed
+    );
+    assert!(
+        mirrored
+            .membership("hidden.pkg", "2.0.0")
+            .await
+            .unwrap()
+            .listed
+    );
+}
+
+#[tokio::test]
+async fn a_version_held_elsewhere_with_other_content_is_a_failure_not_a_skip() {
+    // Another feed on the target holds Clash.Pkg 1.0.0 with different bytes.
+    // The target will never serve the source's copy; counting it as "already
+    // there" hid that.
+    let theirs = Upstream::start().await;
+    theirs.serve(
+        "Clash.Pkg",
+        "1.0.0",
+        build_nupkg_with("Clash.Pkg", "1.0.0", "<tags>theirs</tags>"),
+    );
+    let ours = Upstream::start().await;
+    ours.publish("Clash.Pkg", "1.0.0");
+
+    let local = local_feed().await;
+    assert_eq!(local.migrate_into("other", &theirs).await.imported, 1);
+    let summary = local.migrate(&ours).await;
+    assert_eq!((summary.skipped, summary.failed), (0, 1), "{summary:?}");
+    assert!(summary.failures[0].error.contains("different content"));
+}
+
+#[tokio::test]
+async fn migrate_does_not_bring_back_a_deleted_version() {
+    let upstream = three_packages().await;
+    let local = local_feed().await;
+    let v = NuGetVersion::parse("1.0.0").unwrap();
+    local
+        .db
+        .add_tombstone("mirror", "beta.pkg", &v)
+        .await
+        .unwrap();
+    let summary = local.migrate(&upstream).await;
+    assert_eq!((summary.imported, summary.skipped), (2, 1));
+    assert!(local.membership("beta.pkg", "1.0.0").await.is_none());
 }

@@ -3342,6 +3342,7 @@ dependencies = [
  "bytes",
  "chrono",
  "clap",
+ "flate2",
  "fs4",
  "futures",
  "futures-util",
