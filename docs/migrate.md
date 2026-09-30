@@ -21,10 +21,15 @@ arrives, and renamed into place, exactly as described in
 # Import everything from a source server into the "default" feed.
 yanuget migrate --source https://old-server/v3/index.json --feed default
 
-# Authenticated source, more parallelism, stable versions only.
+# Authenticated source, more parallelism, stable versions only. The password
+# comes from the environment, not the command line, where `ps` shows it.
+export YANUGET_SOURCE_PASSWORD="$TOKEN"
 yanuget migrate --source https://old-server/v3/index.json \
-  --source-username ci --source-password "$TOKEN" \
-  --concurrency 8 --skip-prerelease
+  --source-username ci --concurrency 8 --skip-prerelease
+
+# Or from a file, e.g. a mounted secret.
+yanuget migrate --source https://old-server/v3/index.json \
+  --source-token-file /run/secrets/nuget-token
 
 # See what would be copied, without downloading anything.
 yanuget migrate --source https://old-server/v3/index.json --dry-run
@@ -32,15 +37,25 @@ yanuget migrate --source https://old-server/v3/index.json --dry-run
 
 A live display shows progress, ETA and transfer rate while it runs.
 
+**Keep source secrets off the command line.** Arguments are visible to every
+user on the machine in `ps` and `/proc/*/cmdline`, and stay in shell history;
+writing `--source-token "$TOKEN"` does not help, because the shell expands the
+variable into the argument list. Set `YANUGET_SOURCE_PASSWORD`,
+`YANUGET_SOURCE_TOKEN` or `YANUGET_SOURCE_HEADERS` instead, or point
+`--source-password-file` / `--source-token-file` at a file. A file's trailing
+newline is ignored. Credentials are sent only to the source's own scheme, host
+and port.
+
 ## Options
 
 | Flag | Default | Description |
 | --- | --- | --- |
 | `--source <url>` | *(required)* | Source V3 service index, e.g. `https://old-server/v3/index.json`. |
 | `--feed <name>` | `default` | Local feed to import into. |
-| `--source-username` / `--source-password` | *(none)* | HTTP Basic credentials for the source. |
-| `--source-token <token>` | *(none)* | Bearer token for the source. |
-| `--source-header "Name: Value"` | *(none)* | Extra request header; repeatable. |
+| `--source-username` | *(none)*, or `YANUGET_SOURCE_USERNAME` | HTTP Basic username for the source. |
+| `--source-password` / `--source-password-file <path>` | *(none)*, or `YANUGET_SOURCE_PASSWORD` | HTTP Basic password, given directly or read from a file. |
+| `--source-token` / `--source-token-file <path>` | *(none)*, or `YANUGET_SOURCE_TOKEN` | Bearer token, given directly or read from a file. Not together with a username. |
+| `--source-header "Name: Value"` | *(none)*, or `YANUGET_SOURCE_HEADERS` | Extra request header; repeatable (newline-separated in the variable). |
 | `--timeout-secs <n>` | `60` | How long the source may take to connect, or stay silent while answering. Listing requests must also finish within it; a package download may take longer, as long as data keeps arriving. |
 | `--concurrency <n>` | `4` | Packages downloaded and indexed at once. |
 | `--skip-prerelease` | off | Import only stable versions. |
