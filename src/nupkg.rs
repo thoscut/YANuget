@@ -15,7 +15,8 @@ use crate::error::Error;
 
 /// Hard cap on the `.nuspec` we are willing to read into memory. Real manifests
 /// are a few KiB; this guards against a hostile archive declaring a giant one.
-const MAX_NUSPEC_BYTES: u64 = 16 * 1024 * 1024;
+/// The parser enforces the same bound, so the two cannot drift apart.
+const MAX_NUSPEC_BYTES: u64 = crate::nuspec::MAX_NUSPEC_BYTES as u64;
 
 /// Metadata extracted from a `.nupkg` without reading its payload.
 #[derive(Debug, Clone)]

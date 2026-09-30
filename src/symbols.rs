@@ -62,7 +62,7 @@ async fn index_inner(
 ) -> Result<SymbolResult> {
     // 1. Read the manifest to learn which package these symbols belong to.
     let archive = nupkg::read_archive(temp_path).await?;
-    let manifest = nuspec::parse_nuspec(&archive.nuspec_xml)?;
+    let manifest = nuspec::parse_nuspec_blocking(archive.nuspec_xml.clone()).await?;
     let version = NuGetVersion::parse(&manifest.version)
         .map_err(|e| Error::InvalidPackage(format!("invalid <version>: {e}")))?;
     let id = manifest.id.clone();

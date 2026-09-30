@@ -39,8 +39,9 @@ file. [`nupkg::read_archive`](https://github.com/thoscut/yanuget/blob/main/src/n
 `zip` crate **seek** to that directory and then to the single `.nuspec` entry.
 A 25 GB archive is therefore touched in two tiny reads (directory + manifest),
 never scanned front-to-back. The blocking ZIP work runs on a
-`spawn_blocking` thread so the async runtime is never stalled. The manifest read
-is additionally capped (16 MiB) to reject a hostile archive that declares an
+`spawn_blocking` thread so the async runtime is never stalled, and so does parsing
+the manifest. The manifest read
+is additionally capped (1 MiB) to reject a hostile archive that declares an
 absurd nuspec size.
 
 ### Store → atomic rename (zero copy)

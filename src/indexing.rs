@@ -102,7 +102,7 @@ async fn index_inner(
 ) -> Result<IndexResult> {
     // 1. Read and parse the manifest (seek-based; never reads the payload).
     let archive = nupkg::read_archive(temp_path).await?;
-    let manifest = nuspec::parse_nuspec(&archive.nuspec_xml)?;
+    let manifest = nuspec::parse_nuspec_blocking(archive.nuspec_xml.clone()).await?;
 
     validation::validate_package_id(&manifest.id)?;
     let version = NuGetVersion::parse(&manifest.version)

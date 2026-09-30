@@ -70,8 +70,8 @@ impl Nuspec {
     /// de-duplicated case-insensitively (the first spelling wins), each cut to
     /// [`MAX_TAG_CHARS`], and at most [`MAX_TAGS`] of them.
     ///
-    /// Nothing else bounds this field but the 16 MiB manifest cap, and a
-    /// manifest of `a a a …` is some eight million tags — each rendered on every
+    /// Nothing else bounds this field but the 1 MiB manifest cap, and a
+    /// manifest of `a a a …` is half a million tags — each rendered on every
     /// gallery row, returned in every search result and indexed for the tag
     /// filter. nuget.org's own limits are tighter than these.
     pub fn tag_list(&self) -> Vec<String> {
@@ -105,9 +105,19 @@ impl Nuspec {
 
 /// Bounds on a single manifest. A real nuspec is a few KiB with a handful of
 /// dependency groups; these are far above anything legitimate and exist only so
-/// a hostile manifest cannot turn its (already capped) 16 MiB of XML into an
-/// unbounded pile of allocations, database rows and rendered HTML.
+/// a hostile manifest cannot turn its XML into an unbounded pile of
+/// allocations, database rows and rendered HTML.
+///
+/// [`MAX_NUSPEC_BYTES`] bounds the document itself. A real manifest is a few
+/// KiB, and even a metapackage listing every target framework is far below
+/// 1 MiB; 16 MiB used to be allowed, which let an upload that compresses to a
+/// few KiB buy seconds of parsing.
+pub const MAX_NUSPEC_BYTES: usize = 1024 * 1024;
 const MAX_ELEMENT_DEPTH: usize = 64;
+/// Attributes on one element. A real element carries at most four or five.
+/// quick-xml's duplicate-attribute check scans the attributes already seen, so
+/// an element with tens of thousands of them was quadratic to read.
+const MAX_ATTRIBUTES: usize = 64;
 const MAX_DEPENDENCY_GROUPS: usize = 512;
 const MAX_DEPENDENCIES: usize = 10_000;
 const MAX_PACKAGE_TYPES: usize = 64;
@@ -233,15 +243,39 @@ impl Counts {
     }
 }
 
+/// [`parse_nuspec`] on a blocking thread.
+///
+/// Parsing is bounded, but it is still CPU work proportional to the manifest,
+/// and a push is served on an async worker: a few concurrent pushes of a
+/// crafted (and highly compressible) manifest would otherwise stall every
+/// request sharing those workers. This is what the push and symbol pipelines
+/// call.
+pub async fn parse_nuspec_blocking(xml: String) -> Result<Nuspec, Error> {
+    tokio::task::spawn_blocking(move || parse_nuspec(&xml))
+        .await
+        .map_err(|e| Error::Other(anyhow::anyhow!("nuspec parse task panicked: {e}")))?
+}
+
 /// Parse a `.nuspec` document. Returns [`Error::InvalidPackage`] when the XML is
 /// malformed, exceeds the structural limits above, is ambiguous in one of the
 /// ways the module docs list, or is missing the mandatory `id`/`version`.
 pub fn parse_nuspec(xml: &str) -> Result<Nuspec, Error> {
+    if xml.len() > MAX_NUSPEC_BYTES {
+        return Err(invalid(format!(
+            "nuspec is larger than {} KiB",
+            MAX_NUSPEC_BYTES / 1024
+        )));
+    }
     let mut reader = NsReader::from_str(xml);
     // Text is *not* trimmed per event, because an element's text can arrive as
     // several events (see `text` below) and trimming each one would eat the
     // spaces between them. The accumulated value is trimmed once, at the end.
     reader.config_mut().trim_text(false);
+    // The reader records an element's namespace declarations before the event
+    // reaches `attributes` below, so the same cap has to apply there.
+    reader
+        .resolver_mut()
+        .set_max_declarations_per_element(MAX_ATTRIBUTES);
 
     let mut nuspec = Nuspec::default();
     let mut stack: Vec<Frame> = Vec::new();
@@ -276,8 +310,8 @@ pub fn parse_nuspec(xml: &str) -> Result<Nuspec, Error> {
                 // Checked before anything is pushed, so every element name is
                 // bounded. `<license>` used to push its entry and `continue`
                 // past a check further down, which left the depth unbounded for
-                // that one name: nesting it some 800k times in a 16 MiB
-                // manifest made an ancestor scan quadratic (834ms for 1 MiB).
+                // that one name: nesting it thousands of times made an
+                // ancestor scan quadratic (834ms for a 1 MiB manifest).
                 if stack.len() >= MAX_ELEMENT_DEPTH {
                     return Err(invalid(format!(
                         "nuspec nests deeper than {MAX_ELEMENT_DEPTH} elements"
@@ -549,7 +583,14 @@ fn attributes<const N: usize>(
     names: [&str; N],
 ) -> Result<[Option<String>; N], Error> {
     let mut values: [Option<String>; N] = std::array::from_fn(|_| None);
-    for attribute in e.attributes() {
+    for (count, attribute) in e.attributes().enumerate() {
+        // Before the duplicate check on this attribute runs, so that check
+        // never scans more than the cap.
+        if count == MAX_ATTRIBUTES {
+            return Err(invalid(format!(
+                "nuspec element has more than {MAX_ATTRIBUTES} attributes"
+            )));
+        }
         let attribute =
             attribute.map_err(|err| invalid(format!("malformed nuspec attribute: {err}")))?;
         let value = attribute
@@ -882,7 +923,9 @@ mod tests {
     /// whole subtree) and used to be "B" here.
     #[test]
     fn an_element_inside_a_field_is_refused() {
-        let err = rejection(&manifest("<id>Real<x>Ignored</x>Id</id><version>1.0.0</version>"));
+        let err = rejection(&manifest(
+            "<id>Real<x>Ignored</x>Id</id><version>1.0.0</version>",
+        ));
         assert!(err.contains("<id> contains an element"), "{err}");
         let err = rejection(&manifest("<id>A</id><version>1.0.0<b/></version>"));
         assert!(err.contains("contains an element"), "{err}");
@@ -1004,6 +1047,52 @@ mod tests {
             "<package><metadata><id>A</id><version>1</version></metadata></package><package/>"
         )
         .is_err());
+    }
+
+    /// quick-xml's duplicate-attribute check scans the attributes already
+    /// seen, so one element with tens of thousands of attributes was quadratic
+    /// to read, several times over. The count is now capped before that check
+    /// can grow.
+    #[test]
+    fn attributes_per_element_are_capped() {
+        let many: String = (0..20_000).map(|i| format!(" a{i}=\"x\"")).collect();
+        let xml = manifest(&format!(
+            "<id>A</id><version>1.0.0</version><dependencies><dependency id=\"B\"{many} /></dependencies>"
+        ));
+        let start = std::time::Instant::now();
+        let err = rejection(&xml);
+        assert!(err.contains("attributes"), "{err}");
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+
+        // Namespace declarations are counted by the reader itself.
+        let decls: String = (0..20_000)
+            .map(|i| format!(" xmlns:p{i}=\"u{i}\""))
+            .collect();
+        assert!(parse_nuspec(&format!("<package{decls}><metadata/></package>")).is_err());
+
+        // Ordinary elements are unaffected.
+        let few: String = (0..MAX_ATTRIBUTES - 1)
+            .map(|i| format!(" a{i}=\"x\""))
+            .collect();
+        let xml = manifest(&format!(
+            "<id>A</id><version>1.0.0</version><dependencies><dependency id=\"B\"{few} /></dependencies>"
+        ));
+        assert!(parse_nuspec(&xml).is_ok());
+    }
+
+    #[test]
+    fn the_document_size_is_capped() {
+        let padding = " ".repeat(MAX_NUSPEC_BYTES);
+        let err = rejection(&manifest(&format!(
+            "<id>A</id><version>1.0.0</version>{padding}"
+        )));
+        assert!(err.contains("larger than"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn parses_off_the_runtime() {
+        let n = parse_nuspec_blocking(SAMPLE.to_string()).await.unwrap();
+        assert_eq!(n.id, "Contoso.Utils");
     }
 
     #[test]
