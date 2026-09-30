@@ -196,6 +196,25 @@ async fn run_server(config_path: Option<&str>) -> anyhow::Result<()> {
 
     spawn_file_tasks(&config, &storage, &db, &feeds, &shutdown_rx);
 
+    // Versions a failed purge left without any feed: finished off at startup
+    // and daily, since nothing else ever revisits them.
+    {
+        let storage = storage.clone();
+        let db = db.clone();
+        let mut shutdown = shutdown_rx.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(24 * 3600));
+            loop {
+                tokio::select! {
+                    _ = tick.tick() => {
+                        yanuget::retention::sweep_orphans(storage.as_ref(), db.as_ref()).await;
+                    }
+                    _ = shutdown.changed() => break,
+                }
+            }
+        });
+    }
+
     let app = web::build_app(states);
     let addr = config.socket_addr();
 

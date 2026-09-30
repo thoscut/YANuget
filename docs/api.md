@@ -53,8 +53,24 @@ indexed. Responses:
 | `400 Bad Request` | Malformed package / nuspec / id / version. |
 | `401 Unauthorized` | Missing or wrong API key. |
 | `403 Forbidden` | Rejected by the feed's `license_policy` (`action = "block"`). |
-| `409 Conflict` | Version already exists in this feed (unless `allow_overwrite`). |
+| `409 Conflict` | Version already exists in this feed (unless `allow_overwrite`), or different content is already stored under this id and version (see below). |
 | `413 Payload Too Large` | Exceeds `max_package_size_bytes`. |
+
+An id and version name **one** package across the whole server: the payload
+and metadata are stored once and shared by every feed that holds the version.
+Pushing *different* bytes under an id and version the server already stores —
+in any feed — is refused with `409` and logged as a failure; the same bytes
+simply join the feed. Whoever stores a version first therefore claims it
+everywhere, so a low-trust feed (or a mirror feed filled by anonymous reads)
+can take a name another feed expected to publish. `reserved_id_prefixes` on a
+feed (see [Feeds](configuration.md#feeds)) keeps the ids under a prefix for
+that feed alone.
+
+An overwriting push (`allow_overwrite`) replaces the build, not what an admin
+decided about the version: the version keeps its listed, enabled and pinned
+state, its download count and its attached files. New content lands pending
+again in a feed with `requires_approval`. The new payload is stored before the
+old rows are replaced, and a failure part-way puts the previous build back.
 
 In a feed with `requires_approval = true`, a pushed version is still accepted
 (`201`) but lands **pending** — withheld from clients until an admin approves it.
@@ -173,7 +189,7 @@ GET /v3/search?q=&skip=&take=&prerelease=&semVerLevel=&packageType=
 
 | Param | Default | Notes |
 | --- | --- | --- |
-| `q` | *(empty = all)* | Matches id, description, tags, title. |
+| `q` | *(empty = all)* | A case-insensitive substring of the id, title, a tag or the first 4000 characters of the description. Only the first 256 characters are used. |
 | `skip` | `0` | Pagination offset (over package ids). |
 | `take` | `20` | Clamped to `1000`. |
 | `prerelease` | `false` | Include pre-release versions. |

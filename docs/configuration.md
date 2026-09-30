@@ -115,6 +115,14 @@ version is pruned when it is beyond the newest *N* of its release channel
 version — or newest pre-release when no stable exists — is always kept, so a
 package can never be pruned out of existence.
 
+The rules count only what clients can download. **Pending** and **disabled**
+versions are outside them: they are never deleted by retention, never use up
+one of the "newest *N*", and are never the newest version that is kept — so
+pushing builds into a gated feed cannot prune the approved ones, and disabling
+a broken release does not make it the version retention protects. Unlisted
+versions still count, because a client restoring that exact version still gets
+it.
+
 | TOML key | Env var | Type | Default | Description |
 | --- | --- | --- | --- | --- |
 | `retention.enabled` | `YANUGET_RETENTION_ENABLED` | bool | `false` | Master switch. |
@@ -129,7 +137,9 @@ With no limit set, the sweep does nothing even when `enabled`.
 An admin can **pin** a version in `/admin`; retention then keeps it whatever
 the rules say, and it does not use up one of the "newest *N*" either — a pin is
 kept in addition to what the rules keep. A pin survives an overwriting push and
-moves with a version to another feed; it does not stop an explicit delete.
+moves with a version to another feed; it does not stop an explicit delete. A
+cleanup re-checks each version just before deleting it, so a pin set while one
+is running is honoured.
 
 `/admin/retention` shows these rules, what the last cleanup did, and exactly
 what the next one would delete and why, with a button that deletes that list
@@ -215,19 +225,19 @@ with its own mutable state (listed / enabled / pending / flagged / downloads).
 Removing a version from a feed drops that membership; the shared payload is
 deleted only when the **last** feed referencing it lets go.
 
-The flip side is that **an id and version name one package across every
-feed.** Whoever stores `Contoso.Core 1.2.0` first — a push to any feed, or a
-mirror fetching it on an anonymous read — fixes its bytes everywhere: a later
-push of different content under that id and version to another feed is refused
-(`409`), and another mirror feed cannot fetch its upstream's copy. Metadata
-stored with the payload (readme, icon, attached files) is shared the same way,
-so detaching a file from a version in one feed detaches it in all. Feeds
-separate *who may push and read*, not *what an id means*: a push key on a
-low-trust feed, or a mirror of a public upstream, can claim an id and version
-before the feed you meant it for receives it. Keep feeds whose push keys you
-would not trust with each other's package names on separate servers, and bear
-in mind that mirroring a public feed lets anyone who can publish there claim an
-id and version on this server.
+That makes an id and version **one namespace across every feed**. Whoever
+stores a version first owns it everywhere: pushing different bytes under the
+same id and version is refused (`409`, logged as a failure) in every feed,
+and a mirror fetch of it fails the same way. Package metadata, readmes,
+icons and attached files are shared too, so detaching a file in one feed
+detaches it in all of them. A push key on a low-trust feed, or an anonymous
+read that fills a mirror feed, can therefore claim a version another feed
+meant to publish. `reserved_id_prefixes` closes that for your own ids: a feed
+that reserves `Contoso.` is the only one that may push, mirror or migrate
+`Contoso` or any `Contoso.*` id (matched ignoring case); every other feed
+answers `403`. Reservations of different feeds may not overlap. Copying or
+promoting an existing version into another feed is an admin action and is not
+affected.
 
 | TOML key | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -240,6 +250,7 @@ id and version on this server.
 | `feeds[].hard_delete_enabled` | bool | *(global)* | DELETE removes vs. unlists. |
 | `feeds[].requires_approval` | bool | `false` | Incoming versions are pending until approved. |
 | `feeds[].promotes_to` | string | *(none)* | Next release ring (must name another feed). |
+| `feeds[].reserved_id_prefixes` | string[] | `[]` | Id prefixes (e.g. `"Contoso."`) only this feed may bring in; every other feed refuses them. See below. |
 | `feeds[].mirror.enabled` | bool | `false` | Read-through cache of an upstream V3 feed. |
 | `feeds[].mirror.upstream` | string | `https://api.nuget.org/v3/index.json` | Upstream service index. |
 | `feeds[].mirror.timeout_secs` | int | `30` | Per-request upstream timeout. |
@@ -278,6 +289,16 @@ run — comes back from the upstream on the next read of that package, by
 anyone. A disabled version stays in the feed and is withheld from clients.
 For the same reason, retention on a mirror feed and the mirror undo each
 other's work.
+
+The license policy reads SPDX expressions the way SPDX means them. Case, the
+`+` suffix and the deprecated ids are normalised on both sides, so a rule for
+`GPL-2.0` matches `GPL-2.0+`, `GPL-2.0-only` and `GPL-2.0-or-later` alike.
+Against an allow list, `A OR B` needs one side allowed and `A AND B` both;
+`X WITH exception` passes a rule allowing `X` only when the exception is one
+the SPDX list defines (name the whole pair in a rule to accept any other).
+**A deny list on its own is advisory**: a package that declares its license as
+a file, or as a `licenseUrl` the list does not name, passes it. To control
+what comes in, set `allowed`.
 
 ### Read authentication
 

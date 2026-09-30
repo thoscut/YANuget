@@ -76,6 +76,8 @@ pub struct FeedContext {
     pub mirror: Option<MirrorClient>,
     pub license_policy: LicensePolicyConfig,
     pub retention: RetentionConfig,
+    /// Id prefixes other feeds reserved, which this one refuses.
+    pub reserved_elsewhere: Vec<crate::config::ReservedPrefix>,
     /// The feed's cleanup lock and last report, shared with the background
     /// sweep.
     pub cleanup: Arc<retention::RetentionState>,
@@ -103,6 +105,7 @@ impl FeedContext {
             mirror,
             license_policy: feed.license_policy.clone(),
             retention: feed.retention.clone(),
+            reserved_elsewhere: feed.reserved_elsewhere.clone(),
             cleanup: Arc::default(),
         }
     }
@@ -275,9 +278,14 @@ impl AppState {
         if self.feed.mirror.is_none() {
             return;
         }
+        // Not worth a download that indexing would refuse.
+        if self.feed.reserved_elsewhere.iter().any(|r| r.covers(id)) {
+            return;
+        }
         let options = MirrorOptions {
             requires_approval: self.feed.requires_approval,
             license_policy: self.feed.license_policy.clone(),
+            reserved_elsewhere: self.feed.reserved_elsewhere.clone(),
         };
         // Fetching and indexing is the same store-then-record sequence as a
         // push, so it too finishes when the client that asked goes away.
@@ -906,6 +914,7 @@ async fn push_package(State(state): State<AppState>, request: Request) -> Result
         license_policy: state.feed.license_policy.clone(),
         // A push is self-describing: the manifest defines the identity.
         expect: None,
+        reserved_elsewhere: state.feed.reserved_elsewhere.clone(),
     };
     let state = state.clone();
     detached(async move {
@@ -1974,10 +1983,14 @@ async fn admin_package(
     } else {
         Vec::new()
     };
+    // One query for the whole id rather than one per version, newest version
+    // first, and only the versions this feed holds.
     let mut files = Vec::new();
     if state.config.files.enabled {
+        let mut all = state.db.files_for_id(&id).await?;
         for fv in versions.iter().rev() {
-            files.extend(state.db.files_for(&id, &fv.package.version).await?);
+            let v = fv.package.normalized_version();
+            files.extend(all.extract_if(.., |f| f.normalized_version == v));
         }
     }
     Ok(Html(ui::admin_package_page(
