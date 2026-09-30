@@ -13,6 +13,7 @@
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
+use tokio::io::AsyncWriteExt;
 
 use crate::error::{Error, Result};
 
@@ -22,6 +23,10 @@ use super::{AuxFile, PackageContent, PackageStorage};
 #[derive(Debug, Clone)]
 pub struct FilesystemStorage {
     root: PathBuf,
+    /// Where writes are staged before they are renamed into place: the store's
+    /// own `.uploads`, on the same filesystem as everything it holds, and swept
+    /// of `*.tmp` files on startup.
+    staging: PathBuf,
 }
 
 impl FilesystemStorage {
@@ -29,7 +34,8 @@ impl FilesystemStorage {
     pub async fn new(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
         tokio::fs::create_dir_all(&root).await?;
-        Ok(Self { root })
+        let staging = root.join(".uploads");
+        Ok(Self { root, staging })
     }
 
     /// Directory holding a single package version's files. The id and version
@@ -90,18 +96,93 @@ impl FilesystemStorage {
     }
 }
 
-/// Move `temp_path` to `dest`: a rename when both are on one filesystem (no
-/// copy, whatever the size), else a streaming copy and removal of the source.
-async fn move_into_place(temp_path: &Path, dest: &Path) -> Result<()> {
+/// Move `temp_path` to `dest` so that `dest` is only ever absent, its old
+/// content, or the complete new file — never a partial one, even after a crash.
+///
+/// On one filesystem that is a rename, whatever the size. Across filesystems
+/// (and only then: any other rename error is a real failure, not a reason to
+/// write over the live file) the bytes are copied to a temp file on the
+/// store's filesystem, synced, and renamed over `dest`. Either way the
+/// directory is synced afterwards so the rename itself survives a power cut.
+async fn move_into_place(temp_path: &Path, dest: &Path, staging: &Path) -> Result<()> {
     match tokio::fs::rename(temp_path, dest).await {
-        Ok(()) => Ok(()),
-        Err(_) => {
-            tokio::fs::copy(temp_path, dest).await?;
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
+            let staged = staging_path(staging).await?;
+            let copied = async {
+                tokio::fs::copy(temp_path, &staged).await?;
+                sync_file(&staged).await?;
+                tokio::fs::rename(&staged, dest).await
+            }
+            .await;
+            if let Err(e) = copied {
+                let _ = tokio::fs::remove_file(&staged).await;
+                return Err(e.into());
+            }
             // Best-effort cleanup of the source temp file.
             let _ = tokio::fs::remove_file(temp_path).await;
-            Ok(())
+        }
+        Err(e) => return Err(e.into()),
+    }
+    sync_parent(dest).await;
+    Ok(())
+}
+
+/// Write `bytes` to `dest` through a synced temp file and a rename, so a crash
+/// or a failed write never leaves `dest` truncated.
+async fn write_atomically(dest: &Path, bytes: &[u8], staging: &Path) -> Result<()> {
+    let staged = staging_path(staging).await?;
+    let written = async {
+        let mut file = tokio::fs::File::create_new(&staged).await?;
+        file.write_all(bytes).await?;
+        file.sync_all().await?;
+        drop(file);
+        tokio::fs::rename(&staged, dest).await
+    }
+    .await;
+    if let Err(e) = written {
+        let _ = tokio::fs::remove_file(&staged).await;
+        return Err(e.into());
+    }
+    sync_parent(dest).await;
+    Ok(())
+}
+
+/// A fresh temp file name in the store's staging directory. `.tmp`, so the
+/// startup sweep removes one that a crash left behind.
+async fn staging_path(staging: &Path) -> Result<PathBuf> {
+    tokio::fs::create_dir_all(staging).await?;
+    Ok(staging.join(format!("store-{}.tmp", uuid::Uuid::new_v4().simple())))
+}
+
+/// Flush a file's bytes to stable storage. Opened for writing, because
+/// Windows cannot flush a handle opened only for reading.
+async fn sync_file(path: &Path) -> std::io::Result<()> {
+    tokio::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .await?
+        .sync_all()
+        .await
+}
+
+/// Flush the directory holding `path`, so a rename into it is durable.
+///
+/// Best-effort: some filesystems (network mounts, FUSE) refuse to sync a
+/// directory, and by then the file is in place — failing the store over it
+/// would report a write that most likely stuck as lost. Windows cannot open a
+/// directory this way at all, and NTFS journals the rename itself.
+async fn sync_parent(path: &Path) {
+    #[cfg(unix)]
+    if let Some(dir) = path.parent() {
+        if let Ok(dir) = tokio::fs::File::open(dir).await {
+            if let Err(e) = dir.sync_all().await {
+                tracing::debug!(path = %path.display(), error = %e, "could not sync directory");
+            }
         }
     }
+    #[cfg(not(unix))]
+    let _ = path;
 }
 
 #[async_trait]
@@ -113,7 +194,7 @@ impl PackageStorage for FilesystemStorage {
 
         // Prefer an atomic rename (no copy, regardless of package size). Fall
         // back to a streaming copy when the temp file lives on another device.
-        move_into_place(&temp_path, &dest).await?;
+        move_into_place(&temp_path, &dest, &self.staging).await?;
 
         let meta = tokio::fs::metadata(&dest).await?;
         Ok(meta.len())
@@ -130,7 +211,7 @@ impl PackageStorage for FilesystemStorage {
         if let Some(dir) = dest.parent() {
             tokio::fs::create_dir_all(dir).await?;
         }
-        move_into_place(&temp_path, &dest).await?;
+        move_into_place(&temp_path, &dest, &self.staging).await?;
         Ok(tokio::fs::metadata(&dest).await?.len())
     }
 
@@ -177,13 +258,7 @@ impl PackageStorage for FilesystemStorage {
         let dir = self.version_dir(id, version)?;
         tokio::fs::create_dir_all(&dir).await?;
         let dest = self.symbol_package_path(id, version)?;
-        match tokio::fs::rename(&temp_path, &dest).await {
-            Ok(()) => {}
-            Err(_) => {
-                tokio::fs::copy(&temp_path, &dest).await?;
-                let _ = tokio::fs::remove_file(&temp_path).await;
-            }
-        }
+        move_into_place(&temp_path, &dest, &self.staging).await?;
         let meta = tokio::fs::metadata(&dest).await?;
         Ok(meta.len())
     }
@@ -193,8 +268,7 @@ impl PackageStorage for FilesystemStorage {
         if let Some(parent) = dest.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-        tokio::fs::write(&dest, bytes).await?;
-        Ok(())
+        write_atomically(&dest, bytes, &self.staging).await
     }
 
     async fn get_symbol(&self, key: &str, filename: &str) -> Result<PackageContent> {
@@ -222,8 +296,7 @@ impl PackageStorage for FilesystemStorage {
         let dir = self.version_dir(id, version)?;
         tokio::fs::create_dir_all(&dir).await?;
         let path = self.aux_path(id, version, kind)?;
-        tokio::fs::write(&path, bytes).await?;
-        Ok(())
+        write_atomically(&path, bytes, &self.staging).await
     }
 
     async fn get_aux(&self, id: &str, version: &str, kind: AuxFile) -> Result<Vec<u8>> {
@@ -370,6 +443,78 @@ mod tests {
         let content = storage.get_package("Contoso.Utils", "1.0.0").await.unwrap();
         let PackageContent::LocalPath(path) = content;
         assert_eq!(tokio::fs::read(path).await.unwrap(), b"nupkg-bytes");
+    }
+
+    /// What is left in the staging directory: nothing, after a write finished.
+    fn staged(storage: &FilesystemStorage) -> Vec<PathBuf> {
+        std::fs::read_dir(&storage.staging)
+            .map(|rd| rd.filter_map(|e| e.ok().map(|e| e.path())).collect())
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn small_files_are_replaced_whole_through_a_temp_file() {
+        let (_d, storage) = temp_storage().await;
+        for body in [&b"<first/>"[..], b"<second, longer/>", b"<3/>"] {
+            storage
+                .store_aux("Pkg", "1.0.0", AuxFile::Nuspec, body)
+                .await
+                .unwrap();
+            let got = storage
+                .get_aux("Pkg", "1.0.0", AuxFile::Nuspec)
+                .await
+                .unwrap();
+            assert_eq!(got, body);
+        }
+        storage.store_symbol("KEY", "a.pdb", b"one").await.unwrap();
+        storage.store_symbol("KEY", "a.pdb", b"two").await.unwrap();
+        let PackageContent::LocalPath(path) = storage.get_symbol("KEY", "a.pdb").await.unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), b"two");
+        assert!(staged(&storage).is_empty(), "{:?}", staged(&storage));
+    }
+
+    #[tokio::test]
+    async fn a_failed_rename_does_not_fall_back_to_writing_over_the_file() {
+        let (_d, storage) = temp_storage().await;
+        let (_t, temp) = write_temp(b"new").await;
+        // A directory where the package should go: the rename fails, and not
+        // because of another device, so nothing is copied anywhere.
+        let dest = storage.package_path("P", "1.0.0").unwrap();
+        std::fs::create_dir_all(dest.join("occupied")).unwrap();
+        assert!(storage.store_package("P", "1.0.0", temp.clone()).await.is_err());
+        assert!(dest.join("occupied").is_dir());
+        assert!(temp.exists());
+        assert!(staged(&storage).is_empty());
+    }
+
+    /// Across filesystems the file is copied, synced and renamed into place.
+    /// Needs a second filesystem, which `/dev/shm` usually is on Linux.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_temp_file_on_another_filesystem_is_copied_into_place() {
+        use std::os::unix::fs::MetadataExt;
+        let (_d, storage) = temp_storage().await;
+        let Ok(shm) = tempfile::tempdir_in("/dev/shm") else {
+            return;
+        };
+        let (a, b) = (
+            std::fs::metadata(shm.path()).unwrap().dev(),
+            std::fs::metadata(&storage.root).unwrap().dev(),
+        );
+        if a == b {
+            return;
+        }
+        let temp = shm.path().join("upload.tmp");
+        std::fs::write(&temp, b"from elsewhere").unwrap();
+        let size = storage
+            .store_package("Far", "1.0.0", temp.clone())
+            .await
+            .unwrap();
+        assert_eq!(size, 14);
+        assert!(!temp.exists());
+        let PackageContent::LocalPath(path) = storage.get_package("Far", "1.0.0").await.unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), b"from elsewhere");
+        assert!(staged(&storage).is_empty());
     }
 
     #[tokio::test]
