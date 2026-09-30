@@ -509,3 +509,91 @@ async fn an_upload_the_client_abandons_leaves_no_temp_file() {
         assert!(left.is_empty(), "{path}: {left:?}");
     }
 }
+
+fn tus(req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    req.header("Tus-Resumable", "1.0.0")
+        .header("X-NuGet-ApiKey", API_KEY)
+}
+
+/// Start a resumable upload of `len` bytes; its URL.
+async fn tus_create(server: &TestServer, id: &str, v: &str, name: &str, len: usize) -> String {
+    use base64::Engine;
+    let b64 = |s: &str| base64::engine::general_purpose::STANDARD.encode(s);
+    let created = tus(server.client.post(server.url("/api/v2/uploads")))
+        .header("Upload-Length", len.to_string())
+        .header(
+            "Upload-Metadata",
+            format!("id {},version {},filename {}", b64(id), b64(v), b64(name)),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), reqwest::StatusCode::CREATED);
+    created.headers()["location"].to_str().unwrap().to_string()
+}
+
+async fn tus_patch(
+    server: &TestServer,
+    location: &str,
+    offset: usize,
+    bytes: &[u8],
+) -> reqwest::Response {
+    tus(server.client.patch(location))
+        .header("Content-Type", "application/offset+octet-stream")
+        .header("Upload-Offset", offset.to_string())
+        .body(bytes.to_vec())
+        .send()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_finished_resumable_upload_cannot_be_written_again() {
+    let server = spawn().await;
+    push(&server, build_nupkg("Tus.Img", "1.0.0")).await;
+    let image = vec![3u8; 200_000];
+    let location = tus_create(&server, "Tus.Img", "1.0.0", "base.wim", image.len()).await;
+    let half = image.len() / 2;
+    assert_eq!(
+        tus_patch(&server, &location, 0, &image[..half])
+            .await
+            .status(),
+        reqwest::StatusCode::NO_CONTENT
+    );
+
+    // The last half twice at once, as a client retrying a request it thinks
+    // was lost: one finishes the upload, the other writes nothing.
+    let (a, b) = tokio::join!(
+        tus_patch(&server, &location, half, &image[half..]),
+        tus_patch(&server, &location, half, &[9u8; 100_000]),
+    );
+    let statuses = [a.status(), b.status()];
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|s| **s == reqwest::StatusCode::NO_CONTENT)
+            .count(),
+        1,
+        "{statuses:?}"
+    );
+    // Whichever won, the upload is over; retrying it now finds nothing.
+    let again = tus_patch(&server, &location, half, &image[half..]).await;
+    assert_eq!(again.status(), reqwest::StatusCode::NOT_FOUND);
+
+    let got = download(&server, "tus.img", "1.0.0", "base.wim").await;
+    assert_eq!(got.status(), reqwest::StatusCode::OK);
+    let body = got.bytes().await.unwrap();
+    // The bytes served are the bytes the recorded hash names.
+    let index: serde_json::Value = server
+        .client
+        .get(server.url("/files/tus.img/1.0.0/index.json"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(index["files"][0]["sha256"], sha256_hex(&body));
+    let left = staging_empties(&server).await;
+    assert!(left.is_empty(), "{left:?}");
+}

@@ -182,19 +182,17 @@ pub(crate) struct Finished {
 ///
 /// In a task of its own, so a client that disconnects — which cancels its
 /// request — cannot stop an attach half-way, with a blob stored and no row
-/// for it. `keep` is held until the attach is done, whatever the request does.
+/// for it.
 pub(crate) async fn attach(
     state: &AppState,
     id: &str,
     v: &NuGetVersion,
     name: &str,
     file: Finished,
-    keep: impl Send + 'static,
 ) -> Result<Attached> {
     let state = state.clone();
     let (id, v, name) = (id.to_string(), v.clone(), name.to_string());
     super::detached(async move {
-        let _keep = keep;
         let target = Target {
             storage: state.storage.as_ref(),
             db: state.db.as_ref(),
@@ -395,7 +393,7 @@ pub(super) async fn put(
         )));
     }
     let finished = Finished { temp, sha256, size };
-    let (status, file) = match attach(&state, &id, &v, &name, finished, ()).await? {
+    let (status, file) = match attach(&state, &id, &v, &name, finished).await? {
         Attached::New(f) => (StatusCode::CREATED, f),
         Attached::Same(f) => (StatusCode::OK, f),
     };
@@ -445,6 +443,21 @@ fn forget_slot(upload: &str) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(upload);
+}
+
+/// The slot of an upload whose last byte has arrived, held until its file is
+/// attached: a request still coming in for it meanwhile is turned away as a
+/// concurrent writer, and one after finds no upload. The slot is forgotten
+/// before the lock is released, so nobody is left holding a stale one.
+struct Finishing {
+    upload: String,
+    _writing: tokio::sync::OwnedMutexGuard<Option<Hashing>>,
+}
+
+impl Drop for Finishing {
+    fn drop(&mut self) {
+        forget_slot(&self.upload);
+    }
 }
 
 /// Where an upload's bytes collect until it is finished. `.part`, not `.tmp`:
@@ -665,21 +678,34 @@ pub(super) async fn tus_patch(
             .unwrap_or_default());
     }
     let offset = header_u64(&headers, "upload-offset")?;
-    let s = session(&state, &upload).await?;
+    // Turn away an unknown upload before it gets a slot.
+    session(&state, &upload).await?;
 
-    // One writer at a time; a second request is turned away, not queued.
-    let slot = slot(&upload);
-    let Ok(mut hashing) = slot.try_lock() else {
+    // One writer at a time; a second request is turned away, not queued. The
+    // upload's state is read again under the lock: read before it, it may
+    // describe an upload another request has since finished and attached.
+    let Ok(mut hashing) = slot(&upload).try_lock_owned() else {
         return Err(Error::Conflict(
             "another request is writing this upload".into(),
         ));
+    };
+    let s = match session(&state, &upload).await {
+        Ok(s) => s,
+        Err(e) => {
+            forget_slot(&upload);
+            return Err(e);
+        }
     };
     if offset != s.received {
         return built(tus_response(StatusCode::CONFLICT).header("upload-offset", s.received));
     }
     let part = part_path(&state, &upload);
     resume_hash(&mut hashing, &part, s.received).await?;
-    let h = hashing.as_mut().expect("resume_hash sets the state");
+    // Out of the slot while bytes go in: if this request is cancelled
+    // half-way, the slot is left empty and the next request rebuilds the hash
+    // from the file, instead of trusting a hasher that has seen bytes nobody
+    // recorded.
+    let mut h = hashing.take().expect("resume_hash sets the state");
 
     let mut file = tokio::fs::OpenOptions::new()
         .write(true)
@@ -707,6 +733,9 @@ pub(super) async fn tus_patch(
     let received = s.received + written;
     h.received = received;
     let _ = file.flush().await;
+    // Should the row then not be updated, the two disagree and the next
+    // request rebuilds the hash from the file.
+    *hashing = Some(h);
     state.db.set_upload_received(&upload, received).await?;
     if let Err(e) = streamed {
         return Err(super::map_upload_err(e));
@@ -715,33 +744,62 @@ pub(super) async fn tus_patch(
     if received == s.length {
         file.sync_all().await?;
         drop(file);
-        let sha256 = hex::encode(h.hasher.clone().finalize());
-        *hashing = None;
-        drop(hashing);
-        forget_slot(&upload);
-        state.db.delete_upload(&upload).await?;
-        if s.expected_sha256
-            .as_deref()
-            .is_some_and(|want| want != sha256)
-        {
-            let _ = tokio::fs::remove_file(&part).await;
-            return Err(Error::BadRequest(format!(
-                "checksum mismatch: the upload's SHA-256 is {sha256}; it was discarded"
-            )));
-        }
-        let v = parse_version(&s.normalized_version)?;
-        let file = Finished {
-            temp: TempPath::new(part),
-            sha256,
-            size: received,
+        let h = hashing.take().expect("put back above");
+        // The slot stays taken until the file is attached, then goes; and the
+        // rest runs to its end whatever the client does meanwhile.
+        let finishing = Finishing {
+            upload: upload.clone(),
+            _writing: hashing,
         };
-        attach(&state, &s.lower_id, &v, &s.name, file, ()).await?;
+        let (task_state, task_session) = (state.clone(), s.clone());
+        super::detached(finish(task_state, task_session, part, h.hasher, finishing)).await?;
     }
     built(
         tus_response(StatusCode::NO_CONTENT)
             .header("upload-offset", received)
             .header("upload-expires", http_date(s.expires)),
     )
+}
+
+/// Verify and attach an upload whose last byte has arrived, still holding its
+/// slot through `finishing`.
+async fn finish(
+    state: AppState,
+    s: UploadSession,
+    part: PathBuf,
+    hasher: Sha256,
+    finishing: Finishing,
+) -> Result<()> {
+    let sha256 = hex::encode(hasher.finalize());
+    // The bytes leave the upload's name for one of their own before anything
+    // else, so no request that opens the upload again can write into what is
+    // being verified and stored. `.tmp`: a crash from here on leaves
+    // something the startup sweep removes.
+    let finished = TempPath::new(
+        state
+            .temp_dir
+            .join(format!("tus-{}.tmp", uuid::Uuid::new_v4().simple())),
+    );
+    tokio::fs::rename(&part, finished.path()).await?;
+    state.db.delete_upload(&s.id).await?;
+    if s.expected_sha256
+        .as_deref()
+        .is_some_and(|want| want != sha256)
+    {
+        return Err(Error::BadRequest(format!(
+            "checksum mismatch: the upload's SHA-256 is {sha256}; it was discarded"
+        )));
+    }
+    let v = parse_version(&s.normalized_version)?;
+    let target = Target {
+        storage: state.storage.as_ref(),
+        db: state.db.as_ref(),
+        feed: state.feed(),
+    };
+    let path = finished.path().to_path_buf();
+    attach_to(&target, &s.lower_id, &v, &s.name, path, &sha256, s.length).await?;
+    drop(finishing);
+    Ok(())
 }
 
 /// `DELETE …/uploads/{id}`: abandon an upload.
@@ -759,6 +817,11 @@ pub(super) async fn tus_delete(
     let Ok(_writing) = slot.try_lock() else {
         return Err(Error::Conflict("the upload is being written".into()));
     };
+    // Again under the lock: it may have finished in between.
+    if let Err(e) = session(&state, &upload).await {
+        forget_slot(&upload);
+        return Err(e);
+    }
     let _ = tokio::fs::remove_file(part_path(&state, &upload)).await;
     state.db.delete_upload(&upload).await?;
     forget_slot(&upload);
