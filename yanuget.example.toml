@@ -1,7 +1,9 @@
 # YANuget example configuration.
 #
 # Copy to `yanuget.toml` and pass with `--config yanuget.toml`, or set the
-# matching `YANUGET_*` environment variables (which override this file).
+# matching `YANUGET_*` environment variables (which override this file). An
+# environment value that does not parse (a boolean other than 1/true/yes/on or
+# 0/false/no/off, a size like "10G") stops the server rather than being ignored.
 
 # Interface and port to listen on.
 host = "0.0.0.0"            # YANUGET_HOST
@@ -135,7 +137,7 @@ cors_allowed_origins = []
 [rate_limit]
 enabled = true                # YANUGET_RATELIMIT_ENABLED
 max_requests = 10000          # YANUGET_RATELIMIT_MAX_REQUESTS — per IP per window
-window_secs = 60              # YANUGET_RATELIMIT_WINDOW_SECS
+window_secs = 60              # YANUGET_RATELIMIT_WINDOW_SECS — at least 1
 
 # ---------------------------------------------------------------------------
 # Package retention — automatic pruning of old versions.

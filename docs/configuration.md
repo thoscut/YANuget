@@ -35,7 +35,22 @@ A fully commented template lives in
 | `enable_web_ui` | `YANUGET_ENABLE_WEB_UI` | bool | `true` | Serve the HTML gallery and the embedded `/docs` site. |
 | `primary_client` | `YANUGET_PRIMARY_CLIENT` | string | `choco` | Install command shown first (`choco`/`dotnet`/`nuget`). |
 
-Booleans accept `1/true/yes/on` (case-insensitive) via environment variables.
+Environment variables are parsed as strictly as the TOML file, and a value that
+does not parse stops the server at startup with the variable's name in the
+error — it is never skipped or read as "off":
+
+- Booleans accept `1`/`true`/`yes`/`on` and `0`/`false`/`no`/`off`
+  (case-insensitive), and nothing else.
+- Numbers are plain decimal integers: `10G`, `1e9`, `+5` and `-1` are errors.
+  For a setting that is unset by default (`YANUGET_MAX_PACKAGE_SIZE_BYTES`,
+  the retention limits), the empty string means unset.
+- `YANUGET_HOST` is an IP address or `localhost` (the IPv4 loopback).
+- `YANUGET_ALLOW_OVERWRITE` is `true`, `false` or `prerelease-only` (or a
+  boolean spelling).
+
+A `tls_cert_path` without `tls_key_path`, or the reverse, is also an error
+while TLS is on, rather than a silent fall-back to the self-signed
+certificate.
 
 ## Rate limiting
 
@@ -58,7 +73,7 @@ limit or disable it and rely on a reverse proxy.
 | --- | --- | --- | --- | --- |
 | `rate_limit.enabled` | `YANUGET_RATELIMIT_ENABLED` | bool | `true` | Master switch. |
 | `rate_limit.max_requests` | `YANUGET_RATELIMIT_MAX_REQUESTS` | int | `10000` | Max requests per IP per window (min 1). |
-| `rate_limit.window_secs` | `YANUGET_RATELIMIT_WINDOW_SECS` | int | `60` | Window length in seconds. |
+| `rate_limit.window_secs` | `YANUGET_RATELIMIT_WINDOW_SECS` | int | `60` | Window length in seconds (min 1; `0` is refused at startup, since it would never limit anything). |
 
 ## Trusted proxies
 

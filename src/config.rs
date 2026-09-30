@@ -46,19 +46,24 @@ impl OverwriteMode {
         }
     }
 
-    /// Parse a free-form environment-variable value (lenient; unknown ⇒ off).
-    fn parse_lenient(v: &str) -> OverwriteMode {
+    /// Parse an environment-variable value: the TOML spellings plus the
+    /// boolean ones. Anything else is an error, never a silent "off".
+    fn parse_env(name: &str, v: &str) -> Result<OverwriteMode> {
         match v
             .trim()
             .to_ascii_lowercase()
             .replace(['_', ' '], "-")
             .as_str()
         {
-            "true" | "all" | "enabled" | "yes" | "on" | "1" => OverwriteMode::Enabled,
+            "true" | "all" | "enabled" | "yes" | "on" | "1" => Ok(OverwriteMode::Enabled),
+            "false" | "none" | "disabled" | "no" | "off" | "0" => Ok(OverwriteMode::Disabled),
             "prerelease-only" | "prerelease" | "prereleaseonly" | "pre" => {
-                OverwriteMode::PrereleaseOnly
+                Ok(OverwriteMode::PrereleaseOnly)
             }
-            _ => OverwriteMode::Disabled,
+            _ => Err(env_error(
+                name,
+                &format!("must be true, false or prerelease-only, not {v:?}"),
+            )),
         }
     }
 }
@@ -582,162 +587,194 @@ impl Config {
             }
             None => Config::default(),
         };
-        config.apply_env();
+        config.apply_env()?;
+        config.validate()?;
         Ok(config)
     }
 
-    fn apply_env(&mut self) {
-        if let Ok(v) = std::env::var("YANUGET_HOST") {
-            if let Ok(ip) = v.parse() {
-                self.host = ip;
-            }
-        }
-        if let Ok(v) = std::env::var("YANUGET_PORT") {
-            if let Ok(p) = v.parse() {
-                self.port = p;
-            }
-        }
-        if let Ok(v) = std::env::var("YANUGET_BASE_URL") {
-            self.base_url = Some(v);
-        }
-        if let Ok(v) = std::env::var("YANUGET_DATA_DIR") {
-            self.data_dir = PathBuf::from(v);
-        }
-        if let Ok(v) = std::env::var("YANUGET_STORAGE_PATH") {
-            self.storage_path = Some(PathBuf::from(v));
-        }
-        if let Ok(v) = std::env::var("YANUGET_DATABASE_PATH") {
-            self.database_path = Some(v);
-        }
-        if let Ok(v) = std::env::var("YANUGET_API_KEY") {
-            self.api_key = (!v.is_empty()).then_some(v);
-        }
-        if let Ok(v) = std::env::var("YANUGET_API_KEYS") {
-            self.api_keys = v
-                .split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-                .collect();
-        }
-        if let Ok(v) = std::env::var("YANUGET_ADMIN_API_KEY") {
-            self.admin_api_key = (!v.is_empty()).then_some(v);
-        }
-        if let Ok(v) = std::env::var("YANUGET_GALLERY_PAGE_SIZE") {
-            if let Ok(n) = v.parse::<i64>() {
-                if n > 0 {
-                    self.gallery_page_size = n;
+    fn apply_env(&mut self) -> Result<()> {
+        self.apply_env_from(|name| std::env::var(name))
+    }
+
+    /// Overlay `YANUGET_*` values, read through `var` (the process environment
+    /// in production, a map in tests).
+    ///
+    /// Every value that is set has to parse. Skipping one that does not, as
+    /// this used to, failed *open*: `YANUGET_TLS_ENABLED=enabled` served plain
+    /// HTTP, `YANUGET_MAX_PACKAGE_SIZE_BYTES=10G` meant unlimited, and a typo
+    /// in `YANUGET_RATELIMIT_ENABLED` turned the limiter off — all without a
+    /// word, while the TOML file rejects a misspelled key outright. A setting
+    /// believed on and actually off is worse than a server that refuses to
+    /// start and says why.
+    fn apply_env_from(
+        &mut self,
+        var: impl Fn(&str) -> std::result::Result<String, std::env::VarError>,
+    ) -> Result<()> {
+        let get = |name: &str| -> Result<Option<String>> {
+            match var(name) {
+                Ok(v) => Ok(Some(v)),
+                Err(std::env::VarError::NotPresent) => Ok(None),
+                Err(std::env::VarError::NotUnicode(_)) => {
+                    Err(env_error(name, "is not valid UTF-8"))
                 }
             }
+        };
+        let bool_var = |name: &str| -> Result<Option<bool>> {
+            get(name)?.map(|v| parse_env_bool(name, &v)).transpose()
+        };
+
+        if let Some(v) = get("YANUGET_HOST")? {
+            self.host = parse_env_host("YANUGET_HOST", &v)?;
         }
-        if let Ok(v) = std::env::var("YANUGET_MAX_PACKAGE_SIZE_BYTES") {
-            self.max_package_size_bytes = v.parse().ok();
+        if let Some(v) = get("YANUGET_PORT")? {
+            self.port = parse_env_int("YANUGET_PORT", &v)?;
         }
-        if let Ok(v) = std::env::var("YANUGET_UPLOAD_IDLE_TIMEOUT_SECS") {
-            if let Ok(n) = v.trim().parse() {
-                self.upload_idle_timeout_secs = n;
+        if let Some(v) = get("YANUGET_BASE_URL")? {
+            self.base_url = (!v.trim().is_empty()).then(|| v.trim().to_string());
+        }
+        if let Some(v) = get("YANUGET_DATA_DIR")? {
+            self.data_dir = PathBuf::from(v);
+        }
+        if let Some(v) = get("YANUGET_STORAGE_PATH")? {
+            self.storage_path = Some(PathBuf::from(v));
+        }
+        if let Some(v) = get("YANUGET_DATABASE_PATH")? {
+            self.database_path = Some(v);
+        }
+        if let Some(v) = get("YANUGET_API_KEY")? {
+            self.api_key = (!v.trim().is_empty()).then(|| v.trim().to_string());
+        }
+        if let Some(v) = get("YANUGET_API_KEYS")? {
+            self.api_keys = split_list(&v);
+        }
+        if let Some(v) = get("YANUGET_ADMIN_API_KEY")? {
+            self.admin_api_key = (!v.trim().is_empty()).then(|| v.trim().to_string());
+        }
+        if let Some(v) = get("YANUGET_GALLERY_PAGE_SIZE")? {
+            let n: i64 = parse_env_int("YANUGET_GALLERY_PAGE_SIZE", &v)?;
+            if n < 1 {
+                return Err(env_error("YANUGET_GALLERY_PAGE_SIZE", "must be at least 1"));
             }
+            self.gallery_page_size = n;
         }
-        if let Ok(v) = std::env::var("YANUGET_MIN_FREE_DISK_BYTES") {
-            if let Ok(n) = v.trim().parse() {
-                self.min_free_disk_bytes = n;
-            }
+        if let Some(v) = get("YANUGET_MAX_PACKAGE_SIZE_BYTES")? {
+            self.max_package_size_bytes = parse_env_opt_int("YANUGET_MAX_PACKAGE_SIZE_BYTES", &v)?;
         }
-        if let Ok(v) = std::env::var("YANUGET_ALLOW_OVERWRITE") {
-            self.allow_overwrite = OverwriteMode::parse_lenient(&v);
+        if let Some(v) = get("YANUGET_UPLOAD_IDLE_TIMEOUT_SECS")? {
+            self.upload_idle_timeout_secs = parse_env_int("YANUGET_UPLOAD_IDLE_TIMEOUT_SECS", &v)?;
         }
-        if let Ok(v) = std::env::var("YANUGET_HARD_DELETE_ENABLED") {
-            self.hard_delete_enabled = truthy(&v);
+        if let Some(v) = get("YANUGET_MIN_FREE_DISK_BYTES")? {
+            self.min_free_disk_bytes = parse_env_int("YANUGET_MIN_FREE_DISK_BYTES", &v)?;
         }
-        if let Ok(v) = std::env::var("YANUGET_TLS_ENABLED") {
-            self.tls_enabled = truthy(&v);
+        if let Some(v) = get("YANUGET_ALLOW_OVERWRITE")? {
+            self.allow_overwrite = OverwriteMode::parse_env("YANUGET_ALLOW_OVERWRITE", &v)?;
         }
-        if let Ok(v) = std::env::var("YANUGET_TLS_CERT_PATH") {
+        if let Some(b) = bool_var("YANUGET_HARD_DELETE_ENABLED")? {
+            self.hard_delete_enabled = b;
+        }
+        if let Some(b) = bool_var("YANUGET_TLS_ENABLED")? {
+            self.tls_enabled = b;
+        }
+        if let Some(v) = get("YANUGET_TLS_CERT_PATH")? {
             self.tls_cert_path = (!v.is_empty()).then(|| PathBuf::from(v));
         }
-        if let Ok(v) = std::env::var("YANUGET_TLS_KEY_PATH") {
+        if let Some(v) = get("YANUGET_TLS_KEY_PATH")? {
             self.tls_key_path = (!v.is_empty()).then(|| PathBuf::from(v));
         }
-        if let Ok(v) = std::env::var("YANUGET_ENABLE_SYMBOL_SERVER") {
-            self.enable_symbol_server = truthy(&v);
+        if let Some(b) = bool_var("YANUGET_ENABLE_SYMBOL_SERVER")? {
+            self.enable_symbol_server = b;
         }
-        if let Ok(v) = std::env::var("YANUGET_ENABLE_WEB_UI") {
-            self.enable_web_ui = truthy(&v);
+        if let Some(b) = bool_var("YANUGET_ENABLE_WEB_UI")? {
+            self.enable_web_ui = b;
         }
-        if let Ok(v) = std::env::var("YANUGET_PRIMARY_CLIENT") {
+        if let Some(v) = get("YANUGET_PRIMARY_CLIENT")? {
             if !v.trim().is_empty() {
                 self.primary_client = v.trim().to_ascii_lowercase();
             }
         }
-        if let Ok(v) = std::env::var("YANUGET_RETENTION_ENABLED") {
-            self.retention.enabled = truthy(&v);
+        if let Some(b) = bool_var("YANUGET_RETENTION_ENABLED")? {
+            self.retention.enabled = b;
         }
-        if let Ok(v) = std::env::var("YANUGET_RETENTION_PRUNE_ON_PUSH") {
-            self.retention.prune_on_push = truthy(&v);
+        if let Some(b) = bool_var("YANUGET_RETENTION_PRUNE_ON_PUSH")? {
+            self.retention.prune_on_push = b;
         }
-        if let Ok(v) = std::env::var("YANUGET_RETENTION_INTERVAL_HOURS") {
-            if let Ok(n) = v.parse() {
-                self.retention.interval_hours = n;
-            }
+        if let Some(v) = get("YANUGET_RETENTION_INTERVAL_HOURS")? {
+            self.retention.interval_hours = parse_env_int("YANUGET_RETENTION_INTERVAL_HOURS", &v)?;
         }
-        if let Ok(v) = std::env::var("YANUGET_RETENTION_KEEP_LATEST_STABLE") {
-            self.retention.keep_latest_stable = v.parse().ok();
+        if let Some(v) = get("YANUGET_RETENTION_KEEP_LATEST_STABLE")? {
+            self.retention.keep_latest_stable =
+                parse_env_opt_int("YANUGET_RETENTION_KEEP_LATEST_STABLE", &v)?;
         }
-        if let Ok(v) = std::env::var("YANUGET_RETENTION_KEEP_LATEST_PRERELEASE") {
-            self.retention.keep_latest_prerelease = v.parse().ok();
+        if let Some(v) = get("YANUGET_RETENTION_KEEP_LATEST_PRERELEASE")? {
+            self.retention.keep_latest_prerelease =
+                parse_env_opt_int("YANUGET_RETENTION_KEEP_LATEST_PRERELEASE", &v)?;
         }
-        if let Ok(v) = std::env::var("YANUGET_RETENTION_MAX_AGE_DAYS") {
-            self.retention.max_age_days = v.parse().ok();
+        if let Some(v) = get("YANUGET_RETENTION_MAX_AGE_DAYS")? {
+            self.retention.max_age_days = parse_env_opt_int("YANUGET_RETENTION_MAX_AGE_DAYS", &v)?;
         }
-        if let Ok(v) = std::env::var("YANUGET_RATELIMIT_ENABLED") {
-            self.rate_limit.enabled = truthy(&v);
+        if let Some(b) = bool_var("YANUGET_RATELIMIT_ENABLED")? {
+            self.rate_limit.enabled = b;
         }
-        if let Ok(v) = std::env::var("YANUGET_RATELIMIT_MAX_REQUESTS") {
-            if let Ok(n) = v.parse() {
-                self.rate_limit.max_requests = n;
-            }
+        if let Some(v) = get("YANUGET_RATELIMIT_MAX_REQUESTS")? {
+            self.rate_limit.max_requests = parse_env_int("YANUGET_RATELIMIT_MAX_REQUESTS", &v)?;
         }
-        if let Ok(v) = std::env::var("YANUGET_RATELIMIT_WINDOW_SECS") {
-            if let Ok(n) = v.parse() {
-                self.rate_limit.window_secs = n;
-            }
+        if let Some(v) = get("YANUGET_RATELIMIT_WINDOW_SECS")? {
+            self.rate_limit.window_secs = parse_env_int("YANUGET_RATELIMIT_WINDOW_SECS", &v)?;
         }
-        if let Ok(v) = std::env::var("YANUGET_FILES_ENABLED") {
-            self.files.enabled = truthy(&v);
+        if let Some(b) = bool_var("YANUGET_FILES_ENABLED")? {
+            self.files.enabled = b;
         }
-        if let Ok(v) = std::env::var("YANUGET_FILES_MAX_FILE_SIZE_BYTES") {
-            self.files.max_file_size_bytes = v.trim().parse().ok();
+        if let Some(v) = get("YANUGET_FILES_MAX_FILE_SIZE_BYTES")? {
+            self.files.max_file_size_bytes =
+                parse_env_opt_int("YANUGET_FILES_MAX_FILE_SIZE_BYTES", &v)?;
         }
-        if let Ok(v) = std::env::var("YANUGET_FILES_ALLOWED_EXTENSIONS") {
+        if let Some(v) = get("YANUGET_FILES_ALLOWED_EXTENSIONS")? {
             self.files.allowed_extensions = v
                 .split(',')
                 .map(|s| s.trim().trim_start_matches('.').to_string())
                 .filter(|s| !s.is_empty())
                 .collect();
         }
-        if let Ok(v) = std::env::var("YANUGET_FILES_UPLOAD_EXPIRY_HOURS") {
-            if let Ok(n) = v.trim().parse() {
-                self.files.upload_expiry_hours = n;
-            }
+        if let Some(v) = get("YANUGET_FILES_UPLOAD_EXPIRY_HOURS")? {
+            self.files.upload_expiry_hours =
+                parse_env_int("YANUGET_FILES_UPLOAD_EXPIRY_HOURS", &v)?;
         }
-        if let Ok(v) = std::env::var("YANUGET_FILES_INBOX_DIR") {
+        if let Some(v) = get("YANUGET_FILES_INBOX_DIR")? {
             self.files.inbox_dir = (!v.trim().is_empty()).then(|| PathBuf::from(v.trim()));
         }
-        if let Ok(v) = std::env::var("YANUGET_FILES_INBOX_SCAN_SECS") {
-            if let Ok(n) = v.trim().parse() {
-                self.files.inbox_scan_secs = n;
-            }
+        if let Some(v) = get("YANUGET_FILES_INBOX_SCAN_SECS")? {
+            self.files.inbox_scan_secs = parse_env_int("YANUGET_FILES_INBOX_SCAN_SECS", &v)?;
         }
         // Set (even to the empty string) this replaces the list wholesale, so an
         // operator can pin trust to their proxy — or revoke it entirely.
-        if let Ok(v) = std::env::var("YANUGET_TRUSTED_PROXIES") {
-            self.trusted_proxies = v
-                .split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-                .collect();
+        if let Some(v) = get("YANUGET_TRUSTED_PROXIES")? {
+            self.trusted_proxies = split_list(&v);
         }
+        Ok(())
+    }
+
+    /// Reject combinations that parse but cannot mean what they say.
+    ///
+    /// Runs after both layers, so a TOML value and an environment value are
+    /// held to the same rules.
+    pub fn validate(&self) -> Result<()> {
+        if self.rate_limit.enabled && self.rate_limit.window_secs == 0 {
+            // A zero-length window resets on every request, so no client ever
+            // reaches the limit: the throttle is on in name only.
+            return Err(Error::BadRequest(
+                "rate_limit.window_secs must be at least 1 (set rate_limit.enabled = false \
+                 to turn the limiter off)"
+                    .into(),
+            ));
+        }
+        if self.tls_enabled && self.tls_cert_path.is_some() != self.tls_key_path.is_some() {
+            // Half a pair used to fall back to the self-signed certificate,
+            // silently serving something other than what was configured.
+            return Err(Error::BadRequest(
+                "tls_cert_path and tls_key_path must be set together".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// The resolved set of peers allowed to set forwarding headers.
@@ -900,11 +937,69 @@ fn validate_feed_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn truthy(v: &str) -> bool {
-    matches!(
-        v.trim().to_ascii_lowercase().as_str(),
-        "1" | "true" | "yes" | "on"
-    )
+fn env_error(name: &str, why: &str) -> Error {
+    Error::BadRequest(format!("environment variable {name} {why}"))
+}
+
+/// The spellings a boolean environment variable accepts, case-insensitively.
+/// Anything else is refused rather than read as `false`.
+fn parse_env_bool(name: &str, v: &str) -> Result<bool> {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => Err(env_error(
+            name,
+            &format!("must be one of 1/true/yes/on or 0/false/no/off, not {v:?}"),
+        )),
+    }
+}
+
+/// A plain decimal integer: digits only, so `10G`, `1e9`, `+5` and `-1` are
+/// errors instead of whatever a lenient parse would make of them.
+fn parse_env_int<T: std::str::FromStr>(name: &str, v: &str) -> Result<T> {
+    let t = v.trim();
+    if t.is_empty() || !t.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(env_error(
+            name,
+            &format!("must be a plain whole number, not {v:?}"),
+        ));
+    }
+    t.parse()
+        .map_err(|_| env_error(name, &format!("is out of range: {v:?}")))
+}
+
+/// Like [`parse_env_int`], with the empty string meaning "unset".
+fn parse_env_opt_int<T: std::str::FromStr>(name: &str, v: &str) -> Result<Option<T>> {
+    if v.trim().is_empty() {
+        Ok(None)
+    } else {
+        parse_env_int(name, v).map(Some)
+    }
+}
+
+/// An IP address, or `localhost` for the IPv4 loopback — the one name people
+/// reach for, and the one that used to be dropped for `0.0.0.0`, exposing a
+/// server meant to be local to the whole network.
+fn parse_env_host(name: &str, v: &str) -> Result<IpAddr> {
+    let t = v.trim();
+    if t.eq_ignore_ascii_case("localhost") {
+        return Ok(IpAddr::from([127, 0, 0, 1]));
+    }
+    t.parse().map_err(|_| {
+        env_error(
+            name,
+            &format!("must be an IP address or \"localhost\", not {v:?}"),
+        )
+    })
+}
+
+/// A comma-separated environment list, trimmed, empties dropped.
+fn split_list(v: &str) -> Vec<String> {
+    v.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 /// Combine a single optional key with a list of keys into a deduplicated,
@@ -1040,15 +1135,16 @@ mod tests {
         assert!(OverwriteMode::PrereleaseOnly.allows(true));
         assert!(!OverwriteMode::PrereleaseOnly.allows(false));
 
-        // Lenient env parsing.
+        // Environment parsing: known spellings only.
         assert_eq!(
-            OverwriteMode::parse_lenient("prerelease"),
+            OverwriteMode::parse_env("X", "prerelease").unwrap(),
             OverwriteMode::PrereleaseOnly
         );
         assert_eq!(
-            OverwriteMode::parse_lenient("garbage"),
+            OverwriteMode::parse_env("X", "off").unwrap(),
             OverwriteMode::Disabled
         );
+        assert!(OverwriteMode::parse_env("X", "garbage").is_err());
     }
 
     #[test]
@@ -1107,6 +1203,77 @@ mod tests {
         assert_eq!(c.retention.keep_latest_stable, Some(5));
         assert_eq!(c.retention.max_age_days, Some(90));
         assert!(c.retention.has_limits());
+    }
+
+    /// Apply `vars` as the environment on top of the defaults.
+    fn with_env(vars: &[(&str, &str)]) -> Result<Config> {
+        let map: std::collections::HashMap<String, String> = vars
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let mut c = Config::default();
+        c.apply_env_from(|name| map.get(name).cloned().ok_or(std::env::VarError::NotPresent))?;
+        c.validate()?;
+        Ok(c)
+    }
+
+    #[test]
+    fn an_environment_value_that_does_not_parse_is_an_error() {
+        // Each of these used to be skipped or read as "off", failing open.
+        for (name, value) in [
+            ("YANUGET_TLS_ENABLED", "enabled"),
+            ("YANUGET_RATELIMIT_ENABLED", "ture"),
+            ("YANUGET_MAX_PACKAGE_SIZE_BYTES", "10G"),
+            ("YANUGET_MAX_PACKAGE_SIZE_BYTES", "+5"),
+            ("YANUGET_PORT", "eighty"),
+            ("YANUGET_PORT", "70000"),
+            ("YANUGET_HOST", "example.com"),
+            ("YANUGET_ALLOW_OVERWRITE", "sometimes"),
+            ("YANUGET_GALLERY_PAGE_SIZE", "0"),
+            ("YANUGET_RETENTION_KEEP_LATEST_STABLE", "-1"),
+        ] {
+            let err = with_env(&[(name, value)]).unwrap_err().to_string();
+            assert!(err.contains(name), "{name}={value}: unhelpful error {err}");
+        }
+    }
+
+    #[test]
+    fn environment_values_in_the_documented_forms_apply() {
+        let c = with_env(&[
+            ("YANUGET_HOST", "localhost"),
+            ("YANUGET_TLS_ENABLED", "Off"),
+            ("YANUGET_RATELIMIT_ENABLED", "1"),
+            ("YANUGET_MAX_PACKAGE_SIZE_BYTES", " 1048576 "),
+            ("YANUGET_ALLOW_OVERWRITE", "prerelease-only"),
+            ("YANUGET_RETENTION_MAX_AGE_DAYS", ""),
+        ])
+        .unwrap();
+        assert_eq!(c.host, IpAddr::from([127, 0, 0, 1]));
+        assert!(!c.tls_enabled);
+        assert!(c.rate_limit.enabled);
+        assert_eq!(c.max_package_size_bytes, Some(1_048_576));
+        assert_eq!(c.allow_overwrite, OverwriteMode::PrereleaseOnly);
+        assert_eq!(c.retention.max_age_days, None);
+    }
+
+    #[test]
+    fn a_zero_window_and_half_a_tls_pair_are_refused() {
+        let err = with_env(&[("YANUGET_RATELIMIT_WINDOW_SECS", "0")]).unwrap_err();
+        assert!(err.to_string().contains("window_secs"), "{err}");
+        // With the limiter off, the window does not matter.
+        assert!(with_env(&[
+            ("YANUGET_RATELIMIT_WINDOW_SECS", "0"),
+            ("YANUGET_RATELIMIT_ENABLED", "false"),
+        ])
+        .is_ok());
+
+        let err = with_env(&[("YANUGET_TLS_CERT_PATH", "/c.pem")]).unwrap_err();
+        assert!(err.to_string().contains("tls_key_path"), "{err}");
+        assert!(with_env(&[
+            ("YANUGET_TLS_CERT_PATH", "/c.pem"),
+            ("YANUGET_TLS_KEY_PATH", "/k.pem"),
+        ])
+        .is_ok());
     }
 
     #[test]
