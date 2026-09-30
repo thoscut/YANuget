@@ -281,6 +281,23 @@ pub trait PackageDatabase: Send + Sync {
     /// How many feeds currently contain this version.
     async fn feed_count(&self, id: &str, version: &NuGetVersion) -> Result<i64>;
 
+    /// Insert the global data (if absent) and a membership, in one
+    /// transaction: either both are recorded or neither is. Returns whether the
+    /// global data was new, like [`Self::upsert_package_data`];
+    /// [`Error::PackageAlreadyExists`](crate::error::Error::PackageAlreadyExists)
+    /// when the version is already a member of the feed.
+    async fn add_version(&self, package: &Package, membership: &Membership) -> Result<bool>;
+
+    /// Replace a version's global data with a new build's, and set the
+    /// membership's state, in one transaction. What hangs off the version
+    /// rather than off one build of it stays: attached files, every other
+    /// feed's membership, and this membership's download count.
+    async fn replace_version(&self, package: &Package, membership: &Membership) -> Result<()>;
+
+    /// Up to `limit` versions whose global data no feed holds any more: what a
+    /// purge that failed part-way leaves behind.
+    async fn orphaned_versions(&self, limit: i64) -> Result<Vec<Package>>;
+
     // --- feed membership ---
 
     /// Add a membership. Returns
@@ -370,6 +387,16 @@ pub trait PackageDatabase: Send + Sync {
     /// **and pending** — sorted ascending. For admin views and retention.
     async fn find_all_versions(&self, feed: &str, id: &str) -> Result<Vec<FeedVersion>>;
 
+    /// [`Self::find_all_versions`] for many ids at once (lower-cased), in a
+    /// few statements rather than one per id. Grouped by id in no particular
+    /// order, each id's versions ascending.
+    async fn find_all_versions_of(&self, feed: &str, ids: &[String]) -> Result<Vec<FeedVersion>>;
+
+    /// For every version of the given ids (lower-cased): how many feeds hold
+    /// it and how many bytes of attached files it has. What deleting it would
+    /// free, for many versions in two statements.
+    async fn version_footprints(&self, ids: &[String]) -> Result<Vec<VersionFootprint>>;
+
     /// Atomically increment the per-feed download counter for a version.
     async fn increment_downloads(&self, feed: &str, id: &str, version: &NuGetVersion)
         -> Result<()>;
@@ -420,6 +447,9 @@ pub trait PackageDatabase: Send + Sync {
 
     /// A version's files, by name.
     async fn files_for(&self, id: &str, version: &NuGetVersion) -> Result<Vec<PackageFile>>;
+
+    /// The files of every version of an id, by version then name.
+    async fn files_for_id(&self, id: &str) -> Result<Vec<PackageFile>>;
 
     /// One of a version's files, by name (ignoring case).
     async fn get_file(
@@ -503,6 +533,18 @@ pub struct DatabaseStats {
     pub file_count: i64,
     /// Their total size, in bytes.
     pub file_bytes: i64,
+}
+
+/// What one version occupies beyond its own membership, from
+/// [`PackageDatabase::version_footprints`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VersionFootprint {
+    pub lower_id: String,
+    pub normalized_version: String,
+    /// Feeds holding the version; its payload is freed only when this is 1.
+    pub feeds: i64,
+    /// Total size of its attached files, in bytes.
+    pub file_bytes: u64,
 }
 
 /// A symbol file's owning package, resolved from an SSQP lookup.

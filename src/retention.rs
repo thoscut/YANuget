@@ -211,6 +211,46 @@ pub async fn purge_version(
     Ok(removed)
 }
 
+/// Finish off versions whose global data no feed holds: what a purge that
+/// failed after removing the last membership leaves behind. Nothing serves
+/// them, and nothing else would ever revisit them. Returns how many were
+/// removed.
+///
+/// Each is re-checked under its version lock, so a push adopting the version
+/// at the same moment wins.
+pub async fn sweep_orphans(storage: &dyn PackageStorage, db: &dyn PackageDatabase) -> usize {
+    const BATCH: i64 = 500;
+    let mut removed = 0;
+    let orphans = match db.orphaned_versions(BATCH).await {
+        Ok(orphans) => orphans,
+        Err(e) => {
+            tracing::error!(error = %e, "orphan sweep could not list orphaned versions");
+            return 0;
+        }
+    };
+    for package in orphans {
+        let (id, version) = (&package.id, &package.version);
+        let _guard = crate::locks::lock_version(id, &version.normalized()).await;
+        let still = match db.feed_count(id, version).await {
+            Ok(0) => db.package_data_exists(id, version).await.unwrap_or(false),
+            _ => false,
+        };
+        if !still {
+            continue;
+        }
+        match purge_global_data(storage, db, id, version).await {
+            Ok(()) => {
+                removed += 1;
+                tracing::info!(%id, version = %version.normalized(), "removed a version no feed holds");
+            }
+            Err(e) => {
+                tracing::error!(%id, version = %version.normalized(), error = %e, "orphan sweep failed to remove version");
+            }
+        }
+    }
+    removed
+}
+
 /// Hard-delete the data shared by every feed: symbol files and rows, the stored
 /// payload and sidecars, and the `packages` row.
 ///

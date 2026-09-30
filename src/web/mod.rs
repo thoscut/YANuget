@@ -1963,10 +1963,14 @@ async fn admin_package(
     } else {
         Vec::new()
     };
+    // One query for the whole id rather than one per version, newest version
+    // first, and only the versions this feed holds.
     let mut files = Vec::new();
     if state.config.files.enabled {
+        let mut all = state.db.files_for_id(&id).await?;
         for fv in versions.iter().rev() {
-            files.extend(state.db.files_for(&id, &fv.package.version).await?);
+            let v = fv.package.normalized_version();
+            files.extend(all.extract_if(.., |f| f.normalized_version == v));
         }
     }
     Ok(Html(ui::admin_package_page(

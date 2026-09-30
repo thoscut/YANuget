@@ -21,7 +21,7 @@ use chrono::{DateTime, Utc};
 use sqlx::sqlite::{
     SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow, SqliteSynchronous,
 };
-use sqlx::{Row, SqlitePool};
+use sqlx::{Row, SqliteConnection, SqlitePool};
 
 use crate::error::{Error, Result};
 use crate::models::{DependencyGroup, Package, PackageType};
@@ -30,7 +30,7 @@ use crate::version::NuGetVersion;
 use super::{
     canonical_id, DatabaseStats, FeedVersion, Membership, PackageDatabase, PackageFile,
     SearchGroup, SearchPage, SearchRequest, SearchSort, SymbolKey, SymbolRef, TagCount,
-    UploadSession,
+    UploadSession, VersionFootprint,
 };
 
 const SCHEMA: &str = r#"
@@ -157,6 +157,33 @@ macro_rules! insert_tags {
         "INSERT OR IGNORE INTO package_tags (lower_id, normalized_version, tag) \
          SELECT ?1, ?2, lower(substr(trim(je.value), 1, 64)) FROM json_each(?3) je \
          WHERE trim(je.value) <> '' AND je.key < 64"
+    };
+}
+
+/// The `packages` insert, completed by an `ON CONFLICT` clause (`$conflict`).
+/// Bound by [`bind_package`], in the column order written here.
+macro_rules! package_insert {
+    ($conflict:literal) => {
+        concat!(
+            "INSERT INTO packages ( \
+                id, lower_id, normalized_version, original_version, \
+                version_major, version_minor, version_patch, version_revision, \
+                is_prerelease, is_semver2, listed, enabled, \
+                authors, description, icon_url, license_url, license_expression, \
+                project_url, repository_url, repository_type, min_client_version, \
+                release_notes, language, title, summary, tags, \
+                has_readme, has_embedded_icon, is_development_dependency, \
+                require_license_acceptance, \
+                package_size, package_hash, package_hash_algorithm, \
+                published, downloads, package_types, dependencies \
+            ) VALUES ( \
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, \
+                ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, \
+                ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, \
+                ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37 \
+            ) ",
+            $conflict
+        )
     };
 }
 
@@ -338,20 +365,13 @@ impl SqliteDatabase {
         // id on the page — twenty statements for a default gallery view, and up
         // to a thousand at `take=1000`, against a sixteen-connection pool, on a
         // page anyone can request.
-        //
-        // Chunked because each id is a bound parameter and SQLite builds before
-        // 3.32 cap those at 999; a single `IN` list of a thousand would be a
-        // latent failure on exactly the deployments least able to debug it.
-        const CHUNK: usize = 400;
+        // Chunked: see `ID_CHUNK`.
         let mut by_id: std::collections::HashMap<String, Vec<Package>> =
             std::collections::HashMap::with_capacity(ids.len());
 
-        for chunk in ids.chunks(CHUNK) {
+        for chunk in ids.chunks(ID_CHUNK) {
             // Parameters ?1..?4 are the flags; the ids follow from ?5.
-            let placeholders = (0..chunk.len())
-                .map(|i| format!("?{}", i + 5))
-                .collect::<Vec<_>>()
-                .join(",");
+            let placeholders = placeholders(5, chunk.len());
             let sql = format!(
                 concat!(
                     feed_select!(),
@@ -439,76 +459,94 @@ impl PackageDatabase for SqliteDatabase {
     }
 
     async fn upsert_package_data(&self, p: &Package) -> Result<bool> {
-        let (major, minor, patch, revision) = p.version.core();
-        let result = sqlx::query(
-            r#"INSERT INTO packages (
-                id, lower_id, normalized_version, original_version,
-                version_major, version_minor, version_patch, version_revision,
-                is_prerelease, is_semver2, listed, enabled,
-                authors, description, icon_url, license_url, license_expression,
-                project_url, repository_url, repository_type, min_client_version,
-                release_notes, language, title, summary, tags,
-                has_readme, has_embedded_icon, is_development_dependency,
-                require_license_acceptance,
-                package_size, package_hash, package_hash_algorithm,
-                published, downloads, package_types, dependencies
-            ) VALUES (
-                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21,
-                ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29,
-                ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37
-            )
-            ON CONFLICT(lower_id, normalized_version) DO NOTHING"#,
-        )
-        .bind(&p.id)
-        .bind(p.lower_id())
-        .bind(p.normalized_version())
-        .bind(p.version.original())
-        .bind(major as i64)
-        .bind(minor as i64)
-        .bind(patch as i64)
-        .bind(revision as i64)
-        .bind(i64::from(p.is_prerelease()))
-        .bind(i64::from(p.is_semver2))
-        .bind(i64::from(p.listed))
-        .bind(i64::from(p.enabled))
-        .bind(json(&p.authors)?)
-        .bind(&p.description)
-        .bind(&p.icon_url)
-        .bind(&p.license_url)
-        .bind(&p.license_expression)
-        .bind(&p.project_url)
-        .bind(&p.repository_url)
-        .bind(&p.repository_type)
-        .bind(&p.min_client_version)
-        .bind(&p.release_notes)
-        .bind(&p.language)
-        .bind(&p.title)
-        .bind(&p.summary)
-        .bind(json(&p.tags)?)
-        .bind(i64::from(p.has_readme))
-        .bind(i64::from(p.has_embedded_icon))
-        .bind(i64::from(p.is_development_dependency))
-        .bind(i64::from(p.require_license_acceptance))
-        .bind(p.package_size as i64)
-        .bind(&p.package_hash)
-        .bind(&p.package_hash_algorithm)
-        .bind(p.published.to_rfc3339())
-        .bind(p.downloads as i64)
-        .bind(json(&p.package_types)?)
-        .bind(json(&p.dependencies)?)
-        .execute(&self.pool)
-        .await?;
-        let inserted = result.rows_affected() > 0;
-        if inserted {
-            sqlx::query(insert_tags!())
-                .bind(p.lower_id())
-                .bind(p.normalized_version())
-                .bind(json(&p.tags)?)
-                .execute(&self.pool)
-                .await?;
-        }
+        // The row and its tag index in one transaction: as two autocommit
+        // statements, a failed tag insert left a package the tag filter and
+        // the tag cloud never saw, and nothing ever retried it.
+        let mut tx = self.pool.begin().await?;
+        let inserted = insert_package(&mut tx, p).await?;
+        tx.commit().await?;
         Ok(inserted)
+    }
+
+    async fn add_version(&self, p: &Package, m: &Membership) -> Result<bool> {
+        let mut tx = self.pool.begin().await?;
+        let inserted = insert_package(&mut tx, p).await?;
+        insert_membership(&mut tx, m).await?;
+        tx.commit().await?;
+        Ok(inserted)
+    }
+
+    async fn replace_version(&self, p: &Package, m: &Membership) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        bind_package(
+            sqlx::query(package_insert!(
+                "ON CONFLICT(lower_id, normalized_version) DO UPDATE SET \
+             id = excluded.id, original_version = excluded.original_version, \
+             authors = excluded.authors, description = excluded.description, \
+             icon_url = excluded.icon_url, license_url = excluded.license_url, \
+             license_expression = excluded.license_expression, \
+             project_url = excluded.project_url, repository_url = excluded.repository_url, \
+             repository_type = excluded.repository_type, \
+             min_client_version = excluded.min_client_version, \
+             release_notes = excluded.release_notes, language = excluded.language, \
+             title = excluded.title, summary = excluded.summary, tags = excluded.tags, \
+             has_readme = excluded.has_readme, has_embedded_icon = excluded.has_embedded_icon, \
+             is_development_dependency = excluded.is_development_dependency, \
+             require_license_acceptance = excluded.require_license_acceptance, \
+             package_size = excluded.package_size, package_hash = excluded.package_hash, \
+             package_hash_algorithm = excluded.package_hash_algorithm, \
+             published = excluded.published, package_types = excluded.package_types, \
+             dependencies = excluded.dependencies"
+            )),
+            p,
+        )?
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("DELETE FROM package_tags WHERE lower_id = ?1 AND normalized_version = ?2")
+            .bind(p.lower_id())
+            .bind(p.normalized_version())
+            .execute(&mut *tx)
+            .await?;
+        insert_tags(&mut tx, p).await?;
+        // The membership's own state is the caller's to decide; its download
+        // counter is history and survives the replacement.
+        sqlx::query(
+            r#"INSERT INTO feed_packages
+                   (feed, lower_id, normalized_version, listed, enabled, pending,
+                    flagged, flag_reason, added, downloads, pinned)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10)
+               ON CONFLICT(feed, lower_id, normalized_version) DO UPDATE SET
+                   listed = excluded.listed, enabled = excluded.enabled,
+                   pending = excluded.pending, flagged = excluded.flagged,
+                   flag_reason = excluded.flag_reason, pinned = excluded.pinned"#,
+        )
+        .bind(&m.feed)
+        .bind(canonical_id(&m.lower_id))
+        .bind(&m.normalized_version)
+        .bind(i64::from(m.listed))
+        .bind(i64::from(m.enabled))
+        .bind(i64::from(m.pending))
+        .bind(i64::from(m.flagged))
+        .bind(&m.flag_reason)
+        .bind(Utc::now().to_rfc3339())
+        .bind(i64::from(m.pinned))
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn orphaned_versions(&self, limit: i64) -> Result<Vec<Package>> {
+        let rows = sqlx::query(
+            "SELECT * FROM packages p WHERE NOT EXISTS ( \
+                 SELECT 1 FROM feed_packages fp \
+                 WHERE fp.lower_id = p.lower_id AND fp.normalized_version = p.normalized_version) \
+             LIMIT ?1",
+        )
+        .bind(limit.max(0))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(row_to_package).collect()
     }
 
     async fn package_data_exists(&self, id: &str, version: &NuGetVersion) -> Result<bool> {
@@ -535,29 +573,32 @@ impl PackageDatabase for SqliteDatabase {
     async fn delete_package_data(&self, id: &str, version: &NuGetVersion) -> Result<bool> {
         let lower = canonical_id(id);
         let normalized = version.normalized();
-        sqlx::query("DELETE FROM feed_packages WHERE lower_id = ?1 AND normalized_version = ?2")
-            .bind(&lower)
-            .bind(&normalized)
-            .execute(&self.pool)
-            .await?;
-        sqlx::query("DELETE FROM package_tags WHERE lower_id = ?1 AND normalized_version = ?2")
-            .bind(&lower)
-            .bind(&normalized)
-            .execute(&self.pool)
-            .await?;
-        // The blobs are the caller's to delete (see `retention::purge_global_data`),
-        // which it does before this, while these rows still say what they were.
-        sqlx::query("DELETE FROM package_files WHERE lower_id = ?1 AND normalized_version = ?2")
-            .bind(&lower)
-            .bind(&normalized)
-            .execute(&self.pool)
-            .await?;
+        // All or nothing. As separate statements, a failure after the
+        // memberships went left a `packages` row that no feed held and nothing
+        // would ever revisit; a later push then adopted its missing payload.
+        let mut tx = self.pool.begin().await?;
+        //
+        // The file blobs are the caller's to delete (see
+        // `retention::purge_global_data`), which it does before this, while
+        // these rows still say what they were.
+        for statement in [
+            "DELETE FROM feed_packages WHERE lower_id = ?1 AND normalized_version = ?2",
+            "DELETE FROM package_tags WHERE lower_id = ?1 AND normalized_version = ?2",
+            "DELETE FROM package_files WHERE lower_id = ?1 AND normalized_version = ?2",
+        ] {
+            sqlx::query(statement)
+                .bind(&lower)
+                .bind(&normalized)
+                .execute(&mut *tx)
+                .await?;
+        }
         let result =
             sqlx::query("DELETE FROM packages WHERE lower_id = ?1 AND normalized_version = ?2")
                 .bind(&lower)
                 .bind(&normalized)
-                .execute(&self.pool)
+                .execute(&mut *tx)
                 .await?;
+        tx.commit().await?;
         Ok(result.rows_affected() > 0)
     }
 
@@ -573,29 +614,8 @@ impl PackageDatabase for SqliteDatabase {
     }
 
     async fn add_membership(&self, m: &Membership) -> Result<()> {
-        let result = sqlx::query(
-            r#"INSERT INTO feed_packages
-                   (feed, lower_id, normalized_version, listed, enabled, pending,
-                    flagged, flag_reason, added, downloads, pinned)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10)"#,
-        )
-        .bind(&m.feed)
-        .bind(canonical_id(&m.lower_id))
-        .bind(&m.normalized_version)
-        .bind(i64::from(m.listed))
-        .bind(i64::from(m.enabled))
-        .bind(i64::from(m.pending))
-        .bind(i64::from(m.flagged))
-        .bind(&m.flag_reason)
-        .bind(Utc::now().to_rfc3339())
-        .bind(i64::from(m.pinned))
-        .execute(&self.pool)
-        .await;
-        match result {
-            Ok(_) => Ok(()),
-            Err(e) if is_unique_violation(&e) => Err(Error::PackageAlreadyExists),
-            Err(e) => Err(Error::Database(e)),
-        }
+        let mut conn = self.pool.acquire().await?;
+        insert_membership(&mut conn, m).await
     }
 
     async fn remove_membership(
@@ -783,6 +803,64 @@ impl PackageDatabase for SqliteDatabase {
             .collect::<Result<Vec<_>>>()?;
         versions.sort_by(|a, b| a.package.version.cmp(&b.package.version));
         Ok(versions)
+    }
+
+    async fn find_all_versions_of(&self, feed: &str, ids: &[String]) -> Result<Vec<FeedVersion>> {
+        let mut versions = Vec::new();
+        for chunk in ids.chunks(ID_CHUNK) {
+            // The only interpolation is `?2,?3,…`, generated from a range.
+            let sql = format!(
+                concat!(
+                    feed_select!(),
+                    " WHERE fp.feed = ?1 AND fp.lower_id IN ({placeholders})"
+                ),
+                placeholders = placeholders(2, chunk.len())
+            );
+            let mut query = sqlx::query(&sql).bind(feed);
+            for id in chunk {
+                query = query.bind(canonical_id(id));
+            }
+            for row in query.fetch_all(&self.pool).await? {
+                versions.push(row_to_feed_package(&row)?);
+            }
+        }
+        versions.sort_by(|a, b| {
+            a.package
+                .lower_id()
+                .cmp(&b.package.lower_id())
+                .then_with(|| a.package.version.cmp(&b.package.version))
+        });
+        Ok(versions)
+    }
+
+    async fn version_footprints(&self, ids: &[String]) -> Result<Vec<VersionFootprint>> {
+        let mut out = Vec::new();
+        for chunk in ids.chunks(ID_CHUNK) {
+            let sql = format!(
+                "SELECT fp.lower_id AS lower_id, fp.normalized_version AS normalized_version, \
+                        COUNT(*) AS feeds, \
+                        COALESCE((SELECT SUM(pf.size) FROM package_files pf \
+                                  WHERE pf.lower_id = fp.lower_id \
+                                    AND pf.normalized_version = fp.normalized_version), 0) \
+                            AS file_bytes \
+                 FROM feed_packages fp WHERE fp.lower_id IN ({}) \
+                 GROUP BY fp.lower_id, fp.normalized_version",
+                placeholders(1, chunk.len())
+            );
+            let mut query = sqlx::query(&sql);
+            for id in chunk {
+                query = query.bind(canonical_id(id));
+            }
+            for row in query.fetch_all(&self.pool).await? {
+                out.push(VersionFootprint {
+                    lower_id: row.try_get("lower_id")?,
+                    normalized_version: row.try_get("normalized_version")?,
+                    feeds: row.try_get("feeds")?,
+                    file_bytes: row.try_get::<i64, _>("file_bytes")?.max(0) as u64,
+                });
+            }
+        }
+        Ok(out)
     }
 
     async fn increment_downloads(
@@ -1109,6 +1187,17 @@ impl PackageDatabase for SqliteDatabase {
         rows.iter().map(row_to_file).collect()
     }
 
+    async fn files_for_id(&self, id: &str) -> Result<Vec<PackageFile>> {
+        let rows = sqlx::query(
+            "SELECT * FROM package_files WHERE lower_id = ?1 \
+             ORDER BY normalized_version, lower_name",
+        )
+        .bind(canonical_id(id))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(row_to_file).collect()
+    }
+
     async fn get_file(
         &self,
         id: &str,
@@ -1382,6 +1471,120 @@ async fn migrate_prerelease_keys(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>) -
         sqlx::query(step).execute(&mut **tx).await?;
     }
     Ok(())
+}
+
+type SqliteQuery<'q> = sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>>;
+
+/// Bind a package to the parameters of [`package_insert!`].
+fn bind_package<'q>(query: SqliteQuery<'q>, p: &'q Package) -> Result<SqliteQuery<'q>> {
+    let (major, minor, patch, revision) = p.version.core();
+    Ok(query
+        .bind(&p.id)
+        .bind(p.lower_id())
+        .bind(p.normalized_version())
+        .bind(p.version.original())
+        .bind(major as i64)
+        .bind(minor as i64)
+        .bind(patch as i64)
+        .bind(revision as i64)
+        .bind(i64::from(p.is_prerelease()))
+        .bind(i64::from(p.is_semver2))
+        .bind(i64::from(p.listed))
+        .bind(i64::from(p.enabled))
+        .bind(json(&p.authors)?)
+        .bind(&p.description)
+        .bind(&p.icon_url)
+        .bind(&p.license_url)
+        .bind(&p.license_expression)
+        .bind(&p.project_url)
+        .bind(&p.repository_url)
+        .bind(&p.repository_type)
+        .bind(&p.min_client_version)
+        .bind(&p.release_notes)
+        .bind(&p.language)
+        .bind(&p.title)
+        .bind(&p.summary)
+        .bind(json(&p.tags)?)
+        .bind(i64::from(p.has_readme))
+        .bind(i64::from(p.has_embedded_icon))
+        .bind(i64::from(p.is_development_dependency))
+        .bind(i64::from(p.require_license_acceptance))
+        .bind(p.package_size as i64)
+        .bind(&p.package_hash)
+        .bind(&p.package_hash_algorithm)
+        .bind(p.published.to_rfc3339())
+        .bind(p.downloads as i64)
+        .bind(json(&p.package_types)?)
+        .bind(json(&p.dependencies)?))
+}
+
+/// Insert a version's global data and its tag index if absent. Returns
+/// whether a row was written.
+async fn insert_package(conn: &mut SqliteConnection, p: &Package) -> Result<bool> {
+    let result = bind_package(
+        sqlx::query(package_insert!(
+            "ON CONFLICT(lower_id, normalized_version) DO NOTHING"
+        )),
+        p,
+    )?
+    .execute(&mut *conn)
+    .await?;
+    let inserted = result.rows_affected() > 0;
+    if inserted {
+        insert_tags(conn, p).await?;
+    }
+    Ok(inserted)
+}
+
+async fn insert_tags(conn: &mut SqliteConnection, p: &Package) -> Result<()> {
+    sqlx::query(insert_tags!())
+        .bind(p.lower_id())
+        .bind(p.normalized_version())
+        .bind(json(&p.tags)?)
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
+}
+
+/// Insert a membership; [`Error::PackageAlreadyExists`] when the version is
+/// already in the feed.
+async fn insert_membership(conn: &mut SqliteConnection, m: &Membership) -> Result<()> {
+    let result = sqlx::query(
+        r#"INSERT INTO feed_packages
+               (feed, lower_id, normalized_version, listed, enabled, pending,
+                flagged, flag_reason, added, downloads, pinned)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10)"#,
+    )
+    .bind(&m.feed)
+    .bind(canonical_id(&m.lower_id))
+    .bind(&m.normalized_version)
+    .bind(i64::from(m.listed))
+    .bind(i64::from(m.enabled))
+    .bind(i64::from(m.pending))
+    .bind(i64::from(m.flagged))
+    .bind(&m.flag_reason)
+    .bind(Utc::now().to_rfc3339())
+    .bind(i64::from(m.pinned))
+    .execute(&mut *conn)
+    .await;
+    match result {
+        Ok(_) => Ok(()),
+        Err(e) if is_unique_violation(&e) => Err(Error::PackageAlreadyExists),
+        Err(e) => Err(Error::Database(e)),
+    }
+}
+
+/// How many ids one `IN (…)` list binds. Each is a parameter, and SQLite
+/// builds before 3.32 cap those at 999; a single list of a thousand would be a
+/// latent failure on exactly the deployments least able to debug it.
+const ID_CHUNK: usize = 400;
+
+/// `?first,?first+1,…`: `count` numbered parameters for an `IN (…)` list.
+fn placeholders(first: usize, count: usize) -> String {
+    (first..first + count)
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// Build a `%...%` LIKE pattern, escaping the LIKE metacharacters in `query`.
