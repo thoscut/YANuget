@@ -1008,38 +1008,7 @@ async fn service_index(
 // ---------------------------------------------------------------------------
 
 async fn push_package(State(state): State<AppState>, request: Request) -> Result<Response> {
-    let headers = request.headers().clone();
-    if !state.feed.auth.check_headers(&headers) {
-        return Err(Error::Unauthorized);
-    }
-
-    let is_multipart = headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.starts_with("multipart/"))
-        .unwrap_or(false);
-
-    state.ensure_disk_space(content_length(&headers))?;
-    let (temp_path, mut file) = state.create_temp().await?;
-    let limit = state.config.max_package_size_bytes;
-
-    // Stream the body to disk. On any failure, drop the temp file.
-    let summary = match write_upload(request, &mut file, is_multipart, limit, &state).await {
-        Ok(summary) => summary,
-        Err(e) => {
-            let _ = tokio::fs::remove_file(&temp_path).await;
-            return Err(e);
-        }
-    };
-    // Flush the OS page cache to stable storage before the payload is renamed
-    // into the store. The database row that follows says the package exists; if
-    // a crash lands between the rename and the kernel's own writeback, that row
-    // would point at a truncated or empty file.
-    if let Err(e) = file.sync_all().await {
-        let _ = tokio::fs::remove_file(&temp_path).await;
-        return Err(Error::Io(e));
-    }
-    drop(file);
+    let (temp_path, summary) = receive_push(&state, request).await?;
 
     let options = IndexOptions {
         overwrite: state.feed.allow_overwrite,
@@ -1076,6 +1045,44 @@ async fn push_package(State(state): State<AppState>, request: Request) -> Result
     }
 
     Ok(StatusCode::CREATED.into_response())
+}
+
+/// The part of a push that a package and a symbol package share: check the
+/// push key, then stream the body (raw or multipart) to a fresh temp file,
+/// synced to disk. The temp file is removed on any failure; on success the
+/// caller owns it.
+async fn receive_push(state: &AppState, request: Request) -> Result<(PathBuf, StreamSummary)> {
+    let headers = request.headers();
+    if !state.feed.auth.check_headers(headers) {
+        return Err(Error::Unauthorized);
+    }
+    let is_multipart = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|s| s.starts_with("multipart/"));
+
+    state.ensure_disk_space(content_length(headers))?;
+    let (temp_path, mut file) = state.create_temp().await?;
+    let limit = state.config.max_package_size_bytes;
+
+    // Stream the body to disk. On any failure, drop the temp file.
+    let summary = match write_upload(request, &mut file, is_multipart, limit, state).await {
+        Ok(summary) => summary,
+        Err(e) => {
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            return Err(e);
+        }
+    };
+    // Flush the OS page cache to stable storage before the payload is renamed
+    // into the store. The database row that follows says the package exists; if
+    // a crash lands between the rename and the kernel's own writeback, that row
+    // would point at a truncated or empty file.
+    if let Err(e) = file.sync_all().await {
+        let _ = tokio::fs::remove_file(&temp_path).await;
+        return Err(Error::Io(e));
+    }
+    drop(file);
+    Ok((temp_path, summary))
 }
 
 /// Write the upload (raw body or the first multipart file field) to `file`.
@@ -1615,41 +1622,11 @@ async fn autocomplete(
 // ---------------------------------------------------------------------------
 
 async fn push_symbol_package(State(state): State<AppState>, request: Request) -> Result<Response> {
-    let headers = request.headers().clone();
-    if !state.feed.auth.check_headers(&headers) {
-        return Err(Error::Unauthorized);
-    }
-
-    let is_multipart = headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.starts_with("multipart/"))
-        .unwrap_or(false);
-
-    state.ensure_disk_space(content_length(&headers))?;
-    let (temp_path, mut file) = state.create_temp().await?;
-    let limit = state.config.max_package_size_bytes;
-
     // The size and hash are computed while the bytes stream past, so recording
     // them costs nothing. Dropping them left the one number in the log that says
     // how much a symbol push actually cost, and any later question about which
     // bytes were stored, unanswerable.
-    let summary = match write_upload(request, &mut file, is_multipart, limit, &state).await {
-        Ok(summary) => summary,
-        Err(e) => {
-            let _ = tokio::fs::remove_file(&temp_path).await;
-            return Err(e);
-        }
-    };
-    // Flush the OS page cache to stable storage before the payload is renamed
-    // into the store. The database row that follows says the package exists; if
-    // a crash lands between the rename and the kernel's own writeback, that row
-    // would point at a truncated or empty file.
-    if let Err(e) = file.sync_all().await {
-        let _ = tokio::fs::remove_file(&temp_path).await;
-        return Err(Error::Io(e));
-    }
-    drop(file);
+    let (temp_path, summary) = receive_push(&state, request).await?;
 
     let result = symbols::index_symbol_package(
         state.storage.as_ref(),
