@@ -115,6 +115,14 @@ version is pruned when it is beyond the newest *N* of its release channel
 version — or newest pre-release when no stable exists — is always kept, so a
 package can never be pruned out of existence.
 
+The rules count only what clients can download. **Pending** and **disabled**
+versions are outside them: they are never deleted by retention, never use up
+one of the "newest *N*", and are never the newest version that is kept — so
+pushing builds into a gated feed cannot prune the approved ones, and disabling
+a broken release does not make it the version retention protects. Unlisted
+versions still count, because a client restoring that exact version still gets
+it.
+
 | TOML key | Env var | Type | Default | Description |
 | --- | --- | --- | --- | --- |
 | `retention.enabled` | `YANUGET_RETENTION_ENABLED` | bool | `false` | Master switch. |
@@ -129,7 +137,9 @@ With no limit set, the sweep does nothing even when `enabled`.
 An admin can **pin** a version in `/admin`; retention then keeps it whatever
 the rules say, and it does not use up one of the "newest *N*" either — a pin is
 kept in addition to what the rules keep. A pin survives an overwriting push and
-moves with a version to another feed; it does not stop an explicit delete.
+moves with a version to another feed; it does not stop an explicit delete. A
+cleanup re-checks each version just before deleting it, so a pin set while one
+is running is honoured.
 
 `/admin/retention` shows these rules, what the last cleanup did, and exactly
 what the next one would delete and why, with a button that deletes that list
