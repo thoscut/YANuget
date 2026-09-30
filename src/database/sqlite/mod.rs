@@ -70,6 +70,8 @@ macro_rules! feed_select {
 mod feeds;
 mod files;
 mod memberships;
+#[cfg(test)]
+mod migration_tests;
 mod packages;
 mod schema;
 mod search;

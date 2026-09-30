@@ -1,10 +1,181 @@
 //! The schema and its migrations.
+//!
+//! Every change to the schema is a numbered step in [`MIGRATIONS`], and
+//! `PRAGMA user_version` holds the number of the last step a database has had.
+//! Opening a database runs the steps above that number, in order, each in its
+//! own `BEGIN IMMEDIATE` transaction that re-reads the number first: a step
+//! applies completely or not at all, exactly once, and a second process
+//! opening the same file (the server and `yanuget migrate`) waits for the
+//! first and then finds nothing left to do. A new database runs every step
+//! from the first, so it ends up exactly where an upgraded one does.
+//!
+//! A step that has shipped is never edited: a change is a new step. That
+//! includes an index or trigger whose definition changes, which a new step
+//! drops and creates again — `CREATE … IF NOT EXISTS` would keep the old
+//! definition on every existing database, silently.
+//!
+//! ## Steps 1 to 5: the schema before it was numbered
+//!
+//! Until 0.6 only data migrations were numbered. The tables, indexes and
+//! triggers were created with `IF NOT EXISTS` and columns added when missing
+//! on every start, whatever `user_version` said, so a database at a given
+//! number can have the shape of any build since that step. Steps 1 to 5
+//! therefore bring whatever they find up to the last unnumbered shape first,
+//! with [`legacy_shape`], which is idempotent and frozen: it is what every
+//! database created before 0.6 converges to, and it never changes again.
+//!
+//! ## Why not `sqlx::migrate!`
+//!
+//! sqlx's migrator keeps its own `_sqlx_migrations` table with a checksum per
+//! file, which no existing database has. Bridging to it means detecting which
+//! of the many unnumbered shapes a database is in and forging applied rows for
+//! it — the same detection the steps above do, plus a second bookkeeping
+//! table that could disagree with `user_version`. Its SQLite driver also opens
+//! a deferred transaction per migration and takes no lock, so two processes
+//! starting together could both apply one. And the steps here are not all
+//! plain SQL: bringing an old shape up adds columns only where they are
+//! missing, and the foreign-key step counts and logs what it removes. So the
+//! steps are a table of Rust code, numbered by `user_version`.
 
-use sqlx::{Row, SqlitePool};
+use sqlx::{Row, SqliteConnection, SqlitePool};
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 
-const SCHEMA: &str = r#"
+/// One numbered schema change.
+struct Migration {
+    /// The `user_version` a database has once this step is applied: the
+    /// step's position in [`MIGRATIONS`], counting from 1.
+    version: i64,
+    /// What it does, for the log.
+    description: &'static str,
+    /// The change, run inside the step's transaction by [`apply`].
+    step: Step,
+}
+
+/// Every schema change, in order. Append only.
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        description: "seed the default feed from a database that predates feeds",
+        step: Step::SeedDefaultFeed,
+    },
+    Migration {
+        version: 2,
+        description: "index the tags of versions stored before the tag index",
+        step: Step::IndexTags,
+    },
+    Migration {
+        version: 3,
+        description: "lower-case the pre-release label of versions stored before 0.5.0",
+        step: Step::LowerCasePrereleaseKeys,
+    },
+    Migration {
+        version: 4,
+        description: "fill the search index for versions stored before it",
+        step: Step::FillSearchIndex,
+    },
+    Migration {
+        version: 5,
+        description: "bring the tables of an unnumbered schema up to date",
+        step: Step::LegacyShape,
+    },
+];
+
+/// What a [`Migration`] runs. An enum rather than a function pointer in the
+/// table: a boxed future borrowing the connection for any lifetime is more
+/// than sqlx's executor bounds can prove `Send`.
+#[derive(Debug, Clone, Copy)]
+enum Step {
+    SeedDefaultFeed,
+    IndexTags,
+    LowerCasePrereleaseKeys,
+    FillSearchIndex,
+    LegacyShape,
+}
+
+async fn apply(step: Step, c: &mut SqliteConnection) -> Result<()> {
+    match step {
+        Step::SeedDefaultFeed => seed_default_feed(c).await,
+        Step::IndexTags => index_tags(c).await,
+        Step::LowerCasePrereleaseKeys => lower_case_prerelease_keys(c).await,
+        Step::FillSearchIndex => fill_search_index(c).await,
+        Step::LegacyShape => legacy_shape(c).await,
+    }
+}
+
+/// The schema version this build migrates to.
+pub(super) const LATEST: i64 = MIGRATIONS.len() as i64;
+
+/// Bring the schema up to date.
+pub(super) async fn migrate(pool: &SqlitePool) -> Result<()> {
+    migrate_to(pool, LATEST).await
+}
+
+/// Apply every step up to and including `target`.
+pub(super) async fn migrate_to(pool: &SqlitePool, target: i64) -> Result<()> {
+    // Nothing to do, the usual case: no need to queue for the write lock.
+    if user_version(pool).await? == LATEST {
+        return Ok(());
+    }
+    for step in MIGRATIONS.iter().take_while(|m| m.version <= target) {
+        // `BEGIN IMMEDIATE` takes the write lock before `user_version` is
+        // read. A deferred transaction only asks for it at the first write,
+        // and a reader upgrading to a writer while another connection holds
+        // the lock gets `SQLITE_BUSY` at once, without waiting out the busy
+        // timeout: the second of two processes started together failed to
+        // open the database. Taken up front, the loser waits, then reads the
+        // version the winner wrote and has nothing left to do.
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+        let current: i64 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(&mut *tx)
+            .await?;
+        check_known(current)?;
+        if current >= step.version {
+            continue;
+        }
+        apply(step.step, &mut tx).await?;
+        // `PRAGMA` takes no bound parameters; the number is from the table.
+        sqlx::query(&format!("PRAGMA user_version = {}", step.version))
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        if current > 0 {
+            tracing::info!(
+                version = step.version,
+                "database migrated: {}",
+                step.description
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn user_version(pool: &SqlitePool) -> Result<i64> {
+    let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+        .fetch_one(pool)
+        .await?;
+    check_known(version)?;
+    Ok(version)
+}
+
+/// Refuse a database a newer release has migrated: this build does not know
+/// what its later steps changed, and writing to it would be a guess.
+fn check_known(version: i64) -> Result<()> {
+    if version > LATEST {
+        return Err(Error::Other(anyhow::anyhow!(
+            "the database is at schema version {version}, but this build of YANuget only \
+             knows versions up to {LATEST}; it was opened by a newer release, so run that \
+             one (or restore a backup taken before the upgrade)"
+        )));
+    }
+    Ok(())
+}
+
+// --- steps 1 to 5: the schema before it was numbered ---
+
+/// The last unnumbered shape of the tables: frozen. A change to the schema
+/// goes in a new step, never here.
+const LEGACY_TABLES: &str = r#"
 CREATE TABLE IF NOT EXISTS packages (
     id                        TEXT    NOT NULL,
     lower_id                  TEXT    NOT NULL,
@@ -45,7 +216,6 @@ CREATE TABLE IF NOT EXISTS packages (
     dependencies              TEXT    NOT NULL,
     PRIMARY KEY (lower_id, normalized_version)
 );
-CREATE INDEX IF NOT EXISTS idx_packages_lower_id ON packages (lower_id);
 
 CREATE TABLE IF NOT EXISTS feed_packages (
     feed               TEXT    NOT NULL,
@@ -61,13 +231,6 @@ CREATE TABLE IF NOT EXISTS feed_packages (
     pinned             INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (feed, lower_id, normalized_version)
 );
--- Covers the search ranking: the (feed, lower_id) prefix scopes a feed and
--- supports GROUP BY lower_id, while including `downloads` lets SUM(downloads)
--- be read straight from the index instead of looking up each table row.
-CREATE INDEX IF NOT EXISTS idx_feed_packages_rank
-    ON feed_packages (feed, lower_id, downloads);
-CREATE INDEX IF NOT EXISTS idx_feed_packages_pkg
-    ON feed_packages (lower_id, normalized_version);
 
 CREATE TABLE IF NOT EXISTS symbols (
     ssqp_key           TEXT NOT NULL,   -- upper-case {GUID}{age}
@@ -76,8 +239,6 @@ CREATE TABLE IF NOT EXISTS symbols (
     normalized_version TEXT NOT NULL,
     PRIMARY KEY (ssqp_key, filename)
 );
-CREATE INDEX IF NOT EXISTS idx_symbols_owner
-    ON symbols (lower_id, normalized_version);
 
 -- One row per (version, lower-cased tag): what the tag filter and the tag
 -- cloud read, as index lookups rather than a JSON scan of every package on
@@ -88,7 +249,6 @@ CREATE TABLE IF NOT EXISTS package_tags (
     tag                TEXT NOT NULL,
     PRIMARY KEY (lower_id, normalized_version, tag)
 );
-CREATE INDEX IF NOT EXISTS idx_package_tags_tag ON package_tags (tag, lower_id);
 
 -- Files attached to versions. The bytes are a blob named by `sha256`; a row
 -- is one reference to it, so a blob goes when its last row does.
@@ -103,7 +263,6 @@ CREATE TABLE IF NOT EXISTS package_files (
     downloads          INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (lower_id, normalized_version, lower_name)
 );
-CREATE INDEX IF NOT EXISTS idx_package_files_blob ON package_files (sha256);
 
 -- Resumable uploads in progress; the partial bytes are `.uploads/{id}.part`.
 CREATE TABLE IF NOT EXISTS uploads (
@@ -129,6 +288,7 @@ CREATE TABLE IF NOT EXISTS tombstones (
     created            TEXT    NOT NULL,
     PRIMARY KEY (feed, lower_id, normalized_version)
 );
+
 -- The search index: one row per version in an FTS5 table with the trigram
 -- tokenizer, so a query is a substring match (what search has always done)
 -- answered from an index instead of `LIKE '%q%'` over every version's full
@@ -148,6 +308,24 @@ CREATE TABLE IF NOT EXISTS search_keys (
 CREATE VIRTUAL TABLE IF NOT EXISTS search_text USING fts5(
     lower_id, title, tags, description, tokenize = 'trigram'
 );
+"#;
+
+/// The indexes and triggers of the last unnumbered shape: frozen, like
+/// [`LEGACY_TABLES`]. Separate because some of them cover columns that older
+/// databases lack, which [`legacy_shape`] adds in between.
+const LEGACY_INDEXES: &str = r#"
+CREATE INDEX IF NOT EXISTS idx_packages_lower_id ON packages (lower_id);
+-- Covers the search ranking: the (feed, lower_id) prefix scopes a feed and
+-- supports GROUP BY lower_id, while including `downloads` lets SUM(downloads)
+-- be read straight from the index instead of looking up each table row.
+CREATE INDEX IF NOT EXISTS idx_feed_packages_rank
+    ON feed_packages (feed, lower_id, downloads);
+CREATE INDEX IF NOT EXISTS idx_feed_packages_pkg
+    ON feed_packages (lower_id, normalized_version);
+CREATE INDEX IF NOT EXISTS idx_symbols_owner
+    ON symbols (lower_id, normalized_version);
+CREATE INDEX IF NOT EXISTS idx_package_tags_tag ON package_tags (tag, lower_id);
+CREATE INDEX IF NOT EXISTS idx_package_files_blob ON package_files (sha256);
 CREATE TRIGGER IF NOT EXISTS packages_search_insert AFTER INSERT ON packages BEGIN
     INSERT OR IGNORE INTO search_keys (lower_id, normalized_version)
         VALUES (new.lower_id, new.normalized_version);
@@ -184,134 +362,87 @@ AFTER UPDATE OF lower_id, normalized_version, title, tags, description ON packag
         FROM search_keys
         WHERE lower_id = new.lower_id AND normalized_version = new.normalized_version;
 END;
+-- The (feed, lower_id) index of the first feeds build, subsumed by
+-- `idx_feed_packages_rank`.
+DROP INDEX IF EXISTS idx_feed_packages_feed;
+-- 0.1's search index over `packages.listed`, which nothing has read since
+-- feeds took over listing, and which nothing dropped either.
+DROP INDEX IF EXISTS idx_packages_search;
 "#;
 
-/// Bring the schema up to date.
-pub(super) async fn migrate(pool: &SqlitePool) -> Result<()> {
-    sqlx::raw_sql(SCHEMA).execute(pool).await?;
-    // Migrate databases created before the admin `enabled` column existed.
-    ensure_column(pool, "packages", "enabled", "INTEGER NOT NULL DEFAULT 1").await?;
-    // Databases predating the requireLicenseAcceptance passthrough. The
-    // default is `false`, which is exactly what those rows were reported as.
+/// Bring a database from before numbered steps to the last unnumbered shape:
+/// create what is missing, add the columns older builds did not have. What
+/// every unnumbered start did, and idempotent like it.
+async fn legacy_shape(c: &mut SqliteConnection) -> Result<()> {
+    sqlx::raw_sql(LEGACY_TABLES).execute(&mut *c).await?;
+    // The admin `enabled` flag, from before feeds.
+    ensure_column(c, "packages", "enabled", "INTEGER NOT NULL DEFAULT 1").await?;
+    // The requireLicenseAcceptance passthrough. `false` is exactly what those
+    // rows were reported as.
     ensure_column(
-        pool,
+        c,
         "packages",
         "require_license_acceptance",
         "INTEGER NOT NULL DEFAULT 0",
     )
     .await?;
-    // Databases predating pins: nothing was pinned.
+    // Per-feed download counts: the first feeds build kept them on
+    // `packages` only, and nothing ever added the column to its
+    // `feed_packages`, so such a database failed step 1 until now.
     ensure_column(
-        pool,
+        c,
         "feed_packages",
-        "pinned",
+        "downloads",
         "INTEGER NOT NULL DEFAULT 0",
     )
     .await?;
-    // Drop the legacy (feed, lower_id) index, now subsumed by the wider
-    // covering index `idx_feed_packages_rank` created above.
-    sqlx::query("DROP INDEX IF EXISTS idx_feed_packages_feed")
-        .execute(pool)
-        .await?;
-
-    // One-shot migration of single-feed databases created before feeds
-    // existed: seed each existing package into the implicit `default` feed,
-    // copying its state. Gated by `PRAGMA user_version` so it runs exactly
-    // once on a pre-feeds database and never resurrects memberships that
-    // were later deleted (which an "is feed_packages empty?" guard would).
-    //
-    // In one transaction, and with `OR IGNORE`, because neither the crash
-    // nor the concurrency case is hypothetical: as three separate
-    // autocommit statements, a crash between the insert and the version
-    // bump left the rows written and the version unset, so every later
-    // start re-ran an insert that now violated the primary key — the server
-    // refused to start again, permanently, until someone set
-    // `user_version` by hand. Two processes opening the same file (the
-    // server and `yanuget migrate`) both read 0 and produced the same
-    // failure. Together these make re-running the migration a no-op instead
-    // of an error.
-    //
-    // `BEGIN IMMEDIATE` takes the write lock before `user_version` is read.
-    // A deferred transaction only asks for it at the first write, and a
-    // reader upgrading to a writer while another connection holds the lock
-    // gets `SQLITE_BUSY` at once, without waiting out the busy timeout: the
-    // second of two processes started together failed to open the
-    // database. Taken up front, the loser waits, then reads the version the
-    // winner wrote and has nothing left to do.
-    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
-    let schema_version: i64 = sqlx::query_scalar("PRAGMA user_version")
-        .fetch_one(&mut *tx)
-        .await?;
-    if schema_version < 1 {
-        sqlx::query(
-            r#"INSERT OR IGNORE INTO feed_packages
-                   (feed, lower_id, normalized_version, listed, enabled, pending,
-                    flagged, flag_reason, added, downloads)
-               SELECT 'default', lower_id, normalized_version, listed, enabled, 0, 0, NULL,
-                      published, downloads
-               FROM packages"#,
-        )
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query("PRAGMA user_version = 1")
-            .execute(&mut *tx)
-            .await?;
-    }
-    // Version 2: index the tags of every package stored before
-    // `package_tags` existed. Same transaction and `OR IGNORE`, so it is
-    // exactly-once and a no-op when re-run.
-    if schema_version < 2 {
-        sqlx::query(
-            "INSERT OR IGNORE INTO package_tags (lower_id, normalized_version, tag) \
-             SELECT p.lower_id, p.normalized_version, lower(substr(trim(je.value), 1, 64)) \
-             FROM packages p, json_each(p.tags) je \
-             WHERE trim(je.value) <> '' AND je.key < 64",
-        )
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query("PRAGMA user_version = 2")
-            .execute(&mut *tx)
-            .await?;
-    }
-    // Version 3: lower-case the pre-release label of versions stored
-    // before 0.5.0 made that part of the normalized form.
-    if schema_version < 3 {
-        migrate_prerelease_keys(&mut tx).await?;
-        sqlx::query("PRAGMA user_version = 3")
-            .execute(&mut *tx)
-            .await?;
-    }
-    // Version 4: fill the search index for the versions stored before it
-    // existed. Rebuilt from scratch, so it is a no-op to re-run.
-    if schema_version < 4 {
-        for step in [
-            "DELETE FROM search_text",
-            "DELETE FROM search_keys",
-            "INSERT INTO search_keys (lower_id, normalized_version) \
-             SELECT lower_id, normalized_version FROM packages",
-            "INSERT INTO search_text (rowid, lower_id, title, tags, description) \
-             SELECT k.id, p.lower_id, IFNULL(p.title, ''), \
-                    (SELECT IFNULL(group_concat(value, ' '), '') FROM json_each(p.tags)), \
-                    substr(p.description, 1, 4000) \
-             FROM packages p JOIN search_keys k \
-               ON k.lower_id = p.lower_id AND k.normalized_version = p.normalized_version",
-            "PRAGMA user_version = 4",
-        ] {
-            sqlx::query(step).execute(&mut *tx).await?;
-        }
-    }
-    tx.commit().await?;
+    // Pins: nothing was pinned.
+    ensure_column(c, "feed_packages", "pinned", "INTEGER NOT NULL DEFAULT 0").await?;
+    sqlx::raw_sql(LEGACY_INDEXES).execute(&mut *c).await?;
     Ok(())
 }
 
-/// Rewrite every stored normalized version to its lower-cased form: the
-/// `user_version = 3` data migration.
+/// Step 1: seed each package of a single-feed database, created before feeds
+/// existed, into the implicit `default` feed, copying its state. `OR IGNORE`
+/// because the first feeds build seeded some without numbering it.
+async fn seed_default_feed(c: &mut SqliteConnection) -> Result<()> {
+    legacy_shape(c).await?;
+    sqlx::query(
+        r#"INSERT OR IGNORE INTO feed_packages
+               (feed, lower_id, normalized_version, listed, enabled, pending,
+                flagged, flag_reason, added, downloads)
+           SELECT 'default', lower_id, normalized_version, listed, enabled, 0, 0, NULL,
+                  published, downloads
+           FROM packages"#,
+    )
+    .execute(&mut *c)
+    .await?;
+    Ok(())
+}
+
+/// Step 2: index the tags of every package stored before `package_tags`
+/// existed.
+async fn index_tags(c: &mut SqliteConnection) -> Result<()> {
+    legacy_shape(c).await?;
+    sqlx::query(
+        "INSERT OR IGNORE INTO package_tags (lower_id, normalized_version, tag) \
+         SELECT p.lower_id, p.normalized_version, lower(substr(trim(je.value), 1, 64)) \
+         FROM packages p, json_each(p.tags) je \
+         WHERE trim(je.value) <> '' AND je.key < 64",
+    )
+    .execute(&mut *c)
+    .await?;
+    Ok(())
+}
+
+/// Step 3: rewrite every stored normalized version to its lower-cased form.
 ///
 /// 0.5.0 began lower-casing the pre-release label in
-/// [`NuGetVersion::normalized`], but rows written earlier as `1.0.0-Beta` kept
-/// their case. Listings still found them while every exact lookup (download,
-/// delete, unlist, retention) bound the lower-cased key and missed, and a
-/// re-push created a second row sharing the one lower-cased file on disk.
+/// [`NuGetVersion::normalized`](crate::version::NuGetVersion::normalized), but
+/// rows written earlier as `1.0.0-Beta` kept their case. Listings still found
+/// them while every exact lookup (download, delete, unlist, retention) bound
+/// the lower-cased key and missed, and a re-push created a second row sharing
+/// the one lower-cased file on disk.
 ///
 /// The core of a normalized version is digits and dots, so lower-casing the
 /// whole string lower-cases exactly the label (which is ASCII by grammar).
@@ -323,9 +454,8 @@ pub(super) async fn migrate(pool: &SqlitePool) -> Result<()> {
 /// re-pointed; attached files of the losing row that collide by name with the
 /// survivor's are dropped (their blob is then referenced by nothing and stays
 /// on disk, which is safer than guessing at a live one from here).
-///
-/// Runs in the caller's transaction, so it applies completely or not at all.
-async fn migrate_prerelease_keys(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>) -> Result<()> {
+async fn lower_case_prerelease_keys(c: &mut SqliteConnection) -> Result<()> {
+    legacy_shape(c).await?;
     const STEPS: &[&str] = &[
         "DROP TABLE IF EXISTS temp.v3_packages",
         "DROP TABLE IF EXISTS temp.v3_memberships",
@@ -379,283 +509,89 @@ async fn migrate_prerelease_keys(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>) -
         "DROP TABLE temp.v3_memberships",
     ];
     for step in STEPS {
-        sqlx::query(step).execute(&mut **tx).await?;
+        sqlx::query(step).execute(&mut *c).await?;
     }
     Ok(())
 }
 
-/// Idempotently add a column to an existing table (SQLite has no
-/// `ADD COLUMN IF NOT EXISTS`). Checks `PRAGMA table_info` first so re-running
-/// migrations is a no-op.
+/// Step 4: fill the search index for the versions stored before it existed.
+/// Rebuilt from scratch.
+async fn fill_search_index(c: &mut SqliteConnection) -> Result<()> {
+    legacy_shape(c).await?;
+    for step in [
+        "DELETE FROM search_text",
+        "DELETE FROM search_keys",
+        "INSERT INTO search_keys (lower_id, normalized_version) \
+         SELECT lower_id, normalized_version FROM packages",
+        "INSERT INTO search_text (rowid, lower_id, title, tags, description) \
+         SELECT k.id, p.lower_id, IFNULL(p.title, ''), \
+                (SELECT IFNULL(group_concat(value, ' '), '') FROM json_each(p.tags)), \
+                substr(p.description, 1, 4000) \
+         FROM packages p JOIN search_keys k \
+           ON k.lower_id = p.lower_id AND k.normalized_version = p.normalized_version",
+    ] {
+        sqlx::query(step).execute(&mut *c).await?;
+    }
+    Ok(())
+}
+
+/// Add a column to a table unless it has one of that name (SQLite has no
+/// `ADD COLUMN IF NOT EXISTS`).
 ///
 /// Every name is `&'static str` on purpose: neither `PRAGMA` nor `ALTER TABLE`
 /// takes bound parameters, so all three have to be interpolated. Requiring
 /// literals keeps that safe by construction rather than by convention — a caller
 /// cannot reach this with a request-supplied name without changing the signature
 /// first. It is also exactly what sqlx 0.9's injection guard will want.
+///
+/// Only ever called inside a step's transaction, which holds the write lock,
+/// so no other process can add the column between the check and the `ALTER`.
 async fn ensure_column(
-    pool: &SqlitePool,
+    c: &mut SqliteConnection,
     table: &'static str,
     column: &'static str,
     def: &'static str,
 ) -> Result<()> {
     let rows = sqlx::query(&format!("PRAGMA table_info({table})"))
-        .fetch_all(pool)
+        .fetch_all(&mut *c)
         .await?;
     let exists = rows
         .iter()
         .any(|r| r.get::<String, _>("name").eq_ignore_ascii_case(column));
     if !exists {
-        // Check-then-act, so two processes opening the same file — the server
-        // and `yanuget migrate`, or two replicas on a shared volume — can both
-        // decide to add it and the loser gets `duplicate column name`. SQLite
-        // has no `ADD COLUMN IF NOT EXISTS`, so the race is absorbed here: the
-        // column existing is precisely the outcome this function is asking for.
-        if let Err(e) = sqlx::query(&format!("ALTER TABLE {table} ADD COLUMN {column} {def}"))
-            .execute(pool)
-            .await
-        {
-            if !is_duplicate_column(&e) {
-                return Err(e.into());
-            }
-        }
+        sqlx::query(&format!("ALTER TABLE {table} ADD COLUMN {column} {def}"))
+            .execute(&mut *c)
+            .await?;
     }
     Ok(())
 }
 
-/// Whether a failed `ALTER TABLE … ADD COLUMN` failed only because the column
-/// was already added — by an earlier run, or by another process just now.
-fn is_duplicate_column(e: &sqlx::Error) -> bool {
-    e.as_database_error()
-        .map(|d| d.message().contains("duplicate column name"))
-        .unwrap_or(false)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::super::test_support::pool;
     use super::super::test_support::*;
-    use super::ensure_column;
+    use super::*;
 
-    #[tokio::test]
-    async fn tags_stored_before_the_index_are_indexed_once() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("old.db").to_string_lossy().into_owned();
-        {
-            let db = SqliteDatabase::connect(&path).await.unwrap();
-            db.add_to_feed(FEED, &tagged("Old.Pkg", "1.0.0", &["Legacy", "tools"]))
-                .await
-                .unwrap();
-            // As a database from before the tag index: no index rows, and the
-            // schema version it had then.
-            sqlx::query("DELETE FROM package_tags")
-                .execute(pool(&db))
-                .await
-                .unwrap();
-            sqlx::query("PRAGMA user_version = 1")
-                .execute(pool(&db))
-                .await
-                .unwrap();
-        }
-        let db = SqliteDatabase::connect(&path).await.unwrap();
-        let counts = db.tag_counts(FEED, 10).await.unwrap();
-        assert_eq!(counts.len(), 2, "{counts:?}");
-        assert!(counts.iter().any(|t| t.tag == "legacy"));
-        let version: i64 = sqlx::query_scalar("PRAGMA user_version")
-            .fetch_one(pool(&db))
-            .await
-            .unwrap();
-        assert_eq!(version, 4);
-    }
-
-    /// Give every row of one version the key a pre-0.5.0 server wrote: the
-    /// pre-release label as pushed rather than lower-cased.
-    async fn respell(db: &SqliteDatabase, lower_id: &str, from: &str, to: &str) {
-        for table in [
-            "packages",
-            "feed_packages",
-            "package_tags",
-            "package_files",
-            "symbols",
-        ] {
-            sqlx::query(&format!(
-                "UPDATE {table} SET normalized_version = ?3 \
-                 WHERE lower_id = ?1 AND normalized_version = ?2"
-            ))
-            .bind(lower_id)
-            .bind(from)
-            .bind(to)
-            .execute(pool(db))
-            .await
-            .unwrap();
+    #[test]
+    fn steps_are_numbered_in_order_from_one() {
+        for (i, step) in MIGRATIONS.iter().enumerate() {
+            assert_eq!(step.version, i as i64 + 1, "{}", step.description);
         }
     }
 
     #[tokio::test]
-    async fn pre_release_keys_from_before_0_5_are_lower_cased_once() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("old.db").to_string_lossy().into_owned();
-        let beta = NuGetVersion::parse("1.0.0-Beta").unwrap();
-        let rc = NuGetVersion::parse("2.0.0-rc").unwrap();
-        {
-            let db = SqliteDatabase::connect(&path).await.unwrap();
-            // A version only ever stored the old way, with a symbol and a file.
-            db.add_to_feed(FEED, &tagged("Old.Pkg", "1.0.0-Beta", &["Legacy"]))
-                .await
-                .unwrap();
-            db.add_symbol("ABCDEF01FFFFFFFF", "old.pdb", "Old.Pkg", &beta)
-                .await
-                .unwrap();
-            db.add_file(&PackageFile {
-                lower_id: "old.pkg".into(),
-                normalized_version: "1.0.0-beta".into(),
-                name: "image.iso".into(),
-                sha256: "aa".repeat(32),
-                size: 3,
-                uploaded: Utc::now(),
-                downloads: 0,
-            })
-            .await
-            .unwrap();
-            respell(&db, "old.pkg", "1.0.0-beta", "1.0.0-Beta").await;
-
-            // A version stored the old way and then pushed again after the
-            // upgrade: two rows, one file. The re-push wrote the file last.
-            let mut before = sample("Dup.Pkg", "2.0.0-RC");
-            before.published = Utc::now() - chrono::Duration::days(10);
-            before.package_hash = "old-bytes".into();
-            db.add_to_feed(FEED, &before).await.unwrap();
-            db.add_to_feed("other", &before).await.unwrap();
-            db.set_pinned(FEED, "dup.pkg", &rc, true).await.unwrap();
-            for _ in 0..3 {
-                db.increment_downloads(FEED, "dup.pkg", &rc).await.unwrap();
-            }
-            respell(&db, "dup.pkg", "2.0.0-rc", "2.0.0-RC").await;
-            let mut after = sample("Dup.Pkg", "2.0.0-rc");
-            after.package_hash = "new-bytes".into();
-            db.add_to_feed(FEED, &after).await.unwrap();
-            for _ in 0..2 {
-                db.increment_downloads(FEED, "dup.pkg", &rc).await.unwrap();
-            }
-            // What exact lookups saw before the migration.
-            assert!(db.find(FEED, "old.pkg", &beta).await.unwrap().is_none());
-
-            sqlx::query("PRAGMA user_version = 2")
-                .execute(pool(&db))
-                .await
-                .unwrap();
-        }
-
-        let db = SqliteDatabase::connect(&path).await.unwrap();
-        let old = db.find(FEED, "old.pkg", &beta).await.unwrap().unwrap();
-        assert_eq!(old.version.original(), "1.0.0-Beta", "display form is kept");
-        assert_eq!(db.files_for("old.pkg", &beta).await.unwrap().len(), 1);
-        let symbol = db
-            .find_symbol("ABCDEF01FFFFFFFF", "old.pdb")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(symbol.normalized_version, "1.0.0-beta");
-        let by_tag = SearchRequest {
-            tag: Some("legacy".into()),
-            ..Default::default()
-        };
-        assert_eq!(db.search(FEED, &by_tag).await.unwrap().total_hits, 1);
-
-        // One row survives, the one matching the bytes on disk, and the two
-        // memberships of `default` merged.
-        let rows: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM packages WHERE lower_id = 'dup.pkg'")
-                .fetch_one(pool(&db))
-                .await
-                .unwrap();
-        assert_eq!(rows, 1);
-        let data = db.get_package_data("dup.pkg", &rc).await.unwrap().unwrap();
-        assert_eq!(data.package_hash, "new-bytes");
-        let merged = db.find_all_versions(FEED, "dup.pkg").await.unwrap();
-        assert_eq!(merged.len(), 1);
-        assert!(merged[0].pinned);
-        assert_eq!(merged[0].package.downloads, 5);
-        assert!(db.exists("other", "dup.pkg", &rc).await.unwrap());
-        assert!(db.delete_package_data("dup.pkg", &rc).await.unwrap());
-        assert_eq!(db.feed_count("dup.pkg", &rc).await.unwrap(), 0);
-
-        let version: i64 = sqlx::query_scalar("PRAGMA user_version")
-            .fetch_one(pool(&db))
-            .await
-            .unwrap();
-        assert_eq!(version, 4);
-    }
-
-    #[tokio::test]
-    async fn two_processes_can_migrate_the_same_file_at_once() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("race.db").to_string_lossy().into_owned();
-        {
-            let db = SqliteDatabase::connect(&path).await.unwrap();
-            db.add_to_feed(FEED, &sample("Race.Pkg", "1.0.0-Beta"))
-                .await
-                .unwrap();
-            sqlx::query("PRAGMA user_version = 0")
-                .execute(pool(&db))
-                .await
-                .unwrap();
-        }
-        // The server and `yanuget migrate` started together: both must open
-        // the file, and the migrations must run once.
-        let (a, b) = tokio::join!(
-            SqliteDatabase::connect(&path),
-            SqliteDatabase::connect(&path)
-        );
-        let (a, b) = (a.unwrap(), b.unwrap());
-        let v = NuGetVersion::parse("1.0.0-beta").unwrap();
-        assert!(a.find(FEED, "race.pkg", &v).await.unwrap().is_some());
-        assert_eq!(b.feed_count("race.pkg", &v).await.unwrap(), 1);
-    }
-
-    #[tokio::test]
-    async fn versions_stored_before_the_search_index_are_indexed() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("old.db").to_string_lossy().into_owned();
-        {
-            let db = SqliteDatabase::connect(&path).await.unwrap();
-            db.add_to_feed(FEED, &sample("Before.Index", "1.0.0"))
-                .await
-                .unwrap();
-            for step in [
-                "DELETE FROM search_text",
-                "DELETE FROM search_keys",
-                "PRAGMA user_version = 3",
-            ] {
-                sqlx::query(step).execute(pool(&db)).await.unwrap();
-            }
-        }
-        let db = SqliteDatabase::connect(&path).await.unwrap();
-        assert_eq!(hits(&db, "before.ind").await, ["Before.Index"]);
-    }
-
-    #[tokio::test]
-    async fn ensure_column_is_idempotent() {
-        // Re-opening (which re-runs migrations) must not fail or drop data.
+    async fn ensure_column_adds_a_column_once() {
         let db = SqliteDatabase::in_memory().await.unwrap();
         db.add_to_feed(FEED, &sample("Keep", "1.0.0"))
             .await
             .unwrap();
-        ensure_column(
-            pool(&db),
-            "packages",
-            "enabled",
-            "INTEGER NOT NULL DEFAULT 1",
-        )
-        .await
-        .unwrap();
-        // Adding a genuinely new column then re-running is a no-op the 2nd time.
-        ensure_column(pool(&db), "packages", "extra_col", "TEXT")
+        let mut conn = pool(&db).acquire().await.unwrap();
+        ensure_column(&mut conn, "packages", "extra_col", "TEXT")
             .await
             .unwrap();
-        ensure_column(pool(&db), "packages", "extra_col", "TEXT")
+        ensure_column(&mut conn, "packages", "extra_col", "TEXT")
             .await
             .unwrap();
+        drop(conn);
         assert!(db
             .find(FEED, "keep", &NuGetVersion::parse("1.0.0").unwrap())
             .await
