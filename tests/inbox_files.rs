@@ -11,6 +11,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use futures::StreamExt;
 use yanuget::config::Config;
 use yanuget::database::SqliteDatabase;
 use yanuget::storage::FilesystemStorage;
@@ -436,5 +437,75 @@ async fn detaching_from_one_version_never_deletes_a_blob_another_is_attaching() 
         assert_eq!(got.status(), reqwest::StatusCode::OK, "round {round}");
         assert_eq!(got.bytes().await.unwrap().len(), image.len());
         delete_file(&server, "Race.Img", "2.0.0", "b.wim").await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// What uploads leave behind
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn staging_files_a_crash_left_are_swept_on_startup() {
+    let server = spawn_with(|c| {
+        let staging = c.storage_path().join(".uploads");
+        std::fs::create_dir_all(&staging).unwrap();
+        for name in [
+            "0b7c.tmp",        // an upload's temp file
+            "inbox-9f2e.tmp",  // the inbox's staged copy
+            "inbox-1a2b.part", // the same, from before it was a .tmp
+            "store-77aa.tmp",  // the store's own staging
+            "4c1d5e.part",     // a resumable upload, still going
+        ] {
+            std::fs::write(staging.join(name), b"left over").unwrap();
+        }
+    })
+    .await;
+    let left: Vec<String> = staged(&server)
+        .iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(left, ["4c1d5e.part"]);
+}
+
+/// Wait up to two seconds for the staging directory to empty.
+async fn staging_empties(server: &TestServer) -> Vec<PathBuf> {
+    for _ in 0..40 {
+        if staged(server).is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    staged(server)
+}
+
+#[tokio::test]
+async fn an_upload_the_client_abandons_leaves_no_temp_file() {
+    let server = spawn().await;
+    push(&server, build_nupkg("Gone.Img", "1.0.0")).await;
+    for path in ["/api/v2/package", "/api/v2/files/Gone.Img/1.0.0/base.wim"] {
+        // A body that sends a little and then never finishes.
+        let body = futures::stream::once(async {
+            Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"the first bytes"))
+        })
+        .chain(futures::stream::pending());
+        let request = server
+            .client
+            .put(server.url(path))
+            .header("X-NuGet-ApiKey", API_KEY)
+            .body(reqwest::Body::wrap_stream(body))
+            .send();
+        let sending = tokio::spawn(request);
+        // Until the server has the temp file…
+        for _ in 0..40 {
+            if !staged(&server).is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(!staged(&server).is_empty(), "{path}: no temp file seen");
+        // …then the client goes away.
+        sending.abort();
+        let left = staging_empties(&server).await;
+        assert!(left.is_empty(), "{path}: {left:?}");
     }
 }

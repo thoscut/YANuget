@@ -38,7 +38,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use super::{content_length, files, parse_version, to_io_err, AppState};
 use crate::database::{PackageFile, UploadSession};
 use crate::error::{Error, Result};
-use crate::storage::PackageContent;
+use crate::storage::{PackageContent, TempPath};
 use crate::streaming;
 use crate::version::NuGetVersion;
 
@@ -164,29 +164,55 @@ pub(crate) enum Attached {
     Same(PackageFile),
 }
 
-/// Attach the finished file at `temp` (SHA-256 `sha256`, `size` bytes) to a
-/// version under `name`, storing its bytes as a blob.
+/// An uploaded file, complete and hashed, waiting in a server temp file.
+pub(crate) struct Finished {
+    pub temp: TempPath,
+    pub sha256: String,
+    pub size: u64,
+}
+
+/// Attach a finished file to a version under `name`, storing its bytes as a
+/// blob.
 ///
 /// Under the version lock, like a push or a purge, so the version cannot be
 /// deleted between the check that it exists and the row that references it.
 /// A file of the same name with the same content is a no-op; with different
 /// content it is refused: a file's URL is cached as immutable, so it must not
 /// start serving different bytes.
+///
+/// In a task of its own, so a client that disconnects — which cancels its
+/// request — cannot stop an attach half-way, with a blob stored and no row
+/// for it. `keep` is held until the attach is done, whatever the request does.
 pub(crate) async fn attach(
     state: &AppState,
     id: &str,
     v: &NuGetVersion,
     name: &str,
-    temp: PathBuf,
-    sha256: &str,
-    size: u64,
+    file: Finished,
+    keep: impl Send + 'static,
 ) -> Result<Attached> {
-    let target = Target {
-        storage: state.storage.as_ref(),
-        db: state.db.as_ref(),
-        feed: state.feed(),
-    };
-    attach_to(&target, id, v, name, temp, sha256, size).await
+    let state = state.clone();
+    let (id, v, name) = (id.to_string(), v.clone(), name.to_string());
+    super::detached(async move {
+        let _keep = keep;
+        let target = Target {
+            storage: state.storage.as_ref(),
+            db: state.db.as_ref(),
+            feed: state.feed(),
+        };
+        let Finished { temp, sha256, size } = file;
+        attach_to(
+            &target,
+            &id,
+            &v,
+            &name,
+            temp.path().to_path_buf(),
+            &sha256,
+            size,
+        )
+        .await
+    })
+    .await
 }
 
 /// Where a file is attached: a feed, and the store behind it.
@@ -359,25 +385,17 @@ pub(super) async fn put(
         state.config.upload_idle_timeout(),
     )
     .await;
-    let (size, sha256) = match streamed {
-        Ok(done) => done,
-        Err(e) => {
-            let _ = tokio::fs::remove_file(&temp).await;
-            return Err(super::map_upload_err(e));
-        }
-    };
-    if let Err(e) = file.sync_all().await {
-        let _ = tokio::fs::remove_file(&temp).await;
-        return Err(Error::Io(e));
-    }
+    // `temp` removes the file on every way out that does not attach it.
+    let (size, sha256) = streamed.map_err(super::map_upload_err)?;
+    file.sync_all().await?;
     drop(file);
     if expected.as_deref().is_some_and(|want| want != sha256) {
-        let _ = tokio::fs::remove_file(&temp).await;
         return Err(Error::BadRequest(format!(
             "checksum mismatch: the body's SHA-256 is {sha256}"
         )));
     }
-    let (status, file) = match attach(&state, &id, &v, &name, temp, &sha256, size).await? {
+    let finished = Finished { temp, sha256, size };
+    let (status, file) = match attach(&state, &id, &v, &name, finished, ()).await? {
         Attached::New(f) => (StatusCode::CREATED, f),
         Attached::Same(f) => (StatusCode::OK, f),
     };
@@ -712,7 +730,12 @@ pub(super) async fn tus_patch(
             )));
         }
         let v = parse_version(&s.normalized_version)?;
-        attach(&state, &s.lower_id, &v, &s.name, part, &sha256, received).await?;
+        let file = Finished {
+            temp: TempPath::new(part),
+            sha256,
+            size: received,
+        };
+        attach(&state, &s.lower_id, &v, &s.name, file, ()).await?;
     }
     built(
         tus_response(StatusCode::NO_CONTENT)
