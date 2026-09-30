@@ -156,23 +156,23 @@ enum Field {
 /// The text fields directly under `<metadata>`, by exact (case-sensitive)
 /// local name. `<license>` is handled separately, because its kind comes from
 /// an attribute.
-const FIELDS: &[(&[u8], Field)] = &[
-    (b"id", Field::Id),
-    (b"version", Field::Version),
-    (b"title", Field::Title),
-    (b"authors", Field::Authors),
-    (b"description", Field::Description),
-    (b"summary", Field::Summary),
-    (b"releaseNotes", Field::ReleaseNotes),
-    (b"language", Field::Language),
-    (b"tags", Field::Tags),
-    (b"iconUrl", Field::IconUrl),
-    (b"icon", Field::Icon),
-    (b"readme", Field::Readme),
-    (b"projectUrl", Field::ProjectUrl),
-    (b"licenseUrl", Field::LicenseUrl),
-    (b"requireLicenseAcceptance", Field::RequireLicenseAcceptance),
-    (b"developmentDependency", Field::DevelopmentDependency),
+const FIELDS: &[(&str, Field)] = &[
+    ("id", Field::Id),
+    ("version", Field::Version),
+    ("title", Field::Title),
+    ("authors", Field::Authors),
+    ("description", Field::Description),
+    ("summary", Field::Summary),
+    ("releaseNotes", Field::ReleaseNotes),
+    ("language", Field::Language),
+    ("tags", Field::Tags),
+    ("iconUrl", Field::IconUrl),
+    ("icon", Field::Icon),
+    ("readme", Field::Readme),
+    ("projectUrl", Field::ProjectUrl),
+    ("licenseUrl", Field::LicenseUrl),
+    ("requireLicenseAcceptance", Field::RequireLicenseAcceptance),
+    ("developmentDependency", Field::DevelopmentDependency),
 ];
 
 impl Field {
@@ -181,7 +181,7 @@ impl Field {
         FIELDS
             .iter()
             .find(|(_, field)| *field == self)
-            .and_then(|(name, _)| std::str::from_utf8(name).ok())
+            .map(|(name, _)| *name)
             .unwrap_or("license")
     }
 }
@@ -271,20 +271,22 @@ pub fn parse_nuspec(xml: &str) -> Result<Nuspec, Error> {
     // several events (see `text` below) and trimming each one would eat the
     // spaces between them. The accumulated value is trimmed once, at the end.
     reader.config_mut().trim_text(false);
-    // The reader records an element's namespace declarations before the event
-    // reaches `attributes` below, so the same cap has to apply there.
+    // The reader records namespace declarations before the event reaches
+    // `attributes` below, so they need a cap of their own: no more bindings in
+    // scope at once than an element may have attributes (a real manifest
+    // declares one or two).
     reader
         .resolver_mut()
-        .set_max_declarations_per_element(MAX_ATTRIBUTES);
+        .set_max_namespace_bindings(MAX_ATTRIBUTES);
 
     let mut nuspec = Nuspec::default();
     let mut stack: Vec<Frame> = Vec::new();
     let mut root_closed = false;
     let mut metadata_seen = false;
     // The default namespace in scope at `<metadata>`: fields must be in it.
-    let mut metadata_ns: Option<Vec<u8>> = None;
+    let mut metadata_ns: Option<String> = None;
     // Single-occurrence elements already seen under `<metadata>`.
-    let mut seen: HashSet<&'static [u8]> = HashSet::new();
+    let mut seen: HashSet<&'static str> = HashSet::new();
     // `<dependency>` directly under `<dependencies>` (the legacy, ungrouped
     // form), kept apart until we know whether groups were used as well.
     let mut ungrouped: Vec<Dependency> = Vec::new();
@@ -331,7 +333,7 @@ pub fn parse_nuspec(xml: &str) -> Result<Nuspec, Error> {
                         Frame::Root
                     }
                     // Matched by local name in any namespace, as NuGet does.
-                    Some(Frame::Root) if local == b"metadata" => {
+                    Some(Frame::Root) if local == "metadata" => {
                         if std::mem::replace(&mut metadata_seen, true) {
                             return Err(invalid("nuspec has more than one <metadata>"));
                         }
@@ -349,7 +351,7 @@ pub fn parse_nuspec(xml: &str) -> Result<Nuspec, Error> {
                             field.name()
                         )));
                     }
-                    Some(Frame::Dependencies) if in_metadata_ns && local == b"group" => {
+                    Some(Frame::Dependencies) if in_metadata_ns && local == "group" => {
                         counts.add_group()?;
                         let [target_framework] = attributes(e, ["targetFramework"])?;
                         nuspec.dependency_groups.push(DependencyGroup {
@@ -358,18 +360,18 @@ pub fn parse_nuspec(xml: &str) -> Result<Nuspec, Error> {
                         });
                         Frame::Group(nuspec.dependency_groups.len() - 1)
                     }
-                    Some(Frame::Dependencies) if in_metadata_ns && local == b"dependency" => {
+                    Some(Frame::Dependencies) if in_metadata_ns && local == "dependency" => {
                         counts.add_dependency()?;
                         ungrouped.push(dependency(e)?);
                         Frame::Ignored
                     }
-                    Some(Frame::Group(index)) if in_metadata_ns && local == b"dependency" => {
+                    Some(Frame::Group(index)) if in_metadata_ns && local == "dependency" => {
                         counts.add_dependency()?;
                         let dep = dependency(e)?;
                         nuspec.dependency_groups[index].dependencies.push(dep);
                         Frame::Ignored
                     }
-                    Some(Frame::PackageTypes) if in_metadata_ns && local == b"packageType" => {
+                    Some(Frame::PackageTypes) if in_metadata_ns && local == "packageType" => {
                         counts.add_package_type()?;
                         let [name, version] = attributes(e, ["name", "version"])?;
                         if let Some(name) = name {
@@ -397,21 +399,15 @@ pub fn parse_nuspec(xml: &str) -> Result<Nuspec, Error> {
                 // not resolve entities — quick-xml reports those separately, as
                 // `GeneralRef` events, which is why an element's content arrives
                 // as several events and has to be reassembled.
-                let decoded = e
-                    .xml10_content()
-                    .map_err(|e| invalid(format!("malformed nuspec: {e}")))?;
+                let decoded = e.xml10_content();
                 if in_field(&stack) {
                     text.push_str(&decoded);
                 }
             }
             // `&amp;`, `&lt;`, `&#233;` … — the entity between two text runs.
             Event::GeneralRef(e) => {
-                let resolved = resolve_reference(&e).ok_or_else(|| {
-                    invalid(format!(
-                        "nuspec uses an undefined entity &{};",
-                        String::from_utf8_lossy(&e)
-                    ))
-                })?;
+                let resolved = resolve_reference(&e)
+                    .ok_or_else(|| invalid(format!("nuspec uses an undefined entity &{};", &*e)))?;
                 if in_field(&stack) {
                     text.push(resolved);
                 }
@@ -420,9 +416,7 @@ pub fn parse_nuspec(xml: &str) -> Result<Nuspec, Error> {
             // carries markup without escaping it. Ignoring the event dropped the
             // field entirely.
             Event::CData(e) => {
-                let decoded = e
-                    .decode()
-                    .map_err(|e| invalid(format!("malformed nuspec: {e}")))?;
+                let decoded = e.xml10_content();
                 if in_field(&stack) {
                     text.push_str(&decoded);
                 }
@@ -482,13 +476,12 @@ fn in_field(stack: &[Frame]) -> bool {
 
 /// The namespace an element resolved to, as an owned URI (`None` for no
 /// namespace). A prefix that was never declared makes the document malformed.
-fn namespace(ns: ResolveResult<'_>) -> Result<Option<Vec<u8>>, Error> {
+fn namespace(ns: ResolveResult<'_>) -> Result<Option<String>, Error> {
     match ns {
-        ResolveResult::Bound(ns) if !ns.as_ref().is_empty() => Ok(Some(ns.as_ref().to_vec())),
+        ResolveResult::Bound(ns) if !ns.as_ref().is_empty() => Ok(Some(ns.as_ref().to_string())),
         ResolveResult::Bound(_) | ResolveResult::Unbound => Ok(None),
         ResolveResult::Unknown(prefix) => Err(invalid(format!(
-            "nuspec uses an undeclared namespace prefix {}",
-            String::from_utf8_lossy(&prefix)
+            "nuspec uses an undeclared namespace prefix {prefix}"
         ))),
     }
 }
@@ -496,22 +489,19 @@ fn namespace(ns: ResolveResult<'_>) -> Result<Option<Vec<u8>>, Error> {
 /// Classify a direct child of `<metadata>` (already known to be in the
 /// manifest's namespace), recording what its attributes carry.
 fn metadata_child(
-    local: &[u8],
+    local: &str,
     e: &BytesStart,
-    seen: &mut HashSet<&'static [u8]>,
+    seen: &mut HashSet<&'static str>,
     nuspec: &mut Nuspec,
 ) -> Result<Frame, Error> {
     // Each of these may appear once. NuGet reads the first and ignores the
     // rest; this parser used to keep the last. Rather than hope two readers
     // agree, a manifest that repeats one is refused.
-    let mut once = |name: &'static [u8]| -> Result<(), Error> {
+    let mut once = |name: &'static str| -> Result<(), Error> {
         if seen.insert(name) {
             Ok(())
         } else {
-            Err(invalid(format!(
-                "nuspec declares <{}> more than once",
-                String::from_utf8_lossy(name)
-            )))
+            Err(invalid(format!("nuspec declares <{name}> more than once")))
         }
     };
 
@@ -521,8 +511,8 @@ fn metadata_child(
         return Ok(Frame::Field(field));
     }
     Ok(match local {
-        b"license" => {
-            once(b"license")?;
+        "license" => {
+            once("license")?;
             // NuGet parses the type case-insensitively.
             let [kind] = attributes(e, ["type"])?;
             match kind.as_deref().map(str::to_ascii_lowercase).as_deref() {
@@ -531,20 +521,20 @@ fn metadata_child(
                 _ => Frame::Field(Field::LicenseOther),
             }
         }
-        b"repository" => {
-            once(b"repository")?;
+        "repository" => {
+            once("repository")?;
             let [kind, url] = attributes(e, ["type", "url"])?;
             nuspec.repository_type = kind;
             nuspec.repository_url = url;
             Frame::Ignored
         }
-        b"dependencies" => {
-            once(b"dependencies")?;
+        "dependencies" => {
+            once("dependencies")?;
             attributes(e, [])?;
             Frame::Dependencies
         }
-        b"packageTypes" => {
-            once(b"packageTypes")?;
+        "packageTypes" => {
+            once("packageTypes")?;
             attributes(e, [])?;
             Frame::PackageTypes
         }
@@ -597,7 +587,7 @@ fn attributes<const N: usize>(
             .normalized_value(XmlVersion::Implicit1_0)
             .map_err(|err| invalid(format!("malformed nuspec attribute: {err}")))?;
         let key = attribute.key.as_ref();
-        if let Some(slot) = names.iter().position(|n| n.as_bytes() == key) {
+        if let Some(slot) = names.iter().position(|n| *n == key) {
             values[slot] = Some(value.into_owned());
         }
     }
@@ -614,7 +604,7 @@ fn resolve_reference(e: &BytesRef) -> Option<char> {
     if let Ok(Some(ch)) = e.resolve_char_ref() {
         return Some(ch);
     }
-    match e.decode().ok()?.as_ref() {
+    match &**e {
         "amp" => Some('&'),
         "lt" => Some('<'),
         "gt" => Some('>'),
