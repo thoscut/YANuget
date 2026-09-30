@@ -202,17 +202,41 @@ impl PackageStorage for FilesystemStorage {
 
     async fn store_blob(&self, sha256_hex: &str, temp_path: PathBuf) -> Result<u64> {
         let dest = self.blob_path(sha256_hex)?;
+        // Only a regular file the server wrote itself goes in. A link would
+        // be served as whatever it points at, and its target could change
+        // after the hash was taken; a device or a pipe has no fixed content.
+        let incoming = tokio::fs::symlink_metadata(&temp_path).await?;
+        if !incoming.file_type().is_file() {
+            return Err(Error::Other(anyhow::anyhow!(
+                "refusing to store {} as a blob: not a regular file",
+                temp_path.display()
+            )));
+        }
         // The same bytes are already stored: keep those, drop this copy. The
-        // name *is* the content, so there is nothing to reconcile.
-        if let Ok(meta) = tokio::fs::metadata(&dest).await {
-            let _ = tokio::fs::remove_file(&temp_path).await;
-            return Ok(meta.len());
+        // name *is* the content, so there is nothing to reconcile — provided
+        // the stored blob still is what its name says. Hashing it again would
+        // cost a full read of what may be gigabytes; its size is free, and a
+        // blob of the wrong size is replaced by this verified copy instead of
+        // having one more reference added to it.
+        match tokio::fs::symlink_metadata(&dest).await {
+            Ok(stored) if stored.file_type().is_file() && stored.len() == incoming.len() => {
+                let _ = tokio::fs::remove_file(&temp_path).await;
+                return Ok(stored.len());
+            }
+            Ok(_) => {
+                tracing::warn!(
+                    sha256 = sha256_hex,
+                    "a stored blob does not match its name; replacing it"
+                );
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
         }
         if let Some(dir) = dest.parent() {
             tokio::fs::create_dir_all(dir).await?;
         }
         move_into_place(&temp_path, &dest, &self.staging).await?;
-        Ok(tokio::fs::metadata(&dest).await?.len())
+        Ok(incoming.len())
     }
 
     async fn get_blob(&self, sha256_hex: &str) -> Result<PackageContent> {
@@ -428,6 +452,34 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn only_a_regular_file_becomes_a_blob() {
+        let (_d, storage) = temp_storage().await;
+        let (t, target) = write_temp(b"secret").await;
+        let link = t.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let sha = "cd".repeat(32);
+        assert!(storage.store_blob(&sha, link).await.is_err());
+        assert!(storage.get_blob(&sha).await.is_err());
+        assert!(storage.store_blob(&sha, "/dev/null".into()).await.is_err());
+        assert!(storage.get_blob(&sha).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_blob_that_no_longer_matches_is_replaced_not_reused() {
+        let (_d, storage) = temp_storage().await;
+        let sha = "ef".repeat(32);
+        let (_t1, first) = write_temp(b"the verified bytes").await;
+        storage.store_blob(&sha, first).await.unwrap();
+        // Something changed the stored blob behind the store's back.
+        let PackageContent::LocalPath(path) = storage.get_blob(&sha).await.unwrap();
+        std::fs::write(&path, b"tampered").unwrap();
+        let (_t2, second) = write_temp(b"the verified bytes").await;
+        storage.store_blob(&sha, second).await.unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"the verified bytes");
+    }
+
     #[tokio::test]
     async fn store_and_retrieve_package() {
         let (_d, storage) = temp_storage().await;
@@ -481,7 +533,10 @@ mod tests {
         // because of another device, so nothing is copied anywhere.
         let dest = storage.package_path("P", "1.0.0").unwrap();
         std::fs::create_dir_all(dest.join("occupied")).unwrap();
-        assert!(storage.store_package("P", "1.0.0", temp.clone()).await.is_err());
+        assert!(storage
+            .store_package("P", "1.0.0", temp.clone())
+            .await
+            .is_err());
         assert!(dest.join("occupied").is_dir());
         assert!(temp.exists());
         assert!(staged(&storage).is_empty());

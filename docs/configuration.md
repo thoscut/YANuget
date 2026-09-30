@@ -168,10 +168,16 @@ receives the files and YANuget imports them from that directory:
 The feed directories are created on startup (`default` without `[[feeds]]`).
 A file is imported once its `.sha256` file is there, so upload the file first
 and the checksum last; `rsync --partial --append-verify` resumes a broken
-transfer. The importer moves the file out of the inbox before it checks it,
-then attaches it to the version, which the feed must already hold, and removes
-both files. When a file cannot be imported, a `{name}.error` next to it says
-why; the file stays, and removing the `.error` retries it.
+transfer. The importer copies the file into the server's own staging area
+while it checks it, so what is verified is what is stored, then attaches it to
+the version, which the feed must already hold, and removes both files. The
+copy needs as much free space again on the store's volume while it runs. When
+a file cannot be imported, a `{name}.error` next to it says why; the file
+stays, and removing the `.error` retries it.
+
+Nothing in the inbox is reached through a symbolic link: a linked directory or
+file is ignored, a file with other hard links is refused, and anything at a
+`.error` name that is not a report is replaced rather than written through.
 
 ```bash
 sha256sum base.wim > base.wim.sha256
