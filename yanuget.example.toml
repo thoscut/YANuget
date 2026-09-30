@@ -117,9 +117,22 @@ trusted_proxies = []
 # being on the intranet would have no protection against a browser.
 #
 # List the origins that genuinely need it, or "*" for a feed that really is
-# public. TOML only; there is no environment variable.
+# public. TOML only; there is no environment variable. Cross-origin access is
+# read-only either way (GET, HEAD, OPTIONS).
 # ---------------------------------------------------------------------------
 cors_allowed_origins = []
+
+# ---------------------------------------------------------------------------
+# Host validation — which host names this server answers to.
+#
+# With base_url set, a request whose Host (or, from a trusted proxy,
+# X-Forwarded-Host) names anything other than base_url's host or one of these
+# gets 421 Misdirected Request. That stops DNS rebinding: a hostile page can
+# point its own name at your feed's address, but the browser still sends that
+# name. Empty with base_url unset accepts any host; "*" accepts any host
+# explicitly. /health and friends answer whatever the host.
+# ---------------------------------------------------------------------------
+allowed_hosts = []            # YANUGET_ALLOWED_HOSTS (comma-separated)
 
 # ---------------------------------------------------------------------------
 # Rate limiting — per-client-IP request throttling (brute-force mitigation).

@@ -415,6 +415,128 @@ async fn one_feeds_admin_key_does_not_open_another_admin_area() {
 }
 
 // ---------------------------------------------------------------------------
+// Host validation, CORS and cross-site writes (SEC-13)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_request_for_another_host_is_misdirected() {
+    let server = spawn_with(|c| {
+        c.base_url = Some("https://feed.example.com".into());
+        c.allowed_hosts = vec!["alias.example.com".into()];
+    })
+    .await;
+    let get = |path: &'static str, host: Option<&'static str>| {
+        let mut req = server.client.get(server.url(path));
+        if let Some(host) = host {
+            req = req.header("Host", host);
+        }
+        req.send()
+    };
+    // What a DNS-rebinding page sends: its own name, or the raw address.
+    let rebound = get("/v3/index.json", Some("evil.example.net"))
+        .await
+        .unwrap();
+    assert_eq!(rebound.status(), StatusCode::MISDIRECTED_REQUEST);
+    let by_address = get("/v3/search", None).await.unwrap();
+    assert_eq!(by_address.status(), StatusCode::MISDIRECTED_REQUEST);
+    // Writes are refused the same way, before any handler runs.
+    let push = server
+        .client
+        .put(server.url("/api/v2/package"))
+        .header("Host", "evil.example.net")
+        .body(build_nupkg("Rebind.Pkg", "1.0.0"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(push.status(), StatusCode::MISDIRECTED_REQUEST);
+
+    // The configured names work, with or without a port or in another case.
+    for host in [
+        "feed.example.com",
+        "FEED.example.com:443",
+        "alias.example.com",
+    ] {
+        let ok = server
+            .client
+            .get(server.url("/v3/index.json"))
+            .header("Host", host)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), StatusCode::OK, "{host}");
+    }
+    // Probes use an address, and must keep working.
+    for path in ["/health", "/health/live", "/health/ready"] {
+        assert_eq!(
+            get(path, None).await.unwrap().status(),
+            StatusCode::OK,
+            "{path}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn cross_origin_access_is_read_only() {
+    let server = spawn_with(|c| c.cors_allowed_origins = vec!["*".into()]).await;
+    let preflight = |method: &'static str| {
+        server
+            .client
+            .request(
+                reqwest::Method::OPTIONS,
+                server.url("/api/v2/package/X/1.0.0"),
+            )
+            .header("Origin", "https://page.example")
+            .header("Access-Control-Request-Method", method)
+            .send()
+    };
+    let get = preflight("GET").await.unwrap();
+    let allowed = header(&get, "access-control-allow-methods").to_string();
+    assert!(allowed.contains("GET"), "{allowed}");
+    for write in ["DELETE", "PUT", "POST", "PATCH"] {
+        assert!(
+            !allowed.contains(write),
+            "{write} allowed cross-origin: {allowed}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_browser_write_from_another_site_is_refused() {
+    // No API key: the default, and the case where a page could otherwise
+    // change the feed through a visitor's browser.
+    let server = spawn_with(|c| c.api_key = None).await;
+    assert_eq!(
+        push(&server, "", "", build_nupkg("Site.Pkg", "1.0.0")).await,
+        StatusCode::CREATED
+    );
+    // Relisting is a CORS-simple POST: no preflight protects it.
+    let relist = |site: &'static str| {
+        server
+            .client
+            .post(server.url("/api/v2/package/Site.Pkg/1.0.0"))
+            .header("Sec-Fetch-Site", site)
+            .send()
+    };
+    assert_eq!(
+        relist("cross-site").await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        relist("same-origin").await.unwrap().status(),
+        StatusCode::OK
+    );
+    // Reads from anywhere are still reads.
+    let read = server
+        .client
+        .get(server.url("/v3/index.json"))
+        .header("Sec-Fetch-Site", "cross-site")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(read.status(), StatusCode::OK);
+}
+
+// ---------------------------------------------------------------------------
 // Ids in URLs (SEC-22)
 // ---------------------------------------------------------------------------
 

@@ -3431,7 +3431,8 @@ async fn admin_actions_require_a_csrf_token() {
     assert_eq!(bad_token.status(), reqwest::StatusCode::BAD_REQUEST);
 
     // A browser that tells us the request came from another site is refused
-    // even when it somehow carries the token.
+    // even when it somehow carries the token — by the server-wide guard on
+    // cross-site writes, before the admin area sees it.
     let cross_site = client
         .post(&url)
         .basic_auth("admin", Some(ADMIN_KEY))
@@ -3441,7 +3442,7 @@ async fn admin_actions_require_a_csrf_token() {
         .send()
         .await
         .unwrap();
-    assert_eq!(cross_site.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(cross_site.status(), reqwest::StatusCode::FORBIDDEN);
 
     // The real thing, as the admin page submits it, still works.
     let good = client

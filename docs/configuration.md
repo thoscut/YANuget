@@ -15,7 +15,8 @@ A fully commented template lives in
 | --- | --- | --- | --- | --- |
 | `host` | `YANUGET_HOST` | IP | `0.0.0.0` | Interface to bind. |
 | `port` | `YANUGET_PORT` | int | `5000` | TCP port. |
-| `base_url` | `YANUGET_BASE_URL` | string | *(per-request)* | External base URL. If unset, derived from `Host`/`X-Forwarded-*`. |
+| `base_url` | `YANUGET_BASE_URL` | string | *(per-request)* | External base URL. If unset, derived from `Host`/`X-Forwarded-*`. When set, requests for any other host get `421` (see [Host validation](#host-validation)). |
+| `allowed_hosts` | `YANUGET_ALLOWED_HOSTS` | string[] | `[]` | Further host names the server answers to (env: comma-separated). `*` accepts any. |
 | `data_dir` | `YANUGET_DATA_DIR` | path | `./data` | Root for all data. |
 | `storage_path` | `YANUGET_STORAGE_PATH` | path | `{data_dir}/packages` | Package store. |
 | `database_path` | `YANUGET_DATABASE_PATH` | path | `{data_dir}/yanuget.db` | SQLite file. |
@@ -135,6 +136,39 @@ most robust option when you know the public address.
 
 Responses carry `Vary: Host, X-Forwarded-Host, X-Forwarded-Proto` so a shared
 cache keys on the inputs that determine those URLs.
+
+## Host validation
+
+With `base_url` set, the server answers only requests whose `Host` names the
+host of `base_url`, or one of `allowed_hosts`; anything else gets
+`421 Misdirected Request`. From a trusted proxy, `X-Forwarded-Host` is checked
+instead of `Host`. The comparison ignores case, the port and a trailing dot.
+With neither `base_url` nor `allowed_hosts` set, any host is accepted, as
+before; `allowed_hosts = ["*"]` accepts any host explicitly even with
+`base_url` set.
+
+This is what stops **DNS rebinding**: a hostile web page can point a name it
+controls at your feed's internal address and make a visitor's browser talk to
+it, but the browser still sends the hostile name as `Host`. Without the check
+such a page could read an intranet-only feed, and — on a feed without an API
+key — push or delete.
+
+Behind a proxy, either forward the original host (`proxy_set_header Host
+$host;` in nginx) or send `X-Forwarded-Host` from a trusted proxy. To reach the
+server by another name as well (`localhost` on the box itself, say), list it
+in `allowed_hosts`. `/health`, `/health/live` and `/health/ready` answer
+whatever the host, since container and Kubernetes probes use an address.
+
+Two related guards apply whatever the host settings:
+
+- Cross-origin access (`cors_allowed_origins`, including `*`) allows only
+  `GET`, `HEAD` and `OPTIONS`. A browser page has no business pushing or
+  deleting packages.
+- A `POST`, `PUT`, `PATCH` or `DELETE` that a browser labels
+  `Sec-Fetch-Site: cross-site` is refused with `403`. The relist `POST` needs no
+  CORS preflight, so this is what keeps a hostile page from using a visitor's
+  browser against a feed without an API key. Clients other than browsers do not
+  send the header.
 
 ## Retention
 

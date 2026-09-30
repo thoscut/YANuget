@@ -382,6 +382,8 @@ struct GlobalLayers {
     trusted_proxies: Arc<TrustedProxies>,
     /// Browser origins allowed to read this server. Empty means no CORS headers.
     cors_allowed_origins: Vec<String>,
+    /// Host names requests may carry; `None` accepts any.
+    allowed_hosts: Option<Arc<Vec<String>>>,
 }
 
 /// The CORS layer for the configured origins.
@@ -394,13 +396,24 @@ struct GlobalLayers {
 ///
 /// `*` remains available as an explicit choice, and is the right one for a feed
 /// that really is public.
+///
+/// Either way only reads are allowed cross-origin. A browser page has no
+/// business pushing, deleting or relisting on a package feed, and `permissive()`
+/// allowed every method: on a feed without an API key — the default — that let
+/// any page a user visited change it.
 fn cors_layer(origins: &[String]) -> CorsLayer {
+    use axum::http::Method;
+    const READS: [Method; 3] = [Method::GET, Method::HEAD, Method::OPTIONS];
     if origins.is_empty() {
         // `CorsLayer::new()` adds no headers at all.
         return CorsLayer::new();
     }
     if origins.iter().any(|o| o == "*") {
-        return CorsLayer::permissive();
+        return CorsLayer::new()
+            .allow_origin(tower_http::cors::Any)
+            .allow_methods(READS)
+            .allow_headers(tower_http::cors::Any)
+            .expose_headers(tower_http::cors::Any);
     }
     let parsed: Vec<HeaderValue> = origins
         .iter()
@@ -414,7 +427,7 @@ fn cors_layer(origins: &[String]) -> CorsLayer {
         .collect();
     CorsLayer::new()
         .allow_origin(parsed)
-        .allow_methods(tower_http::cors::Any)
+        .allow_methods(READS)
         .allow_headers(tower_http::cors::Any)
 }
 
@@ -465,6 +478,10 @@ impl GlobalLayers {
                 .as_ref()
                 .map(|c| c.cors_allowed_origins.clone())
                 .unwrap_or_default(),
+            allowed_hosts: config
+                .as_ref()
+                .and_then(|c| c.host_allowlist())
+                .map(Arc::new),
             trusted_proxies: Arc::new(
                 config
                     .as_ref()
@@ -505,6 +522,12 @@ fn apply_global_layers(router: Router, layers: GlobalLayers) -> Router {
             ratelimit::enforce,
         ));
     }
+    // Refuse misdirected and cross-site writes before anything else runs;
+    // inside the security headers, so the refusal carries them too.
+    router = router.layer(axum::middleware::from_fn_with_state(
+        layers.allowed_hosts,
+        request_guard,
+    ));
     // Stamp the baseline security headers (and HSTS when we terminate TLS) on
     // every response, including the rate limiter's 429 and every error body.
     let hsts = layers.hsts;
@@ -545,6 +568,62 @@ async fn filter_forwarded_headers(
         }
     }
     adopt_authority_as_host(&mut req);
+    next.run(req).await
+}
+
+/// Refuse a request for a host this server does not serve, and a state
+/// change a browser says came from another site.
+///
+/// **Host.** With `base_url` or `allowed_hosts` set, the `Host` (or, from a
+/// trusted proxy, `X-Forwarded-Host`) must name one of them, or the answer is
+/// `421 Misdirected Request`. That is what defeats DNS rebinding: a hostile
+/// page can point a name it controls at an intranet feed's address and make
+/// the browser talk to it, but the browser still sends the hostile name. The
+/// health probes are exempt, since orchestrators probe by address.
+///
+/// **Cross-site writes.** A browser labels every request with
+/// `Sec-Fetch-Site`, and a `POST`, `PUT`, `PATCH` or `DELETE` from another
+/// site is never something this server's own pages sent. The relist `POST`
+/// needs no CORS preflight at all, so without this a hostile page could
+/// relist packages on a feed without an API key. Clients that are not
+/// browsers do not send the header and are unaffected.
+async fn request_guard(
+    State(allowed): State<Option<Arc<Vec<String>>>>,
+    req: Request,
+    next: axum::middleware::Next,
+) -> Response {
+    use axum::http::Method;
+    if let Some(allowed) = &allowed {
+        if !req.uri().path().starts_with("/health") {
+            let host = forwarded(req.headers(), "x-forwarded-host").or_else(|| {
+                req.headers()
+                    .get(header::HOST)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string)
+            });
+            let host = host.as_deref().map(crate::config::normalize_host);
+            if !host.is_some_and(|h| allowed.contains(&h)) {
+                return (
+                    StatusCode::MISDIRECTED_REQUEST,
+                    Json(serde_json::json!({ "error": "this server does not serve that host" })),
+                )
+                    .into_response();
+            }
+        }
+    }
+    let safe = matches!(
+        *req.method(),
+        Method::GET | Method::HEAD | Method::OPTIONS | Method::TRACE
+    );
+    let cross_site = req
+        .headers()
+        .get("sec-fetch-site")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.trim().eq_ignore_ascii_case("cross-site"));
+    if !safe && cross_site {
+        return Error::Forbidden("cross-site requests may not change anything here".into())
+            .into_response();
+    }
     next.run(req).await
 }
 

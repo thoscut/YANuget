@@ -81,9 +81,11 @@ Configuration choices that matter most:
 - **Set `cors_allowed_origins` only if a browser really needs cross-origin
   access.** It is empty by default, so no CORS headers are sent. `*` makes the
   feed's whole inventory readable by any page a user with network reach
-  visits.
+  visits. Cross-origin access is read-only either way.
 - **Set `base_url`** when the server is behind a proxy, rather than relying on
-  forwarded headers, if you can.
+  forwarded headers, if you can. It also restricts the server to that host
+  name (plus any `allowed_hosts`), which is what defeats DNS rebinding against
+  an intranet feed.
 - **Use a real certificate** (`tls_cert_path`/`tls_key_path`), or terminate TLS
   at a proxy and set `tls_enabled = false`.
 - **Set `max_package_size_bytes`** on any feed open to more than a few people.

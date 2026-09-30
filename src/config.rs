@@ -218,6 +218,17 @@ pub struct Config {
     /// had none against a browser. List the origins that genuinely need it, or
     /// `*` to restore the old behaviour deliberately.
     pub cors_allowed_origins: Vec<String>,
+    /// Host names this server answers to. A request whose `Host` (or, from a
+    /// trusted proxy, `X-Forwarded-Host`) names anything else gets `421
+    /// Misdirected Request`. The host of `base_url` is always included, so
+    /// setting `base_url` alone restricts the server to it; with neither set,
+    /// any host is accepted. `*` accepts any host explicitly.
+    ///
+    /// This is what stops DNS rebinding: a hostile page can point a name it
+    /// controls at an intranet feed's address and read it from a browser, but
+    /// the browser still sends the hostile name as `Host`. `/health` and its
+    /// siblings answer whatever the host, for probes that use an address.
+    pub allowed_hosts: Vec<String>,
     /// Hosted feeds. When empty, a single implicit feed named `default` is
     /// served at the server root (the historical single-feed behaviour). When
     /// non-empty, each feed is mounted under `/{name}` and the root serves a
@@ -568,6 +579,7 @@ impl Default for Config {
             files: FilesConfig::default(),
             trusted_proxies: Vec::new(),
             cors_allowed_origins: Vec::new(),
+            allowed_hosts: Vec::new(),
             feeds: Vec::new(),
         }
     }
@@ -766,6 +778,9 @@ impl Config {
         if let Some(v) = get("YANUGET_TRUSTED_PROXIES")? {
             self.trusted_proxies = split_list(&v);
         }
+        if let Some(v) = get("YANUGET_ALLOWED_HOSTS")? {
+            self.allowed_hosts = split_list(&v);
+        }
         Ok(())
     }
 
@@ -796,6 +811,35 @@ impl Config {
     /// The resolved set of peers allowed to set forwarding headers.
     pub fn trusted_proxies(&self) -> crate::proxy::TrustedProxies {
         crate::proxy::TrustedProxies::new(self.trusted_proxies.iter().map(String::as_str))
+    }
+
+    /// The host names requests may carry, lower-cased and without a port, or
+    /// `None` when any host is accepted (nothing configured, or `*`).
+    pub fn host_allowlist(&self) -> Option<Vec<String>> {
+        let mut hosts: Vec<String> = self
+            .allowed_hosts
+            .iter()
+            .map(|h| normalize_host(h))
+            .filter(|h| !h.is_empty())
+            .collect();
+        if hosts.iter().any(|h| h == "*") {
+            return None;
+        }
+        if let Some(base) = &self.base_url {
+            let authority = base
+                .split_once("://")
+                .map_or(base.as_str(), |(_, rest)| rest)
+                .split(['/', '?', '#'])
+                .next()
+                .unwrap_or("");
+            // Userinfo is not part of the host.
+            let authority = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+            let host = normalize_host(authority);
+            if !host.is_empty() {
+                hosts.push(host);
+            }
+        }
+        (!hosts.is_empty()).then_some(hosts)
     }
 
     /// The socket address to bind.
@@ -951,6 +995,22 @@ fn validate_feed_name(name: &str) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// A `Host`-style value reduced to what is compared: lower-case, no port, no
+/// IPv6 brackets, no trailing dot.
+pub fn normalize_host(value: &str) -> String {
+    let v = value.trim();
+    let host = if let Some(rest) = v.strip_prefix('[') {
+        rest.split(']').next().unwrap_or(rest)
+    } else {
+        match v.rsplit_once(':') {
+            // One colon is a port; more is a bare IPv6 address.
+            Some((h, port)) if !h.contains(':') && port.bytes().all(|b| b.is_ascii_digit()) => h,
+            _ => v,
+        }
+    };
+    host.trim_end_matches('.').to_ascii_lowercase()
 }
 
 fn env_error(name: &str, why: &str) -> Error {
@@ -1290,6 +1350,44 @@ mod tests {
             ("YANUGET_TLS_KEY_PATH", "/k.pem"),
         ])
         .is_ok());
+    }
+
+    #[test]
+    fn the_host_allowlist_follows_base_url_and_allowed_hosts() {
+        assert_eq!(Config::default().host_allowlist(), None);
+        let c = Config {
+            base_url: Some("https://user:pw@NuGet.Example.com:8443/feed".into()),
+            ..Config::default()
+        };
+        assert_eq!(c.host_allowlist(), Some(vec!["nuget.example.com".into()]));
+        let c = Config {
+            base_url: Some("https://nuget.example.com".into()),
+            allowed_hosts: vec!["localhost".into(), "[::1]:5000".into()],
+            ..Config::default()
+        };
+        assert_eq!(
+            c.host_allowlist(),
+            Some(vec![
+                "localhost".into(),
+                "::1".into(),
+                "nuget.example.com".into()
+            ])
+        );
+        let any = Config {
+            base_url: Some("https://nuget.example.com".into()),
+            allowed_hosts: vec!["*".into()],
+            ..Config::default()
+        };
+        assert_eq!(any.host_allowlist(), None);
+    }
+
+    #[test]
+    fn hosts_normalise_for_comparison() {
+        assert_eq!(normalize_host("Feed.Example.COM:443"), "feed.example.com");
+        assert_eq!(normalize_host("feed.example.com."), "feed.example.com");
+        assert_eq!(normalize_host("[2001:DB8::1]:8443"), "2001:db8::1");
+        assert_eq!(normalize_host("2001:db8::1"), "2001:db8::1");
+        assert_eq!(normalize_host("10.0.0.1:5000"), "10.0.0.1");
     }
 
     #[test]
