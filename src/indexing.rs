@@ -188,7 +188,11 @@ async fn index_inner(
             if db.feed_count(&id, &version).await? > 1 {
                 if let Some(existing) = db.get_package_data(&id, &version).await? {
                     if existing.package_hash != package.package_hash {
-                        return Err(Error::PackageAlreadyExists);
+                        return Err(Error::VersionExists(format!(
+                            "{id} {normalized} cannot be overwritten here: another feed on this \
+                             server holds the same version with different bytes. {}",
+                            new_version_advice(&version)
+                        )));
                     }
                 }
             }
@@ -201,7 +205,13 @@ async fn index_inner(
                 overwriting = true;
             }
         } else {
-            return Err(Error::PackageAlreadyExists);
+            let state = db.get_membership(feed, &id, &version).await?;
+            return Err(Error::VersionExists(already_here(
+                &id,
+                &version,
+                state.as_ref(),
+                options.overwrite,
+            )));
         }
     }
 
@@ -248,7 +258,11 @@ async fn index_inner(
         // name, and it is refused.
         if let Some(existing) = db.get_package_data(&id, &version).await? {
             if existing.package_hash != package.package_hash {
-                return Err(Error::PackageAlreadyExists);
+                return Err(Error::VersionExists(format!(
+                    "{id} {normalized} already exists in another feed on this server with \
+                     different bytes, and one id and version cannot name two packages. {}",
+                    new_version_advice(&version)
+                )));
             }
         }
         let _ = tokio::fs::remove_file(temp_path).await;
@@ -286,6 +300,58 @@ async fn index_inner(
         pending: options.pending,
         flag_reason: outcome.violation,
     })
+}
+
+/// Why a push of an id/version this feed already holds is refused, in the
+/// words a pusher needs: what state the existing one is in, which setting
+/// refuses the overwrite, and what to do instead.
+///
+/// NuGet and Chocolatey show this as the reason of the `409`. The case that
+/// prompted it: a version "deleted" with `nuget delete` on a feed without
+/// `hard_delete_enabled` is only unlisted — still there, still downloadable —
+/// so pushing a corrected build under the same version was refused with
+/// nothing but "409 (Conflict)".
+fn already_here(
+    id: &str,
+    version: &NuGetVersion,
+    state: Option<&Membership>,
+    overwrite: OverwriteMode,
+) -> String {
+    let normalized = version.normalized();
+    let condition = match state {
+        Some(m) if m.pending => " (waiting for approval)",
+        Some(m) if !m.enabled => " (disabled by an admin)",
+        Some(m) if !m.listed => {
+            " (unlisted - which is all a delete does while hard_delete_enabled is off - \
+             and still downloadable)"
+        }
+        _ => "",
+    };
+    let rule = match overwrite {
+        OverwriteMode::PrereleaseOnly => {
+            "only pre-release versions may be overwritten (allow_overwrite = \"prerelease-only\")"
+        }
+        _ => "overwriting is off (allow_overwrite = false)",
+    };
+    format!(
+        "{id} {normalized} already exists in this feed{condition}, and {rule}. {} Or \
+         delete it for good first.",
+        new_version_advice(version)
+    )
+}
+
+/// "Push it as a new version", with an example of Chocolatey's package fix
+/// version (the software's version plus the date) when that applies.
+fn new_version_advice(version: &NuGetVersion) -> String {
+    let (major, minor, patch, revision) = version.core();
+    if !version.is_prerelease() && revision == 0 {
+        format!(
+            "Push it as a new version, such as {major}.{minor}.{patch}.{}.",
+            Utc::now().format("%Y%m%d")
+        )
+    } else {
+        "Push it as a new version.".to_string()
+    }
 }
 
 fn build_package(
@@ -439,9 +505,55 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(matches!(err, Error::PackageAlreadyExists));
+        // The refusal says which setting refuses it and what to do instead.
+        let Error::VersionExists(why) = &err else {
+            panic!("{err:?}");
+        };
+        assert!(why.contains("already exists in this feed"), "{why}");
+        assert!(why.contains("allow_overwrite = false"), "{why}");
+        assert!(why.contains("Push it as a new version"), "{why}");
         // The rejected temp file was cleaned up.
         assert!(!temp2.exists());
+    }
+
+    #[test]
+    fn a_refused_push_explains_the_state_and_the_way_out() {
+        let v = NuGetVersion::parse("11.3.0").unwrap();
+        let unlisted = Membership {
+            feed: FEED.into(),
+            lower_id: "octave.install".into(),
+            normalized_version: "11.3.0".into(),
+            listed: false,
+            enabled: true,
+            pending: false,
+            flagged: false,
+            flag_reason: None,
+            pinned: false,
+        };
+        let why = already_here(
+            "octave.install",
+            &v,
+            Some(&unlisted),
+            OverwriteMode::Disabled,
+        );
+        assert!(
+            why.starts_with("octave.install 11.3.0 already exists in this feed (unlisted"),
+            "{why}"
+        );
+        assert!(why.contains("hard_delete_enabled is off"), "{why}");
+        // Chocolatey's package fix version: the software's version and a date.
+        let today = Utc::now().format("%Y%m%d").to_string();
+        assert!(why.contains(&format!("such as 11.3.0.{today}")), "{why}");
+        // Pre-releases and four-part versions get no fix-version example.
+        for other in ["2.0.0-rc.1", "1.2.3.4"] {
+            let v = NuGetVersion::parse(other).unwrap();
+            assert_eq!(new_version_advice(&v), "Push it as a new version.");
+        }
+        let pre_only = already_here("p", &v, None, OverwriteMode::PrereleaseOnly);
+        assert!(
+            pre_only.contains("only pre-release versions may be overwritten"),
+            "{pre_only}"
+        );
     }
 
     #[tokio::test]

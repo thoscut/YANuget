@@ -397,7 +397,7 @@ async fn migrate_one(
             bytes,
         },
         // A concurrent run (or a non-overwriting policy) already has it.
-        Err(Error::PackageAlreadyExists) => Outcome {
+        Err(Error::PackageAlreadyExists | Error::VersionExists(_)) => Outcome {
             kind: OutcomeKind::Skipped,
             bytes,
         },
