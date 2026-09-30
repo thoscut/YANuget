@@ -708,7 +708,7 @@ pub async fn ensure_package(
                 tracing::info!(%feed, id = %lower_id, version = %normalized, pending = options.requires_approval, "mirrored package");
             }
             // A concurrent request may have mirrored it first — not an error.
-            Err(Error::PackageAlreadyExists) => {}
+            Err(Error::PackageAlreadyExists | Error::VersionExists(_)) => {}
             Err(e) => {
                 tracing::warn!(%feed, id = %lower_id, version = %normalized, error = %e, "mirror index failed")
             }

@@ -75,6 +75,13 @@ still restorable by exact version) — the same semantics as the NuGet client's
 `delete`. With `hard_delete_enabled = true` it removes the package and files.
 `POST` relists, returning `200 OK`. Both require the API key.
 
+An unlisting `DELETE` says so in an `X-NuGet-Warning` header, which NuGet
+clients print as a warning: the version is still there and downloadable, and
+pushing the same version again is refused (`409`) while `allow_overwrite` is
+off. To replace a build, push it as a new version (for Chocolatey, the package
+fix version `1.2.3.20260930`), or remove the old one for good first — with
+`hard_delete_enabled`, or from the admin area.
+
 ## Package content (flat container)
 
 ```
@@ -510,7 +517,11 @@ pinned by SHA-256. The embedded documentation site sets its own, looser policy
 
 Errors return the appropriate status with a JSON body `{ "error": "<message>" }`.
 
-`4xx` messages describe what the caller did wrong and are safe to act on. `5xx`
+`4xx` messages describe what the caller did wrong and are safe to act on, and
+are also sent as the HTTP/1 reason phrase — the part of a failed request that
+NuGet and Chocolatey print, e.g. `409 (Contoso.Utils 1.0.0 already exists in
+this feed, and overwriting is off (allow_overwrite = false). Push it as a new
+version, such as 1.0.0.20260930. Or delete it for good first.)`. `5xx`
 responses return a generic `internal server error`: the underlying I/O,
 SQL or upstream detail would otherwise disclose filesystem paths, queries and
 upstream URLs, so it goes to the server log only.
