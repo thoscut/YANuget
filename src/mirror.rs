@@ -72,6 +72,58 @@ const MIRROR_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
 /// server configured one.
 const DEFAULT_MIRROR_MAX_PACKAGE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
+/// Resolves upstream host names, dropping every private, loopback or
+/// link-local address unless the operator allowed a private upstream.
+///
+/// Checking a URL before requesting it cannot stop a *name* that resolves to
+/// such an address (`metadata.evil.example` with an `A` record of
+/// `169.254.169.254`, or `localhost.` with its trailing dot), and a check that
+/// resolves separately from the connection is undone by a DNS answer that
+/// changes in between. The resolver is where the connection's own addresses
+/// come from, so filtering here covers every URL the mirror fetches, every
+/// redirect hop and every later reconnect at once.
+///
+/// Literal IP hosts never reach a resolver; [`MirrorClient::check_url`] and
+/// the redirect handling classify those.
+struct GuardedResolver {
+    /// A configured outbound proxy's host, resolved without the filter: the
+    /// operator named it, and it is routinely on the private network.
+    proxy_host: Option<String>,
+}
+
+impl reqwest::dns::Resolve for GuardedResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_string();
+        let exempt = self
+            .proxy_host
+            .as_deref()
+            .is_some_and(|p| p.eq_ignore_ascii_case(&host));
+        Box::pin(async move {
+            let addrs: Vec<std::net::SocketAddr> =
+                tokio::net::lookup_host((host.as_str(), 0)).await?.collect();
+            if exempt {
+                return Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs);
+            }
+            let public: Vec<std::net::SocketAddr> = addrs
+                .iter()
+                .copied()
+                .filter(|a| !crate::proxy::is_private_ip_addr(a.ip()))
+                .collect();
+            if public.is_empty() {
+                if let Some(first) = addrs.first() {
+                    return Err(format!(
+                        "upstream host {host} resolves to the private address {}; \
+                         set allow_private_upstream = true to permit it",
+                        first.ip()
+                    )
+                    .into());
+                }
+            }
+            Ok(Box::new(public.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
 impl MirrorClient {
     /// Build a client from a feed's [`MirrorConfig`]. Returns `None` when
     /// mirroring is disabled for the feed.
@@ -79,6 +131,22 @@ impl MirrorClient {
         if !config.enabled {
             return None;
         }
+        Self::build(config, false)
+    }
+
+    /// Build the client `yanuget migrate` copies a source with.
+    ///
+    /// Unlike the read-through mirror, a migration is a command an operator
+    /// runs by hand, like `curl`, so it uses the shell's `HTTP(S)_PROXY` when
+    /// no proxy is configured; and a download may take as long as it needs
+    /// (see [`Self::set_download_deadline`]).
+    pub fn for_migration(config: &MirrorConfig) -> Option<Self> {
+        let mut client = Self::build(config, true)?;
+        client.set_download_deadline(None);
+        Some(client)
+    }
+
+    fn build(config: &MirrorConfig, env_proxy: bool) -> Option<Self> {
         // Connecting and every read are bounded on the client. A read timeout
         // restarts with each chunk received, so it limits how long the upstream
         // may go silent, not how long a transfer may take; each request adds a
@@ -89,6 +157,24 @@ impl MirrorClient {
             .read_timeout(timeout)
             .user_agent(concat!("yanuget/", env!("CARGO_PKG_VERSION")))
             .default_headers(auth_headers(&config.auth));
+        // reqwest honours `HTTP(S)_PROXY` from the environment by default. For
+        // a server that is a surprise egress path chosen by whoever set up the
+        // process environment, and a proxy resolves names itself, past the
+        // resolver below. So a proxy is used only when the feed names one.
+        let mut proxy_host = None;
+        match &config.proxy {
+            Some(proxy) => {
+                builder = builder.proxy(reqwest::Proxy::all(proxy.as_str()).ok()?);
+                proxy_host = reqwest::Url::parse(proxy)
+                    .ok()
+                    .and_then(|u| u.host_str().map(str::to_string));
+            }
+            None if env_proxy => {}
+            None => builder = builder.no_proxy(),
+        }
+        if !config.allow_private_upstream {
+            builder = builder.dns_resolver(std::sync::Arc::new(GuardedResolver { proxy_host }));
+        }
         // Upstream credentials ride on every request as default headers. reqwest
         // drops `Authorization` on a cross-host redirect, but it cannot know that
         // an operator's custom `headers` entry (`X-Feed-Key: …`) is a secret too
@@ -161,6 +247,10 @@ impl MirrorClient {
     /// turns the mirror into an SSRF probe, so non-HTTP schemes and
     /// private/loopback/link-local hosts are refused unless the operator opted
     /// in (which a self-hosted upstream on a private network legitimately does).
+    ///
+    /// This classifies literal addresses and reserved names; a DNS name that
+    /// resolves to a private address is stopped by [`GuardedResolver`] when the
+    /// connection is made.
     fn check_url(&self, url: &str, what: &str) -> Result<()> {
         let parsed = reqwest::Url::parse(url)
             .map_err(|e| Error::Other(anyhow::anyhow!("upstream {what} url is invalid: {e}")))?;
@@ -178,50 +268,6 @@ impl MirrorClient {
                          set allow_private_upstream = true to permit it"
                     )));
                 }
-            }
-        }
-        Ok(())
-    }
-
-    /// [`Self::check_url`], plus a DNS resolution of the host.
-    ///
-    /// `check_url` can only classify an address it can see, so a *name* —
-    /// `metadata.evil.example` with an `A` record of `169.254.169.254` — passed
-    /// it untouched. Resolving closes that, at the cost of one lookup.
-    ///
-    /// This is a check, not a pin: the address the connection finally uses is
-    /// resolved again by the HTTP client, so a DNS entry that changes between
-    /// the two answers (rebinding) is still possible. Narrowing that further
-    /// means pinning the connection to the address checked here, which reqwest
-    /// does not expose per-request — so an upstream is a trust decision, and
-    /// `allow_private_upstream` is how an operator states it deliberately.
-    async fn check_url_resolved(&self, url: &str, what: &str) -> Result<()> {
-        self.check_url(url, what)?;
-        if self.allow_private_upstream {
-            return Ok(());
-        }
-        let parsed = reqwest::Url::parse(url)
-            .map_err(|e| Error::Other(anyhow::anyhow!("upstream {what} url is invalid: {e}")))?;
-        let Some(host) = parsed.host_str() else {
-            return Ok(());
-        };
-        // A literal was already classified by `check_url`.
-        if host.parse::<std::net::IpAddr>().is_ok() {
-            return Ok(());
-        }
-        let port = parsed.port_or_known_default().unwrap_or(443);
-        let Ok(addrs) = tokio::net::lookup_host((host, port)).await else {
-            // Unresolvable: the request will fail on its own, and refusing here
-            // would turn a transient DNS blip into a policy error.
-            return Ok(());
-        };
-        for addr in addrs {
-            if crate::proxy::is_private_ip_addr(addr.ip()) {
-                return Err(Error::Other(anyhow::anyhow!(
-                    "upstream {what} host {host} resolves to the private address {}; \
-                     set allow_private_upstream = true to permit it",
-                    addr.ip()
-                )));
             }
         }
         Ok(())
@@ -266,8 +312,7 @@ impl MirrorClient {
     async fn resources(&self) -> Result<&MirrorResources> {
         self.resources
             .get_or_try_init(|| async {
-                self.check_url_resolved(&self.upstream, "service index")
-                    .await?;
+                self.check_url(&self.upstream, "service index")?;
                 let index: serde_json::Value = self
                     .client
                     .get(&self.upstream)
@@ -302,8 +347,7 @@ impl MirrorClient {
                 // Every one of these is a URL the *upstream* chose; vet each
                 // before it is ever fetched. A bad optional resource is dropped
                 // rather than fatal, so one odd entry cannot disable mirroring.
-                self.check_url_resolved(&package_base, "PackageBaseAddress")
-                    .await?;
+                self.check_url(&package_base, "PackageBaseAddress")?;
                 Ok(MirrorResources {
                     package_base: ensure_trailing_slash(&package_base),
                     search: search.filter(|u| self.log_check(u, "SearchQueryService")),
@@ -944,6 +988,30 @@ mod tests {
             .is_ok());
         // ...but that opt-in still does not enable other schemes.
         assert!(private_ok.check_url("file:///etc/passwd", "index").is_err());
+    }
+
+    #[tokio::test]
+    async fn the_resolver_drops_private_addresses() {
+        use reqwest::dns::Resolve;
+
+        // `localhost` resolves to loopback on every platform, which is exactly
+        // what a name with a private `A` record looks like to the mirror.
+        let guarded = GuardedResolver { proxy_host: None };
+        match guarded.resolve("localhost".parse().unwrap()).await {
+            Ok(_) => panic!("a name resolving to loopback must not connect"),
+            Err(e) => assert!(e.to_string().contains("private address"), "{e}"),
+        }
+
+        // The operator's own proxy is exempt: it is routinely on the private
+        // network, and the operator named it.
+        let proxied = GuardedResolver {
+            proxy_host: Some("LOCALHOST".into()),
+        };
+        let addrs = proxied
+            .resolve("localhost".parse().unwrap())
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(addrs.count() > 0);
     }
 
     #[test]

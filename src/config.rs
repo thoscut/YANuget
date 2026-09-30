@@ -315,6 +315,9 @@ pub struct MirrorConfig {
     /// have hundreds of versions and tens of gigabytes behind it; without a
     /// bound one anonymous request for it pulls the lot.
     pub max_versions_per_package: Option<usize>,
+    /// Outbound proxy for upstream requests (`http://proxy:3128`). Unset, the
+    /// mirror connects directly and ignores `HTTP(S)_PROXY` in the environment.
+    pub proxy: Option<String>,
 }
 
 impl Default for MirrorConfig {
@@ -327,6 +330,7 @@ impl Default for MirrorConfig {
             allow_private_upstream: false,
             max_package_size_bytes: None,
             max_versions_per_package: Some(50),
+            proxy: None,
         }
     }
 }

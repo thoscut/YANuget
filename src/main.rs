@@ -433,6 +433,8 @@ fn build_source_config(args: &MigrateArgs) -> MirrorConfig {
         max_package_size_bytes: args.max_package_size_bytes,
         // A migration is meant to copy everything.
         max_versions_per_package: None,
+        // The shell's `HTTP(S)_PROXY` applies, as it would to `curl`.
+        proxy: None,
     }
 }
 

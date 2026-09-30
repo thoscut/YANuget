@@ -229,6 +229,7 @@ deleted only when the **last** feed referencing it lets go.
 | `feeds[].mirror.max_versions_per_package` | int | `50` | Newest-first cap on how many versions one read-through miss fetches. |
 | `feeds[].mirror.max_package_size_bytes` | int | *(server-wide cap, else 2 GiB)* | Cap on a single mirrored `.nupkg`. |
 | `feeds[].mirror.allow_private_upstream` | bool | `false` | Permit an upstream on a private/loopback address. |
+| `feeds[].mirror.proxy` | string | *(none)* | Outbound proxy for upstream requests. Unset, the mirror connects directly and ignores `HTTP(S)_PROXY`. |
 
 Three things bound a read-through miss, because it is started by an
 *unauthenticated read* and writes what it fetches to your disk:
@@ -320,7 +321,11 @@ responses also carry a `Strict-Transport-Security` header (one year).
   setting fails loudly instead of silently reverting to its default.
 - A feed with `[feeds.mirror]` follows resource URLs chosen by the
   *upstream*. Non-HTTP schemes and private/loopback targets are refused unless
-  `allow_private_upstream = true`, mirrored downloads are bounded by
+  `allow_private_upstream = true` — checked on the addresses a host name
+  resolves to when each connection is made, so a name pointing at the local
+  network, a redirect to one, or a DNS answer that changes between requests is
+  refused too. Through a configured `proxy`, the proxy resolves names, so its
+  own egress rules apply. Mirrored downloads are bounded by
   `max_package_size_bytes` and `max_versions_per_package`, and a mirrored
   package must declare the id/version that was actually requested — so a
   compromised upstream cannot substitute a different package under a name your
