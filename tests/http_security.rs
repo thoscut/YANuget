@@ -1232,3 +1232,70 @@ fn an_unparseable_environment_value_stops_the_server() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// The admin gate covers every admin route (MNT-02)
+// ---------------------------------------------------------------------------
+
+/// Every route under `/admin`, as the router mounts it, with a package that
+/// exists so a handler that forgot the gate would have something to act on.
+const ADMIN_ROUTES: &[(&str, &str)] = &[
+    ("GET", "/admin"),
+    ("GET", "/admin/packages/gated.pkg"),
+    ("POST", "/admin/packages/gated.pkg"),
+    ("POST", "/admin/packages/gated.pkg/1.0.0/disable"),
+    ("POST", "/admin/packages/gated.pkg/1.0.0/enable"),
+    ("POST", "/admin/packages/gated.pkg/1.0.0/delete"),
+    ("POST", "/admin/packages/gated.pkg/1.0.0/approve"),
+    ("POST", "/admin/packages/gated.pkg/1.0.0/promote"),
+    ("POST", "/admin/packages/gated.pkg/1.0.0/pin"),
+    ("POST", "/admin/packages/gated.pkg/1.0.0/unpin"),
+    (
+        "POST",
+        "/admin/packages/gated.pkg/1.0.0/files/base.wim/delete",
+    ),
+    ("GET", "/admin/retention"),
+    ("POST", "/admin/retention/run"),
+];
+
+#[tokio::test]
+async fn every_admin_route_refuses_a_request_without_the_admin_key() {
+    let server = spawn_with(|c| c.admin_api_key = Some("admin".into())).await;
+    assert_eq!(
+        push(&server, "", API_KEY, build_nupkg("Gated.Pkg", "1.0.0")).await,
+        StatusCode::CREATED
+    );
+    // A valid CSRF token, so only the missing credential stands in the way.
+    let csrf = yanuget::auth::AdminAuth::new(Some("admin".into()))
+        .csrf_token()
+        .unwrap();
+    for (method, path) in ADMIN_ROUTES {
+        for credential in [None, Some(API_KEY), Some("wrong-admin-key")] {
+            let mut req = match *method {
+                "GET" => server.client.get(server.url(path)),
+                _ => server
+                    .client
+                    .post(server.url(path))
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(format!("_csrf={csrf}&version=1.0.0")),
+            };
+            if let Some(key) = credential {
+                req = req.basic_auth("admin", Some(key));
+            }
+            let resp = req.send().await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::UNAUTHORIZED,
+                "{method} {path} with {credential:?}"
+            );
+        }
+    }
+    // And nothing was done: the version is still there and served.
+    let got = server
+        .client
+        .get(server.url("/v3/package/gated.pkg/1.0.0/gated.pkg.1.0.0.nupkg"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(got.status(), StatusCode::OK);
+}
