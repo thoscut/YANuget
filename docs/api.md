@@ -317,10 +317,17 @@ is a PowerShell 7 function that uploads resumably:
 
 ```powershell
 . ./scripts/Send-YanugetFile.ps1
-Send-YanugetFile -Feed https://nuget.example.com -ApiKey $key `
+# The key comes from $env:YANUGET_API_KEY, from -ApiKey as a SecureString,
+# or from a prompt.
+Send-YanugetFile -Feed https://nuget.example.com `
     -Id Contoso.Images -Version 1.2.0 -Path .\base.wim
 # after an interruption: the same call with -Resume <the URL it printed>
 ```
+
+It sends the key only over https (`-AllowHttp` for a local test server) and
+only to the scheme, host and port of `-Feed`: an upload URL anywhere else,
+whether handed back by the server or passed as `-Resume`, is refused, and
+redirects are not followed.
 
 ### Over SSH
 
