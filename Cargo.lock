@@ -3292,6 +3292,7 @@ dependencies = [
  "rcgen",
  "reqwest",
  "rust-embed",
+ "rustix",
  "rustls",
  "serde",
  "serde_json",

@@ -243,7 +243,9 @@ pub(crate) async fn purge_global_data(
 /// references. Their rows go with the package data, after this, so a failure
 /// here leaves the rows that say what is left to delete.
 ///
-/// Same contract: the caller must already hold the version lock.
+/// Same contract: the caller must already hold the version lock. Each blob's
+/// own lock is taken here, across the count and the delete, since another
+/// version may be attaching the same bytes right now.
 pub(crate) async fn purge_file_blobs(
     storage: &dyn PackageStorage,
     db: &dyn PackageDatabase,
@@ -256,6 +258,7 @@ pub(crate) async fn purge_file_blobs(
     blobs.dedup();
     for sha in blobs {
         let here = files.iter().filter(|f| f.sha256 == sha).count() as i64;
+        let _blob = crate::locks::lock_blob(sha).await;
         if db.blob_references(sha).await? <= here {
             storage.delete_blob(sha).await?;
         }
