@@ -30,8 +30,10 @@ Run the server:
 YANUGET_API_KEY=change-me cargo run
 ```
 
-It listens on `https://0.0.0.0:5000` with a self-signed certificate, so pass
-`-k` / `--insecure` to `curl` and clients while testing.
+It listens on `https://0.0.0.0:5000` with a self-signed certificate. `curl`
+takes `-k` / `--insecure`; `dotnet` and `choco` have no such switch, so for
+them either trust `data/tls/cert.pem` or run with `YANUGET_TLS_ENABLED=false`
+and use `http://` while testing.
 
 ## Before you open a pull request
 

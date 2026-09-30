@@ -4,9 +4,12 @@ YANuget implements the [NuGet v3 protocol](https://learn.microsoft.com/en-us/nug
 All resource URLs are advertised by the **service index** so clients discover
 them automatically; the paths below are the defaults YANuget serves.
 
-Base URLs in responses are derived per-request from the `Host` /
-`X-Forwarded-Proto` / `X-Forwarded-Host` headers, or taken from
-`YANUGET_BASE_URL` when set.
+Base URLs in responses are taken from `base_url` (`YANUGET_BASE_URL`) when it
+is set, which is the recommended setup whenever the public address is known.
+Otherwise they are derived per request from the `Host` header, and from
+`X-Forwarded-Proto` / `X-Forwarded-Host` only when the connection comes from a
+peer listed in [`trusted_proxies`](configuration.md#trusted-proxies); from
+anyone else those headers are ignored.
 
 ## Feeds and path prefixes
 

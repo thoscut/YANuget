@@ -7,8 +7,10 @@
 host = "0.0.0.0"            # YANUGET_HOST
 port = 5000                # YANUGET_PORT
 
-# Externally visible base URL. Leave unset to derive it per-request from the
-# Host / X-Forwarded-* headers (recommended behind a reverse proxy).
+# Externally visible base URL, from which every URL handed to clients is built.
+# Set it whenever you know the public address, and always behind a reverse
+# proxy. Unset, it is derived per request from the Host header, and from
+# X-Forwarded-* only when the peer is listed in `trusted_proxies`.
 # base_url = "https://nuget.example.com"   # YANUGET_BASE_URL
 
 # Where all server data lives. The package store and SQLite database default to

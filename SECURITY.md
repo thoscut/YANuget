@@ -82,15 +82,25 @@ Configuration choices that matter most:
   access.** It is empty by default, so no CORS headers are sent. `*` makes the
   feed's whole inventory readable by any page a user with network reach
   visits.
-- **Set `base_url`** when the server is behind a proxy, rather than relying on
-  forwarded headers, if you can.
+- **Set `base_url`** whenever you know the public address, and always behind a
+  proxy, rather than relying on forwarded headers.
 - **Use a real certificate** (`tls_cert_path`/`tls_key_path`), or terminate TLS
   at a proxy and set `tls_enabled = false`.
 - **Set `max_package_size_bytes`** on any feed open to more than a few people.
 - **Keep `admin_api_key` distinct** from the push key, and do not expose `/admin`
   to the internet.
+- **Gate reads with a `[[feeds]]` entry.** `read_api_key` is a per-feed
+  setting; the implicit single feed at the root has none, so without
+  `[[feeds]]` anyone who can reach the server can restore from it.
+- **Remember that an id and version are one package across all feeds.** The
+  first feed to store a version fixes its content for every other feed, and a
+  push to one feed can pre-empt another. Feeds separate who may push and read,
+  not what a name means.
 - **Review `[feeds.mirror]` upstreams.** A mirror makes your server fetch
   from, and republish under your name, whatever that upstream serves.
+- **Disable, don't delete, a bad version on a mirror feed.** A deleted version
+  is fetched from the upstream again by the next read; a disabled one stays
+  withheld.
 
 ## Verifying a release
 
