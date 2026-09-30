@@ -20,6 +20,16 @@
 appsettings.local.json
 yanuget.local.toml
 
+# Files the docs tell people to create, and that hold secrets: the config (it
+# can carry API keys and upstream credentials), the systemd/Compose env file
+# with the keys, and TLS keys and certificates. None of them belongs in a
+# commit. The example config is `yanuget.example.toml`, which stays tracked.
+/yanuget.toml
+secrets.env
+*.env
+*.pem
+*.key
+
 # Editor / OS
 .DS_Store
 .idea/
