@@ -42,7 +42,7 @@ use crate::nuget::{self, UrlBuilder};
 use crate::proxy::{self, TrustedProxies};
 use crate::ratelimit::{self, RateLimiter};
 use crate::retention::{self, RetentionPolicy};
-use crate::storage::{AuxFile, PackageContent, PackageStorage};
+use crate::storage::{AuxFile, PackageContent, PackageStorage, TempPath};
 use crate::streaming::{self, StreamSummary};
 use crate::symbols;
 use crate::version::NuGetVersion;
@@ -73,6 +73,8 @@ pub struct FeedContext {
     pub mirror: Option<MirrorClient>,
     pub license_policy: LicensePolicyConfig,
     pub retention: RetentionConfig,
+    /// Id prefixes other feeds reserved, which this one refuses.
+    pub reserved_elsewhere: Vec<crate::config::ReservedPrefix>,
     /// The feed's cleanup lock and last report, shared with the background
     /// sweep.
     pub cleanup: Arc<retention::RetentionState>,
@@ -115,6 +117,7 @@ impl FeedContext {
             mirror,
             license_policy: feed.license_policy.clone(),
             retention: feed.retention.clone(),
+            reserved_elsewhere: feed.reserved_elsewhere.clone(),
             cleanup: Arc::default(),
         }
     }
@@ -266,11 +269,12 @@ impl AppState {
         Ok(())
     }
 
-    /// Create a fresh temp file for an incoming upload.
-    async fn create_temp(&self) -> Result<(PathBuf, tokio::fs::File)> {
+    /// Create a fresh temp file for an incoming upload, removed again when the
+    /// returned [`TempPath`] is dropped unless it has been moved into the store.
+    async fn create_temp(&self) -> Result<(TempPath, tokio::fs::File)> {
         let path = self.temp_dir.join(format!("{}.tmp", uuid::Uuid::new_v4()));
         let file = tokio::fs::File::create(&path).await?;
-        Ok((path, file))
+        Ok((TempPath::new(path), file))
     }
 
     /// Reject the request unless valid read credentials are presented (a no-op
@@ -287,24 +291,38 @@ impl AppState {
     /// lookup missed, fetch the package's versions and index them. Errors are
     /// logged, never surfaced — a mirror outage degrades to a normal miss.
     async fn mirror_if_needed(&self, id: &str) {
-        let Some(client) = &self.feed.mirror else {
+        if self.feed.mirror.is_none() {
             return;
-        };
+        }
+        // Not worth a download that indexing would refuse.
+        if self.feed.reserved_elsewhere.iter().any(|r| r.covers(id)) {
+            return;
+        }
         let options = MirrorOptions {
             requires_approval: self.feed.requires_approval,
             license_policy: self.feed.license_policy.clone(),
+            reserved_elsewhere: self.feed.reserved_elsewhere.clone(),
         };
-        if let Err(e) = mirror::ensure_package(
-            client,
-            self.storage.as_ref(),
-            self.db.as_ref(),
-            self.feed(),
-            &self.temp_dir,
-            id,
-            &options,
-        )
-        .await
-        {
+        // Fetching and indexing is the same store-then-record sequence as a
+        // push, so it too finishes when the client that asked goes away.
+        let (state, owned_id) = (self.clone(), id.to_string());
+        let fetched = detached(async move {
+            let Some(client) = &state.feed.mirror else {
+                return Ok(0);
+            };
+            mirror::ensure_package(
+                client,
+                state.storage.as_ref(),
+                state.db.as_ref(),
+                state.feed(),
+                &state.temp_dir,
+                &owned_id,
+                &options,
+            )
+            .await
+        })
+        .await;
+        if let Err(e) = fetched {
             tracing::warn!(feed = %self.feed(), id, error = %e, "mirror lookup failed");
         }
     }
@@ -453,7 +471,7 @@ async fn sweep_stale_uploads(temp_dir: &std::path::Path) {
     let (mut removed, mut bytes) = (0u64, 0u64);
     while let Ok(Some(entry)) = entries.next_entry().await {
         let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("tmp") {
+        if !is_stale_temp_name(&entry.file_name().to_string_lossy()) {
             continue;
         }
         let size = entry.metadata().await.map(|m| m.len()).unwrap_or(0);
@@ -469,6 +487,14 @@ async fn sweep_stale_uploads(temp_dir: &std::path::Path) {
             "removed upload temp files left by a previous run"
         );
     }
+}
+
+/// Whether a name in the staging directory is something only a running process
+/// uses: every temp and staged file is `*.tmp`, and before those the inbox
+/// staged as `inbox-*.part`. A resumable upload's `{id}.part` is not one; it
+/// outlives restarts on purpose and goes when the upload expires.
+fn is_stale_temp_name(name: &str) -> bool {
+    name.ends_with(".tmp") || (name.starts_with("inbox-") && name.ends_with(".part"))
 }
 
 impl GlobalLayers {
@@ -1008,7 +1034,7 @@ async fn service_index(
 // ---------------------------------------------------------------------------
 
 async fn push_package(State(state): State<AppState>, request: Request) -> Result<Response> {
-    let (temp_path, summary) = receive_push(&state, request).await?;
+    let (temp, summary) = receive_push(&state, request).await?;
 
     let options = IndexOptions {
         overwrite: state.feed.allow_overwrite,
@@ -1016,42 +1042,48 @@ async fn push_package(State(state): State<AppState>, request: Request) -> Result
         license_policy: state.feed.license_policy.clone(),
         // A push is self-describing: the manifest defines the identity.
         expect: None,
+        reserved_elsewhere: state.feed.reserved_elsewhere.clone(),
     };
-    let result = indexing::index_package(
-        state.storage.as_ref(),
-        state.db.as_ref(),
-        state.feed(),
-        temp_path,
-        summary,
-        &options,
-    )
-    .await?;
-
-    // Optionally prune older versions of this id in this feed (best-effort:
-    // never fail the push because of retention).
-    if state.feed.retention.enabled && state.feed.retention.prune_on_push {
-        let policy = RetentionPolicy::from(&state.feed.retention);
-        if let Err(e) = retention::prune_package(
+    let state = state.clone();
+    detached(async move {
+        let result = indexing::index_package(
             state.storage.as_ref(),
             state.db.as_ref(),
             state.feed(),
-            &result.id,
-            &policy,
+            temp.path().to_path_buf(),
+            summary,
+            &options,
         )
-        .await
-        {
-            tracing::error!(id = %result.id, error = %e, "prune-on-push failed");
+        .await?;
+
+        // Optionally prune older versions of this id in this feed
+        // (best-effort: never fail the push because of retention).
+        if state.feed.retention.enabled && state.feed.retention.prune_on_push {
+            let policy = RetentionPolicy::from(&state.feed.retention);
+            if let Err(e) = retention::prune_package(
+                state.storage.as_ref(),
+                state.db.as_ref(),
+                state.feed(),
+                &result.id,
+                &policy,
+            )
+            .await
+            {
+                tracing::error!(id = %result.id, error = %e, "prune-on-push failed");
+            }
         }
-    }
+        Ok(())
+    })
+    .await?;
 
     Ok(StatusCode::CREATED.into_response())
 }
 
 /// The part of a push that a package and a symbol package share: check the
 /// push key, then stream the body (raw or multipart) to a fresh temp file,
-/// synced to disk. The temp file is removed on any failure; on success the
-/// caller owns it.
-async fn receive_push(state: &AppState, request: Request) -> Result<(PathBuf, StreamSummary)> {
+/// synced to disk. The temp file is removed on every way out that does not
+/// store it — an error here, a failed index later, or a dropped connection.
+async fn receive_push(state: &AppState, request: Request) -> Result<(TempPath, StreamSummary)> {
     let headers = request.headers();
     if !state.feed.auth.check_headers(headers) {
         return Err(Error::Unauthorized);
@@ -1062,27 +1094,17 @@ async fn receive_push(state: &AppState, request: Request) -> Result<(PathBuf, St
         .is_some_and(|s| s.starts_with("multipart/"));
 
     state.ensure_disk_space(content_length(headers))?;
-    let (temp_path, mut file) = state.create_temp().await?;
+    let (temp, mut file) = state.create_temp().await?;
     let limit = state.config.max_package_size_bytes;
 
-    // Stream the body to disk. On any failure, drop the temp file.
-    let summary = match write_upload(request, &mut file, is_multipart, limit, state).await {
-        Ok(summary) => summary,
-        Err(e) => {
-            let _ = tokio::fs::remove_file(&temp_path).await;
-            return Err(e);
-        }
-    };
+    let summary = write_upload(request, &mut file, is_multipart, limit, state).await?;
     // Flush the OS page cache to stable storage before the payload is renamed
     // into the store. The database row that follows says the package exists; if
     // a crash lands between the rename and the kernel's own writeback, that row
     // would point at a truncated or empty file.
-    if let Err(e) = file.sync_all().await {
-        let _ = tokio::fs::remove_file(&temp_path).await;
-        return Err(Error::Io(e));
-    }
+    file.sync_all().await?;
     drop(file);
-    Ok((temp_path, summary))
+    Ok((temp, summary))
 }
 
 /// Write the upload (raw body or the first multipart file field) to `file`.
@@ -1626,14 +1648,18 @@ async fn push_symbol_package(State(state): State<AppState>, request: Request) ->
     // them costs nothing. Dropping them left the one number in the log that says
     // how much a symbol push actually cost, and any later question about which
     // bytes were stored, unanswerable.
-    let (temp_path, summary) = receive_push(&state, request).await?;
+    let (temp, summary) = receive_push(&state, request).await?;
 
-    let result = symbols::index_symbol_package(
-        state.storage.as_ref(),
-        state.db.as_ref(),
-        state.feed(),
-        temp_path,
-    )
+    let indexing = state.clone();
+    let result = detached(async move {
+        symbols::index_symbol_package(
+            indexing.storage.as_ref(),
+            indexing.db.as_ref(),
+            indexing.feed(),
+            temp.path().to_path_buf(),
+        )
+        .await
+    })
     .await?;
     tracing::info!(
         id = %result.id,
@@ -2174,10 +2200,14 @@ async fn admin_package(
     } else {
         Vec::new()
     };
+    // One query for the whole id rather than one per version, newest version
+    // first, and only the versions this feed holds.
     let mut files = Vec::new();
     if state.config.files.enabled {
+        let mut all = state.db.files_for_id(&id).await?;
         for fv in versions.iter().rev() {
-            files.extend(state.db.files_for(&id, &fv.package.version).await?);
+            let v = fv.package.normalized_version();
+            files.extend(all.extract_if(.., |f| f.normalized_version == v));
         }
     }
     Ok(Html(ui::admin_package_page(
@@ -2718,12 +2748,11 @@ fn admin_package_url(prefix: &str, id: &str) -> String {
 /// Refuse a package id taken from a URL unless it is one a package could
 /// have, before it reaches the database, the store or a lock.
 ///
-/// The layers do not fold case the same way: the database uses Unicode
-/// `to_lowercase()`, storage paths and the version lock ASCII. An id no push
-/// could create — `\u{212A}` (the Kelvin sign) folds to `k` in one and not in
-/// the other — could match a database row while missing its directory and its
-/// lock: a delete then removed the rows, orphaned the payload, and did not
-/// serialise with a concurrent push. Such an id names nothing, so it is a 404.
+/// The same rule a push is held to (`validate_package_id`), so every layer
+/// below sees only ASCII ids, which `database::canonical_id`, storage paths
+/// and the version lock all fold identically. An id no push could create —
+/// one with the Kelvin sign `\u{212A}`, say, or a Windows device name — names
+/// nothing, so it is a 404 before any of them is consulted.
 fn check_id(id: &str) -> Result<()> {
     crate::validation::validate_package_id(id).map_err(|_| Error::PackageNotFound)
 }
@@ -2752,6 +2781,21 @@ fn forwarded(headers: &HeaderMap, name: &str) -> Option<String> {
 
 fn to_io_err<E: std::fmt::Display>(e: E) -> std::io::Error {
     std::io::Error::other(e.to_string())
+}
+
+/// Run `work` to completion in a task of its own and wait for it.
+///
+/// A client that disconnects cancels its request's future at whatever await
+/// it has reached. Work that is a sequence of store and database steps — an
+/// indexing, an attach, a mirror fetch — must not stop between two of them,
+/// leaving a payload without its row or an overwrite with its old rows gone.
+/// Spawned, it finishes either way; only the answer is lost.
+async fn detached<T: Send + 'static>(
+    work: impl std::future::Future<Output = Result<T>> + Send + 'static,
+) -> Result<T> {
+    tokio::spawn(work)
+        .await
+        .map_err(|e| Error::Other(anyhow::anyhow!("background task failed: {e}")))?
 }
 
 fn map_upload_err(e: std::io::Error) -> Error {

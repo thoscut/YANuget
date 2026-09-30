@@ -601,6 +601,8 @@ pub struct MirrorOptions {
     pub requires_approval: bool,
     /// The feed's license policy, applied to each mirrored version.
     pub license_policy: LicensePolicyConfig,
+    /// Id prefixes other feeds reserved, which this feed refuses to mirror.
+    pub reserved_elsewhere: Vec<crate::config::ReservedPrefix>,
 }
 
 /// Ensure every upstream version of `id` is present in `feed`, fetching and
@@ -701,6 +703,7 @@ pub async fn ensure_package(
                 id: lower_id.clone(),
                 version: version.clone(),
             }),
+            reserved_elsewhere: options.reserved_elsewhere.clone(),
         };
         match indexing::index_package(storage, db, feed, temp_path, summary, &opts).await {
             Ok(_) => {

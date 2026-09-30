@@ -11,9 +11,10 @@ around one guiding constraint: **handle very large packages (25 GB and beyond)
 without ever loading them into memory.**
 
 > Status: the core is complete and verified end to end against the real `dotnet`
-> client in CI — pack, push, restore, build and run — alongside the symbol
-> server and the multi-feed features. See [Roadmap](#roadmap) for what is not
-> implemented, and the [changelog](CHANGELOG.md) for what changed.
+> client in CI — pack, push, restore, build and run, plus the symbol server —
+> on a single feed. The multi-feed features are covered by the Rust test suite.
+> See [Roadmap](#roadmap) for what is not implemented, and the
+> [changelog](CHANGELOG.md) for what changed.
 
 ---
 
@@ -86,6 +87,13 @@ Download the archive for your platform from the
 [latest release](https://github.com/thoscut/yanuget/releases/latest), verify it
 against `SHA256SUMS`, unpack and run. Release binaries ship the full offline
 documentation.
+
+From the first release after 0.5.1, the archives and the container image
+(`linux/amd64` and `linux/arm64`) come with signed build provenance, and the
+image is also signed with cosign. `gh attestation verify <archive> --repo
+thoscut/yanuget` checks that a download was built by this repository's release
+workflow; [SECURITY.md](SECURITY.md#verifying-a-release) has the commands for
+the image.
 
 ### From source
 
@@ -478,8 +486,12 @@ configurable overwrite (incl. **pre-release-only**), Range downloads,
 mirroring** (read-through caching of a public feed, with optional
 Basic/Bearer/custom-header **upstream auth**), **bulk migration** (`migrate`
 command — copy every package from another server, with progress/ETA/transfer
-rate), **release-ring promotion & approval gates**, and an **offline license
-policy**.
+rate), **release-ring promotion & approval gates**, **copying and moving
+versions between feeds**, an **offline license policy**, **pinned versions**
+that retention never prunes, a **retention preview** (and on-demand runs) in
+`/admin`, and **attached files** — large artifacts stored once by SHA-256
+alongside a package version, uploaded in one `PUT`, resumably over **tus**, or
+over SSH through an **inbox** directory.
 
 Hardening that protects the *client* consuming this feed: forwarding headers are
 only honoured from a configured **trusted proxy** (so nothing can steer the
@@ -493,6 +505,10 @@ Not yet implemented (contributions welcome): additional storage backends
 (S3/Azure Blob) and database backends (PostgreSQL/MySQL), online vulnerability
 scanning, and native (Windows) PDB indexing. These are deliberately behind trait
 boundaries so they can be added without touching the core.
+
+What is planned, and the open findings from the latest full review (security,
+correctness, CI, docs and test gaps, each with an id to reference in commits),
+are tracked in [ROADMAP.md](ROADMAP.md).
 
 ---
 

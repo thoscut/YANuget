@@ -1,0 +1,19 @@
+# Documentation toolchain for the embedded `/docs` site: the direct
+# requirements. `requirements-docs.txt` is the lock compiled from this file,
+# with every transitive package pinned and hashed, and it is what gets installed.
+#
+# The site is built with `mkdocs build` (output: site/) and embedded into the
+# YANuget binary. It must remain fully offline — keep `font: false` in
+# mkdocs.yml and do not add plugins that fetch remote assets. Bump this version
+# deliberately when updating the bundled theme.
+#
+# The lock is installed with `pip install --require-hashes`: in CI, in the
+# release builds and in the container image, this code runs next to a token or
+# ends up inside a published artifact, and a bare range meant that any new
+# upload to PyPI ran there unreviewed. After editing this file, regenerate the
+# lock. It is universal so that the Windows and macOS release runners install
+# the same hashed set as Linux:
+#
+#   uv pip compile --universal --generate-hashes --python-version 3.10 \
+#       requirements-docs.in -o requirements-docs.txt
+mkdocs-material>=9.5,<10

@@ -49,7 +49,27 @@ fn main() {
     }
 
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-changed=site");
+    // Cargo treats a `rerun-if-changed` path that does not exist as changed on
+    // every build, so watching a missing `site` re-ran this script — and
+    // recompiled the crate — on every `cargo build`, `test` and `clippy` of a
+    // checkout that never ran mkdocs. `site` is watched only once it exists.
+    //
+    // Until then the docs sources stand in: editing them and running mkdocs
+    // is the usual way a site appears, and it re-runs this script. The one
+    // sequence that is missed is `mkdocs build` on unchanged sources after a
+    // build without a site; `touch build.rs` picks the site up then (the
+    // Dockerfile does exactly that). Cargo has no way to watch for a path
+    // appearing without also watching everything next to it, `target/`
+    // included, which would bring back the rebuild on every build.
+    if source.exists() {
+        println!("cargo:rerun-if-changed=site");
+    } else {
+        for input in ["docs", "mkdocs.yml"] {
+            if Path::new(input).exists() {
+                println!("cargo:rerun-if-changed={input}");
+            }
+        }
+    }
 }
 
 /// Recursively copy `from` into `to`, which must already exist.

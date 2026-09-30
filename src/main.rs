@@ -3,6 +3,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
@@ -32,6 +33,10 @@ enum Command {
     /// Migrate every package from a source NuGet server into a local feed,
     /// with live progress, ETA and transfer rate.
     Migrate(MigrateArgs),
+    /// Probe the readiness endpoint of the server running on this machine
+    /// (the configured port and scheme) and exit 0 when it is ready, 1 when
+    /// it is not. Meant for container health checks.
+    Healthcheck,
 }
 
 /// Arguments for `yanuget migrate`.
@@ -82,6 +87,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Some(Command::Migrate(args)) => run_migrate(cli.config.as_deref(), args).await,
+        Some(Command::Healthcheck) => run_healthcheck(cli.config.as_deref()).await,
         None => {
             init_tracing();
             run_server(cli.config.as_deref()).await
@@ -204,6 +210,28 @@ async fn run_server(config_path: Option<&str>) -> anyhow::Result<()> {
         &feeds,
         &shutdown_rx,
     ));
+
+    // Versions a failed purge left without any feed: finished off at startup
+    // and daily, since nothing else ever revisits them.
+    {
+        let storage = storage.clone();
+        let db = db.clone();
+        let mut shutdown = shutdown_rx.clone();
+        background.push(tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(24 * 3600));
+            loop {
+                tokio::select! {
+                    _ = tick.tick() => {}
+                    _ = shutdown.changed() => break,
+                }
+                // Like the retention sweep: a pass that started finishes.
+                yanuget::retention::sweep_orphans(storage.as_ref(), db.as_ref()).await;
+                if *shutdown.borrow() {
+                    break;
+                }
+            }
+        }));
+    }
 
     let app = web::build_app(states);
 
@@ -345,6 +373,58 @@ fn banner(
     }
     out.push('\n');
     out
+}
+
+/// Ask the local server whether it is ready, for a container `HEALTHCHECK`.
+///
+/// The image used to run `curl` against `YANUGET_PORT`, which reported a
+/// server whose port was set in the TOML file as unhealthy, and kept `curl` in
+/// the runtime image for nothing else. Loading the same configuration the
+/// server loads means the probe follows the port and scheme wherever they were
+/// set. The certificate is deliberately not verified: the probe is checking
+/// this process on loopback, and the default certificate is self-signed.
+///
+/// An `Err` makes `main` exit with status 1, which is what Docker reads as
+/// unhealthy.
+async fn run_healthcheck(config_path: Option<&str>) -> anyhow::Result<()> {
+    let config = Config::load(config_path)?;
+    let url = healthcheck_url(&config);
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        // Inside Docker's 5 s health-check timeout, so a hung server is
+        // reported by this process rather than by Docker killing it.
+        .timeout(Duration::from_secs(4))
+        // A proxy from the environment has no business carrying a loopback
+        // probe.
+        .no_proxy()
+        .build()?;
+    let status = client
+        .get(&url)
+        .send()
+        .await
+        .with_context(|| format!("no answer from {url}"))?
+        .status();
+    if !status.is_success() {
+        anyhow::bail!("{url}: {status}");
+    }
+    Ok(())
+}
+
+/// The readiness URL of the server this configuration describes, on this
+/// machine. A wildcard bind is reached through loopback of the same family;
+/// a server bound to one address is only reachable there.
+fn healthcheck_url(config: &Config) -> String {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+    let ip = match config.host {
+        IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(ip) if ip.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ip => ip,
+    };
+    format!(
+        "{}://{}/health/ready",
+        config.scheme(),
+        SocketAddr::new(ip, config.port)
+    )
 }
 
 fn init_tracing() {
@@ -679,5 +759,42 @@ mod tests {
         // is also the one that ends up in `docker logs` and journald.
         let out = render(SocketAddr::from(([127, 0, 0, 1], 5000)), &["default"], true);
         assert!(!out.contains('\x1b'), "{out}");
+    }
+
+    #[test]
+    fn the_healthcheck_follows_the_configured_port_and_scheme() {
+        let config = Config {
+            port: 8443,
+            ..Config::default()
+        };
+        assert_eq!(
+            healthcheck_url(&config),
+            "https://127.0.0.1:8443/health/ready"
+        );
+        let config = Config {
+            tls_enabled: false,
+            ..config
+        };
+        assert_eq!(
+            healthcheck_url(&config),
+            "http://127.0.0.1:8443/health/ready"
+        );
+    }
+
+    #[test]
+    fn the_healthcheck_probes_loopback_for_a_wildcard_bind_and_the_address_otherwise() {
+        let v6 = Config {
+            host: IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+            ..Config::default()
+        };
+        assert_eq!(healthcheck_url(&v6), "https://[::1]:5000/health/ready");
+        let bound = Config {
+            host: IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3)),
+            ..Config::default()
+        };
+        assert_eq!(
+            healthcheck_url(&bound),
+            "https://10.1.2.3:5000/health/ready"
+        );
     }
 }

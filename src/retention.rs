@@ -12,11 +12,17 @@
 //! never make a package disappear entirely. A **pinned** version is never
 //! pruned, and does not use up one of the "newest N" either: a pin is kept in
 //! addition to what the rules keep.
+//!
+//! The rules only see what clients can see. A **pending** or **disabled**
+//! version is outside them like a pin: never pruned, never ranked, and never
+//! the "newest" that is kept. Otherwise pushing N builds into a gated feed
+//! deleted every approved version, and rejecting the builds then left nothing;
+//! disabling a broken newest version did the same by accident.
 
 use chrono::{DateTime, Duration, Utc};
 
 use crate::config::RetentionConfig;
-use crate::database::{FeedVersion, PackageDatabase};
+use crate::database::{canonical_id, FeedVersion, PackageDatabase};
 use crate::error::Result;
 use crate::models::Package;
 use crate::storage::PackageStorage;
@@ -86,14 +92,36 @@ pub struct Pruned {
     pub reason: PruneReason,
 }
 
+/// One version as retention sees it.
+#[derive(Debug, Clone, Copy)]
+pub struct Candidate<'a> {
+    pub package: &'a Package,
+    /// Kept whatever the rules say (see [`Membership::pinned`](crate::database::Membership::pinned)).
+    pub pinned: bool,
+    /// Enabled and approved: what a client can download. Unlisted versions
+    /// count, because a client restoring an exact version still gets them —
+    /// they are hidden from search, not withdrawn.
+    pub servable: bool,
+}
+
+impl<'a> Candidate<'a> {
+    /// A servable, unpinned version.
+    pub fn ranked(package: &'a Package) -> Self {
+        Self {
+            package,
+            pinned: false,
+            servable: true,
+        }
+    }
+}
+
 /// Decide which versions of a single package id to prune, and why.
 ///
-/// `versions` pairs each version with whether it is pinned, in any order.
-/// Pinned versions are set aside *before* ranking, so they are never pruned
-/// and never count towards "the newest N". `now` is injected for
-/// deterministic testing.
+/// `versions` may be in any order. Pinned and unservable versions are set
+/// aside *before* ranking, so they are never pruned and never count towards
+/// "the newest N". `now` is injected for deterministic testing.
 pub fn prune_plan(
-    versions: &[(&Package, bool)],
+    versions: &[Candidate<'_>],
     policy: &RetentionPolicy,
     now: DateTime<Utc>,
 ) -> Vec<Pruned> {
@@ -101,24 +129,26 @@ pub fn prune_plan(
         return Vec::new();
     }
 
-    // The single version that must survive no matter what, chosen among all
-    // versions: pinned or not, the package keeps its newest.
+    // The single version that must survive no matter what, chosen among the
+    // servable ones, pinned or not: the package keeps its newest version a
+    // client can actually get. A pending build does not count — it may never
+    // be approved.
     let newest = |pre: bool| {
         versions
             .iter()
-            .filter(|(p, _)| p.is_prerelease() == pre)
-            .map(|(p, _)| &p.version)
+            .filter(|c| c.servable && c.package.is_prerelease() == pre)
+            .map(|c| &c.package.version)
             .max()
     };
     let protected: Option<&NuGetVersion> = newest(false).or_else(|| newest(true));
 
     // Newest-first within each channel so "rank" is an index from the top.
-    let unpinned = versions
+    let ranked = versions
         .iter()
-        .filter(|(_, pinned)| !pinned)
-        .map(|(p, _)| *p);
-    let mut stable: Vec<&Package> = unpinned.clone().filter(|p| !p.is_prerelease()).collect();
-    let mut prerelease: Vec<&Package> = unpinned.filter(|p| p.is_prerelease()).collect();
+        .filter(|c| c.servable && !c.pinned)
+        .map(|c| c.package);
+    let mut stable: Vec<&Package> = ranked.clone().filter(|p| !p.is_prerelease()).collect();
+    let mut prerelease: Vec<&Package> = ranked.filter(|p| p.is_prerelease()).collect();
     stable.sort_by(|a, b| b.version.cmp(&a.version));
     prerelease.sort_by(|a, b| b.version.cmp(&a.version));
 
@@ -168,21 +198,35 @@ pub fn versions_to_prune(
     policy: &RetentionPolicy,
     now: DateTime<Utc>,
 ) -> Vec<NuGetVersion> {
-    let versions: Vec<(&Package, bool)> = packages.iter().map(|p| (p, false)).collect();
+    let versions: Vec<Candidate<'_>> = packages.iter().map(Candidate::ranked).collect();
     prune_plan(&versions, policy, now)
         .into_iter()
         .map(|p| p.version)
         .collect()
 }
 
-/// [`prune_plan`] over a feed's versions of one package, pins included.
+/// [`prune_plan`] over a feed's versions of one package, with their pins and
+/// their pending and disabled states.
 pub fn plan_for(
     versions: &[FeedVersion],
     policy: &RetentionPolicy,
     now: DateTime<Utc>,
 ) -> Vec<Pruned> {
-    let pairs: Vec<(&Package, bool)> = versions.iter().map(|v| (&v.package, v.pinned)).collect();
-    prune_plan(&pairs, policy, now)
+    let candidates: Vec<Candidate<'_>> = versions.iter().map(candidate).collect();
+    prune_plan(&candidates, policy, now)
+}
+
+fn candidate(v: &FeedVersion) -> Candidate<'_> {
+    Candidate {
+        package: &v.package,
+        pinned: v.pinned,
+        servable: is_servable(v),
+    }
+}
+
+/// Enabled and approved. `FeedVersion::package.enabled` is the membership's.
+fn is_servable(v: &FeedVersion) -> bool {
+    v.package.enabled && !v.pending
 }
 
 /// Remove one package version from a single feed.
@@ -204,11 +248,87 @@ pub async fn purge_version(
     // Serialize against a concurrent push of the same version into another feed,
     // so the feed-count check and global GC see a consistent snapshot.
     let _guard = crate::locks::lock_version(id, &version.normalized()).await;
+    purge_locked(storage, db, feed, id, version).await
+}
+
+/// [`purge_version`] for retention: the same, unless the version was pinned,
+/// or stopped being servable, since the plan that chose it was made.
+///
+/// A cleanup plans every package first and deletes afterwards, and a sweep of
+/// a large feed takes a while; an admin pinning a version in the meantime
+/// must win. The check is under the version lock, so it cannot go stale again
+/// before the delete.
+async fn purge_planned(
+    storage: &dyn PackageStorage,
+    db: &dyn PackageDatabase,
+    feed: &str,
+    id: &str,
+    version: &NuGetVersion,
+) -> Result<bool> {
+    let _guard = crate::locks::lock_version(id, &version.normalized()).await;
+    let Some(membership) = db.get_membership(feed, id, version).await? else {
+        return Ok(false);
+    };
+    if membership.pinned || membership.pending || !membership.enabled {
+        tracing::info!(%feed, %id, version = %version.normalized(), "retention kept a version pinned or withheld since it was planned");
+        return Ok(false);
+    }
+    purge_locked(storage, db, feed, id, version).await
+}
+
+/// The body of [`purge_version`]; the caller holds the version lock.
+async fn purge_locked(
+    storage: &dyn PackageStorage,
+    db: &dyn PackageDatabase,
+    feed: &str,
+    id: &str,
+    version: &NuGetVersion,
+) -> Result<bool> {
     let removed = db.remove_membership(feed, id, version).await?;
     if db.feed_count(id, version).await? == 0 {
         purge_global_data(storage, db, id, version).await?;
     }
     Ok(removed)
+}
+
+/// Finish off versions whose global data no feed holds: what a purge that
+/// failed after removing the last membership leaves behind. Nothing serves
+/// them, and nothing else would ever revisit them. Returns how many were
+/// removed.
+///
+/// Each is re-checked under its version lock, so a push adopting the version
+/// at the same moment wins.
+pub async fn sweep_orphans(storage: &dyn PackageStorage, db: &dyn PackageDatabase) -> usize {
+    const BATCH: i64 = 500;
+    let mut removed = 0;
+    let orphans = match db.orphaned_versions(BATCH).await {
+        Ok(orphans) => orphans,
+        Err(e) => {
+            tracing::error!(error = %e, "orphan sweep could not list orphaned versions");
+            return 0;
+        }
+    };
+    for package in orphans {
+        let (id, version) = (&package.id, &package.version);
+        let _guard = crate::locks::lock_version(id, &version.normalized()).await;
+        let still = match db.feed_count(id, version).await {
+            Ok(0) => db.package_data_exists(id, version).await.unwrap_or(false),
+            _ => false,
+        };
+        if !still {
+            continue;
+        }
+        match purge_global_data(storage, db, id, version).await {
+            Ok(()) => {
+                removed += 1;
+                tracing::info!(%id, version = %version.normalized(), "removed a version no feed holds");
+            }
+            Err(e) => {
+                tracing::error!(%id, version = %version.normalized(), error = %e, "orphan sweep failed to remove version");
+            }
+        }
+    }
+    removed
 }
 
 /// Hard-delete the data shared by every feed: symbol files and rows, the stored
@@ -243,7 +363,9 @@ pub(crate) async fn purge_global_data(
 /// references. Their rows go with the package data, after this, so a failure
 /// here leaves the rows that say what is left to delete.
 ///
-/// Same contract: the caller must already hold the version lock.
+/// Same contract: the caller must already hold the version lock. Each blob's
+/// own lock is taken here, across the count and the delete, since another
+/// version may be attaching the same bytes right now.
 pub(crate) async fn purge_file_blobs(
     storage: &dyn PackageStorage,
     db: &dyn PackageDatabase,
@@ -256,6 +378,7 @@ pub(crate) async fn purge_file_blobs(
     blobs.dedup();
     for sha in blobs {
         let here = files.iter().filter(|f| f.sha256 == sha).count() as i64;
+        let _blob = crate::locks::lock_blob(sha).await;
         if db.blob_references(sha).await? <= here {
             storage.delete_blob(sha).await?;
         }
@@ -323,7 +446,7 @@ async fn delete_planned(
         .map(|p| p.package_size)
         .unwrap_or(0)
         + attached_bytes(db, id, version).await;
-    match purge_version(storage, db, feed, id, version).await {
+    match purge_planned(storage, db, feed, id, version).await {
         Ok(true) => {
             outcome.deleted += 1;
             if !db.package_data_exists(id, version).await.unwrap_or(true) {
@@ -443,7 +566,7 @@ impl Preview {
         let mut keys: Vec<String> = self
             .planned
             .iter()
-            .map(|p| format!("{}\0{}", p.id.to_lowercase(), p.version.normalized()))
+            .map(|p| format!("{}\0{}", canonical_id(&p.id), p.version.normalized()))
             .collect();
         keys.sort();
         let mut hasher = Sha256::new();
@@ -461,36 +584,62 @@ impl Preview {
 }
 
 /// What the next cleanup of `feed` would delete under `policy`, and why.
+///
+/// Every GET of the admin page runs this, so it reads the feed a chunk of ids
+/// at a time — a few statements per chunk — rather than several per id and
+/// per planned version.
 pub async fn preview(
     db: &dyn PackageDatabase,
     feed: &str,
     policy: &RetentionPolicy,
     now: DateTime<Utc>,
 ) -> Result<Preview> {
+    const CHUNK: usize = 200;
     let mut out = Preview::default();
-    for id in db.all_package_ids(feed).await? {
-        let versions = db.find_all_versions(feed, &id).await?;
-        for v in versions.iter().filter(|v| v.pinned) {
-            out.pinned
-                .push((v.package.id.clone(), v.package.version.clone()));
+    let ids = db.all_package_ids(feed).await?;
+    for chunk in ids.chunks(CHUNK) {
+        let lower: Vec<String> = chunk.iter().map(|id| canonical_id(id)).collect();
+        let mut by_id: std::collections::HashMap<String, Vec<FeedVersion>> =
+            std::collections::HashMap::new();
+        for v in db.find_all_versions_of(feed, &lower).await? {
+            by_id.entry(v.package.lower_id()).or_default().push(v);
         }
-        for planned in plan_for(&versions, policy, now) {
-            let Some(fv) = versions
-                .iter()
-                .find(|v| v.package.version == planned.version)
-            else {
+        let mut planned: Vec<(&FeedVersion, Pruned)> = Vec::new();
+        for id in &lower {
+            let Some(versions) = by_id.get(id) else {
                 continue;
             };
-            let frees = if db.feed_count(&id, &planned.version).await? <= 1 {
-                fv.package.package_size + attached_bytes(db, &id, &planned.version).await
-            } else {
-                0
+            for v in versions.iter().filter(|v| v.pinned) {
+                out.pinned
+                    .push((v.package.id.clone(), v.package.version.clone()));
+            }
+            for p in plan_for(versions, policy, now) {
+                if let Some(fv) = versions.iter().find(|v| v.package.version == p.version) {
+                    planned.push((fv, p));
+                }
+            }
+        }
+        if planned.is_empty() {
+            continue;
+        }
+        let footprints: std::collections::HashMap<(String, String), (i64, u64)> = db
+            .version_footprints(&lower)
+            .await?
+            .into_iter()
+            .map(|f| ((f.lower_id, f.normalized_version), (f.feeds, f.file_bytes)))
+            .collect();
+        for (fv, p) in planned {
+            let key = (fv.package.lower_id(), fv.package.normalized_version());
+            let frees = match footprints.get(&key) {
+                Some(&(feeds, files)) if feeds <= 1 => fv.package.package_size + files,
+                Some(_) => 0,
+                None => fv.package.package_size,
             };
             out.planned.push(Planned {
                 id: fv.package.id.clone(),
-                version: planned.version,
+                version: p.version,
                 published: fv.package.published,
-                reason: planned.reason,
+                reason: p.reason,
                 frees,
             });
         }
@@ -687,9 +836,12 @@ mod tests {
             ..Default::default()
         };
         let with_pins = |pinned: &[&str]| {
-            let versions: Vec<(&Package, bool)> = packages
+            let versions: Vec<Candidate<'_>> = packages
                 .iter()
-                .map(|p| (p, pinned.contains(&p.version.normalized().as_str())))
+                .map(|p| Candidate {
+                    pinned: pinned.contains(&p.version.normalized().as_str()),
+                    ..Candidate::ranked(p)
+                })
                 .collect();
             plan_names(&prune_plan(&versions, &policy, Utc::now()))
         };
@@ -706,9 +858,12 @@ mod tests {
             max_age_days: Some(90),
             ..Default::default()
         };
-        let versions: Vec<(&Package, bool)> = packages
+        let versions: Vec<Candidate<'_>> = packages
             .iter()
-            .map(|p| (p, p.version.normalized() == "1.0.0"))
+            .map(|p| Candidate {
+                pinned: p.version.normalized() == "1.0.0",
+                ..Candidate::ranked(p)
+            })
             .collect();
         let plan = prune_plan(&versions, &policy, Utc::now());
         // 3.0.0 is the protected newest, 1.0.0 is pinned: only 2.0.0 goes.
@@ -738,7 +893,7 @@ mod tests {
         };
         assert_eq!(one.describe(), "beyond the newest 1 pre-release version");
         let packages = [pkg("1.0.0-rc.1", 0), pkg("1.0.0-rc.2", 0), pkg("0.9.0", 0)];
-        let versions: Vec<(&Package, bool)> = packages.iter().map(|p| (p, false)).collect();
+        let versions: Vec<Candidate<'_>> = packages.iter().map(Candidate::ranked).collect();
         let policy = RetentionPolicy {
             keep_latest_prerelease: Some(1),
             ..Default::default()
@@ -991,5 +1146,147 @@ mod tests {
         assert!(!purge_version(&storage, &db, FEED, "Pkg", &p.version)
             .await
             .unwrap());
+    }
+
+    #[test]
+    fn pending_and_disabled_versions_are_outside_the_rules() {
+        let packages = [
+            pkg("1.0.0", 0),
+            pkg("2.0.0", 0),
+            pkg("3.0.0", 0),
+            pkg("4.0.0", 0),
+        ];
+        let policy = RetentionPolicy {
+            keep_latest_stable: Some(1),
+            ..Default::default()
+        };
+        // 3.0.0 awaits approval and 4.0.0 was disabled: neither is ranked,
+        // neither is the newest that is kept, and neither is pruned.
+        let versions: Vec<Candidate<'_>> = packages
+            .iter()
+            .map(|p| Candidate {
+                servable: p.version.core().0 < 3,
+                ..Candidate::ranked(p)
+            })
+            .collect();
+        assert_eq!(
+            plan_names(&prune_plan(&versions, &policy, Utc::now())),
+            vec!["1.0.0"]
+        );
+        // With nothing servable there is nothing to rank or prune.
+        let withheld: Vec<Candidate<'_>> = packages
+            .iter()
+            .map(|p| Candidate {
+                servable: false,
+                ..Candidate::ranked(p)
+            })
+            .collect();
+        assert!(prune_plan(&withheld, &policy, Utc::now()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn pushing_pending_builds_does_not_prune_the_approved_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FilesystemStorage::new(dir.path()).await.unwrap();
+        let db = SqliteDatabase::in_memory().await.unwrap();
+        let approved = pkg("1.0.0", 0);
+        db.add_to_feed(FEED, &approved).await.unwrap();
+        store_dummy(&storage, "Pkg", "1.0.0").await;
+        for v in ["2.0.0", "3.0.0"] {
+            let p = pkg(v, 0);
+            db.upsert_package_data(&p).await.unwrap();
+            db.add_membership(&crate::database::Membership {
+                pending: true,
+                ..crate::database::Membership::active(FEED, &p)
+            })
+            .await
+            .unwrap();
+            store_dummy(&storage, "Pkg", v).await;
+        }
+        let policy = RetentionPolicy {
+            keep_latest_stable: Some(1),
+            ..Default::default()
+        };
+        assert_eq!(
+            prune_package(&storage, &db, FEED, "Pkg", &policy)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(db.find_all_versions(FEED, "pkg").await.unwrap().len(), 3);
+        assert!(db
+            .is_servable(FEED, "pkg", &approved.version)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_pin_set_after_planning_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FilesystemStorage::new(dir.path()).await.unwrap();
+        let db = SqliteDatabase::in_memory().await.unwrap();
+        for v in ["1.0.0", "2.0.0", "3.0.0"] {
+            db.add_to_feed(FEED, &pkg(v, 0)).await.unwrap();
+            store_dummy(&storage, "Pkg", v).await;
+        }
+        let policy = RetentionPolicy {
+            keep_latest_stable: Some(1),
+            ..Default::default()
+        };
+        let plan = preview(&db, FEED, &policy, Utc::now()).await.unwrap();
+        assert_eq!(plan.planned.len(), 2);
+        // Each version is stored in no other feed, so deleting it frees it.
+        assert!(plan.planned.iter().all(|p| p.frees == 1));
+        // An admin pins 1.0.0 while the cleanup is under way.
+        let v1 = NuGetVersion::parse("1.0.0").unwrap();
+        db.set_pinned(FEED, "pkg", &v1, true).await.unwrap();
+
+        let outcome = apply(&storage, &db, FEED, &plan).await;
+        assert_eq!(outcome.deleted, 1);
+        assert!(db.exists(FEED, "pkg", &v1).await.unwrap());
+        assert!(storage.package_exists("pkg", "1.0.0").await);
+        assert!(!storage.package_exists("pkg", "2.0.0").await);
+    }
+
+    #[tokio::test]
+    async fn the_preview_counts_a_shared_version_as_freeing_nothing() {
+        let db = SqliteDatabase::in_memory().await.unwrap();
+        for v in ["1.0.0", "2.0.0"] {
+            db.add_to_feed(FEED, &pkg(v, 0)).await.unwrap();
+        }
+        db.add_to_feed("other", &pkg("1.0.0", 0)).await.unwrap();
+        let policy = RetentionPolicy {
+            keep_latest_stable: Some(1),
+            ..Default::default()
+        };
+        let plan = preview(&db, FEED, &policy, Utc::now()).await.unwrap();
+        assert_eq!(plan.planned.len(), 1);
+        assert_eq!(plan.planned[0].frees, 0);
+    }
+
+    #[tokio::test]
+    async fn the_orphan_sweep_finishes_an_interrupted_purge() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FilesystemStorage::new(dir.path()).await.unwrap();
+        let db = SqliteDatabase::in_memory().await.unwrap();
+        let orphan = pkg("1.0.0", 0);
+        let kept = pkg("2.0.0", 0);
+        for p in [&orphan, &kept] {
+            db.add_to_feed(FEED, p).await.unwrap();
+            store_dummy(&storage, "Pkg", &p.version.normalized()).await;
+        }
+        // The purge removed the membership and then failed.
+        db.remove_membership(FEED, "pkg", &orphan.version)
+            .await
+            .unwrap();
+
+        assert_eq!(sweep_orphans(&storage, &db).await, 1);
+        assert!(!db
+            .package_data_exists("pkg", &orphan.version)
+            .await
+            .unwrap());
+        assert!(!storage.package_exists("pkg", "1.0.0").await);
+        assert!(storage.package_exists("pkg", "2.0.0").await);
+        assert_eq!(sweep_orphans(&storage, &db).await, 0);
     }
 }

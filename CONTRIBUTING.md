@@ -14,9 +14,15 @@ cargo build
 
 # The docs site is optional for building — a placeholder page is embedded when
 # MkDocs has not run — but you need it to work on the /docs endpoint.
-pip install -r requirements-docs.txt
+# The lock is hashed; after editing requirements-docs.in, regenerate it as
+# described at the top of that file.
+pip install --require-hashes -r requirements-docs.txt
 mkdocs build
 ```
+
+Cargo notices a new or changed `site/` on the next build, with one exception:
+if the first `mkdocs build` comes after a `cargo build` and the docs sources
+have not changed since, run `touch build.rs` so the site is picked up.
 
 Run the server:
 
@@ -24,8 +30,10 @@ Run the server:
 YANUGET_API_KEY=change-me cargo run
 ```
 
-It listens on `https://0.0.0.0:5000` with a self-signed certificate, so pass
-`-k` / `--insecure` to `curl` and clients while testing.
+It listens on `https://0.0.0.0:5000` with a self-signed certificate. `curl`
+takes `-k` / `--insecure`; `dotnet` and `choco` have no such switch, so for
+them either trust `data/tls/cert.pem` or run with `YANUGET_TLS_ENABLED=false`
+and use `http://` while testing.
 
 ## Before you open a pull request
 
@@ -37,6 +45,14 @@ cargo clippy --all-targets --all-features   # must be warning-free
 cargo test --all-features
 mkdocs build --strict                       # if you touched docs/
 ```
+
+CI also runs `cargo audit` and `cargo deny check licenses bans sources`
+(policy in `deny.toml`): a new dependency under a license not on the list
+there fails the build until someone has looked at it.
+
+Every action in `.github/workflows/` is pinned to a full commit SHA with the
+release in a comment (`uses: actions/checkout@<sha> # v7.0.1`). Keep it that
+way when adding one; Dependabot keeps the pins current.
 
 If you changed anything that a NuGet client can observe — the service index, the
 flat container, registration, search, download URLs, or symbol keys — also run

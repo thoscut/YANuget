@@ -64,6 +64,12 @@ rust-embed = { version = "8", features = ["debug-embed", "interpolate-folder-pat
 indicatif = "0.18"
 fs4 = "1.1.0"
 
+# The SSH inbox walks a directory the uploader writes to one component at a
+# time relative to open handles (openat with O_NOFOLLOW), so no link it plants
+# is ever followed. Already in the tree through fs4.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["fs"] }
+
 [dev-dependencies]
 tempfile = "3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "multipart", "rustls-tls", "http2"] }

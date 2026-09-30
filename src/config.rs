@@ -391,6 +391,11 @@ pub struct FeedConfig {
     pub license_policy: LicensePolicyConfig,
     /// Retention for this feed; falls back to the global `[retention]`.
     pub retention: Option<RetentionConfig>,
+    /// Package-id prefixes only this feed may bring in (`Contoso.`): every
+    /// other feed refuses to push, mirror or migrate an id under one. An id and
+    /// version are one namespace across every feed, so without this whoever
+    /// stores a version first claims it in all of them.
+    pub reserved_id_prefixes: Vec<String>,
 }
 
 /// The default feed name used when no `[[feeds]]` are configured.
@@ -415,6 +420,33 @@ pub struct ResolvedFeed {
     pub mirror: MirrorConfig,
     pub license_policy: LicensePolicyConfig,
     pub retention: RetentionConfig,
+    /// This feed's own `reserved_id_prefixes`.
+    pub reserved_id_prefixes: Vec<String>,
+    /// The prefixes every *other* feed reserved, which this one must refuse.
+    pub reserved_elsewhere: Vec<ReservedPrefix>,
+}
+
+/// A package-id prefix reserved by one feed (`reserved_id_prefixes`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReservedPrefix {
+    pub prefix: String,
+    /// The feed it is reserved for.
+    pub feed: String,
+}
+
+impl ReservedPrefix {
+    /// Whether `id` falls under the prefix, ignoring ASCII case. A prefix
+    /// ending in `.` also covers the bare id before it (`Contoso.` covers
+    /// `Contoso` as well as `Contoso.Utils`).
+    pub fn covers(&self, id: &str) -> bool {
+        let id = id.as_bytes();
+        let prefix = self.prefix.as_bytes();
+        let starts = id.len() >= prefix.len() && id[..prefix.len()].eq_ignore_ascii_case(prefix);
+        starts
+            || prefix
+                .strip_suffix(b".")
+                .is_some_and(|bare| id.eq_ignore_ascii_case(bare))
+    }
 }
 
 /// Configuration for the package retention sweep.
@@ -913,6 +945,9 @@ impl Config {
                 mirror: MirrorConfig::default(),
                 license_policy: LicensePolicyConfig::default(),
                 retention: self.retention.clone(),
+                // A single feed has no other feed to reserve anything from.
+                reserved_id_prefixes: Vec::new(),
+                reserved_elsewhere: Vec::new(),
             }]);
         }
 
@@ -953,7 +988,38 @@ impl Config {
                     .retention
                     .clone()
                     .unwrap_or_else(|| self.retention.clone()),
+                reserved_id_prefixes: reserved_prefixes(f)?,
+                reserved_elsewhere: Vec::new(),
             });
+        }
+
+        // Each feed refuses what the others reserved. Two reservations that
+        // overlap would leave the ids under the narrower one to nobody.
+        let all: Vec<ReservedPrefix> = resolved
+            .iter()
+            .flat_map(|f| {
+                f.reserved_id_prefixes.iter().map(|p| ReservedPrefix {
+                    prefix: p.clone(),
+                    feed: f.name.clone(),
+                })
+            })
+            .collect();
+        for (i, a) in all.iter().enumerate() {
+            for b in &all[i + 1..] {
+                if a.feed != b.feed
+                    && (a.covers(&b.prefix)
+                        || b.covers(&a.prefix)
+                        || a.prefix.eq_ignore_ascii_case(&b.prefix))
+                {
+                    return Err(Error::BadRequest(format!(
+                        "feeds {:?} and {:?} reserve overlapping id prefixes {:?} and {:?}",
+                        a.feed, b.feed, a.prefix, b.prefix
+                    )));
+                }
+            }
+        }
+        for f in &mut resolved {
+            f.reserved_elsewhere = all.iter().filter(|r| r.feed != f.name).cloned().collect();
         }
 
         // Promotion targets must reference real feeds.
@@ -1063,8 +1129,34 @@ impl std::fmt::Debug for ResolvedFeed {
             .field("mirror_upstream", &url_origin(&self.mirror.upstream))
             .field("license_policy", &self.license_policy)
             .field("retention", &self.retention)
+            .field("reserved_id_prefixes", &self.reserved_id_prefixes)
+            .field("reserved_elsewhere", &self.reserved_elsewhere)
             .finish_non_exhaustive()
     }
+}
+
+/// A feed's `reserved_id_prefixes`, checked: made of package-id characters
+/// and starting with a letter, digit or `_`, so each can match real ids.
+fn reserved_prefixes(feed: &FeedConfig) -> Result<Vec<String>> {
+    let mut prefixes = Vec::with_capacity(feed.reserved_id_prefixes.len());
+    for raw in &feed.reserved_id_prefixes {
+        let prefix = raw.trim();
+        let valid = prefix
+            .bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_alphanumeric() || b == b'_')
+            && prefix
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'));
+        if !valid || prefix.len() > crate::validation::MAX_ID_LENGTH {
+            return Err(Error::BadRequest(format!(
+                "feed {:?}: invalid reserved_id_prefixes entry {raw:?}",
+                feed.name
+            )));
+        }
+        prefixes.push(prefix.to_string());
+    }
+    Ok(prefixes)
 }
 
 /// Route path segments a feed may not shadow. A feed is mounted at `/{name}`,
@@ -1224,6 +1316,56 @@ mod tests {
             max_request = 5
         "#;
         assert!(toml::from_str::<Config>(nested).is_err());
+    }
+
+    #[test]
+    fn reserved_id_prefixes_are_refused_by_every_other_feed() {
+        let feed = |name: &str, prefixes: &[&str]| FeedConfig {
+            name: name.into(),
+            reserved_id_prefixes: prefixes.iter().map(|p| p.to_string()).collect(),
+            ..Default::default()
+        };
+        let config = Config {
+            feeds: vec![
+                feed("internal", &["Contoso."]),
+                feed("public", &[]),
+                feed("tools", &["Fabrikam.Tools."]),
+            ],
+            ..Default::default()
+        };
+        let feeds = config.resolved_feeds().unwrap();
+        let elsewhere = |name: &str| {
+            let f = feeds.iter().find(|f| f.name == name).unwrap();
+            f.reserved_elsewhere
+                .iter()
+                .map(|r| r.prefix.as_str())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(elsewhere("internal"), ["Fabrikam.Tools."]);
+        assert_eq!(elsewhere("public"), ["Contoso.", "Fabrikam.Tools."]);
+
+        let contoso = ReservedPrefix {
+            prefix: "Contoso.".into(),
+            feed: "internal".into(),
+        };
+        for covered in ["Contoso.Utils", "contoso.utils", "CONTOSO", "contoso.a.b"] {
+            assert!(contoso.covers(covered), "{covered:?}");
+        }
+        for free in ["ContosoUtils", "Contos", "My.Contoso.Utils"] {
+            assert!(!contoso.covers(free), "{free:?}");
+        }
+
+        // Overlapping reservations would leave the narrower ids to nobody.
+        let overlapping = Config {
+            feeds: vec![feed("a", &["Contoso."]), feed("b", &["contoso.internal."])],
+            ..Default::default()
+        };
+        assert!(overlapping.resolved_feeds().is_err());
+        let invalid = Config {
+            feeds: vec![feed("a", &[".Contoso"])],
+            ..Default::default()
+        };
+        assert!(invalid.resolved_feeds().is_err());
     }
 
     #[test]
