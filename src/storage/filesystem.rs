@@ -197,6 +197,36 @@ impl PackageStorage for FilesystemStorage {
         Ok(())
     }
 
+    async fn store_symbol_file(&self, key: &str, filename: &str, temp_path: PathBuf) -> Result<()> {
+        let dest = self.symbol_path(key, filename)?;
+        let Some(parent) = dest.parent() else {
+            return Err(Error::Storage("symbol path has no parent".into()));
+        };
+        tokio::fs::create_dir_all(parent).await?;
+        match tokio::fs::rename(&temp_path, &dest).await {
+            Ok(()) => Ok(()),
+            // Only a different filesystem is worth a copy; anything else is a
+            // real failure. The copy goes to a temp name beside the target
+            // first, so the rename that publishes it is still atomic.
+            Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
+                let staged = parent.join(format!(".{}.tmp", uuid::Uuid::new_v4()));
+                let copied = async {
+                    tokio::fs::copy(&temp_path, &staged).await?;
+                    tokio::fs::File::open(&staged).await?.sync_all().await?;
+                    tokio::fs::rename(&staged, &dest).await
+                }
+                .await;
+                if copied.is_err() {
+                    let _ = tokio::fs::remove_file(&staged).await;
+                }
+                copied?;
+                let _ = tokio::fs::remove_file(&temp_path).await;
+                Ok(())
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
     async fn get_symbol(&self, key: &str, filename: &str) -> Result<PackageContent> {
         let path = self.symbol_path(key, filename)?;
         if tokio::fs::try_exists(&path).await.unwrap_or(false) {

@@ -81,6 +81,13 @@ pub trait PackageStorage: Send + Sync {
     /// bounded in size and already in memory, so bytes are passed directly.
     async fn store_symbol(&self, key: &str, filename: &str, bytes: &[u8]) -> Result<()>;
 
+    /// Move an already-written (and synced) temp file into storage as the
+    /// symbol file for `key`/`filename`, atomically: a reader sees the old
+    /// bytes or the new ones, never a partial file. The symbol push extracts
+    /// each PDB to its own temp file rather than into memory, so this is how
+    /// it stores them.
+    async fn store_symbol_file(&self, key: &str, filename: &str, temp_path: PathBuf) -> Result<()>;
+
     /// Resolve a stored symbol file for serving.
     async fn get_symbol(&self, key: &str, filename: &str) -> Result<PackageContent>;
 

@@ -219,6 +219,9 @@ Streams a `.snupkg` to disk, reads its `.nuspec` to identify the owning package
 PDB** and indexes it by its SSQP key. Responses mirror package push (`201`,
 `400`, `401`, `404`, `413`). Requires `enable_symbol_server` (on by default).
 Native (Windows) PDBs are stored within the `.snupkg` but cannot be indexed.
+Each PDB is extracted to disk rather than into memory; a PDB over 256 MiB, or
+PDBs totalling over 512 MiB, or more than 512 of them, refuse the push with a
+`400` (never a truncated PDB).
 
 ```
 GET /download/symbols/{file}/{key}/{file}

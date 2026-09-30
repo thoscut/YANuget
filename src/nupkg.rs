@@ -161,38 +161,69 @@ pub async fn extract_file(
 /// entries as it likes — so an upload of a few hundred KiB could occupy a
 /// blocking thread for tens of minutes. This opens and parses once.
 ///
-/// `max_bytes_each` caps an individual entry and `max_total_bytes` caps the sum,
-/// because the results are held in memory. Entries that would push the total
-/// over the cap are not read, and the returned vector is short — the caller is
-/// expected to notice and report rather than silently proceed.
+/// Each entry is streamed to its own file in `dir` (named `{uuid}.tmp`, so a
+/// leftover is swept like any other stale upload) rather than held in memory:
+/// a symbol package's PDBs compress well, and holding up to half a GiB of them
+/// per request let a few small concurrent uploads exhaust memory.
 ///
-/// Returns the entries in archive order, each as `(original name, bytes)`.
-/// Names that are absent are skipped.
-pub async fn extract_entries(
+/// `max_bytes_each` caps an individual entry and `max_total_bytes` the sum. An
+/// entry over either is an error naming it — never a truncated file, which
+/// used to be indexed as though it were the whole PDB. On any error, the files
+/// written so far are removed; on success, removing them is the caller's job.
+///
+/// Returns the entries in archive order. Names that are absent are skipped.
+pub async fn extract_entries_to_files(
     path: impl AsRef<Path>,
     entry_names: &[String],
+    dir: impl AsRef<Path>,
     max_bytes_each: u64,
     max_total_bytes: u64,
-) -> Result<Vec<(String, Vec<u8>)>, Error> {
+) -> Result<Vec<ExtractedEntry>, Error> {
     let path: PathBuf = path.as_ref().to_path_buf();
-    let wanted: std::collections::HashSet<String> =
-        entry_names.iter().map(|n| normalize_entry(n)).collect();
+    let dir: PathBuf = dir.as_ref().to_path_buf();
+    let wanted: HashSet<String> = entry_names.iter().map(|n| normalize_entry(n)).collect();
     tokio::task::spawn_blocking(move || {
-        extract_entries_blocking(&path, &wanted, max_bytes_each, max_total_bytes)
+        let mut out = Vec::new();
+        let result = extract_entries_blocking(
+            &path,
+            &wanted,
+            &dir,
+            max_bytes_each,
+            max_total_bytes,
+            &mut out,
+        );
+        if result.is_err() {
+            for entry in &out {
+                let _ = std::fs::remove_file(&entry.path);
+            }
+        }
+        result.map(|()| out)
     })
     .await
     .map_err(|e| Error::Other(anyhow::anyhow!("nupkg extract task panicked: {e}")))?
 }
 
+/// One archive entry written out by [`extract_entries_to_files`].
+#[derive(Debug, Clone)]
+pub struct ExtractedEntry {
+    /// The entry's name as the archive spells it.
+    pub name: String,
+    /// Where its bytes were written.
+    pub path: PathBuf,
+    /// How many bytes that is.
+    pub size: u64,
+}
+
 fn extract_entries_blocking(
     path: &Path,
-    wanted: &std::collections::HashSet<String>,
+    wanted: &HashSet<String>,
+    dir: &Path,
     max_bytes_each: u64,
     max_total_bytes: u64,
-) -> Result<Vec<(String, Vec<u8>)>, Error> {
+    out: &mut Vec<ExtractedEntry>,
+) -> Result<(), Error> {
     let mut archive = open_archive(path)?;
 
-    let mut out = Vec::new();
     let mut total: u64 = 0;
     for i in 0..archive.len() {
         let Some(name) = archive.name_for_index(i) else {
@@ -202,22 +233,50 @@ fn extract_entries_blocking(
             continue;
         }
         let name = name.to_string();
-        let remaining = max_total_bytes.saturating_sub(total);
-        if remaining == 0 {
-            break;
-        }
+        let too_large = |what: &str, limit: u64| {
+            Error::InvalidPackage(format!(
+                "{name} takes the {what} past the {} MiB limit",
+                limit / (1024 * 1024)
+            ))
+        };
         let mut entry = archive
             .by_index(i)
-            .map_err(|e| Error::InvalidPackage(format!("corrupt zip entry: {e}")))?;
-        let mut buf = Vec::new();
-        (&mut entry)
-            .take(max_bytes_each.min(remaining))
-            .read_to_end(&mut buf)
-            .map_err(Error::Io)?;
-        total = total.saturating_add(buf.len() as u64);
-        out.push((name, buf));
+            .map_err(|e| Error::InvalidPackage(format!("could not open {name}: {e}")))?;
+        // The declared sizes are checked first, so an honest oversized entry
+        // costs nothing to refuse; the copy below enforces the same limits on
+        // what actually decompresses.
+        if entry.size() > max_bytes_each {
+            return Err(too_large("entry", max_bytes_each));
+        }
+        if total.saturating_add(entry.size()) > max_total_bytes {
+            return Err(too_large("package", max_total_bytes));
+        }
+
+        let target = dir.join(format!("{}.tmp", uuid::Uuid::new_v4()));
+        let mut file = File::create(&target)?;
+        out.push(ExtractedEntry {
+            name: name.clone(),
+            path: target,
+            size: 0,
+        });
+        let limit = max_bytes_each.min(max_total_bytes - total);
+        let written = std::io::copy(&mut (&mut entry).take(limit.saturating_add(1)), &mut file)
+            .map_err(|e| Error::InvalidPackage(format!("could not read {name}: {e}")))?;
+        if written > limit {
+            return Err(if written > max_bytes_each {
+                too_large("entry", max_bytes_each)
+            } else {
+                too_large("package", max_total_bytes)
+            });
+        }
+        // Durable before anything renames it into the store.
+        file.sync_all()?;
+        total += written;
+        if let Some(last) = out.last_mut() {
+            last.size = written;
+        }
     }
-    Ok(out)
+    Ok(())
 }
 
 fn extract_file_blocking(
@@ -770,6 +829,47 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    /// Entries are streamed to files, and one over either cap is an error —
+    /// never a short file that goes on to be indexed as the whole PDB.
+    #[tokio::test]
+    async fn entries_are_extracted_to_files_within_caps() {
+        let a = manifest("First.Id");
+        let bytes = zip_with_entries(&[
+            ("P.nuspec", &a),
+            ("lib/a.pdb", &[1u8; 100]),
+            ("lib/b.pdb", &[2u8; 50]),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.snupkg");
+        std::fs::write(&path, &bytes).unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let names = vec!["lib/a.pdb".to_string(), "LIB\\B.PDB".to_string()];
+        let files_in = |d: &Path| std::fs::read_dir(d).unwrap().count();
+
+        let got = extract_entries_to_files(&path, &names, out.path(), 100, 150)
+            .await
+            .unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].name, "lib/a.pdb");
+        assert_eq!(std::fs::read(&got[0].path).unwrap(), vec![1u8; 100]);
+        assert_eq!(got[1].size, 50);
+        for entry in &got {
+            std::fs::remove_file(&entry.path).unwrap();
+        }
+
+        // One entry over its cap.
+        let err = extract_entries_to_files(&path, &names, out.path(), 99, 1000)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("lib/a.pdb"), "{err}");
+        // The total over its cap, on the second entry: the first is cleaned up.
+        let err = extract_entries_to_files(&path, &names, out.path(), 100, 149)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("lib/b.pdb"), "{err}");
+        assert_eq!(files_in(out.path()), 0, "partial output left behind");
     }
 
     #[tokio::test]

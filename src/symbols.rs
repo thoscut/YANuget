@@ -9,7 +9,7 @@
 //! NuGet requires the matching package to be pushed *before* its symbols, so a
 //! symbol push for an unknown id/version is rejected.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::database::PackageDatabase;
 use crate::error::{Error, Result};
@@ -18,12 +18,13 @@ use crate::storage::PackageStorage;
 use crate::version::NuGetVersion;
 use crate::{nupkg, pdb};
 
-/// Hard cap on a single `.pdb` we will read into memory to index/store it.
+/// Hard cap on a single `.pdb`. An entry over it refuses the push rather than
+/// being stored cut short.
 const MAX_PDB_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Caps on a symbol package as a whole. Without them a `.snupkg` of a few
 /// hundred KiB — entry names and deflated zeros both compress enormously —
-/// decides how much memory and disk one request consumes. A real symbol package
+/// decides how much disk and time one request consumes. A real symbol package
 /// carries one PDB per assembly, so a few hundred is already generous.
 const MAX_PDB_ENTRIES: usize = 512;
 const MAX_PDB_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
@@ -94,15 +95,37 @@ async fn index_inner(
     // directory every time, so the cost grew with the square of the entry
     // count: a 200 KiB upload naming 2000 PDBs took 25 seconds of a blocking
     // thread, and the entry count had no upper bound at all.
-    let extracted =
-        nupkg::extract_entries(temp_path, &pdb_entries, MAX_PDB_BYTES, MAX_PDB_TOTAL_BYTES).await?;
+    //
+    // Each PDB goes to its own temp file next to the upload, not into memory:
+    // up to 512 MiB of highly compressible PDBs per request was a small upload
+    // away, and a few concurrent ones exhausted memory. An entry over the cap
+    // is refused, where it used to be cut short and indexed as if whole.
+    let dir = temp_path.parent().unwrap_or_else(|| Path::new("."));
+    let extracted = TempFiles(
+        nupkg::extract_entries_to_files(
+            temp_path,
+            &pdb_entries,
+            dir,
+            MAX_PDB_BYTES,
+            MAX_PDB_TOTAL_BYTES,
+        )
+        .await?,
+    );
 
     let mut indexed = 0;
     let mut skipped = 0;
     let lower_id = id.to_lowercase();
-    for (entry, bytes) in &extracted {
-        let filename = file_name(entry);
-        match pdb::portable_pdb_signature(bytes) {
+    for entry in &extracted.0 {
+        let filename = file_name(&entry.name);
+        let path = entry.path.clone();
+        let key = tokio::task::spawn_blocking(move || {
+            let mut file = std::fs::File::open(path)?;
+            pdb::read_pdb_id(&mut file)
+        })
+        .await
+        .map_err(|e| Error::Other(anyhow::anyhow!("pdb read task panicked: {e}")))??
+        .map(|id| id.ssqp_key());
+        match key {
             Some(key) => {
                 // The SSQP key comes out of the uploaded PDB and the filename
                 // out of the zip entry name, so both are entirely chosen by
@@ -127,7 +150,9 @@ async fn index_inner(
                         )));
                     }
                 }
-                storage.store_symbol(&key, &filename, bytes).await?;
+                storage
+                    .store_symbol_file(&key, &filename, entry.path.clone())
+                    .await?;
                 db.add_symbol(&key, &filename, &id, &version).await?;
                 indexed += 1;
             }
@@ -151,6 +176,19 @@ async fn index_inner(
         indexed,
         skipped,
     })
+}
+
+/// Extracted PDBs awaiting a decision. Whatever was not moved into the store
+/// is removed when this goes out of scope, on every path out of the push.
+struct TempFiles(Vec<nupkg::ExtractedEntry>);
+
+impl Drop for TempFiles {
+    fn drop(&mut self) {
+        for entry in &self.0 {
+            // Gone already when it was moved into the store.
+            let _ = std::fs::remove_file(&entry.path);
+        }
+    }
 }
 
 /// The final path segment (the bare file name), lower-cased.
