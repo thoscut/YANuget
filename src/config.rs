@@ -161,6 +161,10 @@ pub struct Config {
     /// Refuse an upload that would leave less than this many bytes free on the
     /// storage volume (`507 Insufficient Storage`). `0` turns the check off.
     pub min_free_disk_bytes: u64,
+    /// Concurrent connections the server accepts; one over the cap is closed
+    /// as soon as it is accepted. `0` is unlimited. Bounds the sockets (and
+    /// file descriptors) that slow or idle clients can hold.
+    pub max_connections: usize,
     /// Whether (and which) pushes may overwrite an existing id/version. Off by
     /// default to preserve NuGet's immutability guarantee.
     pub allow_overwrite: OverwriteMode,
@@ -569,6 +573,7 @@ impl Default for Config {
             max_package_size_bytes: None,
             upload_idle_timeout_secs: 300,
             min_free_disk_bytes: 2 * 1024 * 1024 * 1024,
+            max_connections: 4096,
             allow_overwrite: OverwriteMode::Disabled,
             hard_delete_enabled: false,
             tls_enabled: true,
@@ -692,6 +697,9 @@ impl Config {
         }
         if let Some(v) = get("YANUGET_MIN_FREE_DISK_BYTES")? {
             self.min_free_disk_bytes = parse_env_int("YANUGET_MIN_FREE_DISK_BYTES", &v)?;
+        }
+        if let Some(v) = get("YANUGET_MAX_CONNECTIONS")? {
+            self.max_connections = parse_env_int("YANUGET_MAX_CONNECTIONS", &v)?;
         }
         if let Some(v) = get("YANUGET_ALLOW_OVERWRITE")? {
             self.allow_overwrite = OverwriteMode::parse_env("YANUGET_ALLOW_OVERWRITE", &v)?;
@@ -1000,6 +1008,7 @@ impl std::fmt::Debug for Config {
             .field("max_package_size_bytes", &self.max_package_size_bytes)
             .field("upload_idle_timeout_secs", &self.upload_idle_timeout_secs)
             .field("min_free_disk_bytes", &self.min_free_disk_bytes)
+            .field("max_connections", &self.max_connections)
             .field("allow_overwrite", &self.allow_overwrite)
             .field("hard_delete_enabled", &self.hard_delete_enabled)
             .field("tls_enabled", &self.tls_enabled)

@@ -27,6 +27,7 @@ A fully commented template lives in
 | `max_package_size_bytes` | `YANUGET_MAX_PACKAGE_SIZE_BYTES` | int | *(unlimited)* | Upload cap; streamed either way. |
 | `upload_idle_timeout_secs` | `YANUGET_UPLOAD_IDLE_TIMEOUT_SECS` | int | `300` | Abort an upload after this long without a byte arriving (`408`). Only silence counts; a slow transfer is never cut off. `0` waits forever. |
 | `min_free_disk_bytes` | `YANUGET_MIN_FREE_DISK_BYTES` | int | `2147483648` (2 GiB) | Refuse an upload (`507`) that would leave less than this free on the storage volume. Checked against the declared size when there is one. `0` turns the check off. |
+| `max_connections` | `YANUGET_MAX_CONNECTIONS` | int | `4096` | Concurrent connections accepted; one over the cap is closed at once. `0` is unlimited. |
 | `allow_overwrite` | `YANUGET_ALLOW_OVERWRITE` | bool \| string | `false` | Re-push an existing version: `false`, `true`, or `"prerelease-only"` (overwrite pre-releases only). |
 | `hard_delete_enabled` | `YANUGET_HARD_DELETE_ENABLED` | bool | `false` | DELETE removes vs. unlists. |
 | `tls_enabled` | `YANUGET_TLS_ENABLED` | bool | `true` | Serve HTTPS (self-signed fallback). |
@@ -393,6 +394,13 @@ responses also carry a `Strict-Transport-Security` header (one year).
   carry a `Content-Security-Policy` of `default-src 'none'` whose only permitted
   inline style and script are the two the server itself emits, pinned by
   SHA-256 — so an escaping bug could not become script execution.
+- A client gets 30 seconds to send a request's headers, and at most
+  `max_connections` connections are open at once, so clients that open
+  sockets and trickle bytes cannot hold them indefinitely. (Request bodies are
+  bounded by `upload_idle_timeout_secs` instead.) On shutdown, in-flight
+  requests get 10 seconds, on plain HTTP as on HTTPS, and background work (a
+  retention sweep, an inbox scan) is allowed to finish within the same
+  period rather than being dropped mid-way.
 - `5xx` responses return a generic message; the underlying I/O, SQL or upstream
   detail goes to the log only.
 - Unknown keys in the TOML file are a **hard error**, so a mistyped security

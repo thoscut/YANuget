@@ -133,6 +133,8 @@ async fn run_server(config_path: Option<&str>) -> anyhow::Result<()> {
         let _ = shutdown_tx.send(true);
     });
 
+    // Every background task, joined on shutdown so none is cut off mid-write.
+    let mut background: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     let mut states = Vec::with_capacity(feeds.len());
     for feed in &feeds {
         let state = AppState::for_feed(
@@ -160,7 +162,7 @@ async fn run_server(config_path: Option<&str>) -> anyhow::Result<()> {
             let feed_name = feed.name.clone();
             let mut shutdown = shutdown_rx.clone();
             tracing::info!(feed = %feed_name, interval_hours = interval, "retention sweep enabled");
-            tokio::spawn(async move {
+            background.push(tokio::spawn(async move {
                 // `interval_hours` comes from configuration as a `u64`; the
                 // multiplication into seconds would overflow (a panic in debug,
                 // a wrap to a tiny period in release — a sweep every few
@@ -169,15 +171,21 @@ async fn run_server(config_path: Option<&str>) -> anyhow::Result<()> {
                 let mut tick = tokio::time::interval(period);
                 loop {
                     tokio::select! {
-                        _ = tick.tick() => {
-                            if let Err(e) = cleanup
-                                .sweep(storage.as_ref(), db.as_ref(), &feed_name, &policy)
-                                .await
-                            {
-                                tracing::error!(feed = %feed_name, error = %e, "retention sweep failed");
-                            }
-                        }
+                        _ = tick.tick() => {}
                         _ = shutdown.changed() => break,
+                    }
+                    // Not raced against shutdown: dropping a sweep mid-way
+                    // abandons it at whatever await it reached, between a
+                    // version's files and its rows. Shutdown waits for it
+                    // (up to the grace period) instead.
+                    if let Err(e) = cleanup
+                        .sweep(storage.as_ref(), db.as_ref(), &feed_name, &policy)
+                        .await
+                    {
+                        tracing::error!(feed = %feed_name, error = %e, "retention sweep failed");
+                    }
+                    if *shutdown.borrow() {
+                        break;
                     }
                 }
                 // Only reached on shutdown. If this task ever ends any other
@@ -185,40 +193,74 @@ async fn run_server(config_path: Option<&str>) -> anyhow::Result<()> {
                 // that silently — retention would stop for the life of the
                 // process while `/settings` kept advertising "every N h".
                 tracing::debug!(feed = %feed_name, "retention sweep stopped");
-            });
+            }));
         }
     }
 
-    spawn_file_tasks(&config, &storage, &db, &feeds, &shutdown_rx);
+    background.extend(spawn_file_tasks(
+        &config,
+        &storage,
+        &db,
+        &feeds,
+        &shutdown_rx,
+    ));
 
     let app = web::build_app(states);
-    let addr = config.socket_addr();
 
-    // Rendered here, printed last — after any certificate or configuration
-    // warning — so the summary is what is left on screen, not scrolled off it.
-    let feed_names: Vec<&str> = feeds.iter().map(|f| f.name.as_str()).collect();
-    let banner = banner(
-        if config.tls_enabled { "https" } else { "http" },
-        addr,
-        &feed_names,
-        &config.data_dir,
-        feeds.iter().any(|f| f.api_keys.is_empty()),
-    );
+    // Both paths shut down the same way: stop accepting, give in-flight
+    // requests the grace period, then close what is left. The plain-HTTP path
+    // used to wait for its last connection indefinitely.
+    let handle = axum_server::Handle::new();
+    {
+        let handle = handle.clone();
+        let shutdown_rx = shutdown_rx.clone();
+        tokio::spawn(async move {
+            wait_for_shutdown(shutdown_rx).await;
+            handle.graceful_shutdown(Some(yanuget::server::SHUTDOWN_GRACE));
+        });
+    }
+    let limits = yanuget::server::ServeLimits::from_config(&config);
+    let mut server = tokio::spawn({
+        let (config, handle) = (config.clone(), handle.clone());
+        async move { yanuget::server::serve(app, &config, handle, limits).await }
+    });
 
-    if config.tls_enabled {
-        serve_tls(app, addr, &config, &banner, shutdown_rx).await?;
-    } else {
-        let listener = tokio::net::TcpListener::bind(addr).await?;
-        tracing::info!("YANuget listening on http://{addr} (TLS disabled)");
-        print!("{banner}");
-        // `with_connect_info` exposes the peer address so the rate limiter can
-        // key on it when no `X-Forwarded-*` header is present.
-        axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-        )
-        .with_graceful_shutdown(wait_for_shutdown(shutdown_rx))
-        .await?;
+    // Printed once the socket is bound — after any certificate or
+    // configuration warning — so the summary is what is left on screen, not
+    // scrolled off it, and shows the port actually bound.
+    tokio::select! {
+        bound = handle.listening() => {
+            if let Some(addr) = bound {
+                let scheme = config.scheme();
+                tracing::info!("YANuget listening on {scheme}://{addr}");
+                let feed_names: Vec<&str> = feeds.iter().map(|f| f.name.as_str()).collect();
+                print!(
+                    "{}",
+                    banner(
+                        scheme,
+                        addr,
+                        &feed_names,
+                        &config.data_dir,
+                        feeds.iter().any(|f| f.api_keys.is_empty()),
+                    )
+                );
+            }
+        }
+        // Failed before binding (a bad certificate, a port in use).
+        result = &mut server => return Ok(result??),
+    }
+    server.await??;
+
+    // The server has stopped; let background work that was mid-way finish,
+    // within the same grace period.
+    if tokio::time::timeout(
+        yanuget::server::SHUTDOWN_GRACE,
+        futures::future::join_all(background),
+    )
+    .await
+    .is_err()
+    {
+        tracing::warn!("background tasks still running at shutdown; abandoning them");
     }
     Ok(())
 }
@@ -303,46 +345,6 @@ fn banner(
     }
     out.push('\n');
     out
-}
-
-/// Serve over HTTPS, resolving (and if necessary generating a self-signed)
-/// certificate, with the same graceful-shutdown behaviour as the HTTP path.
-async fn serve_tls(
-    app: axum::Router,
-    addr: std::net::SocketAddr,
-    config: &Config,
-    banner: &str,
-    shutdown_rx: tokio::sync::watch::Receiver<bool>,
-) -> anyhow::Result<()> {
-    // Install the ring crypto provider as the process default before any
-    // rustls configuration is built.
-    rustls::crypto::ring::default_provider()
-        .install_default()
-        .map_err(|_| anyhow::anyhow!("failed to install rustls crypto provider"))?;
-
-    let sans = yanuget::tls::certificate_sans(config.base_url.as_deref());
-    let paths =
-        yanuget::tls::ensure_certificate(config.tls_pair(), &config.data_dir, &sans).await?;
-
-    let tls = axum_server::tls_rustls::RustlsConfig::from_pem_file(&paths.cert, &paths.key)
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to load TLS certificate: {e}"))?;
-
-    tracing::info!("YANuget listening on https://{addr}");
-    print!("{banner}");
-
-    let handle = axum_server::Handle::new();
-    let shutdown = handle.clone();
-    tokio::spawn(async move {
-        wait_for_shutdown(shutdown_rx).await;
-        shutdown.graceful_shutdown(Some(std::time::Duration::from_secs(10)));
-    });
-
-    axum_server::bind_rustls(addr, tls)
-        .handle(handle)
-        .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
-        .await?;
-    Ok(())
 }
 
 fn init_tracing() {
@@ -473,9 +475,10 @@ fn spawn_file_tasks(
     db: &Arc<SqliteDatabase>,
     feeds: &[yanuget::config::ResolvedFeed],
     shutdown: &tokio::sync::watch::Receiver<bool>,
-) {
+) -> Vec<tokio::task::JoinHandle<()>> {
+    let mut tasks = Vec::new();
     if !config.files.enabled {
-        return;
+        return tasks;
     }
     let staging = config.storage_path().join(".uploads");
 
@@ -484,7 +487,7 @@ fn spawn_file_tasks(
         let db = db.clone();
         let staging = staging.clone();
         let mut shutdown = shutdown.clone();
-        tokio::spawn(async move {
+        tasks.push(tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(15 * 60));
             loop {
                 tokio::select! {
@@ -492,18 +495,18 @@ fn spawn_file_tasks(
                     _ = shutdown.changed() => break,
                 }
             }
-        });
+        }));
     }
 
     let Some(inbox) = config.files.inbox_dir.clone() else {
-        return;
+        return tasks;
     };
     if let Err(e) = std::fs::create_dir_all(&inbox)
         .map_err(yanuget::Error::from)
         .and_then(|_| yanuget::inbox::check_location(&inbox, &config.storage_path()))
     {
         tracing::error!(inbox = %inbox.display(), error = %e, "file inbox disabled");
-        return;
+        return tasks;
     }
     let names: Vec<String> = feeds.iter().map(|f| f.name.clone()).collect();
     for name in &names {
@@ -512,30 +515,39 @@ fn spawn_file_tasks(
     tracing::info!(inbox = %inbox.display(), every_secs = config.files.inbox_scan_secs, "file inbox enabled");
     let (config, storage, db) = (config.clone(), storage.clone(), db.clone());
     let mut shutdown = shutdown.clone();
-    tokio::spawn(async move {
+    tasks.push(tokio::spawn(async move {
         let period = Duration::from_secs(config.files.inbox_scan_secs.max(5));
         let mut tick = tokio::time::interval(period);
         loop {
             tokio::select! {
-                _ = tick.tick() => {
-                    let scan = yanuget::inbox::Inbox {
-                        dir: &inbox,
-                        storage: storage.as_ref(),
-                        db: db.as_ref(),
-                        files: &config.files,
-                        max_file_size: config.max_file_size_bytes(),
-                        feeds: &names,
-                        staging: &staging,
-                    };
-                    let report = scan.scan().await;
-                    if report.imported + report.failed > 0 {
-                        tracing::info!(imported = report.imported, failed = report.failed, "file inbox scanned");
-                    }
-                }
+                _ = tick.tick() => {}
                 _ = shutdown.changed() => break,
             }
+            // Like the retention sweep, a scan runs to completion rather than
+            // being dropped half way through an import.
+            let scan = yanuget::inbox::Inbox {
+                dir: &inbox,
+                storage: storage.as_ref(),
+                db: db.as_ref(),
+                files: &config.files,
+                max_file_size: config.max_file_size_bytes(),
+                feeds: &names,
+                staging: &staging,
+            };
+            let report = scan.scan().await;
+            if report.imported + report.failed > 0 {
+                tracing::info!(
+                    imported = report.imported,
+                    failed = report.failed,
+                    "file inbox scanned"
+                );
+            }
+            if *shutdown.borrow() {
+                break;
+            }
         }
-    });
+    }));
+    tasks
 }
 
 async fn wait_for_shutdown(mut rx: tokio::sync::watch::Receiver<bool>) {

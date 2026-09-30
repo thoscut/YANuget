@@ -908,6 +908,166 @@ async fn promotion_does_not_republish_what_the_source_withholds() {
     assert_eq!(search["totalHits"], 0, "{search}");
 }
 
+// ---------------------------------------------------------------------------
+// The real serve path: TLS, timeouts, the connection cap, shutdown
+// (TEST-06, SEC-23)
+// ---------------------------------------------------------------------------
+
+struct Served {
+    addr: SocketAddr,
+    handle: axum_server::Handle,
+    task: tokio::task::JoinHandle<yanuget::Result<()>>,
+    dir: tempfile::TempDir,
+}
+
+/// Serve through `yanuget::server::serve`, as `main.rs` does.
+async fn serve_real(
+    customize: impl FnOnce(&mut Config),
+    limits: impl FnOnce(&mut yanuget::server::ServeLimits),
+) -> Served {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = Config {
+        api_key: Some(API_KEY.to_string()),
+        ..base_config(&dir)
+    };
+    customize(&mut config);
+    let mut serve_limits = yanuget::server::ServeLimits::from_config(&config);
+    limits(&mut serve_limits);
+    let app = web::build_app(build_states(config.clone()).await);
+    let handle = axum_server::Handle::new();
+    let task = tokio::spawn({
+        let handle = handle.clone();
+        async move { yanuget::server::serve(app, &config, handle, serve_limits).await }
+    });
+    let addr = tokio::time::timeout(Duration::from_secs(30), handle.listening())
+        .await
+        .expect("server did not start")
+        .expect("server did not bind");
+    Served {
+        addr,
+        handle,
+        task,
+        dir,
+    }
+}
+
+#[tokio::test]
+async fn tls_serves_hsts_and_keeps_its_generated_key_private() {
+    let served = serve_real(|c| c.tls_enabled = true, |_| {}).await;
+    let tls = served.dir.path().join("tls");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(tls.join("key.pem"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "key mode {:o}", mode & 0o777);
+    }
+
+    // Trust exactly the generated certificate, and reach it by the name it
+    // was issued for.
+    let cert =
+        reqwest::Certificate::from_pem(&std::fs::read(tls.join("cert.pem")).unwrap()).unwrap();
+    let client = reqwest::Client::builder()
+        .add_root_certificate(cert)
+        .resolve("localhost", served.addr)
+        .build()
+        .unwrap();
+    let port = served.addr.port();
+    let resp = client
+        .get(format!("https://localhost:{port}/v3/index.json"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        header(&resp, "strict-transport-security"),
+        "max-age=31536000"
+    );
+    let index = resp.text().await.unwrap();
+    assert!(
+        index.contains(&format!("https://localhost:{port}/")),
+        "URLs keep the https scheme: {index}"
+    );
+    served.handle.shutdown();
+}
+
+#[tokio::test]
+async fn a_client_that_trickles_its_headers_is_cut_off() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let served = serve_real(
+        |_| {},
+        |l| l.header_read_timeout = Duration::from_millis(300),
+    )
+    .await;
+    let mut conn = tokio::net::TcpStream::connect(served.addr).await.unwrap();
+    conn.write_all(b"GET /v3/index.json HTTP/1.1\r\nHost: x\r\n")
+        .await
+        .unwrap();
+    // Never finish the headers. The server must give up, not wait forever.
+    let mut buf = Vec::new();
+    let read = tokio::time::timeout(Duration::from_secs(10), conn.read_to_end(&mut buf)).await;
+    assert!(read.is_ok(), "the connection was still open after 10 s");
+    served.handle.shutdown();
+}
+
+#[tokio::test]
+async fn connections_over_the_cap_are_turned_away() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let served = serve_real(|_| {}, |l| l.max_connections = 1).await;
+    let first = tokio::net::TcpStream::connect(served.addr).await.unwrap();
+    // Give the server a moment to accept the first and take its slot.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let mut second = tokio::net::TcpStream::connect(served.addr).await.unwrap();
+    let mut buf = Vec::new();
+    let closed = tokio::time::timeout(Duration::from_secs(5), second.read_to_end(&mut buf)).await;
+    assert!(
+        matches!(closed, Ok(Ok(0)) | Ok(Err(_))),
+        "the second connection was served: {closed:?}"
+    );
+
+    // Closing the first frees its slot.
+    drop(first);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let mut third = tokio::net::TcpStream::connect(served.addr).await.unwrap();
+    third
+        .write_all(b"GET /health/live HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut reply = String::new();
+    tokio::time::timeout(Duration::from_secs(5), third.read_to_string(&mut reply))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
+    served.handle.shutdown();
+}
+
+#[tokio::test]
+async fn plain_http_shutdown_has_a_deadline() {
+    use tokio::io::AsyncWriteExt;
+    // A client in the middle of a request, with nothing to cut it off but
+    // the shutdown deadline.
+    let served = serve_real(
+        |_| {},
+        |l| l.header_read_timeout = Duration::from_secs(3600),
+    )
+    .await;
+    let mut conn = tokio::net::TcpStream::connect(served.addr).await.unwrap();
+    conn.write_all(b"GET /v3/index.json HTTP/1.1\r\nHost: x\r\n")
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    served
+        .handle
+        .graceful_shutdown(Some(Duration::from_millis(500)));
+    let stopped = tokio::time::timeout(Duration::from_secs(10), served.task).await;
+    assert!(stopped.is_ok(), "shutdown waited on the connection forever");
+    drop(conn);
+}
+
 /// Run the real binary with `env` and return its exit status and stderr,
 /// killing it if it is still running after `timeout` (it then started, which
 /// is what these tests assert does not happen).

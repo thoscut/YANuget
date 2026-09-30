@@ -19,6 +19,10 @@ data_dir = "./data"        # YANUGET_DATA_DIR
 # storage_path = "./data/packages"        # YANUGET_STORAGE_PATH
 # database_path = "./data/yanuget.db"     # YANUGET_DATABASE_PATH
 
+# Concurrent connections accepted; one over the cap is closed at once. Bounds
+# the sockets slow or idle clients can hold. 0 = unlimited.
+max_connections = 4096     # YANUGET_MAX_CONNECTIONS
+
 # API key required to push and delete packages. STRONGLY recommended.
 # If unset, those endpoints are unauthenticated.
 # api_key = "change-me"    # YANUGET_API_KEY
