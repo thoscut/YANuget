@@ -251,6 +251,20 @@ impl MirrorClient {
         if !config.allow_private_upstream {
             builder = builder.dns_resolver(std::sync::Arc::new(GuardedResolver { proxy_host }));
         }
+        // The system store and the bundled roots are both trusted already;
+        // an internal CA the host does not carry can be named here.
+        if let Some(path) = &config.ca_cert_path {
+            let unusable = |why: String| invalid(format!("ca_cert_path {}: {why}", path.display()));
+            let pem = std::fs::read(path).map_err(|e| unusable(e.to_string()))?;
+            let certs = reqwest::Certificate::from_pem_bundle(&pem)
+                .map_err(|e| unusable(error_chain(&e)))?;
+            if certs.is_empty() {
+                return Err(unusable("no PEM certificate in the file".into()));
+            }
+            for cert in certs {
+                builder = builder.add_root_certificate(cert);
+            }
+        }
         let client = builder
             .build()
             .map_err(|e| invalid(format!("cannot build the HTTP client: {}", error_chain(&e))))?;

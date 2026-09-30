@@ -237,6 +237,7 @@ or a header that cannot be sent, is a startup error.
 | `feeds[].mirror.max_package_size_bytes` | int | *(server-wide cap, else 2 GiB)* | Cap on a single mirrored `.nupkg`. |
 | `feeds[].mirror.allow_private_upstream` | bool | `false` | Permit an upstream on a private/loopback address. |
 | `feeds[].mirror.proxy` | string | *(none)* | Outbound proxy for upstream requests. Unset, the mirror connects directly and ignores `HTTP(S)_PROXY`. |
+| `feeds[].mirror.ca_cert_path` | path | *(none)* | PEM file of extra CA certificates to trust for the upstream, on top of the system store and the bundled Mozilla roots. |
 
 Three things bound a read-through miss, because it is started by an
 *unauthenticated read* and writes what it fetches to your disk:

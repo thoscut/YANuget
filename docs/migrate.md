@@ -46,6 +46,7 @@ A live display shows progress, ETA and transfer rate while it runs.
 | `--overwrite` | off | Replace versions the target feed already has. |
 | `--dry-run` | off | Discover and report only; download nothing. |
 | `--max-package-size-bytes <n>` | *(no limit)* | Skip any source package larger than this. |
+| `--source-ca-cert <path>` | *(none)* | PEM file of extra CA certificates to trust for the source. The system store and the bundled Mozilla roots are trusted either way. |
 
 `--config` works here too, so the target server's TOML — including the feed
 definitions — is read the same way the server reads it.

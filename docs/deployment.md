@@ -14,8 +14,11 @@ see [Large packages](large-packages.md).
 | `cargo install yanuget` | ❌ (placeholder page) | Trying it out, custom builds |
 | `cargo build --release` | Only if you ran `mkdocs build` first | Development |
 
-The binary has no runtime dependencies beyond a C runtime and CA certificates
-(the latter only if you enable mirroring or migration).
+The binary has no runtime dependencies beyond a C runtime. For mirroring and
+migration it trusts the Mozilla root certificates built into it *and* the
+system's CA store when there is one, so an upstream behind an internal CA or a
+TLS-inspecting proxy works once that CA is in the system store — or named in
+the feed's `mirror.ca_cert_path` (`--source-ca-cert` for `migrate`).
 
 ## Minimum viable production setup
 

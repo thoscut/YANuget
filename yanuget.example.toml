@@ -224,6 +224,9 @@ inbox_scan_secs = 30                # YANUGET_FILES_INBOX_SCAN_SECS
 #   # Outbound proxy for upstream requests. Unset, the mirror connects directly:
 #   # HTTP(S)_PROXY in the environment is ignored.
 #   # proxy = "http://proxy.internal:3128"
+#   # Extra CA certificates (PEM) for an upstream behind an internal CA. The
+#   # system store and the bundled Mozilla roots are trusted either way.
+#   # ca_cert_path = "/etc/yanuget/internal-ca.pem"
 #
 #     # Credentials for an authenticated upstream (all optional). Set the
 #     # username/password pair for HTTP Basic OR token for a Bearer token, plus

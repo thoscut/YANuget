@@ -102,6 +102,47 @@ impl Upstream {
         Self { state }
     }
 
+    /// The same upstream over HTTPS as `https://localhost:{port}`, with a
+    /// certificate from a private CA. Returns the CA's PEM, which is what an
+    /// operator would put in `ca_cert_path`.
+    async fn start_tls() -> (Self, String) {
+        // Whichever test gets here first installs the provider.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        let tls = axum_server::tls_rustls::RustlsConfig::from_pem(
+            cert.pem().into_bytes(),
+            key.serialize_pem().into_bytes(),
+        )
+        .await
+        .unwrap();
+        let listener =
+            std::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let base = format!(
+            "https://localhost:{}",
+            listener.local_addr().unwrap().port()
+        );
+        let state = Arc::new(UpstreamState {
+            base,
+            behaviour: Mutex::default(),
+            seen: Mutex::default(),
+        });
+        let app = axum::Router::new()
+            .fallback(handle)
+            .with_state(state.clone());
+        tokio::spawn(async move {
+            axum_server::from_tcp_rustls(listener, tls)
+                .serve(app.into_make_service())
+                .await
+                .unwrap();
+        });
+        (Self { state }, cert.pem())
+    }
+
     fn base(&self) -> &str {
         &self.state.base
     }
@@ -358,4 +399,44 @@ async fn upstream_errors_do_not_echo_credentials_in_the_url() {
     assert!(!err.contains("hunter2"), "{err}");
     assert!(!err.contains("hunter3"), "{err}");
     assert!(err.contains(&addr.to_string()), "{err}");
+}
+
+// ---------------------------------------------------------------------------
+// TLS trust
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn an_upstream_behind_a_private_ca_is_trusted_through_ca_cert_path() {
+    let (upstream, ca_pem) = Upstream::start_tls().await;
+    upstream.publish("Tls.Pkg", "1.0.0");
+
+    // Neither the bundled roots nor the system store know this CA.
+    let untrusted = yanuget::mirror::MirrorClient::from_config(&mirror_config(&upstream)).unwrap();
+    let err = untrusted.upstream_versions("tls.pkg").await.unwrap_err();
+    assert!(err.to_string().contains("certificate"), "{err}");
+
+    let dir = tempfile::tempdir().unwrap();
+    let ca = dir.path().join("internal-ca.pem");
+    std::fs::write(&ca, ca_pem).unwrap();
+    let mut config = mirror_config(&upstream);
+    config.ca_cert_path = Some(ca);
+    let trusted = yanuget::mirror::MirrorClient::from_config(&config).unwrap();
+    assert_eq!(
+        trusted.upstream_versions("tls.pkg").await.unwrap(),
+        vec!["1.0.0".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn an_unreadable_ca_file_is_a_configuration_error() {
+    let upstream = Upstream::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = mirror_config(&upstream);
+    config.ca_cert_path = Some(dir.path().join("missing.pem"));
+    assert!(yanuget::mirror::MirrorClient::try_from_config(&config).is_err());
+
+    let empty = dir.path().join("empty.pem");
+    std::fs::write(&empty, "not a certificate").unwrap();
+    config.ca_cert_path = Some(empty);
+    assert!(yanuget::mirror::MirrorClient::try_from_config(&config).is_err());
 }

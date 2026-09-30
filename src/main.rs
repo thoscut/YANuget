@@ -75,6 +75,10 @@ struct MigrateArgs {
     /// Skip any source package larger than this many bytes (default: no limit).
     #[arg(long)]
     max_package_size_bytes: Option<u64>,
+    /// PEM file of extra CA certificates to trust for the source, on top of
+    /// the system store (e.g. an internal CA).
+    #[arg(long)]
+    source_ca_cert: Option<std::path::PathBuf>,
 }
 
 impl std::fmt::Debug for MigrateArgs {
@@ -103,6 +107,7 @@ impl std::fmt::Debug for MigrateArgs {
             .field("overwrite", &self.overwrite)
             .field("dry_run", &self.dry_run)
             .field("max_package_size_bytes", &self.max_package_size_bytes)
+            .field("source_ca_cert", &self.source_ca_cert)
             .finish()
     }
 }
@@ -465,6 +470,7 @@ fn build_source_config(args: &MigrateArgs) -> MirrorConfig {
         max_versions_per_package: None,
         // The shell's `HTTP(S)_PROXY` applies, as it would to `curl`.
         proxy: None,
+        ca_cert_path: args.source_ca_cert.clone(),
     }
 }
 

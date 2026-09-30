@@ -352,6 +352,10 @@ pub struct MirrorConfig {
     /// Outbound proxy for upstream requests (`http://proxy:3128`). Unset, the
     /// mirror connects directly and ignores `HTTP(S)_PROXY` in the environment.
     pub proxy: Option<String>,
+    /// PEM file of extra CA certificates to trust for the upstream, on top of
+    /// the system store and the bundled Mozilla roots — for an upstream behind
+    /// an internal CA or a TLS-inspecting proxy.
+    pub ca_cert_path: Option<PathBuf>,
 }
 
 impl MirrorConfig {
@@ -376,6 +380,7 @@ impl std::fmt::Debug for MirrorConfig {
             .field("max_package_size_bytes", &self.max_package_size_bytes)
             .field("max_versions_per_package", &self.max_versions_per_package)
             .field("proxy", &self.proxy.as_deref().map(redact))
+            .field("ca_cert_path", &self.ca_cert_path)
             .finish_non_exhaustive()
     }
 }
@@ -391,6 +396,7 @@ impl Default for MirrorConfig {
             max_package_size_bytes: None,
             max_versions_per_package: Some(50),
             proxy: None,
+            ca_cert_path: None,
         }
     }
 }
