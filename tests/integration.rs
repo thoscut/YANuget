@@ -3327,8 +3327,16 @@ async fn responses_carry_baseline_security_headers() {
     assert_eq!(headers.get("x-content-type-options").unwrap(), "nosniff");
     assert_eq!(headers.get("x-frame-options").unwrap(), "DENY");
     assert_eq!(headers.get("referrer-policy").unwrap(), "no-referrer");
-    let vary = headers.get("vary").unwrap().to_str().unwrap();
-    assert!(vary.contains("X-Forwarded-Host"), "vary was {vary}");
+    // Several `Vary` lines (the CORS layer adds its own), all of which count.
+    let vary: Vec<&str> = headers
+        .get_all("vary")
+        .iter()
+        .map(|v| v.to_str().unwrap())
+        .collect();
+    assert!(
+        vary.iter().any(|v| v.contains("X-Forwarded-Host")),
+        "vary was {vary:?}"
+    );
 
     // The gallery renders package-supplied metadata, so it gets a policy that
     // denies everything except the two inline assets the server itself emits.

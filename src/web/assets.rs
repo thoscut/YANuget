@@ -26,7 +26,7 @@ async fn font() -> impl IntoResponse {
     (
         [
             (header::CONTENT_TYPE, "font/woff2"),
-            (header::CACHE_CONTROL, super::IMMUTABLE_CACHE),
+            (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
         ],
         FONT,
     )

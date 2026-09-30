@@ -49,9 +49,6 @@ use crate::version::NuGetVersion;
 
 const NUPKG_CONTENT_TYPE: &str = "application/octet-stream";
 const MAX_SEARCH_TAKE: i64 = 1000;
-/// A published id/version never changes its bytes, so its sidecars are cacheable
-/// indefinitely.
-const IMMUTABLE_CACHE: &str = "public, max-age=31536000, immutable";
 
 /// The resolved, ready-to-serve context for a single feed: its identity, its
 /// own put/get/delete authenticators, and its mirror/policy/retention settings.
@@ -82,6 +79,21 @@ pub struct FeedContext {
 }
 
 impl FeedContext {
+    /// How content addressed by id and version — a payload, its manifest and
+    /// icon, its symbols — may be cached.
+    ///
+    /// `private` when the feed gates reads, so a shared cache or CDN in front
+    /// of the server never hands it to someone without the key. `immutable`
+    /// only while overwriting is off: with it on, the same URL can serve new
+    /// bytes, and a year-long `immutable` would keep the old ones in every
+    /// client and proxy that saw them.
+    pub(crate) fn content_cache(&self) -> files::CachePolicy {
+        files::CachePolicy {
+            private: self.read_auth.is_enabled(),
+            immutable: self.allow_overwrite == OverwriteMode::Disabled,
+        }
+    }
+
     /// Build a feed's serving context. `upload_limit` is the server-wide
     /// `max_package_size_bytes`, which mirrored downloads inherit unless the
     /// feed's mirror set a tighter one of its own.
@@ -582,7 +594,12 @@ async fn security_headers(req: Request, next: axum::middleware::Next, hsts: bool
     // scheme, so a shared cache in front of this server must key on them.
     // Without it, one request's answer — including where clients are told to
     // fetch packages from — can be replayed to everyone else.
-    headers.insert(
+    //
+    // Appended, not inserted: the CORS layer's `Vary: origin, …` and a gated
+    // feed's `Vary: Authorization, …` must survive, or a shared cache replays
+    // one origin's `Access-Control-Allow-Origin`, or one key's answer, to
+    // another.
+    headers.append(
         header::VARY,
         HeaderValue::from_static("Host, X-Forwarded-Host, X-Forwarded-Proto"),
     );
@@ -765,7 +782,31 @@ fn feed_routes(state: AppState) -> Router {
         router = router.route("/", get(index_page));
     }
 
+    if state.feed.read_auth.is_enabled() {
+        router = router.layer(axum::middleware::from_fn(gated_feed_headers));
+    }
     router.with_state(state)
+}
+
+/// Keep a read-gated feed's answers out of shared caches.
+///
+/// Whatever a handler says about caching, the answer depends on the
+/// credential the request carried, so a cache has to key on it (`Vary`) and
+/// must not share it (`private`). Content handlers already mark themselves
+/// `private`; this covers every other answer (registration, search, the
+/// gallery), which carries no `Cache-Control` of its own and would otherwise
+/// be left to a cache's heuristics.
+async fn gated_feed_headers(request: Request, next: axum::middleware::Next) -> Response {
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    headers.append(
+        header::VARY,
+        HeaderValue::from_static("Authorization, X-NuGet-ApiKey"),
+    );
+    if !headers.contains_key(header::CACHE_CONTROL) {
+        headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("private"));
+    }
+    response
 }
 
 /// Re-render an error from a gallery route as an HTML page.
@@ -1110,11 +1151,67 @@ async fn download_package(
 
     // The flat container exposes both the `.nupkg` and the bare `.nuspec` under
     // the same path prefix; dispatch on the requested file's extension.
-    if filename.to_lowercase().ends_with(".nuspec") {
-        let nuspec = state
+    let is_nuspec = filename.to_lowercase().ends_with(".nuspec");
+    let content = if is_nuspec {
+        state
             .storage
-            .get_aux(&id, &normalized, AuxFile::Nuspec)
-            .await?;
+            .aux_content(&id, &normalized, AuxFile::Nuspec)
+            .await?
+    } else {
+        state.storage.get_package(&id, &normalized).await?
+    };
+    let PackageContent::LocalPath(path) = content;
+
+    // The stored SHA-512 is a content hash of the package, which makes it a
+    // correct strong validator: a client that already holds this package gets
+    // a 304 instead of re-downloading gigabytes. The manifest is extracted
+    // from exactly those bytes, so a tag derived from the same hash validates
+    // it too. The publish time is the matching `Last-Modified`.
+    //
+    // The row is read on both sides of opening the file. An overwrite renames
+    // new bytes into place, so a tag read only before the open could be served
+    // with bytes opened after it — and an `If-Range` would then splice old and
+    // new. If anything moved in between, the response goes out without
+    // validators rather than with wrong ones.
+    let before = state
+        .db
+        .find(state.feed(), &id, &version)
+        .await
+        .ok()
+        .flatten();
+    let file = files::open(&path).await?;
+    let after = state
+        .db
+        .find(state.feed(), &id, &version)
+        .await
+        .ok()
+        .flatten();
+    let size = file.metadata().await?.len();
+    let package = match (before, after) {
+        (Some(b), Some(a))
+            if b.package_hash == a.package_hash
+                && b.published == a.published
+                && (is_nuspec || a.package_size == size) =>
+        {
+            Some(a)
+        }
+        _ => None,
+    };
+    let etag = package.as_ref().map(|p| {
+        if is_nuspec {
+            format!("{}-nuspec", p.package_hash)
+        } else {
+            p.package_hash.clone()
+        }
+    });
+    let meta = files::FileMeta {
+        etag: etag.as_deref(),
+        last_modified: package.as_ref().map(|p| p.published),
+        cache: state.feed.content_cache(),
+        ..Default::default()
+    };
+
+    if is_nuspec {
         // These bytes are whatever the pusher put in the manifest, stored
         // verbatim — including anything before or around `<metadata>`, which the
         // parser ignores. Served as bare `application/xml` from this origin, a
@@ -1129,34 +1226,34 @@ async fn download_package(
         // download. Clients fetch this with an HTTP library, which ignores all
         // three; only a browser is affected, and a browser has no business
         // rendering it.
-        return Ok((
-            [
-                (header::CONTENT_TYPE, "application/xml"),
-                (header::CACHE_CONTROL, IMMUTABLE_CACHE),
-                (header::CONTENT_SECURITY_POLICY, "default-src 'none'"),
-                (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
-                (
-                    header::CONTENT_DISPOSITION,
-                    "attachment; filename=\"manifest.nuspec\"",
-                ),
-            ],
-            nuspec,
+        let mut response = files::serve_open_file(
+            file,
+            &headers,
+            "application/xml",
+            files::FileMeta {
+                download_name: Some("manifest.nuspec"),
+                ..meta
+            },
         )
-            .into_response());
+        .await?;
+        response.headers_mut().insert(
+            header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static("default-src 'none'"),
+        );
+        return Ok(response);
     }
 
-    let content = state.storage.get_package(&id, &normalized).await?;
-
-    // The stored SHA-512 is a content hash of exactly these bytes, which makes
-    // it a correct strong validator: a client that already holds this package
-    // gets a 304 instead of re-downloading gigabytes. The publish time is the
-    // matching `Last-Modified`.
-    let package = state
-        .db
-        .find(state.feed(), &id, &version)
-        .await
-        .ok()
-        .flatten();
+    let name = format!("{}.{}.nupkg", id.to_lowercase(), normalized.to_lowercase());
+    let response = files::serve_open_file(
+        file,
+        &headers,
+        NUPKG_CONTENT_TYPE,
+        files::FileMeta {
+            download_name: Some(&name),
+            ..meta
+        },
+    )
+    .await?;
 
     // Count the download (best effort — never block the response on it), once
     // per transfer rather than once per ranged request of it.
@@ -1166,24 +1263,7 @@ async fn download_package(
             .increment_downloads(state.feed(), &id, &version)
             .await;
     }
-
-    match content {
-        PackageContent::LocalPath(path) => {
-            let name = format!("{}.{}.nupkg", id.to_lowercase(), normalized.to_lowercase());
-            files::serve_local_file(
-                path,
-                &headers,
-                NUPKG_CONTENT_TYPE,
-                files::FileMeta {
-                    download_name: Some(&name),
-                    etag: package.as_ref().map(|p| p.package_hash.as_str()),
-                    last_modified: package.as_ref().map(|p| p.published),
-                    sha256_base64: None,
-                },
-            )
-            .await
-        }
-    }
+    Ok(response)
 }
 
 // ---------------------------------------------------------------------------
@@ -1527,6 +1607,7 @@ async fn download_symbol(
                 NUPKG_CONTENT_TYPE,
                 files::FileMeta {
                     etag: Some(&key),
+                    cache: state.feed.content_cache(),
                     ..Default::default()
                 },
             )
@@ -1732,8 +1813,21 @@ async fn package_icon(
 ) -> Result<Response> {
     state.require_read(&headers)?;
     let version = parse_version(&version)?;
-    if !state.db.is_servable(state.feed(), &id, &version).await? {
+    let Some(package) = state.db.find(state.feed(), &id, &version).await? else {
         return Err(Error::PackageNotFound);
+    };
+    // Extracted from the package, so the package's hash validates it.
+    let etag = format!("\"{}-icon\"", package.package_hash);
+    let cache = state.feed.content_cache().header_value();
+    if files::if_none_match_hits(&headers, &etag) {
+        return Ok((
+            StatusCode::NOT_MODIFIED,
+            [
+                (header::ETAG, etag.as_str()),
+                (header::CACHE_CONTROL, cache),
+            ],
+        )
+            .into_response());
     }
     let bytes = state
         .storage
@@ -1746,7 +1840,8 @@ async fn package_icon(
     Ok((
         [
             (header::CONTENT_TYPE, content_type),
-            (header::CACHE_CONTROL, IMMUTABLE_CACHE),
+            (header::CACHE_CONTROL, cache),
+            (header::ETAG, etag.as_str()),
             (header::CONTENT_SECURITY_POLICY, "default-src 'none'"),
             (header::CONTENT_DISPOSITION, "inline"),
         ],

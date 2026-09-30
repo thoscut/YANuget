@@ -101,18 +101,30 @@ Streams the `.nupkg`. Supports `Range: bytes=...` (responds `206 Partial
 Content` with `Content-Range`); always sends `Accept-Ranges: bytes`. Each
 successful fetch increments the download counter.
 
-A published id/version is immutable, so the response carries a strong `ETag`
-(the package's SHA-512 — a content hash of exactly the bytes served) and
-`Cache-Control: public, max-age=31536000, immutable`. Repeating the request with
+The response carries a strong `ETag` (the package's SHA-512 — a content hash
+of exactly the bytes served) and `Last-Modified`. Repeating the request with
 `If-None-Match` returns `304 Not Modified` with an empty body, so a client that
 already holds a multi-gigabyte package pays for a header exchange rather than
-the payload.
+the payload. `Cache-Control` depends on the feed:
+
+| Feed | `Cache-Control` |
+| --- | --- |
+| Overwrite off (the default) | `public, max-age=31536000, immutable` — an id/version never serves other bytes |
+| Overwrite on (`true` or `"prerelease-only"`) | `public, no-cache` — every use revalidates, since a re-push changes the bytes |
+| Read-gated (`read_api_key`) | `private, …` instead of `public, …`, plus `Vary: Authorization, X-NuGet-ApiKey` |
+
+On a read-gated feed every other response (registration, search, the
+gallery) is `Cache-Control: private` as well, so no shared cache or CDN in
+front of the server can hand gated content to someone without the key. The
+`.nuspec` and the gallery's icon endpoint carry `ETag`s derived from the
+same hash and follow the same rules.
 
 ```
 GET /v3/package/{id}/{version}/{id}.nuspec
 ```
 
-Returns the package's `.nuspec` manifest as `application/xml`.
+Returns the package's `.nuspec` manifest as `application/xml`, streamed, as
+an attachment, with the same validators and caching as the package.
 
 ## Registration
 
@@ -240,9 +252,11 @@ disabled, not pending). The response is built for resumable clients:
 - `Accept-Ranges: bytes`, single ranges answered with `206`, and `If-Range`
   honoured — a resume against changed content gets the whole file.
 - A strong `ETag` (the SHA-256), `Last-Modified` (the upload time), and
-  `Repr-Digest: sha-256=:…:` (RFC 9530). `Cache-Control: immutable`: a file's
-  URL never serves different bytes, because a file of the same name cannot be
-  replaced, only deleted.
+  `Repr-Digest: sha-256=:…:` (RFC 9530). `Cache-Control: public, no-cache`
+  (`private, no-cache` on a read-gated feed): a file of the same name cannot
+  be replaced in place, but it can be deleted and attached again with other
+  bytes, so a cached copy is revalidated — a cheap `304` — rather than trusted
+  for a year.
 - Always `Content-Type: application/octet-stream`, `Content-Disposition:
   attachment` and `Content-Security-Policy: default-src 'none'`, so no hosted
   file can render in a browser as this origin.

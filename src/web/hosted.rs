@@ -90,6 +90,12 @@ pub(super) async fn download(
             etag: Some(&file.sha256),
             last_modified: Some(file.uploaded),
             sha256_base64: digest.as_deref(),
+            // A name can be detached and attached again with other bytes, so
+            // never `immutable`; the content-hash ETag makes revalidating cheap.
+            cache: files::CachePolicy {
+                private: state.feed.read_auth.is_enabled(),
+                immutable: false,
+            },
         },
     )
     .await?;

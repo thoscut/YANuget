@@ -93,6 +93,10 @@ pub trait PackageStorage: Send + Sync {
     /// Read a small auxiliary file.
     async fn get_aux(&self, id: &str, version: &str, kind: AuxFile) -> Result<Vec<u8>>;
 
+    /// Resolve a small auxiliary file for serving as-is, without reading it
+    /// into memory (a manifest can run to megabytes).
+    async fn aux_content(&self, id: &str, version: &str, kind: AuxFile) -> Result<PackageContent>;
+
     /// Delete a package and all of its auxiliary files. Succeeds even if some
     /// files are already gone.
     async fn delete(&self, id: &str, version: &str) -> Result<()>;

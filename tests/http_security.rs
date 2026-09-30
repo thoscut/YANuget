@@ -414,6 +414,158 @@ async fn one_feeds_admin_key_does_not_open_another_admin_area() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Caching (SEC-04, COR-12, SEC-25, COR-25)
+// ---------------------------------------------------------------------------
+
+fn header<'a>(resp: &'a reqwest::Response, name: &str) -> &'a str {
+    resp.headers()
+        .get(name)
+        .unwrap_or_else(|| panic!("no {name} header"))
+        .to_str()
+        .unwrap()
+}
+
+fn vary(resp: &reqwest::Response) -> String {
+    resp.headers()
+        .get_all("vary")
+        .iter()
+        .map(|v| v.to_str().unwrap())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+#[tokio::test]
+async fn gated_content_is_never_shared_by_a_cache() {
+    let server = spawn_feeds(|c| {
+        c.feeds = vec![FeedConfig {
+            read_api_key: Some("reader".into()),
+            ..feed("g")
+        }];
+    })
+    .await;
+    assert_eq!(
+        push(&server, "/g", API_KEY, build_nupkg("Gated.Pkg", "1.0.0")).await,
+        StatusCode::CREATED
+    );
+    let get = |path: &str| {
+        server
+            .client
+            .get(server.url(path))
+            .basic_auth("dotnet", Some("reader"))
+            .send()
+    };
+
+    let nupkg = get("/g/v3/package/gated.pkg/1.0.0/gated.pkg.1.0.0.nupkg")
+        .await
+        .unwrap();
+    assert_eq!(nupkg.status(), StatusCode::OK);
+    assert!(header(&nupkg, "cache-control").starts_with("private"));
+    let v = vary(&nupkg);
+    assert!(
+        v.contains("Authorization") && v.contains("X-NuGet-ApiKey"),
+        "{v}"
+    );
+
+    // The manifest and the icon get validators now, and the same privacy.
+    for path in [
+        "/g/v3/package/gated.pkg/1.0.0/gated.pkg.nuspec",
+        "/g/packages/gated.pkg/1.0.0/icon",
+    ] {
+        let first = get(path).await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK, "{path}");
+        assert!(
+            header(&first, "cache-control").starts_with("private"),
+            "{path}"
+        );
+        let etag = header(&first, "etag").to_string();
+        let again = server
+            .client
+            .get(server.url(path))
+            .basic_auth("dotnet", Some("reader"))
+            .header("If-None-Match", &etag)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(again.status(), StatusCode::NOT_MODIFIED, "{path}");
+    }
+
+    // Protocol JSON has no caching of its own; on a gated feed it is private.
+    let reg = get("/g/v3/registration/gated.pkg/index.json")
+        .await
+        .unwrap();
+    assert_eq!(reg.status(), StatusCode::OK);
+    assert_eq!(header(&reg, "cache-control"), "private");
+    assert!(vary(&reg).contains("Authorization"));
+    // And the security layer's own Vary survives next to it.
+    assert!(vary(&reg).contains("X-Forwarded-Host"));
+}
+
+#[tokio::test]
+async fn immutable_only_while_versions_cannot_be_overwritten() {
+    let url = "/v3/package/over.pkg/1.0.0/over.pkg.1.0.0.nupkg";
+
+    let fixed = spawn_with(|_| {}).await;
+    push(&fixed, "", API_KEY, build_nupkg("Over.Pkg", "1.0.0")).await;
+    let resp = fixed.client.get(fixed.url(url)).send().await.unwrap();
+    assert_eq!(
+        header(&resp, "cache-control"),
+        "public, max-age=31536000, immutable"
+    );
+
+    let overwritable = spawn_with(|c| {
+        c.allow_overwrite = yanuget::config::OverwriteMode::Enabled;
+    })
+    .await;
+    push(&overwritable, "", API_KEY, build_nupkg("Over.Pkg", "1.0.0")).await;
+    let resp = overwritable
+        .client
+        .get(overwritable.url(url))
+        .send()
+        .await
+        .unwrap();
+    // Revalidate every time; the ETag makes that a cheap 304.
+    assert_eq!(header(&resp, "cache-control"), "public, no-cache");
+    let etag = header(&resp, "etag").to_string();
+    let again = overwritable
+        .client
+        .get(overwritable.url(url))
+        .header("If-None-Match", etag)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(again.status(), StatusCode::NOT_MODIFIED);
+}
+
+#[tokio::test]
+async fn an_invalid_range_is_ignored_rather_than_refused() {
+    let server = spawn_with(|_| {}).await;
+    push(&server, "", API_KEY, build_nupkg("Range.Pkg", "1.0.0")).await;
+    let url = server.url("/v3/package/range.pkg/1.0.0/range.pkg.1.0.0.nupkg");
+    let whole = server.client.get(&url).send().await.unwrap();
+    let len = whole.bytes().await.unwrap().len();
+    for range in ["bytes=5-3", "bytes=+0-1"] {
+        let resp = server
+            .client
+            .get(&url)
+            .header("Range", range)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{range}");
+        assert_eq!(resp.bytes().await.unwrap().len(), len, "{range}");
+    }
+    // A well-formed range past the end is still a 416.
+    let past = server
+        .client
+        .get(&url)
+        .header("Range", "bytes=999999-")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(past.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+}
+
 /// Run the real binary with `env` and return its exit status and stderr,
 /// killing it if it is still running after `timeout` (it then started, which
 /// is what these tests assert does not happen).
