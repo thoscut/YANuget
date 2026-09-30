@@ -24,6 +24,13 @@
 //! with [`legacy_shape`], which is idempotent and frozen: it is what every
 //! database created before 0.6 converges to, and it never changes again.
 //!
+//! ## Steps 6 onwards
+//!
+//! Each writes exactly the shape it wants. A table whose definition changes is
+//! rebuilt — created anew, filled from the old one, the old one dropped and
+//! the new one renamed — which also gives every database the same definition
+//! text, column order and all, however it got there.
+//!
 //! ## Why not `sqlx::migrate!`
 //!
 //! sqlx's migrator keeps its own `_sqlx_migrations` table with a checksum per
@@ -37,7 +44,7 @@
 //! missing, and the foreign-key step counts and logs what it removes. So the
 //! steps are a table of Rust code, numbered by `user_version`.
 
-use sqlx::{Row, SqliteConnection, SqlitePool};
+use sqlx::{Connection, Row, SqliteConnection};
 
 use crate::error::{Error, Result};
 
@@ -79,6 +86,11 @@ const MIGRATIONS: &[Migration] = &[
         description: "bring the tables of an unnumbered schema up to date",
         step: Step::LegacyShape,
     },
+    Migration {
+        version: 6,
+        description: "drop the columns of `packages` that nothing reads",
+        step: Step::DropDeadColumns,
+    },
 ];
 
 /// What a [`Migration`] runs. An enum rather than a function pointer in the
@@ -91,6 +103,7 @@ enum Step {
     LowerCasePrereleaseKeys,
     FillSearchIndex,
     LegacyShape,
+    DropDeadColumns,
 }
 
 async fn apply(step: Step, c: &mut SqliteConnection) -> Result<()> {
@@ -100,6 +113,7 @@ async fn apply(step: Step, c: &mut SqliteConnection) -> Result<()> {
         Step::LowerCasePrereleaseKeys => lower_case_prerelease_keys(c).await,
         Step::FillSearchIndex => fill_search_index(c).await,
         Step::LegacyShape => legacy_shape(c).await,
+        Step::DropDeadColumns => drop_dead_columns(c).await,
     }
 }
 
@@ -107,14 +121,14 @@ async fn apply(step: Step, c: &mut SqliteConnection) -> Result<()> {
 pub(super) const LATEST: i64 = MIGRATIONS.len() as i64;
 
 /// Bring the schema up to date.
-pub(super) async fn migrate(pool: &SqlitePool) -> Result<()> {
-    migrate_to(pool, LATEST).await
+pub(super) async fn migrate(conn: &mut SqliteConnection) -> Result<()> {
+    migrate_to(conn, LATEST).await
 }
 
 /// Apply every step up to and including `target`.
-pub(super) async fn migrate_to(pool: &SqlitePool, target: i64) -> Result<()> {
+pub(super) async fn migrate_to(conn: &mut SqliteConnection, target: i64) -> Result<()> {
     // Nothing to do, the usual case: no need to queue for the write lock.
-    if user_version(pool).await? == LATEST {
+    if user_version(conn).await? == LATEST {
         return Ok(());
     }
     for step in MIGRATIONS.iter().take_while(|m| m.version <= target) {
@@ -125,7 +139,7 @@ pub(super) async fn migrate_to(pool: &SqlitePool, target: i64) -> Result<()> {
         // timeout: the second of two processes started together failed to
         // open the database. Taken up front, the loser waits, then reads the
         // version the winner wrote and has nothing left to do.
-        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = conn.begin_with("BEGIN IMMEDIATE").await?;
         let current: i64 = sqlx::query_scalar("PRAGMA user_version")
             .fetch_one(&mut *tx)
             .await?;
@@ -150,9 +164,9 @@ pub(super) async fn migrate_to(pool: &SqlitePool, target: i64) -> Result<()> {
     Ok(())
 }
 
-async fn user_version(pool: &SqlitePool) -> Result<i64> {
+async fn user_version(conn: &mut SqliteConnection) -> Result<i64> {
     let version: i64 = sqlx::query_scalar("PRAGMA user_version")
-        .fetch_one(pool)
+        .fetch_one(&mut *conn)
         .await?;
     check_known(version)?;
     Ok(version)
@@ -565,6 +579,137 @@ async fn ensure_column(
     }
     Ok(())
 }
+
+// --- steps 6 onwards ---
+
+/// Step 6: rebuild `packages` without the columns nothing reads.
+///
+/// `listed`, `enabled` and `downloads` are each feed's own and have lived on
+/// `feed_packages` since feeds; the copies here were written and never read.
+/// The split version core (`version_major` … `version_revision`) was meant
+/// for ordering in SQL, which cannot order pre-releases anyway and never did
+/// it. The index on `lower_id` alone duplicated the primary key's, and 0.1's
+/// index over `listed` goes with the table.
+///
+/// A rebuild rather than `ALTER TABLE … DROP COLUMN`: the columns 0.1 and
+/// 0.4 added with `ADD COLUMN` sit at the end of their table, so only a
+/// rebuild gives every database the same `packages`. Nothing references the
+/// table yet (foreign keys come in step 7), so dropping it is safe with
+/// enforcement on; its search triggers go with it and are created again.
+async fn drop_dead_columns(c: &mut SqliteConnection) -> Result<()> {
+    sqlx::raw_sql(concat!(
+        "CREATE TABLE packages_new (",
+        packages_columns!(),
+        ");
+        INSERT INTO packages_new (
+            id, lower_id, normalized_version, original_version, is_prerelease, is_semver2,
+            authors, description, icon_url, license_url, license_expression, project_url,
+            repository_url, repository_type, min_client_version, release_notes, language,
+            title, summary, tags, has_readme, has_embedded_icon, is_development_dependency,
+            require_license_acceptance, package_size, package_hash, package_hash_algorithm,
+            published, package_types, dependencies)
+        SELECT
+            id, lower_id, normalized_version, original_version, is_prerelease, is_semver2,
+            authors, description, icon_url, license_url, license_expression, project_url,
+            repository_url, repository_type, min_client_version, release_notes, language,
+            title, summary, tags, has_readme, has_embedded_icon, is_development_dependency,
+            require_license_acceptance, package_size, package_hash, package_hash_algorithm,
+            published, package_types, dependencies
+        FROM packages;
+        DROP TABLE packages;
+        ALTER TABLE packages_new RENAME TO packages;",
+        search_triggers!(),
+    ))
+    .execute(&mut *c)
+    .await?;
+    Ok(())
+}
+
+/// The columns of `packages` from step 6 on.
+macro_rules! packages_columns {
+    () => {
+        "
+    id                         TEXT    NOT NULL,
+    lower_id                   TEXT    NOT NULL,
+    normalized_version         TEXT    NOT NULL,
+    original_version           TEXT    NOT NULL,
+    is_prerelease              INTEGER NOT NULL,
+    is_semver2                 INTEGER NOT NULL,
+    authors                    TEXT    NOT NULL,
+    description                TEXT    NOT NULL,
+    icon_url                   TEXT,
+    license_url                TEXT,
+    license_expression         TEXT,
+    project_url                TEXT,
+    repository_url             TEXT,
+    repository_type            TEXT,
+    min_client_version         TEXT,
+    release_notes              TEXT,
+    language                   TEXT,
+    title                      TEXT,
+    summary                    TEXT,
+    tags                       TEXT    NOT NULL,
+    has_readme                 INTEGER NOT NULL,
+    has_embedded_icon          INTEGER NOT NULL,
+    is_development_dependency  INTEGER NOT NULL,
+    require_license_acceptance INTEGER NOT NULL,
+    package_size               INTEGER NOT NULL,
+    package_hash               TEXT    NOT NULL,
+    package_hash_algorithm     TEXT    NOT NULL,
+    published                  TEXT    NOT NULL,
+    package_types              TEXT    NOT NULL,
+    dependencies               TEXT    NOT NULL,
+    PRIMARY KEY (lower_id, normalized_version)
+"
+    };
+}
+use packages_columns;
+
+/// The triggers that keep the search index in step with `packages`, as step 6
+/// creates them. Their bodies are those of the unnumbered shape.
+macro_rules! search_triggers {
+    () => {
+        "
+CREATE TRIGGER packages_search_insert AFTER INSERT ON packages BEGIN
+    INSERT OR IGNORE INTO search_keys (lower_id, normalized_version)
+        VALUES (new.lower_id, new.normalized_version);
+    DELETE FROM search_text WHERE rowid = (
+        SELECT id FROM search_keys
+        WHERE lower_id = new.lower_id AND normalized_version = new.normalized_version);
+    INSERT INTO search_text (rowid, lower_id, title, tags, description)
+        SELECT id, new.lower_id, IFNULL(new.title, ''),
+               (SELECT IFNULL(group_concat(value, ' '), '') FROM json_each(new.tags)),
+               substr(new.description, 1, 4000)
+        FROM search_keys
+        WHERE lower_id = new.lower_id AND normalized_version = new.normalized_version;
+END;
+CREATE TRIGGER packages_search_delete AFTER DELETE ON packages BEGIN
+    DELETE FROM search_text WHERE rowid = (
+        SELECT id FROM search_keys
+        WHERE lower_id = old.lower_id AND normalized_version = old.normalized_version);
+    DELETE FROM search_keys
+        WHERE lower_id = old.lower_id AND normalized_version = old.normalized_version;
+END;
+CREATE TRIGGER packages_search_update
+AFTER UPDATE OF lower_id, normalized_version, title, tags, description ON packages BEGIN
+    DELETE FROM search_text WHERE rowid = (
+        SELECT id FROM search_keys
+        WHERE lower_id = old.lower_id AND normalized_version = old.normalized_version);
+    DELETE FROM search_keys
+        WHERE lower_id = old.lower_id AND normalized_version = old.normalized_version;
+    INSERT OR IGNORE INTO search_keys (lower_id, normalized_version)
+        VALUES (new.lower_id, new.normalized_version);
+    INSERT INTO search_text (rowid, lower_id, title, tags, description)
+        SELECT id, new.lower_id, IFNULL(new.title, ''),
+               (SELECT IFNULL(group_concat(value, ' '), '') FROM json_each(new.tags)),
+               substr(new.description, 1, 4000)
+        FROM search_keys
+        WHERE lower_id = new.lower_id AND normalized_version = new.normalized_version;
+END;
+"
+    };
+}
+use search_triggers;
 
 #[cfg(test)]
 mod tests {

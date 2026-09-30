@@ -291,6 +291,10 @@ pub trait PackageDatabase: Send + Sync {
     async fn package_data_exists(&self, id: &str, version: &NuGetVersion) -> Result<bool>;
 
     /// Fetch global package metadata, ignoring feed membership and visibility.
+    ///
+    /// Listing, the admin flag and download counts belong to each feed's
+    /// membership, so the package comes back listed, enabled and with no
+    /// downloads; read a feed for those.
     async fn get_package_data(&self, id: &str, version: &NuGetVersion) -> Result<Option<Package>>;
 
     /// Hard-delete global metadata (and every feed membership). Returns `true`

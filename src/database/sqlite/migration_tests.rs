@@ -245,7 +245,9 @@ async fn shape(pool: &SqlitePool, era: Era) {
         // The unreleased shapes: the last unnumbered one, less what they did
         // not have yet.
         Era::Tags | Era::Files | Era::Search | Era::Unnumbered => {
-            migrate_to(pool, 4).await.unwrap();
+            migrate_to(&mut pool.acquire().await.unwrap(), 4)
+                .await
+                .unwrap();
             if era <= Era::Search {
                 run(pool, "DROP TABLE tombstones").await;
             }
@@ -478,6 +480,14 @@ async fn upgrade(era: Era) {
     // The schema a new database gets, whatever the path here.
     let fresh = SqliteDatabase::in_memory().await.unwrap();
     assert_eq!(tables(&db).await, tables(&fresh).await, "{era:?}");
+    let dead: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('packages') \
+         WHERE name IN ('listed', 'enabled', 'downloads', 'version_major')",
+    )
+    .fetch_one(pool(&db))
+    .await
+    .unwrap();
+    assert_eq!(dead, 0, "{era:?}: legacy columns are gone");
 
     // Memberships, with their state: copied from the package where the era
     // had no feeds.
@@ -591,7 +601,9 @@ async fn pre_release_keys_from_before_0_5_are_lower_cased_once() {
     let rc = v("2.0.0-rc");
     {
         let pool = open(&path).await;
-        migrate_to(&pool, 2).await.unwrap();
+        migrate_to(&mut pool.acquire().await.unwrap(), 2)
+            .await
+            .unwrap();
         // A version only ever stored the old way, with a symbol and a file.
         package(
             &pool,

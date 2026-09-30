@@ -31,20 +31,18 @@ macro_rules! package_insert {
         concat!(
             "INSERT INTO packages ( \
                 id, lower_id, normalized_version, original_version, \
-                version_major, version_minor, version_patch, version_revision, \
-                is_prerelease, is_semver2, listed, enabled, \
+                is_prerelease, is_semver2, \
                 authors, description, icon_url, license_url, license_expression, \
                 project_url, repository_url, repository_type, min_client_version, \
                 release_notes, language, title, summary, tags, \
                 has_readme, has_embedded_icon, is_development_dependency, \
                 require_license_acceptance, \
                 package_size, package_hash, package_hash_algorithm, \
-                published, downloads, package_types, dependencies \
+                published, package_types, dependencies \
             ) VALUES ( \
-                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, \
-                ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, \
-                ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, \
-                ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37 \
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, \
+                ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, \
+                ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30 \
             ) ",
             $conflict
         )
@@ -229,20 +227,13 @@ type SqliteQuery<'q> = sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::Sqlite
 
 /// Bind a package to the parameters of [`package_insert!`].
 fn bind_package<'q>(query: SqliteQuery<'q>, p: &'q Package) -> Result<SqliteQuery<'q>> {
-    let (major, minor, patch, revision) = p.version.core();
     Ok(query
         .bind(&p.id)
         .bind(p.lower_id())
         .bind(p.normalized_version())
         .bind(p.version.original())
-        .bind(major as i64)
-        .bind(minor as i64)
-        .bind(patch as i64)
-        .bind(revision as i64)
         .bind(i64::from(p.is_prerelease()))
         .bind(i64::from(p.is_semver2))
-        .bind(i64::from(p.listed))
-        .bind(i64::from(p.enabled))
         .bind(json(&p.authors)?)
         .bind(&p.description)
         .bind(&p.icon_url)
@@ -265,7 +256,6 @@ fn bind_package<'q>(query: SqliteQuery<'q>, p: &'q Package) -> Result<SqliteQuer
         .bind(&p.package_hash)
         .bind(&p.package_hash_algorithm)
         .bind(p.published.to_rfc3339())
-        .bind(p.downloads as i64)
         .bind(json(&p.package_types)?)
         .bind(json(&p.dependencies)?))
 }
@@ -299,8 +289,8 @@ async fn insert_tags(conn: &mut SqliteConnection, p: &Package) -> Result<()> {
 }
 
 /// Build a [`Package`] from a `packages` row, taking the listed/enabled flags
-/// and download count from explicit arguments so it works for both global and
-/// feed reads (each of which sources those values from a different column).
+/// and download count from explicit arguments: a feed read has them from the
+/// membership, a global read has none.
 fn build_package(row: &SqliteRow, listed: bool, enabled: bool, downloads: u64) -> Result<Package> {
     let original_version: String = row.try_get("original_version")?;
     // Stored rows are read with the rules they were written under; see
@@ -351,12 +341,11 @@ fn build_package(row: &SqliteRow, listed: bool, enabled: bool, downloads: u64) -
     })
 }
 
-/// A global `packages` row: listed/enabled/downloads come from its own columns.
+/// A global `packages` row. Listing, the admin flag and download counts are
+/// each feed's own and live on its membership, so the global record reports
+/// what a new membership starts with: listed, enabled, no downloads.
 fn row_to_package(row: &SqliteRow) -> Result<Package> {
-    let listed = row.try_get::<i64, _>("listed")? != 0;
-    let enabled = row.try_get::<i64, _>("enabled")? != 0;
-    let downloads = row.try_get::<i64, _>("downloads")? as u64;
-    build_package(row, listed, enabled, downloads)
+    build_package(row, true, true, 0)
 }
 
 pub(super) fn row_to_feed_package(row: &SqliteRow) -> Result<FeedVersion> {
@@ -409,6 +398,36 @@ mod tests {
         assert!(!db.exists(FEED, kelvin, &p.version).await.unwrap());
         assert!(!db.delete_package_data(kelvin, &p.version).await.unwrap());
         assert!(db.exists(FEED, "KIT.pkg", &p.version).await.unwrap());
+    }
+
+    /// Listing, the admin flag and downloads are a feed's: the global record
+    /// reports none of one feed's state.
+    #[tokio::test]
+    async fn global_data_carries_no_feed_state() {
+        let db = SqliteDatabase::in_memory().await.unwrap();
+        let p = sample("Global.Pkg", "1.0.0");
+        db.add_to_feed(FEED, &p).await.unwrap();
+        db.set_listed(FEED, "global.pkg", &p.version, false)
+            .await
+            .unwrap();
+        db.set_enabled(FEED, "global.pkg", &p.version, false)
+            .await
+            .unwrap();
+        db.increment_downloads(FEED, "global.pkg", &p.version)
+            .await
+            .unwrap();
+
+        let data = db
+            .get_package_data("global.pkg", &p.version)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(data.listed && data.enabled);
+        assert_eq!(data.downloads, 0);
+        assert_eq!(data.package_size, p.package_size);
+        let all = db.find_all_versions(FEED, "global.pkg").await.unwrap();
+        assert!(!all[0].package.listed && !all[0].package.enabled);
+        assert_eq!(all[0].package.downloads, 1);
     }
 
     #[tokio::test]

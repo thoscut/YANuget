@@ -4,9 +4,8 @@
 //! as JSON text columns, which keeps the schema small while remaining fully
 //! queryable for the few fields search needs. Versions are stored both
 //! normalized (the canonical key) and in their original form (so the exact
-//! string the author pushed can be round-tripped), plus split numeric
-//! components for fast SQL ordering of the version *core*. Pre-release ordering,
-//! which SQL cannot express faithfully, is finished in Rust via
+//! string the author pushed can be round-tripped). Version ordering, which SQL
+//! cannot express faithfully for pre-releases, is done in Rust via
 //! [`NuGetVersion`]'s `Ord`.
 //!
 //! Package metadata lives once in `packages`. Which feeds expose a version, and
@@ -38,7 +37,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
-use sqlx::SqlitePool;
+use sqlx::{ConnectOptions, Connection, SqlitePool};
 
 use crate::error::{Error, Result};
 use crate::models::Package;
@@ -103,11 +102,20 @@ impl SqliteDatabase {
             .synchronous(SqliteSynchronous::Full)
             .busy_timeout(Duration::from_secs(30))
             .foreign_keys(true);
+        // Migrated on a connection of its own, closed before the pool
+        // opens. A pooled connection that had read the schema before a step
+        // rebuilt a table would prepare `SELECT p.*` against its stale copy:
+        // SQLite re-prepares it with the new columns when it runs, but sqlx
+        // keeps the column names of the first prepare, and reads the wrong
+        // ones or past the end of the row.
+        let mut conn = options.connect().await?;
+        schema::migrate(&mut conn).await?;
+        conn.close().await?;
         let pool = SqlitePoolOptions::new()
             .max_connections(16)
             .connect_with(options)
             .await?;
-        Self::from_pool(pool).await
+        Ok(Self { pool })
     }
 
     /// Build a fresh in-memory database (primarily for tests).
@@ -122,11 +130,8 @@ impl SqliteDatabase {
             .max_lifetime(None)
             .connect_with(options)
             .await?;
-        Self::from_pool(pool).await
-    }
-
-    async fn from_pool(pool: SqlitePool) -> Result<Self> {
-        schema::migrate(&pool).await?;
+        // The pool's one connection, so nothing else can hold a stale schema.
+        schema::migrate(&mut *pool.acquire().await?).await?;
         Ok(Self { pool })
     }
 
