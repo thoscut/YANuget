@@ -308,6 +308,14 @@ impl SqliteDatabase {
                 .execute(&mut *tx)
                 .await?;
         }
+        // Version 3: lower-case the pre-release label of versions stored
+        // before 0.5.0 made that part of the normalized form.
+        if schema_version < 3 {
+            migrate_prerelease_keys(&mut tx).await?;
+            sqlx::query("PRAGMA user_version = 3")
+                .execute(&mut *tx)
+                .await?;
+        }
         tx.commit().await?;
         Ok(Self { pool })
     }
@@ -1296,6 +1304,86 @@ impl PackageDatabase for SqliteDatabase {
     }
 }
 
+/// Rewrite every stored normalized version to its lower-cased form: the
+/// `user_version = 3` data migration.
+///
+/// 0.5.0 began lower-casing the pre-release label in
+/// [`NuGetVersion::normalized`], but rows written earlier as `1.0.0-Beta` kept
+/// their case. Listings still found them while every exact lookup (download,
+/// delete, unlist, retention) bound the lower-cased key and missed, and a
+/// re-push created a second row sharing the one lower-cased file on disk.
+///
+/// The core of a normalized version is digits and dots, so lower-casing the
+/// whole string lower-cases exactly the label (which is ASCII by grammar).
+/// Where both spellings exist, one `packages` row survives: the most recently
+/// published, because its push is the one whose bytes were written to the
+/// shared file last. Memberships of the same feed merge the cautious way:
+/// withheld if either was, pinned or flagged if either was, downloads summed.
+/// Symbol rows are keyed by their SSQP key, not the version, so they are only
+/// re-pointed; attached files of the losing row that collide by name with the
+/// survivor's are dropped (their blob is then referenced by nothing and stays
+/// on disk, which is safer than guessing at a live one from here).
+///
+/// Runs in the caller's transaction, so it applies completely or not at all.
+async fn migrate_prerelease_keys(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>) -> Result<()> {
+    const STEPS: &[&str] = &[
+        "DROP TABLE IF EXISTS temp.v3_packages",
+        "DROP TABLE IF EXISTS temp.v3_memberships",
+        // Every row of a version that has a mixed-case spelling, ranked so the
+        // survivor is rank 1.
+        "CREATE TEMP TABLE v3_packages AS \
+         SELECT rowid AS rid, lower_id, normalized_version AS old_v, \
+                ROW_NUMBER() OVER (PARTITION BY lower_id, lower(normalized_version) \
+                                   ORDER BY published DESC, rowid DESC) AS rank \
+         FROM packages \
+         WHERE (lower_id, lower(normalized_version)) IN ( \
+             SELECT lower_id, lower(normalized_version) FROM packages \
+             WHERE normalized_version <> lower(normalized_version))",
+        // The losers' tags describe metadata that is going away.
+        "DELETE FROM package_tags WHERE (lower_id, normalized_version) IN ( \
+             SELECT lower_id, old_v FROM v3_packages WHERE rank > 1)",
+        "UPDATE OR IGNORE package_tags SET normalized_version = lower(normalized_version) \
+         WHERE normalized_version <> lower(normalized_version)",
+        "DELETE FROM package_tags WHERE normalized_version <> lower(normalized_version)",
+        // The survivor's files first, so a name clash keeps its row.
+        "UPDATE OR IGNORE package_files SET normalized_version = lower(normalized_version) \
+         WHERE normalized_version <> lower(normalized_version) \
+           AND (lower_id, normalized_version) IN ( \
+               SELECT lower_id, old_v FROM v3_packages WHERE rank = 1)",
+        "UPDATE OR IGNORE package_files SET normalized_version = lower(normalized_version) \
+         WHERE normalized_version <> lower(normalized_version)",
+        "DELETE FROM package_files WHERE normalized_version <> lower(normalized_version)",
+        "DELETE FROM packages WHERE rowid IN (SELECT rid FROM v3_packages WHERE rank > 1)",
+        "UPDATE packages SET normalized_version = lower(normalized_version) \
+         WHERE normalized_version <> lower(normalized_version)",
+        "CREATE TEMP TABLE v3_memberships AS \
+         SELECT feed, lower_id, lower(normalized_version) AS nv, \
+                MAX(listed) AS listed, MIN(enabled) AS enabled, MAX(pending) AS pending, \
+                MAX(flagged) AS flagged, MAX(flag_reason) AS flag_reason, MIN(added) AS added, \
+                SUM(downloads) AS downloads, MAX(pinned) AS pinned \
+         FROM feed_packages \
+         GROUP BY feed, lower_id, lower(normalized_version) \
+         HAVING SUM(normalized_version <> lower(normalized_version)) > 0",
+        "DELETE FROM feed_packages WHERE (feed, lower_id, lower(normalized_version)) IN ( \
+             SELECT feed, lower_id, nv FROM v3_memberships)",
+        "INSERT INTO feed_packages (feed, lower_id, normalized_version, listed, enabled, \
+                                    pending, flagged, flag_reason, added, downloads, pinned) \
+         SELECT feed, lower_id, nv, listed, enabled, pending, flagged, flag_reason, added, \
+                downloads, pinned \
+         FROM v3_memberships",
+        "UPDATE symbols SET normalized_version = lower(normalized_version) \
+         WHERE normalized_version <> lower(normalized_version)",
+        "UPDATE uploads SET normalized_version = lower(normalized_version) \
+         WHERE normalized_version <> lower(normalized_version)",
+        "DROP TABLE temp.v3_packages",
+        "DROP TABLE temp.v3_memberships",
+    ];
+    for step in STEPS {
+        sqlx::query(step).execute(&mut **tx).await?;
+    }
+    Ok(())
+}
+
 /// Build a `%...%` LIKE pattern, escaping the LIKE metacharacters in `query`.
 fn like_pattern(query: &str) -> String {
     let mut escaped = String::with_capacity(query.len() + 2);
@@ -1782,7 +1870,126 @@ mod tests {
             .fetch_one(&db.pool)
             .await
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
+    }
+
+    /// Give every row of one version the key a pre-0.5.0 server wrote: the
+    /// pre-release label as pushed rather than lower-cased.
+    async fn respell(db: &SqliteDatabase, lower_id: &str, from: &str, to: &str) {
+        for table in [
+            "packages",
+            "feed_packages",
+            "package_tags",
+            "package_files",
+            "symbols",
+        ] {
+            sqlx::query(&format!(
+                "UPDATE {table} SET normalized_version = ?3 \
+                 WHERE lower_id = ?1 AND normalized_version = ?2"
+            ))
+            .bind(lower_id)
+            .bind(from)
+            .bind(to)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn pre_release_keys_from_before_0_5_are_lower_cased_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.db").to_string_lossy().into_owned();
+        let beta = NuGetVersion::parse("1.0.0-Beta").unwrap();
+        let rc = NuGetVersion::parse("2.0.0-rc").unwrap();
+        {
+            let db = SqliteDatabase::connect(&path).await.unwrap();
+            // A version only ever stored the old way, with a symbol and a file.
+            db.add_to_feed(FEED, &tagged("Old.Pkg", "1.0.0-Beta", &["Legacy"]))
+                .await
+                .unwrap();
+            db.add_symbol("ABCDEF01FFFFFFFF", "old.pdb", "Old.Pkg", &beta)
+                .await
+                .unwrap();
+            db.add_file(&PackageFile {
+                lower_id: "old.pkg".into(),
+                normalized_version: "1.0.0-beta".into(),
+                name: "image.iso".into(),
+                sha256: "aa".repeat(32),
+                size: 3,
+                uploaded: Utc::now(),
+                downloads: 0,
+            })
+            .await
+            .unwrap();
+            respell(&db, "old.pkg", "1.0.0-beta", "1.0.0-Beta").await;
+
+            // A version stored the old way and then pushed again after the
+            // upgrade: two rows, one file. The re-push wrote the file last.
+            let mut before = sample("Dup.Pkg", "2.0.0-RC");
+            before.published = Utc::now() - chrono::Duration::days(10);
+            before.package_hash = "old-bytes".into();
+            db.add_to_feed(FEED, &before).await.unwrap();
+            db.add_to_feed("other", &before).await.unwrap();
+            db.set_pinned(FEED, "dup.pkg", &rc, true).await.unwrap();
+            for _ in 0..3 {
+                db.increment_downloads(FEED, "dup.pkg", &rc).await.unwrap();
+            }
+            respell(&db, "dup.pkg", "2.0.0-rc", "2.0.0-RC").await;
+            let mut after = sample("Dup.Pkg", "2.0.0-rc");
+            after.package_hash = "new-bytes".into();
+            db.add_to_feed(FEED, &after).await.unwrap();
+            for _ in 0..2 {
+                db.increment_downloads(FEED, "dup.pkg", &rc).await.unwrap();
+            }
+            // What exact lookups saw before the migration.
+            assert!(db.find(FEED, "old.pkg", &beta).await.unwrap().is_none());
+
+            sqlx::query("PRAGMA user_version = 2")
+                .execute(&db.pool)
+                .await
+                .unwrap();
+        }
+
+        let db = SqliteDatabase::connect(&path).await.unwrap();
+        let old = db.find(FEED, "old.pkg", &beta).await.unwrap().unwrap();
+        assert_eq!(old.version.original(), "1.0.0-Beta", "display form is kept");
+        assert_eq!(db.files_for("old.pkg", &beta).await.unwrap().len(), 1);
+        let symbol = db
+            .find_symbol("ABCDEF01FFFFFFFF", "old.pdb")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(symbol.normalized_version, "1.0.0-beta");
+        let by_tag = SearchRequest {
+            tag: Some("legacy".into()),
+            ..Default::default()
+        };
+        assert_eq!(db.search(FEED, &by_tag).await.unwrap().total_hits, 1);
+
+        // One row survives, the one matching the bytes on disk, and the two
+        // memberships of `default` merged.
+        let rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM packages WHERE lower_id = 'dup.pkg'")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(rows, 1);
+        let data = db.get_package_data("dup.pkg", &rc).await.unwrap().unwrap();
+        assert_eq!(data.package_hash, "new-bytes");
+        let merged = db.find_all_versions(FEED, "dup.pkg").await.unwrap();
+        assert_eq!(merged.len(), 1);
+        assert!(merged[0].pinned);
+        assert_eq!(merged[0].package.downloads, 5);
+        assert!(db.exists("other", "dup.pkg", &rc).await.unwrap());
+        assert!(db.delete_package_data("dup.pkg", &rc).await.unwrap());
+        assert_eq!(db.feed_count("dup.pkg", &rc).await.unwrap(), 0);
+
+        let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(version, 3);
     }
 
     #[tokio::test]
@@ -1791,7 +1998,7 @@ mod tests {
         let path = dir.path().join("race.db").to_string_lossy().into_owned();
         {
             let db = SqliteDatabase::connect(&path).await.unwrap();
-            db.add_to_feed(FEED, &sample("Race.Pkg", "1.0.0-beta"))
+            db.add_to_feed(FEED, &sample("Race.Pkg", "1.0.0-Beta"))
                 .await
                 .unwrap();
             sqlx::query("PRAGMA user_version = 0")
