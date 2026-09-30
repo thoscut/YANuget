@@ -36,7 +36,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
+use sqlx::sqlite::{
+    SqliteConnectOptions, SqliteConnection, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous,
+};
 use sqlx::{ConnectOptions, Connection, SqlitePool};
 
 use crate::error::{Error, Result};
@@ -80,6 +82,32 @@ mod uploads;
 
 pub use search::MAX_QUERY_CHARS;
 
+/// Open the migration connection, waiting out another process that is
+/// opening the same file.
+///
+/// Opening sets `journal_mode = WAL`, and switching a database that is still
+/// in rollback-journal mode needs an exclusive lock that SQLite does not wait
+/// for: the busy timeout is not consulted, and a second process opening the
+/// file at the same moment (the server and `yanuget migrate`) failed with
+/// "database is locked". The switch happens once per file, so retrying for as
+/// long as the busy timeout would have waited is enough.
+async fn connect_when_free(options: &SqliteConnectOptions) -> Result<SqliteConnection> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut pause = Duration::from_millis(10);
+    loop {
+        match options.connect().await {
+            Ok(conn) => return Ok(conn),
+            Err(sqlx::Error::Database(e))
+                if e.code().as_deref() == Some("5") && tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(pause).await;
+                pause = (pause * 2).min(Duration::from_millis(250));
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
 /// A SQLite package index.
 #[derive(Debug, Clone)]
 pub struct SqliteDatabase {
@@ -108,7 +136,7 @@ impl SqliteDatabase {
         // SQLite re-prepares it with the new columns when it runs, but sqlx
         // keeps the column names of the first prepare, and reads the wrong
         // ones or past the end of the row.
-        let mut conn = options.connect().await?;
+        let mut conn = connect_when_free(&options).await?;
         schema::migrate(&mut conn).await?;
         conn.close().await?;
         let pool = SqlitePoolOptions::new()

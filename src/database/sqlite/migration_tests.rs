@@ -739,18 +739,22 @@ async fn pre_release_keys_from_before_0_5_are_lower_cased_once() {
 
 #[tokio::test]
 async fn two_processes_can_migrate_the_same_file_at_once() {
-    let (_dir, path) = fixture(Era::V0_1).await;
     // The server and `yanuget migrate` started together: both must open
-    // the file, and the migrations must run once.
-    let (a, b) = tokio::join!(
-        SqliteDatabase::connect(&path),
-        SqliteDatabase::connect(&path)
-    );
-    let (a, b) = (a.unwrap(), b.unwrap());
-    let beta = v("2.0.0-beta");
-    assert!(a.find(FEED, "alpha", &beta).await.unwrap().is_some());
-    assert_eq!(b.feed_count("alpha", &beta).await.unwrap(), 1);
-    assert_eq!(user_version(&a).await, LATEST);
+    // the file, and the migrations must run once. Opening switches an old
+    // database to WAL, which SQLite does not wait for; a single round lost
+    // that race about one time in eight, so it is run several times.
+    for _ in 0..20 {
+        let (_dir, path) = fixture(Era::V0_1).await;
+        let (a, b) = tokio::join!(
+            SqliteDatabase::connect(&path),
+            SqliteDatabase::connect(&path)
+        );
+        let (a, b) = (a.unwrap(), b.unwrap());
+        let beta = v("2.0.0-beta");
+        assert!(a.find(FEED, "alpha", &beta).await.unwrap().is_some());
+        assert_eq!(b.feed_count("alpha", &beta).await.unwrap(), 1);
+        assert_eq!(user_version(&a).await, LATEST);
+    }
 }
 
 #[tokio::test]
