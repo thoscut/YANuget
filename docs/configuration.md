@@ -246,7 +246,9 @@ and the checksum last; `rsync --partial --append-verify` resumes a broken
 transfer. The importer copies the file into the server's own staging area
 while it checks it, so what is verified is what is stored, then attaches it to
 the version, which the feed must already hold, and removes both files. The
-copy needs as much free space again on the store's volume while it runs. When
+copy needs as much free space again on the store's volume while it runs, and
+is refused, like a push, when it would leave less than `min_free_disk_bytes`
+free. When
 a file cannot be imported, a `{name}.error` next to it says why; the file
 stays, and removing the `.error` retries it.
 

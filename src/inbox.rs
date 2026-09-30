@@ -60,6 +60,9 @@ pub struct Inbox<'a> {
     pub feeds: &'a [String],
     /// The server's private staging directory (the store's `.uploads`).
     pub staging: &'a Path,
+    /// Free space an import must leave on the staging volume
+    /// (`min_free_disk_bytes`); 0 checks nothing.
+    pub min_free_disk_bytes: u64,
 }
 
 /// Refuse an inbox inside the package store: the importer removes files from
@@ -183,6 +186,11 @@ impl Inbox<'_> {
         // Out of the uploader's reach first, then verified: a copy only the
         // server can write, removed on any way out of here but the store.
         tokio::fs::create_dir_all(self.staging).await?;
+        // The copy needs the file's size again on the store's volume, and the
+        // uploader's quota is not the server's: held to the same reserve as a
+        // push, so an inbox full of images cannot fill the disk the database
+        // lives on.
+        ensure_disk_space(self.staging, size, self.min_free_disk_bytes)?;
         let staged = TempPath::new(
             self.staging
                 .join(format!("inbox-{}.tmp", uuid::Uuid::new_v4().simple())),
@@ -261,6 +269,30 @@ fn write_report(dir: &dir::InboxDir, report: &str, e: &Error) {
     if let Err(e) = written {
         tracing::warn!(report, error = %e, "could not write an inbox error report");
     }
+}
+
+/// Refuse a copy of `incoming` bytes that would leave `dir`'s volume with
+/// less than `reserve` free. Unmeasurable free space lets the import through,
+/// as it does a push: a guard that fails closed would stop every import.
+fn ensure_disk_space(dir: &Path, incoming: u64, reserve: u64) -> Result<()> {
+    if reserve == 0 {
+        return Ok(());
+    }
+    let available = match fs4::available_space(dir) {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!(error = %e, "could not measure free disk space");
+            return Ok(());
+        }
+    };
+    let needed = incoming.saturating_add(reserve);
+    if available < needed {
+        return Err(Error::InsufficientStorage(format!(
+            "{available} bytes free on the storage volume, {needed} needed \
+             (the file plus the configured reserve)"
+        )));
+    }
+    Ok(())
 }
 
 /// The SHA-256 a checksum file names: its first word, 64 hex digits, as

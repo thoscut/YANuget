@@ -731,6 +731,7 @@ fn spawn_file_tasks(
                 max_file_size: config.max_file_size_bytes(),
                 feeds: &names,
                 staging: &staging,
+                min_free_disk_bytes: config.min_free_disk_bytes,
             };
             let report = scan.scan().await;
             if report.imported + report.failed > 0 {
