@@ -186,7 +186,13 @@ mod tests {
             assert!(err.contains("Windows device name"), "{id}: {err}");
         }
         // Only the whole first part counts, as in the store.
-        for id in ["Console.Utils", "Contoso.Aux", "Com10.Sdk", "Nullable", "Con-Utils"] {
+        for id in [
+            "Console.Utils",
+            "Contoso.Aux",
+            "Com10.Sdk",
+            "Nullable",
+            "Con-Utils",
+        ] {
             assert!(validate_package_id(id).is_ok(), "{id} should be valid");
         }
     }
