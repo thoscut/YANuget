@@ -76,6 +76,8 @@ pub struct FeedContext {
     pub mirror: Option<MirrorClient>,
     pub license_policy: LicensePolicyConfig,
     pub retention: RetentionConfig,
+    /// Id prefixes other feeds reserved, which this one refuses.
+    pub reserved_elsewhere: Vec<crate::config::ReservedPrefix>,
     /// The feed's cleanup lock and last report, shared with the background
     /// sweep.
     pub cleanup: Arc<retention::RetentionState>,
@@ -103,6 +105,7 @@ impl FeedContext {
             mirror,
             license_policy: feed.license_policy.clone(),
             retention: feed.retention.clone(),
+            reserved_elsewhere: feed.reserved_elsewhere.clone(),
             cleanup: Arc::default(),
         }
     }
@@ -274,9 +277,14 @@ impl AppState {
         let Some(client) = &self.feed.mirror else {
             return;
         };
+        // Not worth a download that indexing would refuse.
+        if self.feed.reserved_elsewhere.iter().any(|r| r.covers(id)) {
+            return;
+        }
         let options = MirrorOptions {
             requires_approval: self.feed.requires_approval,
             license_policy: self.feed.license_policy.clone(),
+            reserved_elsewhere: self.feed.reserved_elsewhere.clone(),
         };
         if let Err(e) = mirror::ensure_package(
             client,
@@ -895,6 +903,7 @@ async fn push_package(State(state): State<AppState>, request: Request) -> Result
         license_policy: state.feed.license_policy.clone(),
         // A push is self-describing: the manifest defines the identity.
         expect: None,
+        reserved_elsewhere: state.feed.reserved_elsewhere.clone(),
     };
     let result = indexing::index_package(
         state.storage.as_ref(),

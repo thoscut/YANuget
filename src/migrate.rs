@@ -297,6 +297,7 @@ pub async fn run(
         // Pinned per item in `migrate_one` — the source is asked for a specific
         // id/version and must not be able to answer with a different package.
         expect: None,
+        reserved_elsewhere: feed.reserved_elsewhere.clone(),
     };
 
     let outcomes: Vec<Outcome> = stream::iter(work)

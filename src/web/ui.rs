@@ -3785,6 +3785,7 @@ mod tests {
             mirror: None,
             license_policy: crate::config::LicensePolicyConfig::default(),
             retention: crate::config::RetentionConfig::default(),
+            reserved_elsewhere: Vec::new(),
             cleanup: Default::default(),
         }
     }

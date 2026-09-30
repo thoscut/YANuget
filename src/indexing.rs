@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use chrono::Utc;
 
-use crate::config::{LicensePolicyConfig, OverwriteMode};
+use crate::config::{LicensePolicyConfig, OverwriteMode, ReservedPrefix};
 use crate::database::{Membership, PackageDatabase};
 use crate::error::{Error, Result};
 use crate::models::Package;
@@ -49,6 +49,8 @@ pub struct IndexOptions {
     /// compromised upstream cannot substitute a different package under a name
     /// local clients already trust.
     pub expect: Option<ExpectedIdentity>,
+    /// Id prefixes other feeds reserved: an id under one is refused here.
+    pub reserved_elsewhere: Vec<ReservedPrefix>,
 }
 
 /// The id/version a caller requires the indexed manifest to declare.
@@ -110,6 +112,17 @@ async fn index_inner(
 
     let id = manifest.id.clone();
     let normalized = version.normalized();
+
+    // Before anything is stored: the first feed to store an id+version owns
+    // it everywhere, so a reserved prefix is only worth anything if no other
+    // feed can get there first.
+    if let Some(reserved) = options.reserved_elsewhere.iter().find(|r| r.covers(&id)) {
+        tracing::warn!(%feed, %id, version = %normalized, owner = %reserved.feed, "refused: id prefix reserved for another feed");
+        return Err(Error::Forbidden(format!(
+            "package id {id} is under the prefix {:?}, reserved for feed {:?}",
+            reserved.prefix, reserved.feed
+        )));
+    }
 
     // The caller pinned an identity (mirror/migrate): the fetched payload must
     // be the package that was requested, not merely a valid package.

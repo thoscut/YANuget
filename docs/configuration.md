@@ -219,6 +219,20 @@ with its own mutable state (listed / enabled / pending / flagged / downloads).
 Removing a version from a feed drops that membership; the shared payload is
 deleted only when the **last** feed referencing it lets go.
 
+That makes an id and version **one namespace across every feed**. Whoever
+stores a version first owns it everywhere: pushing different bytes under the
+same id and version is refused (`409`, logged as a failure) in every feed,
+and a mirror fetch of it fails the same way. Package metadata, readmes,
+icons and attached files are shared too, so detaching a file in one feed
+detaches it in all of them. A push key on a low-trust feed, or an anonymous
+read that fills a mirror feed, can therefore claim a version another feed
+meant to publish. `reserved_id_prefixes` closes that for your own ids: a feed
+that reserves `Contoso.` is the only one that may push, mirror or migrate
+`Contoso` or any `Contoso.*` id (matched ignoring case); every other feed
+answers `403`. Reservations of different feeds may not overlap. Copying or
+promoting an existing version into another feed is an admin action and is not
+affected.
+
 | TOML key | Type | Default | Description |
 | --- | --- | --- | --- |
 | `feeds[].name` | string | *(required)* | URL slug + DB key; `[A-Za-z0-9._-]+`, unique. |
@@ -230,6 +244,7 @@ deleted only when the **last** feed referencing it lets go.
 | `feeds[].hard_delete_enabled` | bool | *(global)* | DELETE removes vs. unlists. |
 | `feeds[].requires_approval` | bool | `false` | Incoming versions are pending until approved. |
 | `feeds[].promotes_to` | string | *(none)* | Next release ring (must name another feed). |
+| `feeds[].reserved_id_prefixes` | string[] | `[]` | Id prefixes (e.g. `"Contoso."`) only this feed may bring in; every other feed refuses them. See below. |
 | `feeds[].mirror.enabled` | bool | `false` | Read-through cache of an upstream V3 feed. |
 | `feeds[].mirror.upstream` | string | `https://api.nuget.org/v3/index.json` | Upstream service index. |
 | `feeds[].mirror.timeout_secs` | int | `30` | Per-request upstream timeout. |
