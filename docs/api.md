@@ -99,7 +99,8 @@ GET /v3/package/{id}/{version}/{id}.{version}.nupkg
 
 Streams the `.nupkg`. Supports `Range: bytes=...` (responds `206 Partial
 Content` with `Content-Range`); always sends `Accept-Ranges: bytes`. Each
-successful fetch increments the download counter.
+transfer that sends bytes (`200`, or `206` from the first byte) increments the
+download counter; a `HEAD`, a continuation range and a `304` do not.
 
 The response carries a strong `ETag` (the package's SHA-512 — a content hash
 of exactly the bytes served) and `Last-Modified`. Repeating the request with

@@ -538,6 +538,55 @@ async fn immutable_only_while_versions_cannot_be_overwritten() {
 }
 
 #[tokio::test]
+async fn a_not_modified_answer_is_not_a_download() {
+    let server = spawn_with(|_| {}).await;
+    push(&server, "", API_KEY, build_nupkg("Count.Pkg", "1.0.0")).await;
+    let url = server.url("/v3/package/count.pkg/1.0.0/count.pkg.1.0.0.nupkg");
+    let first = server.client.get(&url).send().await.unwrap();
+    let etag = header(&first, "etag").to_string();
+    for _ in 0..3 {
+        let again = server
+            .client
+            .get(&url)
+            .header("If-None-Match", &etag)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(again.status(), StatusCode::NOT_MODIFIED);
+    }
+    // Counted off the request path: give it a moment, then expect one.
+    let mut downloads = serde_json::Value::Null;
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let search: serde_json::Value = server
+            .client
+            .get(server.url("/v3/search?q=count.pkg"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        downloads = search["data"][0]["totalDownloads"].clone();
+        if downloads == 1 {
+            break;
+        }
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let search: serde_json::Value = server
+        .client
+        .get(server.url("/v3/search?q=count.pkg"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(downloads, 1);
+    assert_eq!(search["data"][0]["totalDownloads"], 1, "a 304 was counted");
+}
+
+#[tokio::test]
 async fn an_invalid_range_is_ignored_rather_than_refused() {
     let server = spawn_with(|_| {}).await;
     push(&server, "", API_KEY, build_nupkg("Range.Pkg", "1.0.0")).await;

@@ -1255,13 +1255,17 @@ async fn download_package(
     )
     .await?;
 
-    // Count the download (best effort — never block the response on it), once
-    // per transfer rather than once per ranged request of it.
-    if files::counts_as_download(&method, &headers) {
-        let _ = state
-            .db
-            .increment_downloads(state.feed(), &id, &version)
-            .await;
+    // Count the download once per transfer rather than once per ranged request
+    // of it, and only when bytes actually go out: a 304 is a client confirming
+    // it already has them. The write runs off the request path, so a busy
+    // database never holds up the file.
+    if files::counts_as_download(&method, &headers) && files::sends_content(&response) {
+        let (db, feed) = (state.db.clone(), state.feed.name.clone());
+        tokio::spawn(async move {
+            if let Err(e) = db.increment_downloads(&feed, &id, &version).await {
+                tracing::debug!(%feed, %id, error = %e, "download not counted");
+            }
+        });
     }
     Ok(response)
 }

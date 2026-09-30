@@ -281,6 +281,15 @@ pub fn counts_as_download(method: &axum::http::Method, headers: &HeaderMap) -> b
     }
 }
 
+/// Whether a response carries the file's bytes (`200` or `206`), as opposed to
+/// a `304`, a `416` or an error.
+pub fn sends_content(response: &Response) -> bool {
+    matches!(
+        response.status(),
+        StatusCode::OK | StatusCode::PARTIAL_CONTENT
+    )
+}
+
 /// Whether `If-None-Match` names `quoted` (or is the `*` wildcard).
 pub fn if_none_match_hits(headers: &HeaderMap, quoted: &str) -> bool {
     let Some(raw) = headers

@@ -1033,6 +1033,7 @@ async fn the_gallery_sorts_by_downloads_name_and_last_update() {
         .await
         .unwrap();
     assert!(dl.status().is_success());
+    await_downloads(&server, "zulu.pkg", 1).await;
 
     let order = |html: &str| {
         let mut ids: Vec<(usize, &str)> = ["Alpha.Pkg", "Mike.Pkg", "Zulu.Pkg"]
@@ -4473,16 +4474,35 @@ async fn downloads_resume_safely_and_count_once() {
     assert_eq!(stale.bytes().await.unwrap().len() as u64, total);
 
     // HEAD, the continuations and the refused resume are one download.
-    let search: serde_json::Value = server
-        .client
-        .get(server.url("/v3/search?q=resume.pkg"))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(search["data"][0]["totalDownloads"], 1);
+    await_downloads(&server, "resume.pkg", 1).await;
+    // And nothing else lands late.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    await_downloads(&server, "resume.pkg", 1).await;
+}
+
+/// Wait until search reports `expected` downloads of `id`.
+///
+/// Downloads are counted off the request path, so the count can trail the
+/// response that caused it by a moment.
+async fn await_downloads(server: &TestServer, id: &str, expected: u64) {
+    let mut last = serde_json::Value::Null;
+    for _ in 0..100 {
+        let search: serde_json::Value = server
+            .client
+            .get(server.url(&format!("/v3/search?q={id}")))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        last = search["data"][0]["totalDownloads"].clone();
+        if last == expected {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("{id}: expected {expected} downloads, search says {last}");
 }
 
 #[tokio::test]

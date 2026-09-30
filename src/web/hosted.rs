@@ -75,9 +75,6 @@ pub(super) async fn download(
         .await?
         .ok_or(Error::PackageNotFound)?;
     let PackageContent::LocalPath(path) = state.storage.get_blob(&file.sha256).await?;
-    if files::counts_as_download(&method, &headers) {
-        let _ = state.db.increment_file_downloads(&id, &v, &name).await;
-    }
     let digest = hex::decode(&file.sha256)
         .map(|d| base64::engine::general_purpose::STANDARD.encode(d))
         .ok();
@@ -106,6 +103,16 @@ pub(super) async fn download(
         header::CONTENT_SECURITY_POLICY,
         HeaderValue::from_static("default-src 'none'"),
     );
+    // Counted like a package download: once per transfer, only when bytes go
+    // out, and off the request path.
+    if files::counts_as_download(&method, &headers) && files::sends_content(&response) {
+        let db = state.db.clone();
+        tokio::spawn(async move {
+            if let Err(e) = db.increment_file_downloads(&id, &v, &name).await {
+                tracing::debug!(%id, %name, error = %e, "file download not counted");
+            }
+        });
+    }
     Ok(response)
 }
 
