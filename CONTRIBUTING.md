@@ -112,9 +112,12 @@ your change.
 - **Configuration additions are documented** in `yanuget.example.toml` and
   `docs/configuration.md`, and rejected when misspelled — every config struct
   uses `deny_unknown_fields` so a typo is an error rather than a silent no-op.
+- **Escape at every HTML sink.** The pages are built with `format!`, so
+  nothing is escaped unless the code says so. `src/web/ui/escape.rs` holds the
+  helpers and the rule for which one a value needs.
 - **Keep the web UI dependency-free.** The gallery loads no external CSS, fonts,
   scripts or images, and CI enforces the same for the docs site. Inline assets
-  must be added to the CSP hash list in `src/web/ui.rs`.
+  must be added to the CSP hash list in `src/web/ui/layout.rs`.
 
 ## Commit messages and branches
 
@@ -137,7 +140,12 @@ Branch off `main` and open the pull request against `main`.
 | `src/nuget/` | Protocol: URL generation and JSON response builders |
 | `src/indexing.rs` | Upload → validate → store → record, with rollback |
 | `src/pdb.rs`, `src/pe.rs`, `src/symbols.rs` | Portable PDB parsing, the PE debug-directory reader that ties a PDB to its assembly, and `.snupkg` ingest |
-| `src/web/` | axum router, handlers, Range-aware file serving, HTML gallery |
+| `src/web/mod.rs` | The axum routers; admin routes sit behind one `route_layer` |
+| `src/web/state.rs`, `src/web/middleware.rs` | Per-feed state; the global and per-feed middleware |
+| `src/web/protocol.rs`, `src/web/publish.rs` | NuGet V3 read endpoints; push, delete and relist |
+| `src/web/gallery.rs`, `src/web/admin.rs` | Gallery and admin-area handlers |
+| `src/web/hosted.rs`, `src/web/files.rs` | Attached files and resumable uploads; Range-aware file serving |
+| `src/web/ui/` | HTML rendering, one module per page family; escaping lives in `ui/escape.rs` |
 | `docs/` | MkDocs sources for the site embedded at `/docs` |
 | `tests/` | Integration tests |
 | `scripts/verify-with-dotnet.sh` | End-to-end check against the real .NET SDK |
