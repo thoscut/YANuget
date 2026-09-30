@@ -38,7 +38,13 @@ src/
 │   └── filesystem.rs Streaming filesystem backend (global, deduplicated)
 ├── database/
 │   ├── mod.rs        PackageDatabase trait, Membership, FeedVersion, Search*
-│   └── sqlite.rs     SQLite backend: global `packages` + `feed_packages` membership
+│   └── sqlite/       SQLite backend: global `packages` + `feed_packages` membership
+│       ├── mod.rs    Connection setup; the trait impl, delegating per concern
+│       ├── schema.rs Numbered migrations (`PRAGMA user_version`)
+│       ├── packages.rs, memberships.rs, feeds.rs
+│       │             Global package data; per-feed state; feed-scoped reads
+│       ├── search.rs Search, autocomplete, tag counts (FTS5 index, tag index)
+│       └── files.rs, uploads.rs, symbols.rs, tombstones.rs
 ├── nuget/
 │   ├── mod.rs        JSON response builders (pure)
 │   └── urls.rs       UrlBuilder (absolute resource URLs, feed-prefix aware)
@@ -105,9 +111,14 @@ PUT /api/v2/package
 ```
 
 The database keeps a full-text index for search (FTS5, trigram tokenizer)
-next to `packages`, maintained by triggers. Schema changes are numbered by
-`PRAGMA user_version` and run once, inside a `BEGIN IMMEDIATE` transaction, so
-two processes opening the same file never both migrate it.
+next to `packages`, maintained by triggers. Memberships, tags, attached files
+and symbol mappings each have a foreign key to their version in `packages`,
+so deleting the version takes them with it. Every schema change is a numbered
+step in `database/sqlite/schema.rs`, recorded in `PRAGMA user_version`; each
+runs once, in its own `BEGIN IMMEDIATE` transaction, so two processes opening
+the same file never both apply it, and a new database runs every step, so it
+ends up with exactly the schema an upgraded one has. A changed table, index
+or trigger is a new step, never an edit to an old one.
 
 ## Request flow: restore / download
 

@@ -136,7 +136,8 @@ Branch off `main` and open the pull request against `main`.
 | `src/nuspec.rs`, `src/nupkg.rs` | Manifest parsing; seek-based archive reading |
 | `src/streaming.rs` | Bounded-memory copy-to-disk with incremental SHA-512 |
 | `src/storage/` | `PackageStorage` trait and the filesystem backend |
-| `src/database/` | `PackageDatabase` trait and the SQLite backend |
+| `src/database/` | `PackageDatabase` trait and the SQLite backend, one module per table group under `sqlite/` |
+| `src/database/sqlite/schema.rs` | Numbered schema migrations: a schema change is a new step at the end, never an edit to a shipped one |
 | `src/nuget/` | Protocol: URL generation and JSON response builders |
 | `src/indexing.rs` | Upload → validate → store → record, with rollback |
 | `src/pdb.rs`, `src/pe.rs`, `src/symbols.rs` | Portable PDB parsing, the PE debug-directory reader that ties a PDB to its assembly, and `.snupkg` ingest |
