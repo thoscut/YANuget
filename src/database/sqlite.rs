@@ -146,6 +146,17 @@ CREATE TABLE IF NOT EXISTS uploads (
     created            TEXT    NOT NULL,
     expires            TEXT    NOT NULL
 );
+
+-- Versions deliberately removed from a feed. Deleting drops the membership
+-- row, which is all a read-through mirror checks, so without this a version
+-- an admin removed came straight back on the next anonymous read.
+CREATE TABLE IF NOT EXISTS tombstones (
+    feed               TEXT    NOT NULL,
+    lower_id           TEXT    NOT NULL,
+    normalized_version TEXT    NOT NULL,
+    created            TEXT    NOT NULL,
+    PRIMARY KEY (feed, lower_id, normalized_version)
+);
 "#;
 
 /// Fill `package_tags` for one version from its JSON tag array (`?3`),
@@ -1279,6 +1290,45 @@ impl PackageDatabase for SqliteDatabase {
                 .await?;
         Ok(result.rows_affected())
     }
+
+    async fn add_tombstone(&self, feed: &str, id: &str, version: &NuGetVersion) -> Result<()> {
+        sqlx::query(
+            "INSERT OR IGNORE INTO tombstones (feed, lower_id, normalized_version, created) \
+             VALUES (?1, ?2, ?3, ?4)",
+        )
+        .bind(feed)
+        .bind(id.to_lowercase())
+        .bind(version.normalized())
+        .bind(Utc::now().to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn is_tombstoned(&self, feed: &str, id: &str, version: &NuGetVersion) -> Result<bool> {
+        let row = sqlx::query(
+            "SELECT 1 FROM tombstones \
+             WHERE feed = ?1 AND lower_id = ?2 AND normalized_version = ?3",
+        )
+        .bind(feed)
+        .bind(id.to_lowercase())
+        .bind(version.normalized())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.is_some())
+    }
+
+    async fn clear_tombstone(&self, feed: &str, id: &str, version: &NuGetVersion) -> Result<()> {
+        sqlx::query(
+            "DELETE FROM tombstones WHERE feed = ?1 AND lower_id = ?2 AND normalized_version = ?3",
+        )
+        .bind(feed)
+        .bind(id.to_lowercase())
+        .bind(version.normalized())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
 }
 
 /// Build a `%...%` LIKE pattern, escaping the LIKE metacharacters in `query`.
@@ -2088,5 +2138,21 @@ mod tests {
             .await
             .unwrap()
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn tombstones_are_per_feed_and_version() {
+        let db = SqliteDatabase::in_memory().await.unwrap();
+        let v1 = NuGetVersion::parse("1.0.0").unwrap();
+        let v2 = NuGetVersion::parse("2.0.0").unwrap();
+        assert!(!db.is_tombstoned(FEED, "Gone", &v1).await.unwrap());
+        db.add_tombstone(FEED, "Gone", &v1).await.unwrap();
+        // Idempotent, and matched case-insensitively.
+        db.add_tombstone(FEED, "gone", &v1).await.unwrap();
+        assert!(db.is_tombstoned(FEED, "GONE", &v1).await.unwrap());
+        assert!(!db.is_tombstoned(FEED, "gone", &v2).await.unwrap());
+        assert!(!db.is_tombstoned("other", "gone", &v1).await.unwrap());
+        db.clear_tombstone(FEED, "Gone", &v1).await.unwrap();
+        assert!(!db.is_tombstoned(FEED, "gone", &v1).await.unwrap());
     }
 }

@@ -468,6 +468,18 @@ pub trait PackageDatabase: Send + Sync {
     /// Remove all symbol mappings for a package version. Returns how many rows
     /// were removed.
     async fn delete_symbols(&self, id: &str, version: &NuGetVersion) -> Result<u64>;
+
+    // --- tombstones (per feed) ---
+
+    /// Record that a version was deliberately removed from `feed` (deleted,
+    /// pruned or moved out), so a read-through mirror never fetches it back.
+    async fn add_tombstone(&self, feed: &str, id: &str, version: &NuGetVersion) -> Result<()>;
+
+    /// Whether a version was removed from `feed` and not pushed again since.
+    async fn is_tombstoned(&self, feed: &str, id: &str, version: &NuGetVersion) -> Result<bool>;
+
+    /// Forget a tombstone: a push of the version brings it back on purpose.
+    async fn clear_tombstone(&self, feed: &str, id: &str, version: &NuGetVersion) -> Result<()>;
 }
 
 /// Feed-wide aggregate statistics.

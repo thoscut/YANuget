@@ -253,6 +253,13 @@ Three things bound a read-through miss, because it is started by an
   what has been mirrored so far and the remaining versions are fetched on a
   later request. Nothing is lost — a mirror is a cache, and it warms up
   incrementally rather than holding one connection open for the whole job.
+
+A version removed from a mirror feed stays removed. Deleting it (from `/admin`,
+a hard `DELETE`, or a retention sweep) or moving it to another feed records a
+tombstone for that feed, id and version, and the mirror never fetches a
+tombstoned version again — so a package pulled as malicious does not come back
+on the next read, and retention and the mirror do not fight over old versions.
+Pushing the version to the feed again clears its tombstone.
 | `feeds[].license_policy.enabled` | bool | `false` | Evaluate the offline license policy. |
 | `feeds[].license_policy.allowed` | string[] | `[]` | If non-empty, license must match one. |
 | `feeds[].license_policy.blocked` | string[] | `[]` | Always rejected (even if also allowed). |

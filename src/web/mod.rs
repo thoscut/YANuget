@@ -907,6 +907,14 @@ async fn push_package(State(state): State<AppState>, request: Request) -> Result
         &options,
     )
     .await?;
+    // Pushing a deleted version back is how it is un-deleted for the mirror.
+    if let Err(e) = state
+        .db
+        .clear_tombstone(state.feed(), &result.id, &result.version)
+        .await
+    {
+        tracing::warn!(id = %result.id, error = %e, "could not clear the version's tombstone");
+    }
 
     // Optionally prune older versions of this id in this feed (best-effort:
     // never fail the push because of retention).
@@ -2095,6 +2103,10 @@ async fn transfer_version(
     }
     if mode == Transfer::Move {
         state.db.remove_membership(state.feed(), id, v).await?;
+        // Moved out on purpose: this feed's mirror must not fetch it back.
+        if let Err(e) = state.db.add_tombstone(state.feed(), id, v).await {
+            tracing::error!(feed = %state.feed(), %id, error = %e, "could not record the move");
+        }
     }
     Ok(())
 }

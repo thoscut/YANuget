@@ -205,6 +205,12 @@ pub async fn purge_version(
     // so the feed-count check and global GC see a consistent snapshot.
     let _guard = crate::locks::lock_version(id, &version.normalized()).await;
     let removed = db.remove_membership(feed, id, version).await?;
+    // Deleted on purpose: a read-through mirror must not fetch it back.
+    if removed {
+        if let Err(e) = db.add_tombstone(feed, id, version).await {
+            tracing::error!(%feed, %id, version = %version.normalized(), error = %e, "could not record the deletion; a mirror may fetch this version again");
+        }
+    }
     if db.feed_count(id, version).await? == 0 {
         purge_global_data(storage, db, id, version).await?;
     }

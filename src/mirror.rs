@@ -884,8 +884,14 @@ pub async fn ensure_package(
     let deadline = tokio::time::Instant::now() + MIRROR_BUDGET;
 
     for version in versions {
-        // Skip versions the feed already exposes.
-        if db.exists(feed, &lower_id, &version).await.unwrap_or(false) {
+        // Skip versions the feed already exposes, and those removed from it
+        // on purpose (when the check itself fails, assume removed).
+        if db.exists(feed, &lower_id, &version).await.unwrap_or(false)
+            || db
+                .is_tombstoned(feed, &lower_id, &version)
+                .await
+                .unwrap_or(true)
+        {
             continue;
         }
         if tokio::time::Instant::now() >= deadline {
@@ -912,6 +918,16 @@ pub async fn ensure_package(
                 continue;
             }
         };
+
+        // A delete may have landed while the download ran.
+        if db
+            .is_tombstoned(feed, &lower_id, &version)
+            .await
+            .unwrap_or(true)
+        {
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            continue;
+        }
 
         let opts = IndexOptions {
             overwrite: crate::config::OverwriteMode::Disabled,

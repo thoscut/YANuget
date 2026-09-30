@@ -9,7 +9,10 @@ use std::sync::{Arc, Mutex};
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
-use yanuget::config::{MirrorAuthConfig, MirrorConfig};
+use yanuget::config::{Config, FeedConfig, MirrorAuthConfig, MirrorConfig};
+use yanuget::database::SqliteDatabase;
+use yanuget::storage::FilesystemStorage;
+use yanuget::web::{self, AppState, FeedMeta};
 use zip::write::SimpleFileOptions;
 
 /// Build a minimal but valid `.nupkg` in memory.
@@ -290,6 +293,164 @@ fn credentials() -> MirrorAuthConfig {
         headers,
         ..Default::default()
     }
+}
+
+const API_KEY: &str = "push-key";
+
+/// A YANuget server with one feed, `mirror`, reading through to an upstream.
+struct Server {
+    base: String,
+    client: reqwest::Client,
+    _dir: tempfile::TempDir,
+}
+
+impl Server {
+    /// `path` under the mirror feed.
+    fn url(&self, path: &str) -> String {
+        format!("{}/mirror{path}", self.base)
+    }
+
+    async fn get(&self, path: &str) -> reqwest::Response {
+        self.client.get(self.url(path)).send().await.unwrap()
+    }
+
+    /// The versions the flat container lists, or `None` on a 404.
+    async fn versions(&self, id: &str) -> Option<Vec<String>> {
+        let resp = self.get(&format!("/v3/package/{id}/index.json")).await;
+        if resp.status() == StatusCode::NOT_FOUND {
+            return None;
+        }
+        assert!(resp.status().is_success(), "{}", resp.status());
+        let doc: serde_json::Value = resp.json().await.unwrap();
+        Some(
+            doc["versions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect(),
+        )
+    }
+
+    async fn download(&self, id: &str, version: &str) -> reqwest::Response {
+        self.get(&format!("/v3/package/{id}/{version}/{id}.{version}.nupkg"))
+            .await
+    }
+}
+
+async fn spawn_mirror(upstream: &Upstream, customize: impl FnOnce(&mut FeedConfig)) -> Server {
+    let dir = tempfile::tempdir().unwrap();
+    let mut feed = FeedConfig {
+        name: "mirror".into(),
+        mirror: mirror_config(upstream),
+        ..Default::default()
+    };
+    customize(&mut feed);
+    let config = Config {
+        data_dir: dir.path().to_path_buf(),
+        api_key: Some(API_KEY.into()),
+        tls_enabled: false,
+        feeds: vec![feed],
+        ..Config::default()
+    };
+    let storage = Arc::new(FilesystemStorage::new(config.storage_path()).await.unwrap());
+    let db = Arc::new(
+        SqliteDatabase::connect(&config.database_path())
+            .await
+            .unwrap(),
+    );
+    let config = Arc::new(config);
+    let feeds = config.resolved_feeds().unwrap();
+    let meta = Arc::new(
+        feeds
+            .iter()
+            .map(FeedMeta::from_resolved)
+            .collect::<Vec<_>>(),
+    );
+    let mut states = Vec::new();
+    for f in &feeds {
+        states.push(
+            AppState::for_feed(storage.clone(), db.clone(), config.clone(), f, meta.clone())
+                .await
+                .unwrap(),
+        );
+    }
+    let app = web::build_app(states);
+    let listener = tokio::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    Server {
+        base: format!("http://{addr}"),
+        client: reqwest::Client::new(),
+        _dir: dir,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Deletes stick
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_version_deleted_from_a_mirror_feed_is_not_fetched_back() {
+    // Deleting drops the membership, which is all the mirror used to check:
+    // a version removed as malicious came straight back on the next read.
+    let upstream = Upstream::start().await;
+    upstream.publish("Gone.Pkg", "1.0.0");
+    upstream.publish("Gone.Pkg", "2.0.0");
+    let server = spawn_mirror(&upstream, |f| f.hard_delete_enabled = Some(true)).await;
+    assert_eq!(
+        server.versions("gone.pkg").await.unwrap(),
+        ["1.0.0", "2.0.0"]
+    );
+
+    let deleted = server
+        .client
+        .delete(server.url("/api/v2/package/gone.pkg/1.0.0"))
+        .header("X-NuGet-ApiKey", API_KEY)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+
+    // A client asking for it gets a 404, not a fresh copy from upstream.
+    let fetched = upstream.seen().len();
+    assert_eq!(
+        server.download("gone.pkg", "1.0.0").await.status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(server.versions("gone.pkg").await.unwrap(), ["2.0.0"]);
+    let downloads_of_deleted = upstream.seen()[fetched..]
+        .iter()
+        .filter(|s| s.path.ends_with("gone.pkg.1.0.0.nupkg"))
+        .count();
+    assert_eq!(downloads_of_deleted, 0);
+
+    // Pushing it back is how an operator undoes the delete.
+    let part = reqwest::multipart::Part::bytes(build_nupkg("Gone.Pkg", "1.0.0"))
+        .file_name("package.nupkg");
+    let pushed = server
+        .client
+        .put(server.url("/api/v2/package"))
+        .header("X-NuGet-ApiKey", API_KEY)
+        .multipart(reqwest::multipart::Form::new().part("package", part))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(pushed.status(), StatusCode::CREATED);
+    assert!(server
+        .download("gone.pkg", "1.0.0")
+        .await
+        .status()
+        .is_success());
 }
 
 // ---------------------------------------------------------------------------
