@@ -820,6 +820,89 @@ async fn an_invalid_range_is_ignored_rather_than_refused() {
     assert_eq!(past.status(), StatusCode::RANGE_NOT_SATISFIABLE);
 }
 
+// ---------------------------------------------------------------------------
+// Copy and promote (COR-16)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn promotion_does_not_republish_what_the_source_withholds() {
+    let server = spawn_feeds(|c| {
+        c.admin_api_key = Some("admin".into());
+        c.feeds = vec![
+            FeedConfig {
+                promotes_to: Some("stable".into()),
+                ..feed("dev")
+            },
+            feed("stable"),
+        ];
+    })
+    .await;
+    for id in ["Unlisted.Pkg", "Disabled.Pkg"] {
+        assert_eq!(
+            push(&server, "/dev", API_KEY, build_nupkg(id, "1.0.0")).await,
+            StatusCode::CREATED
+        );
+    }
+    // Unlist one (the client's "delete"), disable the other.
+    let unlist = server
+        .client
+        .delete(server.url("/dev/api/v2/package/Unlisted.Pkg/1.0.0"))
+        .header("X-NuGet-ApiKey", API_KEY)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unlist.status(), StatusCode::NO_CONTENT);
+    let csrf = yanuget::auth::AdminAuth::new(Some("admin".into()))
+        .csrf_token()
+        .unwrap();
+    let admin_post = |path: String| {
+        server
+            .client
+            .post(server.url(&path))
+            .basic_auth("admin", Some("admin"))
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(format!("_csrf={csrf}"))
+            .send()
+    };
+    let disable = admin_post("/dev/admin/packages/disabled.pkg/1.0.0/disable".into())
+        .await
+        .unwrap();
+    assert_eq!(disable.status(), StatusCode::SEE_OTHER);
+    for id in ["unlisted.pkg", "disabled.pkg"] {
+        let promote = admin_post(format!("/dev/admin/packages/{id}/1.0.0/promote"))
+            .await
+            .unwrap();
+        assert_eq!(promote.status(), StatusCode::SEE_OTHER, "{id}");
+    }
+
+    // The disabled version stays withheld in the next ring.
+    let disabled = server
+        .client
+        .get(server.url("/stable/v3/package/disabled.pkg/1.0.0/disabled.pkg.1.0.0.nupkg"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(disabled.status(), StatusCode::NOT_FOUND);
+    // The unlisted one stays restorable, and out of search.
+    let unlisted = server
+        .client
+        .get(server.url("/stable/v3/package/unlisted.pkg/1.0.0/unlisted.pkg.1.0.0.nupkg"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unlisted.status(), StatusCode::OK);
+    let search: serde_json::Value = server
+        .client
+        .get(server.url("/stable/v3/search?q=unlisted.pkg"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(search["totalHits"], 0, "{search}");
+}
+
 /// Run the real binary with `env` and return its exit status and stderr,
 /// killing it if it is still running after `timeout` (it then started, which
 /// is what these tests assert does not happen).

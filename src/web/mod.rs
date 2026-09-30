@@ -2253,10 +2253,13 @@ enum Transfer {
 /// Copy or move one version of this feed into `target`.
 ///
 /// The target's license policy and approval gate apply, exactly as for a push
-/// into it. A copy arrives active, as a promotion always has; a move keeps
-/// the listed and enabled state it had here, since it is the same version,
-/// elsewhere. A version the target already holds keeps its state there. Its
-/// files are never touched: the target holds them afterwards either way.
+/// into it. Either way the version arrives with the listed and enabled state
+/// it has here, and still pending if it is pending here: a copy or promotion
+/// must not re-publish what this feed withholds (an admin who disabled a
+/// broken build would otherwise see it go live in the next ring). A move
+/// also keeps its pin, since it is the same version, elsewhere. A version the
+/// target already holds keeps its state there. Its files are never touched:
+/// the target holds them afterwards either way.
 async fn transfer_version(
     state: &AppState,
     target: &FeedMeta,
@@ -2303,17 +2306,15 @@ async fn transfer_version(
     if !state.db.package_data_exists(id, v).await? {
         return Err(Error::PackageNotFound);
     }
-    let mut membership = Membership {
-        pending: target.requires_approval,
+    let membership = Membership {
+        pending: target.requires_approval || here.pending,
         flagged: outcome.violation.is_some(),
         flag_reason: outcome.violation,
+        listed: here.listed,
+        enabled: here.enabled,
+        pinned: mode == Transfer::Move && here.pinned,
         ..Membership::active(&target.name, &package)
     };
-    if mode == Transfer::Move {
-        membership.listed = here.listed;
-        membership.enabled = here.enabled;
-        membership.pinned = here.pinned;
-    }
     match state.db.add_membership(&membership).await {
         Ok(()) | Err(Error::PackageAlreadyExists) => {}
         Err(e) => return Err(e),
