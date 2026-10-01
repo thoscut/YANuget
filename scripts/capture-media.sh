@@ -31,15 +31,19 @@ BIN="$REPO_ROOT/target/release/yanuget"
 
 # --- toolchain ---------------------------------------------------------------
 # Pillow assembles the GIFs; Playwright drives the browser. Both are dev-only,
-# so they live in this working directory rather than in the repo.
+# so they live in this working directory rather than in the repo. Both are
+# installed from their lockfiles — hashed pins for Pillow, `npm ci` for
+# Playwright — so a capture runs the versions that were reviewed, not whatever
+# was published that morning.
 echo "==> preparing the capture toolchain"
 python3 -m venv "$WORK/venv" >/dev/null
-"$WORK/venv/bin/pip" install --quiet --no-cache-dir Pillow
+"$WORK/venv/bin/pip" install --quiet --no-cache-dir --require-hashes \
+    -r "$REPO_ROOT/scripts/media/requirements.txt"
 PYTHON="$WORK/venv/bin/python"
 
 if [ ! -d "$REPO_ROOT/scripts/media/node_modules/playwright" ]; then
     echo "==> installing playwright"
-    npm install --prefix "$REPO_ROOT/scripts/media" --silent
+    npm ci --prefix "$REPO_ROOT/scripts/media" --silent
     # PLAYWRIGHT_BROWSERS_PATH may already point at a shared browser install;
     # only fetch chromium when it is genuinely absent.
     if [ -z "${PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD:-}" ]; then

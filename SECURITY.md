@@ -81,13 +81,46 @@ Configuration choices that matter most:
 - **Set `cors_allowed_origins` only if a browser really needs cross-origin
   access.** It is empty by default, so no CORS headers are sent. `*` makes the
   feed's whole inventory readable by any page a user with network reach
-  visits.
-- **Set `base_url`** when the server is behind a proxy, rather than relying on
-  forwarded headers, if you can.
+  visits. Cross-origin access is read-only either way.
+- **Set `base_url`** whenever you know the public address, and always behind a
+  proxy, rather than relying on forwarded headers. It also restricts the server
+  to that host name (plus any `allowed_hosts`), which is what defeats DNS
+  rebinding against an intranet feed.
 - **Use a real certificate** (`tls_cert_path`/`tls_key_path`), or terminate TLS
   at a proxy and set `tls_enabled = false`.
 - **Set `max_package_size_bytes`** on any feed open to more than a few people.
 - **Keep `admin_api_key` distinct** from the push key, and do not expose `/admin`
   to the internet.
+- **Gate reads with a `[[feeds]]` entry.** `read_api_key` is a per-feed
+  setting; the implicit single feed at the root has none, so without
+  `[[feeds]]` anyone who can reach the server can restore from it.
+- **Remember that an id and version are one package across all feeds.** The
+  first feed to store a version fixes its content for every other feed, and a
+  push to one feed can pre-empt another. Feeds separate who may push and read,
+  not what a name means.
 - **Review `[feeds.mirror]` upstreams.** A mirror makes your server fetch
   from, and republish under your name, whatever that upstream serves.
+- **Pull a bad version from a mirror feed by deleting or disabling it.** A
+  deleted version is recorded and never fetched from the upstream again; a
+  disabled one stays in the feed, withheld.
+
+## Verifying a release
+
+Release archives, `SHA256SUMS` and the container image of every release after
+0.5.1 carry signed build provenance from the release workflow, and the image is
+also signed with cosign (keyless). Check them before you run them:
+
+```bash
+# An archive (or SHA256SUMS) downloaded from the GitHub Release.
+gh attestation verify yanuget-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz \
+  --repo thoscut/yanuget
+
+# The container image: provenance, then the cosign signature.
+gh attestation verify oci://ghcr.io/thoscut/yanuget:X.Y.Z --repo thoscut/yanuget
+cosign verify ghcr.io/thoscut/yanuget:X.Y.Z \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  --certificate-identity-regexp '^https://github\.com/thoscut/yanuget/\.github/workflows/release\.yml@refs/tags/v'
+```
+
+Either check failing means the file or image did not come from this
+repository's release workflow run for a tag; do not use it.

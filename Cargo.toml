@@ -31,19 +31,20 @@ tokio = { version = "1", features = ["full"] }
 axum = { version = "0.8", features = ["macros", "multipart"] }
 axum-server = { version = "0.7", default-features = false, features = ["tls-rustls-no-provider"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
-rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.7", features = ["trace", "cors"] }
 hyper = "1"
+hyper-util = { version = "0.1", features = ["tokio"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "macros", "migrate", "chrono"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "macros", "chrono"] }
 futures = "0.3"
 futures-util = "0.3"
 tokio-util = { version = "0.7", features = ["io"] }
 bytes = "1"
 zip = { version = "2", default-features = false, features = ["deflate"] }
-quick-xml = { version = "0.41", features = ["serialize"] }
+quick-xml = { version = "0.42", features = ["serialize"] }
 sha2 = "0.10"
 base64 = "0.23"
 hex = "0.4"
@@ -58,10 +59,17 @@ async-trait = "0.1"
 mime = "0.3"
 percent-encoding = "2"
 toml = "1"
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "rustls-tls-native-roots"] }
 rust-embed = { version = "8", features = ["debug-embed", "interpolate-folder-path"] }
 indicatif = "0.18"
 fs4 = "1.1.0"
+flate2 = "1"
+
+# The SSH inbox walks a directory the uploader writes to one component at a
+# time relative to open handles (openat with O_NOFOLLOW), so no link it plants
+# is ever followed. Already in the tree through fs4.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["fs"] }
 
 [dev-dependencies]
 tempfile = "3"

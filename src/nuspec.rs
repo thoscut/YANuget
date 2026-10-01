@@ -1,11 +1,38 @@
 //! Parsing of the `.nuspec` manifest embedded in every `.nupkg`.
 //!
 //! The nuspec is small XML, so it is parsed in full with an event-based reader.
-//! We match on *local* element names so the parser is agnostic to the (several)
-//! XML namespaces NuGet has used over the years.
+//!
+//! What matters most is reading the *same* manifest the NuGet client reads
+//! from the same bytes. The feed indexes an id, a version, dependencies and a
+//! license from it; if a crafted document made this parser see one identity and
+//! NuGet's `NuspecReader` another, the feed would advertise a package the client
+//! does not agree it installed, or evaluate the license policy against a
+//! license nobody else sees. So the rules follow `NuspecReader`:
+//!
+//! * `<metadata>` is a direct child of the root element, matched by local name
+//!   whatever its namespace (NuGet does the same, because some legacy packages
+//!   put the namespace there rather than on `<package>`).
+//! * Fields are *direct* children of `<metadata>`, in the namespace that is the
+//!   default at `<metadata>` — which for every real manifest is the one on
+//!   `<package>`, one of the `…/packaging/…/nuspec.xsd` URIs, or none. Element
+//!   and attribute names are case-sensitive, as in XML and in NuGet.
+//! * Dependencies are `metadata/dependencies/group/dependency`, or the legacy
+//!   `metadata/dependencies/dependency`; package types are
+//!   `metadata/packageTypes/packageType`.
+//!
+//! Where NuGet would quietly pick one of several readings, the manifest is
+//! refused instead of betting on agreeing with it: a duplicate `<id>`,
+//! `<version>`, `<license>` or other field (NuGet takes the first), a child
+//! element inside a text field (NuGet concatenates its text), a second
+//! `<metadata>`, `<dependencies>` mixing groups with ungrouped dependencies
+//! (NuGet ignores the ungrouped ones), a `DOCTYPE` or an undefined entity.
 
-use quick_xml::events::{BytesRef, Event};
-use quick_xml::{Reader, XmlVersion};
+use std::collections::HashSet;
+
+use quick_xml::events::{BytesRef, BytesStart, Event};
+use quick_xml::name::ResolveResult;
+use quick_xml::reader::NsReader;
+use quick_xml::XmlVersion;
 
 use crate::error::Error;
 use crate::models::{Dependency, DependencyGroup, PackageType};
@@ -43,8 +70,8 @@ impl Nuspec {
     /// de-duplicated case-insensitively (the first spelling wins), each cut to
     /// [`MAX_TAG_CHARS`], and at most [`MAX_TAGS`] of them.
     ///
-    /// Nothing else bounds this field but the 16 MiB manifest cap, and a
-    /// manifest of `a a a …` is some eight million tags — each rendered on every
+    /// Nothing else bounds this field but the 1 MiB manifest cap, and a
+    /// manifest of `a a a …` is half a million tags — each rendered on every
     /// gallery row, returned in every search result and indexed for the tag
     /// filter. nuget.org's own limits are tighter than these.
     pub fn tag_list(&self) -> Vec<String> {
@@ -78,9 +105,19 @@ impl Nuspec {
 
 /// Bounds on a single manifest. A real nuspec is a few KiB with a handful of
 /// dependency groups; these are far above anything legitimate and exist only so
-/// a hostile manifest cannot turn its (already capped) 16 MiB of XML into an
-/// unbounded pile of allocations, database rows and rendered HTML.
+/// a hostile manifest cannot turn its XML into an unbounded pile of
+/// allocations, database rows and rendered HTML.
+///
+/// [`MAX_NUSPEC_BYTES`] bounds the document itself. A real manifest is a few
+/// KiB, and even a metapackage listing every target framework is far below
+/// 1 MiB; 16 MiB used to be allowed, which let an upload that compresses to a
+/// few KiB buy seconds of parsing.
+pub const MAX_NUSPEC_BYTES: usize = 1024 * 1024;
 const MAX_ELEMENT_DEPTH: usize = 64;
+/// Attributes on one element. A real element carries at most four or five.
+/// quick-xml's duplicate-attribute check scans the attributes already seen, so
+/// an element with tens of thousands of them was quadratic to read.
+const MAX_ATTRIBUTES: usize = 64;
 const MAX_DEPENDENCY_GROUPS: usize = 512;
 const MAX_DEPENDENCIES: usize = 10_000;
 const MAX_PACKAGE_TYPES: usize = 64;
@@ -88,22 +125,173 @@ const MAX_PACKAGE_TYPES: usize = 64;
 pub const MAX_TAGS: usize = 64;
 pub const MAX_TAG_CHARS: usize = 64;
 
+/// A text field directly under `<metadata>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Field {
+    Id,
+    Version,
+    Title,
+    Authors,
+    Description,
+    Summary,
+    ReleaseNotes,
+    Language,
+    Tags,
+    IconUrl,
+    Icon,
+    Readme,
+    ProjectUrl,
+    LicenseUrl,
+    RequireLicenseAcceptance,
+    DevelopmentDependency,
+    /// `<license type="expression">`.
+    LicenseExpression,
+    /// `<license type="file">`.
+    LicenseFile,
+    /// `<license>` of a type NuGet does not know: still a field (it may not
+    /// contain elements, or appear twice), but its value is not used.
+    LicenseOther,
+}
+
+/// The text fields directly under `<metadata>`, by exact (case-sensitive)
+/// local name. `<license>` is handled separately, because its kind comes from
+/// an attribute.
+const FIELDS: &[(&str, Field)] = &[
+    ("id", Field::Id),
+    ("version", Field::Version),
+    ("title", Field::Title),
+    ("authors", Field::Authors),
+    ("description", Field::Description),
+    ("summary", Field::Summary),
+    ("releaseNotes", Field::ReleaseNotes),
+    ("language", Field::Language),
+    ("tags", Field::Tags),
+    ("iconUrl", Field::IconUrl),
+    ("icon", Field::Icon),
+    ("readme", Field::Readme),
+    ("projectUrl", Field::ProjectUrl),
+    ("licenseUrl", Field::LicenseUrl),
+    ("requireLicenseAcceptance", Field::RequireLicenseAcceptance),
+    ("developmentDependency", Field::DevelopmentDependency),
+];
+
+impl Field {
+    /// The element name, for messages.
+    fn name(self) -> &'static str {
+        FIELDS
+            .iter()
+            .find(|(_, field)| *field == self)
+            .map(|(name, _)| *name)
+            .unwrap_or("license")
+    }
+}
+
+/// What an open element is to the manifest. One frame per open element, so the
+/// stack depth is the element depth.
+#[derive(Debug, Clone, Copy)]
+enum Frame {
+    /// The document element (`<package>`).
+    Root,
+    Metadata,
+    Field(Field),
+    Dependencies,
+    /// An open `<group>`, by index into `dependency_groups`.
+    Group(usize),
+    PackageTypes,
+    /// Anything else. Its whole subtree is skipped (but still bounded).
+    Ignored,
+}
+
+/// Running totals checked as elements arrive, so no limit check has to walk
+/// what has already been collected.
+#[derive(Default)]
+struct Counts {
+    groups: usize,
+    dependencies: usize,
+    package_types: usize,
+}
+
+impl Counts {
+    fn add_group(&mut self) -> Result<(), Error> {
+        self.groups += 1;
+        if self.groups > MAX_DEPENDENCY_GROUPS {
+            return Err(invalid(format!(
+                "nuspec declares more than {MAX_DEPENDENCY_GROUPS} dependency groups"
+            )));
+        }
+        Ok(())
+    }
+
+    fn add_dependency(&mut self) -> Result<(), Error> {
+        self.dependencies += 1;
+        if self.dependencies > MAX_DEPENDENCIES {
+            return Err(invalid(format!(
+                "nuspec declares more than {MAX_DEPENDENCIES} dependencies"
+            )));
+        }
+        Ok(())
+    }
+
+    fn add_package_type(&mut self) -> Result<(), Error> {
+        self.package_types += 1;
+        if self.package_types > MAX_PACKAGE_TYPES {
+            return Err(invalid(format!(
+                "nuspec declares more than {MAX_PACKAGE_TYPES} package types"
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// [`parse_nuspec`] on a blocking thread.
+///
+/// Parsing is bounded, but it is still CPU work proportional to the manifest,
+/// and a push is served on an async worker: a few concurrent pushes of a
+/// crafted (and highly compressible) manifest would otherwise stall every
+/// request sharing those workers. This is what the push and symbol pipelines
+/// call.
+pub async fn parse_nuspec_blocking(xml: String) -> Result<Nuspec, Error> {
+    tokio::task::spawn_blocking(move || parse_nuspec(&xml))
+        .await
+        .map_err(|e| Error::Other(anyhow::anyhow!("nuspec parse task panicked: {e}")))?
+}
+
 /// Parse a `.nuspec` document. Returns [`Error::InvalidPackage`] when the XML is
-/// malformed, exceeds the structural limits above, or is missing the mandatory
-/// `id`/`version` fields.
+/// malformed, exceeds the structural limits above, is ambiguous in one of the
+/// ways the module docs list, or is missing the mandatory `id`/`version`.
 pub fn parse_nuspec(xml: &str) -> Result<Nuspec, Error> {
-    let mut reader = Reader::from_str(xml);
+    if xml.len() > MAX_NUSPEC_BYTES {
+        return Err(invalid(format!(
+            "nuspec is larger than {} KiB",
+            MAX_NUSPEC_BYTES / 1024
+        )));
+    }
+    let mut reader = NsReader::from_str(xml);
     // Text is *not* trimmed per event, because an element's text can arrive as
     // several events (see `text` below) and trimming each one would eat the
     // spaces between them. The accumulated value is trimmed once, at the end.
     reader.config_mut().trim_text(false);
+    // The reader records namespace declarations before the event reaches
+    // `attributes` below, so they need a cap of their own: no more bindings in
+    // scope at once than an element may have attributes (a real manifest
+    // declares one or two).
+    reader
+        .resolver_mut()
+        .set_max_namespace_bindings(MAX_ATTRIBUTES);
 
     let mut nuspec = Nuspec::default();
-    // Lower-cased local-name stack of currently open elements.
-    let mut path: Vec<String> = Vec::new();
-    // Index into `dependency_groups` for the currently open `<group>`, if any.
-    let mut current_group: Option<usize> = None;
-    // Text accumulated for the element currently open.
+    let mut stack: Vec<Frame> = Vec::new();
+    let mut root_closed = false;
+    let mut metadata_seen = false;
+    // The default namespace in scope at `<metadata>`: fields must be in it.
+    let mut metadata_ns: Option<String> = None;
+    // Single-occurrence elements already seen under `<metadata>`.
+    let mut seen: HashSet<&'static str> = HashSet::new();
+    // `<dependency>` directly under `<dependencies>` (the legacy, ungrouped
+    // form), kept apart until we know whether groups were used as well.
+    let mut ungrouped: Vec<Dependency> = Vec::new();
+    let mut counts = Counts::default();
+    // Text accumulated for the open field.
     //
     // quick-xml reports the content of one element as *one event per run
     // between entity references*: `Alice &amp; Bob` arrives as "Alice ", "&",
@@ -114,123 +302,309 @@ pub fn parse_nuspec(xml: &str) -> Result<Nuspec, Error> {
     let mut text = String::new();
 
     loop {
-        match reader.read_event() {
-            // Self-closing elements (`<dependency/>`, `<group/>`, ...) have no
-            // matching `End`, so they must not touch the path stack or leave a
-            // group "open".
-            Ok(Event::Empty(e)) => {
-                let name = local_name(e.name().as_ref());
-                handle_attr_element(&name, &e, &mut nuspec, current_group);
-                check_limits(&nuspec)?;
-            }
-            Ok(Event::Start(e)) => {
-                let name = local_name(e.name().as_ref());
+        let event = reader
+            .read_event()
+            .map_err(|e| invalid(format!("malformed nuspec: {e}")))?;
+        match event {
+            Event::Start(ref e) | Event::Empty(ref e) => {
+                let empty = matches!(event, Event::Empty(_));
 
-                // Checked before anything is pushed, so every branch below is
-                // covered. `<license>` used to push its synthetic entry and
-                // `continue` past a check that sat further down, which left the
-                // depth entirely unbounded for that one element name: nesting
-                // `<license>` some 800k times inside a 16 MiB manifest grew
-                // `path` without limit and made `assign_text`'s ancestor scan —
-                // O(depth) on every closing tag — quadratic. Measured at 834ms
-                // for a 1 MiB manifest, and `parse_nuspec` runs on a tokio
-                // worker rather than a blocking thread, so a few concurrent
-                // pushes of a tiny, highly compressible file stall the runtime.
-                if path.len() >= MAX_ELEMENT_DEPTH {
-                    return Err(Error::InvalidPackage(format!(
+                // Checked before anything is pushed, so every element name is
+                // bounded. `<license>` used to push its entry and `continue`
+                // past a check further down, which left the depth unbounded for
+                // that one name: nesting it thousands of times made an
+                // ancestor scan quadratic (834ms for a 1 MiB manifest).
+                if stack.len() >= MAX_ELEMENT_DEPTH {
+                    return Err(invalid(format!(
                         "nuspec nests deeper than {MAX_ELEMENT_DEPTH} elements"
                     )));
                 }
 
-                // `<license type="...">` carries its value as following text, so
-                // remember which flavour we are inside via a synthetic path entry.
-                if name == "license" {
-                    let kind = attr(&e, "type").unwrap_or_default();
-                    if kind.eq_ignore_ascii_case("file") {
-                        path.push("license:file".into());
-                    } else {
-                        path.push("license:expression".into());
-                    }
-                    continue;
-                }
+                let (ns, local) = reader.resolver().resolve_element(e.name());
+                let in_metadata_ns = namespace(ns)? == metadata_ns;
+                let local = local.as_ref();
 
-                handle_attr_element(&name, &e, &mut nuspec, current_group);
-                if name == "group" {
-                    // `handle_attr_element` always pushes a group for this name,
-                    // so the list is non-empty here.
-                    current_group = nuspec.dependency_groups.len().checked_sub(1);
+                let frame = match stack.last().copied() {
+                    None => {
+                        if root_closed {
+                            return Err(invalid("nuspec has more than one root element"));
+                        }
+                        attributes(e, [])?;
+                        Frame::Root
+                    }
+                    // Matched by local name in any namespace, as NuGet does.
+                    Some(Frame::Root) if local == "metadata" => {
+                        if std::mem::replace(&mut metadata_seen, true) {
+                            return Err(invalid("nuspec has more than one <metadata>"));
+                        }
+                        metadata_ns = namespace(reader.resolver().resolve_prefix(None, true))?;
+                        let [min_client] = attributes(e, ["minClientVersion"])?;
+                        nuspec.min_client_version = min_client;
+                        Frame::Metadata
+                    }
+                    Some(Frame::Metadata) if in_metadata_ns => {
+                        metadata_child(local, e, &mut seen, &mut nuspec)?
+                    }
+                    Some(Frame::Field(field)) => {
+                        return Err(invalid(format!(
+                            "nuspec field <{}> contains an element",
+                            field.name()
+                        )));
+                    }
+                    Some(Frame::Dependencies) if in_metadata_ns && local == "group" => {
+                        counts.add_group()?;
+                        let [target_framework] = attributes(e, ["targetFramework"])?;
+                        nuspec.dependency_groups.push(DependencyGroup {
+                            target_framework,
+                            dependencies: Vec::new(),
+                        });
+                        Frame::Group(nuspec.dependency_groups.len() - 1)
+                    }
+                    Some(Frame::Dependencies) if in_metadata_ns && local == "dependency" => {
+                        counts.add_dependency()?;
+                        ungrouped.push(dependency(e)?);
+                        Frame::Ignored
+                    }
+                    Some(Frame::Group(index)) if in_metadata_ns && local == "dependency" => {
+                        counts.add_dependency()?;
+                        let dep = dependency(e)?;
+                        nuspec.dependency_groups[index].dependencies.push(dep);
+                        Frame::Ignored
+                    }
+                    Some(Frame::PackageTypes) if in_metadata_ns && local == "packageType" => {
+                        counts.add_package_type()?;
+                        let [name, version] = attributes(e, ["name", "version"])?;
+                        if let Some(name) = name {
+                            nuspec.package_types.push(PackageType { name, version });
+                        }
+                        Frame::Ignored
+                    }
+                    Some(_) => {
+                        // Still validated: a document NuGet cannot load (a
+                        // duplicate attribute anywhere) is refused whole.
+                        attributes(e, [])?;
+                        Frame::Ignored
+                    }
+                };
+
+                // A self-closing element has no `End`, so it never becomes the
+                // open element. An empty field simply has no value.
+                if !empty {
+                    stack.push(frame);
+                    text.clear();
                 }
-                path.push(name);
-                // Any text seen before this child belongs to the parent, which
-                // in a nuspec is never a scalar field — drop it rather than let
-                // it bleed into the child's value.
-                text.clear();
-                check_limits(&nuspec)?;
             }
-            Ok(Event::Text(e)) => {
+            Event::Text(e) => {
                 // `xml10_content` decodes the bytes and normalizes EOLs. It does
-                // not resolve entities — quick-xml 0.41 reports those separately,
-                // as `GeneralRef` events, which is why an element's content
-                // arrives as several events and has to be reassembled.
-                match e.xml10_content() {
-                    Ok(decoded) => text.push_str(&decoded),
-                    Err(_) => continue,
+                // not resolve entities — quick-xml reports those separately, as
+                // `GeneralRef` events, which is why an element's content arrives
+                // as several events and has to be reassembled.
+                let decoded = e.xml10_content();
+                if in_field(&stack) {
+                    text.push_str(&decoded);
                 }
             }
             // `&amp;`, `&lt;`, `&#233;` … — the entity between two text runs.
-            Ok(Event::GeneralRef(e)) => {
-                if let Some(resolved) = resolve_reference(&e) {
+            Event::GeneralRef(e) => {
+                let resolved = resolve_reference(&e)
+                    .ok_or_else(|| invalid(format!("nuspec uses an undefined entity &{};", &*e)))?;
+                if in_field(&stack) {
                     text.push(resolved);
                 }
             }
             // A `<description><![CDATA[...]]></description>` is how a manifest
             // carries markup without escaping it. Ignoring the event dropped the
             // field entirely.
-            Ok(Event::CData(e)) => match e.decode() {
-                Ok(decoded) => text.push_str(&decoded),
-                Err(_) => continue,
-            },
-            Ok(Event::End(_)) => {
-                let value = std::mem::take(&mut text);
-                let value = value.trim();
-                if !value.is_empty() {
-                    assign_text(&mut nuspec, &path, value.to_string());
+            Event::CData(e) => {
+                let decoded = e.xml10_content();
+                if in_field(&stack) {
+                    text.push_str(&decoded);
                 }
-                if let Some(top) = path.pop() {
-                    if top == "group" {
-                        current_group = None;
+            }
+            // A DTD could define entities NuGet expands and this parser does
+            // not; no real manifest has one.
+            Event::DocType(_) => return Err(invalid("nuspec must not contain a DOCTYPE")),
+            Event::End(_) => {
+                if let Some(Frame::Field(field)) = stack.pop() {
+                    let value = std::mem::take(&mut text);
+                    let value = value.trim();
+                    if !value.is_empty() {
+                        assign(&mut nuspec, field, value.to_string());
                     }
                 }
+                if stack.is_empty() {
+                    root_closed = true;
+                }
             }
-            Ok(Event::Eof) => break,
-            Err(e) => {
-                return Err(Error::InvalidPackage(format!("malformed nuspec: {e}")));
-            }
+            Event::Eof => break,
             _ => {}
         }
     }
 
+    if !metadata_seen {
+        return Err(invalid("nuspec has no <metadata>"));
+    }
+    if !ungrouped.is_empty() {
+        if !nuspec.dependency_groups.is_empty() {
+            return Err(invalid(
+                "nuspec <dependencies> mixes <group> elements with ungrouped <dependency> \
+                 elements; NuGet ignores the ungrouped ones",
+            ));
+        }
+        nuspec.dependency_groups.push(DependencyGroup {
+            target_framework: None,
+            dependencies: ungrouped,
+        });
+    }
     if nuspec.id.trim().is_empty() {
-        return Err(Error::InvalidPackage("nuspec is missing <id>".into()));
+        return Err(invalid("nuspec is missing <id>"));
     }
     if nuspec.version.trim().is_empty() {
-        return Err(Error::InvalidPackage("nuspec is missing <version>".into()));
+        return Err(invalid("nuspec is missing <version>"));
     }
     Ok(nuspec)
+}
+
+fn invalid(message: impl Into<String>) -> Error {
+    Error::InvalidPackage(message.into())
+}
+
+/// Whether the open element is a text field, whose content is collected.
+fn in_field(stack: &[Frame]) -> bool {
+    matches!(stack.last(), Some(Frame::Field(_)))
+}
+
+/// The namespace an element resolved to, as an owned URI (`None` for no
+/// namespace). A prefix that was never declared makes the document malformed.
+fn namespace(ns: ResolveResult<'_>) -> Result<Option<String>, Error> {
+    match ns {
+        ResolveResult::Bound(ns) if !ns.as_ref().is_empty() => Ok(Some(ns.as_ref().to_string())),
+        ResolveResult::Bound(_) | ResolveResult::Unbound => Ok(None),
+        ResolveResult::Unknown(prefix) => Err(invalid(format!(
+            "nuspec uses an undeclared namespace prefix {prefix}"
+        ))),
+    }
+}
+
+/// Classify a direct child of `<metadata>` (already known to be in the
+/// manifest's namespace), recording what its attributes carry.
+fn metadata_child(
+    local: &str,
+    e: &BytesStart,
+    seen: &mut HashSet<&'static str>,
+    nuspec: &mut Nuspec,
+) -> Result<Frame, Error> {
+    // Each of these may appear once. NuGet reads the first and ignores the
+    // rest; this parser used to keep the last. Rather than hope two readers
+    // agree, a manifest that repeats one is refused.
+    let mut once = |name: &'static str| -> Result<(), Error> {
+        if seen.insert(name) {
+            Ok(())
+        } else {
+            Err(invalid(format!("nuspec declares <{name}> more than once")))
+        }
+    };
+
+    if let Some(&(name, field)) = FIELDS.iter().find(|(name, _)| *name == local) {
+        once(name)?;
+        attributes(e, [])?;
+        return Ok(Frame::Field(field));
+    }
+    Ok(match local {
+        "license" => {
+            once("license")?;
+            // NuGet parses the type case-insensitively.
+            let [kind] = attributes(e, ["type"])?;
+            match kind.as_deref().map(str::to_ascii_lowercase).as_deref() {
+                Some("expression") => Frame::Field(Field::LicenseExpression),
+                Some("file") => Frame::Field(Field::LicenseFile),
+                _ => Frame::Field(Field::LicenseOther),
+            }
+        }
+        "repository" => {
+            once("repository")?;
+            let [kind, url] = attributes(e, ["type", "url"])?;
+            nuspec.repository_type = kind;
+            nuspec.repository_url = url;
+            Frame::Ignored
+        }
+        "dependencies" => {
+            once("dependencies")?;
+            attributes(e, [])?;
+            Frame::Dependencies
+        }
+        "packageTypes" => {
+            once("packageTypes")?;
+            attributes(e, [])?;
+            Frame::PackageTypes
+        }
+        _ => {
+            attributes(e, [])?;
+            Frame::Ignored
+        }
+    })
+}
+
+/// Read a `<dependency>`. One without an id is refused: NuGet cannot construct
+/// it, so dropping it would advertise a dependency list the client disagrees
+/// with.
+fn dependency(e: &BytesStart) -> Result<Dependency, Error> {
+    let [id, version_range, include, exclude] =
+        attributes(e, ["id", "version", "include", "exclude"])?;
+    let id = id
+        .filter(|id| !id.trim().is_empty())
+        .ok_or_else(|| invalid("nuspec declares a <dependency> without an id"))?;
+    Ok(Dependency {
+        id,
+        version_range,
+        include,
+        exclude,
+    })
+}
+
+/// Collect the named attributes of `e` in a single pass, validating all of
+/// them on the way (a duplicate attribute, or a value with an undefined
+/// entity, makes the document one NuGet cannot load).
+///
+/// Names are matched exactly and without a namespace prefix, which is how
+/// `XElement.Attribute("id")` finds them.
+fn attributes<const N: usize>(
+    e: &BytesStart,
+    names: [&str; N],
+) -> Result<[Option<String>; N], Error> {
+    let mut values: [Option<String>; N] = std::array::from_fn(|_| None);
+    for (count, attribute) in e.attributes().enumerate() {
+        // Before the duplicate check on this attribute runs, so that check
+        // never scans more than the cap.
+        if count == MAX_ATTRIBUTES {
+            return Err(invalid(format!(
+                "nuspec element has more than {MAX_ATTRIBUTES} attributes"
+            )));
+        }
+        let attribute =
+            attribute.map_err(|err| invalid(format!("malformed nuspec attribute: {err}")))?;
+        let value = attribute
+            .normalized_value(XmlVersion::Implicit1_0)
+            .map_err(|err| invalid(format!("malformed nuspec attribute: {err}")))?;
+        let key = attribute.key.as_ref();
+        if let Some(slot) = names.iter().position(|n| *n == key) {
+            values[slot] = Some(value.into_owned());
+        }
+    }
+    Ok(values)
 }
 
 /// Resolve one entity reference to its character.
 ///
 /// A nuspec is a standalone document with no DTD, so the only references that
 /// can legitimately appear are numeric character references and the five XML
-/// predefined entities. Anything else is undefined and is dropped rather than
-/// reproduced literally, which would silently turn `&foo;` into text that looks
-/// like markup.
+/// predefined entities. Anything else is undefined, which makes the document
+/// one NuGet refuses to load.
 fn resolve_reference(e: &BytesRef) -> Option<char> {
     if let Ok(Some(ch)) = e.resolve_char_ref() {
         return Some(ch);
     }
-    match e.decode().ok()?.as_ref() {
+    match &**e {
         "amp" => Some('&'),
         "lt" => Some('<'),
         "gt" => Some('>'),
@@ -240,157 +614,33 @@ fn resolve_reference(e: &BytesRef) -> Option<char> {
     }
 }
 
-/// Reject a manifest that has grown past the structural limits.
-fn check_limits(n: &Nuspec) -> Result<(), Error> {
-    if n.dependency_groups.len() > MAX_DEPENDENCY_GROUPS {
-        return Err(Error::InvalidPackage(format!(
-            "nuspec declares more than {MAX_DEPENDENCY_GROUPS} dependency groups"
-        )));
-    }
-    if n.package_types.len() > MAX_PACKAGE_TYPES {
-        return Err(Error::InvalidPackage(format!(
-            "nuspec declares more than {MAX_PACKAGE_TYPES} package types"
-        )));
-    }
-    let deps: usize = n
-        .dependency_groups
-        .iter()
-        .map(|g| g.dependencies.len())
-        .sum();
-    if deps > MAX_DEPENDENCIES {
-        return Err(Error::InvalidPackage(format!(
-            "nuspec declares more than {MAX_DEPENDENCIES} dependencies"
-        )));
-    }
-    Ok(())
-}
-
-/// Process an element whose data lives entirely in its attributes. Shared by
-/// the `Start` and `Empty` event arms. For `<group>` this only *creates* the
-/// group; marking it as the currently-open group is the caller's job (it only
-/// applies to a non-empty `Start`).
-fn handle_attr_element(
-    name: &str,
-    e: &quick_xml::events::BytesStart,
-    nuspec: &mut Nuspec,
-    current_group: Option<usize>,
-) {
-    match name {
-        "metadata" => {
-            if let Some(v) = attr(e, "minclientversion") {
-                nuspec.min_client_version = Some(v);
-            }
-        }
-        "repository" => {
-            if let Some(v) = attr(e, "url") {
-                nuspec.repository_url = Some(v);
-            }
-            if let Some(v) = attr(e, "type") {
-                nuspec.repository_type = Some(v);
-            }
-        }
-        "group" => {
-            nuspec.dependency_groups.push(DependencyGroup {
-                target_framework: attr(e, "targetframework"),
-                dependencies: Vec::new(),
-            });
-        }
-        "dependency" => {
-            let dep = Dependency {
-                id: attr(e, "id").unwrap_or_default(),
-                version_range: attr(e, "version"),
-                include: attr(e, "include"),
-                exclude: attr(e, "exclude"),
-            };
-            if !dep.id.is_empty() {
-                let idx = match current_group {
-                    Some(i) => i,
-                    None => ungrouped_index(nuspec),
-                };
-                nuspec.dependency_groups[idx].dependencies.push(dep);
-            }
-        }
-        "packagetype" => {
-            if let Some(n) = attr(e, "name") {
-                nuspec.package_types.push(PackageType {
-                    name: n,
-                    version: attr(e, "version"),
-                });
-            }
-        }
-        _ => {}
-    }
-}
-
-/// Find or create the "ungrouped" dependency group (no target framework).
-fn ungrouped_index(nuspec: &mut Nuspec) -> usize {
-    if let Some(i) = nuspec
-        .dependency_groups
-        .iter()
-        .position(|g| g.target_framework.is_none())
-    {
-        return i;
-    }
-    nuspec.dependency_groups.push(DependencyGroup::default());
-    nuspec.dependency_groups.len() - 1
-}
-
-/// Assign a text value to the right field based on the open-element path.
-fn assign_text(nuspec: &mut Nuspec, path: &[String], text: String) {
-    let Some(top) = path.last() else { return };
-    // Only assign metadata-scalar fields when inside <metadata>.
-    let in_metadata = path.iter().any(|p| p == "metadata");
-    if !in_metadata {
-        return;
-    }
-    match top.as_str() {
-        "id" => nuspec.id = text,
-        "version" => nuspec.version = text,
-        "title" => nuspec.title = Some(text),
-        "authors" => nuspec.authors = Some(text),
-        "description" => nuspec.description = Some(text),
-        "summary" => nuspec.summary = Some(text),
-        "releasenotes" => nuspec.release_notes = Some(text),
-        "language" => nuspec.language = Some(text),
-        "tags" => nuspec.tags = Some(text),
-        "iconurl" => nuspec.icon_url = Some(text),
-        "icon" => nuspec.icon = Some(text),
-        "readme" => nuspec.readme = Some(text),
-        "projecturl" => nuspec.project_url = Some(text),
-        "licenseurl" => nuspec.license_url = Some(text),
-        "requirelicenseacceptance" => {
+/// Store a field's text.
+fn assign(nuspec: &mut Nuspec, field: Field, text: String) {
+    match field {
+        Field::Id => nuspec.id = text,
+        Field::Version => nuspec.version = text,
+        Field::Title => nuspec.title = Some(text),
+        Field::Authors => nuspec.authors = Some(text),
+        Field::Description => nuspec.description = Some(text),
+        Field::Summary => nuspec.summary = Some(text),
+        Field::ReleaseNotes => nuspec.release_notes = Some(text),
+        Field::Language => nuspec.language = Some(text),
+        Field::Tags => nuspec.tags = Some(text),
+        Field::IconUrl => nuspec.icon_url = Some(text),
+        Field::Icon => nuspec.icon = Some(text),
+        Field::Readme => nuspec.readme = Some(text),
+        Field::ProjectUrl => nuspec.project_url = Some(text),
+        Field::LicenseUrl => nuspec.license_url = Some(text),
+        Field::RequireLicenseAcceptance => {
             nuspec.require_license_acceptance = text.eq_ignore_ascii_case("true")
         }
-        "developmentdependency" => {
+        Field::DevelopmentDependency => {
             nuspec.development_dependency = text.eq_ignore_ascii_case("true")
         }
-        "license:expression" => nuspec.license_expression = Some(text),
-        "license:file" => nuspec.license_file = Some(text),
-        _ => {}
+        Field::LicenseExpression => nuspec.license_expression = Some(text),
+        Field::LicenseFile => nuspec.license_file = Some(text),
+        Field::LicenseOther => {}
     }
-}
-
-/// Extract the local (namespace-stripped) name and lower-case it.
-fn local_name(raw: &[u8]) -> String {
-    let s = std::str::from_utf8(raw).unwrap_or("");
-    let local = s.rsplit(':').next().unwrap_or(s);
-    local.to_ascii_lowercase()
-}
-
-/// Look up an attribute by its lower-cased local name.
-fn attr(e: &quick_xml::events::BytesStart, name: &str) -> Option<String> {
-    e.attributes().flatten().find_map(|a| {
-        let key = local_name(a.key.as_ref());
-        if key == name {
-            // `normalized_value` replaces the deprecated `unescape_value` and
-            // applies XML 1.0 attribute-value normalization plus entity resolution.
-            a.normalized_value(XmlVersion::Implicit1_0)
-                .ok()
-                .map(|v| v.into_owned())
-        } else {
-            None
-        }
-    })
 }
 
 #[cfg(test)]
@@ -399,18 +649,34 @@ mod tests {
     /// ones handled by a special branch.
     ///
     /// `<license>` used to push its synthetic path entry and `continue` past
-    /// the check. Depth was then unbounded for that name alone, which made the
-    /// ancestor scan in `assign_text` quadratic — a 1 MiB manifest of nested
-    /// `<license>` took 834ms, on a tokio worker rather than a blocking thread,
-    /// from an upload that compresses to a few KiB.
+    /// the check. Depth was then unbounded for that name alone, which made an
+    /// ancestor scan quadratic — a 1 MiB manifest of nested `<license>` took
+    /// 834ms, on a tokio worker rather than a blocking thread, from an upload
+    /// that compresses to a few KiB.
     #[test]
     fn no_element_can_nest_past_the_depth_cap() {
-        for (name, wrapper) in [
-            ("license", ("<package><metadata>", "</metadata></package>")),
-            // Outside `<metadata>` the ancestor scan has no early exit, which
-            // is the shape that actually went quadratic.
-            ("license", ("<package>", "</package>")),
-            ("group", ("<package><metadata>", "</metadata></package>")),
+        for (name, wrapper, expected) in [
+            // A field may not contain elements at all, so this one stops at
+            // the second level.
+            (
+                "license",
+                ("<package><metadata>", "</metadata></package>"),
+                "contains an element",
+            ),
+            ("license", ("<package>", "</package>"), "nests deeper"),
+            (
+                "group",
+                ("<package><metadata>", "</metadata></package>"),
+                "nests deeper",
+            ),
+            (
+                "group",
+                (
+                    "<package><metadata><dependencies>",
+                    "</dependencies></metadata></package>",
+                ),
+                "nests deeper",
+            ),
         ] {
             let n = MAX_ELEMENT_DEPTH + 50;
             let mut xml = String::from(wrapper.0);
@@ -421,7 +687,7 @@ mod tests {
             let start = std::time::Instant::now();
             let err = parse_nuspec(&xml).expect_err("{name} nested past the cap must be rejected");
             assert!(
-                err.to_string().contains("nests deeper"),
+                err.to_string().contains(expected),
                 "{name}: unexpected error {err}"
             );
             // Bailing at the cap means the cost cannot scale with the input.
@@ -604,5 +870,239 @@ mod tests {
         );
         assert!(parse_nuspec("<package><metadata><id>A</id></metadata></package>").is_err());
         assert!(parse_nuspec("not xml at <<<").is_err());
+    }
+
+    fn manifest(metadata: &str) -> String {
+        format!(
+            r#"<package xmlns="http://schemas.microsoft.com/packaging/2013/05/nuspec.xsd"><metadata>{metadata}</metadata></package>"#
+        )
+    }
+
+    fn rejection(xml: &str) -> String {
+        parse_nuspec(xml)
+            .expect_err("manifest must be refused")
+            .to_string()
+    }
+
+    /// NuGet's `NuspecReader` takes the *first* `<id>`; this parser used to
+    /// keep the last. Either way two readers can disagree about which package
+    /// the same bytes are, so a repeated field is refused.
+    #[test]
+    fn a_repeated_field_is_refused() {
+        for dup in [
+            "<id>A</id><version>1.0.0</version><id>B</id>",
+            "<id>A</id><version>1.0.0</version><version>2.0.0</version>",
+            r#"<id>A</id><version>1.0.0</version><license type="expression">MIT</license>
+               <license type="expression">GPL-3.0-only</license>"#,
+            "<id>A</id><version>1.0.0</version><licenseUrl>x</licenseUrl><licenseUrl>y</licenseUrl>",
+            "<id>A</id><version>1.0.0</version><dependencies/><dependencies/>",
+            r#"<id>A</id><version>1.0.0</version><repository url="a"/><repository url="b"/>"#,
+        ] {
+            assert!(
+                rejection(&manifest(dup)).contains("more than once"),
+                "{dup}"
+            );
+        }
+        assert!(rejection(
+            "<package><metadata><id>A</id><version>1</version></metadata><metadata/></package>"
+        )
+        .contains("more than one <metadata>"));
+    }
+
+    /// `<id>A<x/>B</id>` is "AB" to NuGet (it concatenates the text of the
+    /// whole subtree) and used to be "B" here.
+    #[test]
+    fn an_element_inside_a_field_is_refused() {
+        let err = rejection(&manifest(
+            "<id>Real<x>Ignored</x>Id</id><version>1.0.0</version>",
+        ));
+        assert!(err.contains("<id> contains an element"), "{err}");
+        let err = rejection(&manifest("<id>A</id><version>1.0.0<b/></version>"));
+        assert!(err.contains("contains an element"), "{err}");
+    }
+
+    /// Only direct children of `<metadata>` are fields. Any descendant used to
+    /// count, so an `<id>` buried in an unrelated element could replace the
+    /// real one.
+    #[test]
+    fn only_direct_children_of_metadata_are_fields() {
+        let n = parse_nuspec(&manifest(
+            r#"<id>Real</id><version>1.0.0</version>
+               <owners><id>Fake</id><version>9.9.9</version></owners>
+               <frameworkAssemblies><dependency id="Nope" /></frameworkAssemblies>
+               <dependencies><group targetFramework="net8.0">
+                 <dependency id="Yes" /><x><dependency id="Hidden" /></x>
+               </group></dependencies>"#,
+        ))
+        .unwrap();
+        assert_eq!(n.id, "Real");
+        assert_eq!(n.version, "1.0.0");
+        let deps: Vec<&str> = n
+            .dependency_groups
+            .iter()
+            .flat_map(|g| g.dependencies.iter().map(|d| d.id.as_str()))
+            .collect();
+        assert_eq!(deps, vec!["Yes"]);
+
+        // Outside `<metadata>` nothing counts at all.
+        let err = rejection(
+            "<package><files><metadata2/></files><id>A</id><version>1.0.0</version></package>",
+        );
+        assert!(err.contains("no <metadata>"), "{err}");
+    }
+
+    /// NuGet reads fields in the namespace that is the default at `<metadata>`;
+    /// an element of the same local name in another namespace is not a field.
+    #[test]
+    fn fields_are_read_in_the_manifest_namespace_only() {
+        let n = parse_nuspec(&manifest(
+            r#"<id xmlns="urn:other">Fake</id><o:version xmlns:o="urn:other">9.9.9</o:version>
+               <id>Real</id><version>1.0.0</version>"#,
+        ))
+        .unwrap();
+        assert_eq!(n.id, "Real");
+        assert_eq!(n.version, "1.0.0");
+
+        // A prefixed manifest whose default namespace is empty: NuGet looks
+        // for un-namespaced fields and finds none, and so does this parser.
+        let prefixed = r#"<n:package xmlns:n="http://schemas.microsoft.com/packaging/2013/05/nuspec.xsd">
+            <n:metadata><n:id>A</n:id><n:version>1.0.0</n:version></n:metadata></n:package>"#;
+        assert!(rejection(prefixed).contains("missing <id>"));
+
+        // Every real form parses: no namespace, and each schema version.
+        for ns in [
+            "",
+            r#" xmlns="http://schemas.microsoft.com/packaging/2010/07/nuspec.xsd""#,
+            r#" xmlns="http://schemas.microsoft.com/packaging/2011/08/nuspec.xsd""#,
+            r#" xmlns="http://schemas.microsoft.com/packaging/2012/06/nuspec.xsd""#,
+            r#" xmlns="http://schemas.microsoft.com/packaging/2013/01/nuspec.xsd""#,
+        ] {
+            let xml = format!(
+                "<package{ns}><metadata><id>A</id><version>1.0.0</version></metadata></package>"
+            );
+            assert_eq!(parse_nuspec(&xml).unwrap().id, "A", "{ns}");
+        }
+        // The legacy shape with the namespace on <metadata> rather than <package>.
+        let legacy = r#"<package><metadata xmlns="http://schemas.microsoft.com/packaging/2010/07/nuspec.xsd">
+            <id>A</id><version>1.0.0</version></metadata></package>"#;
+        assert_eq!(parse_nuspec(legacy).unwrap().id, "A");
+    }
+
+    /// Element names are case-sensitive in XML and in NuGet; `<ID>` is not an
+    /// id to the client, so it is not one here either.
+    #[test]
+    fn field_names_are_case_sensitive() {
+        let err = rejection(&manifest("<ID>A</ID><Version>1.0.0</Version>"));
+        assert!(err.contains("missing <id>"), "{err}");
+    }
+
+    #[test]
+    fn dependency_shapes_follow_nuget() {
+        // NuGet ignores ungrouped dependencies once any group exists.
+        let err = rejection(&manifest(
+            r#"<id>A</id><version>1.0.0</version><dependencies>
+               <dependency id="Legacy" /><group targetFramework="net8.0"><dependency id="B" /></group>
+               </dependencies>"#,
+        ));
+        assert!(err.contains("mixes"), "{err}");
+
+        // A dependency NuGet could not construct is not silently dropped.
+        let err = rejection(&manifest(
+            r#"<id>A</id><version>1.0.0</version><dependencies><dependency version="1.0" /></dependencies>"#,
+        ));
+        assert!(err.contains("without an id"), "{err}");
+
+        // A <dependency> outside <dependencies> is not a dependency.
+        let n = parse_nuspec(&manifest(
+            r#"<id>A</id><version>1.0.0</version><dependency id="Stray" />"#,
+        ))
+        .unwrap();
+        assert!(n.dependency_groups.is_empty());
+    }
+
+    #[test]
+    fn documents_nuget_cannot_load_are_refused() {
+        let err = rejection(&manifest("<id>A&custom;</id><version>1.0.0</version>"));
+        assert!(err.contains("undefined entity"), "{err}");
+        let err = rejection(
+            "<!DOCTYPE package [<!ENTITY x \"y\">]><package><metadata><id>A</id>\
+             <version>1.0.0</version></metadata></package>",
+        );
+        assert!(err.contains("DOCTYPE"), "{err}");
+        let err = rejection(&manifest(
+            r#"<id>A</id><version>1.0.0</version><dependencies><dependency id="B" id="C" /></dependencies>"#,
+        ));
+        assert!(err.contains("attribute"), "{err}");
+        assert!(parse_nuspec(
+            "<package><metadata><id>A</id><version>1</version></metadata></package><package/>"
+        )
+        .is_err());
+    }
+
+    /// quick-xml's duplicate-attribute check scans the attributes already
+    /// seen, so one element with tens of thousands of attributes was quadratic
+    /// to read, several times over. The count is now capped before that check
+    /// can grow.
+    #[test]
+    fn attributes_per_element_are_capped() {
+        let many: String = (0..20_000).map(|i| format!(" a{i}=\"x\"")).collect();
+        let xml = manifest(&format!(
+            "<id>A</id><version>1.0.0</version><dependencies><dependency id=\"B\"{many} /></dependencies>"
+        ));
+        let start = std::time::Instant::now();
+        let err = rejection(&xml);
+        assert!(err.contains("attributes"), "{err}");
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+
+        // Namespace declarations are counted by the reader itself.
+        let decls: String = (0..20_000)
+            .map(|i| format!(" xmlns:p{i}=\"u{i}\""))
+            .collect();
+        assert!(parse_nuspec(&format!("<package{decls}><metadata/></package>")).is_err());
+
+        // Ordinary elements are unaffected.
+        let few: String = (0..MAX_ATTRIBUTES - 1)
+            .map(|i| format!(" a{i}=\"x\""))
+            .collect();
+        let xml = manifest(&format!(
+            "<id>A</id><version>1.0.0</version><dependencies><dependency id=\"B\"{few} /></dependencies>"
+        ));
+        assert!(parse_nuspec(&xml).is_ok());
+    }
+
+    #[test]
+    fn the_document_size_is_capped() {
+        let padding = " ".repeat(MAX_NUSPEC_BYTES);
+        let err = rejection(&manifest(&format!(
+            "<id>A</id><version>1.0.0</version>{padding}"
+        )));
+        assert!(err.contains("larger than"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn parses_off_the_runtime() {
+        let n = parse_nuspec_blocking(SAMPLE.to_string()).await.unwrap();
+        assert_eq!(n.id, "Contoso.Utils");
+    }
+
+    #[test]
+    fn license_kinds() {
+        let n = parse_nuspec(&manifest(
+            r#"<id>A</id><version>1.0.0</version><license type="Expression">MIT</license>"#,
+        ))
+        .unwrap();
+        assert_eq!(n.license_expression.as_deref(), Some("MIT"));
+        let n = parse_nuspec(&manifest(
+            r#"<id>A</id><version>1.0.0</version><license type="file">LICENSE.txt</license>"#,
+        ))
+        .unwrap();
+        assert_eq!(n.license_file.as_deref(), Some("LICENSE.txt"));
+        assert!(n.license_expression.is_none());
+        // An unknown type is not read as an expression the policy evaluates.
+        let n = parse_nuspec(&manifest(
+            r#"<id>A</id><version>1.0.0</version><license type="other">MIT</license>"#,
+        ))
+        .unwrap();
+        assert!(n.license_expression.is_none() && n.license_file.is_none());
     }
 }

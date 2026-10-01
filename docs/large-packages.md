@@ -39,8 +39,9 @@ file. [`nupkg::read_archive`](https://github.com/thoscut/yanuget/blob/main/src/n
 `zip` crate **seek** to that directory and then to the single `.nuspec` entry.
 A 25 GB archive is therefore touched in two tiny reads (directory + manifest),
 never scanned front-to-back. The blocking ZIP work runs on a
-`spawn_blocking` thread so the async runtime is never stalled. The manifest read
-is additionally capped (16 MiB) to reject a hostile archive that declares an
+`spawn_blocking` thread so the async runtime is never stalled, and so does parsing
+the manifest. The manifest read
+is additionally capped (1 MiB) to reject a hostile archive that declares an
 absurd nuspec size.
 
 ### Store → atomic rename (zero copy)
@@ -108,8 +109,11 @@ which streams. The server is the part that does not buffer.
 - **Keep `{storage}/.uploads` on the storage filesystem** (the default) so
   ingest stays a rename. If you bind-mount storage, mount the whole directory,
   not a subpath, so `.uploads` rides along.
-- **No upload timeout is imposed by YANuget.** If you put a reverse proxy in
-  front, raise its request timeout and body-size limits (e.g. nginx
+- **Only silence times an upload out.** YANuget imposes no limit on how long
+  a transfer takes, but aborts one after `upload_idle_timeout_secs` (default
+  300) without a single byte arriving (`408`); `0` waits forever. A slow but
+  moving 25 GB push is never cut off. If you put a reverse proxy in front,
+  raise its request timeout and body-size limits too (e.g. nginx
   `client_max_body_size 0;` and generous `proxy_read_timeout`).
 - **Reverse-proxy buffering:** disable request/response buffering for the
   package endpoints (nginx `proxy_request_buffering off;`,

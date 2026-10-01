@@ -14,14 +14,42 @@ use tokio_util::io::ReaderStream;
 
 use crate::error::{Error, Result};
 
+/// How a response may be cached, and by whom.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct CachePolicy {
+    /// Only the requesting client may keep a copy: the content is behind a
+    /// read key, and a shared cache or CDN in front of the server would
+    /// otherwise hand it to anyone.
+    pub private: bool,
+    /// The bytes under this URL can never change, so a copy never needs
+    /// revalidating. Only true where the server guarantees it (for a package,
+    /// while overwriting is off); otherwise every use revalidates, which the
+    /// `ETag` makes a cheap `304`.
+    pub immutable: bool,
+}
+
+impl CachePolicy {
+    /// The `Cache-Control` value.
+    pub fn header_value(self) -> &'static str {
+        match (self.private, self.immutable) {
+            (false, true) => "public, max-age=31536000, immutable",
+            (true, true) => "private, max-age=31536000, immutable",
+            (false, false) => "public, no-cache",
+            (true, false) => "private, no-cache",
+        }
+    }
+}
+
 /// What a served file is, beyond its bytes.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct FileMeta<'a> {
     /// Offered as the `Content-Disposition: attachment` filename.
     pub download_name: Option<&'a str>,
-    /// A strong validator (a content hash). Served as `ETag`, answers a
-    /// matching `If-None-Match` with `304`, and marks the file immutable.
+    /// A strong validator (a content hash). Served as `ETag`, and answers a
+    /// matching `If-None-Match` with `304`.
     pub etag: Option<&'a str>,
+    /// Served as `Cache-Control`.
+    pub cache: CachePolicy,
     /// When the file was published. Served as `Last-Modified`, which BITS
     /// compares between the requests of one transfer to notice a changed file.
     pub last_modified: Option<DateTime<Utc>>,
@@ -41,9 +69,29 @@ pub async fn serve_local_file(
     content_type: &'static str,
     meta: FileMeta<'_>,
 ) -> Result<Response> {
-    let mut file = tokio::fs::File::open(&path)
+    let file = open(&path).await?;
+    serve_open_file(file, headers, content_type, meta).await
+}
+
+/// Open a stored file for serving; a missing one is a `404`.
+///
+/// Separate from [`serve_open_file`] so a caller can look up the file's
+/// validators *after* it holds the handle: an overwrite renames new bytes into
+/// place, and a tag read before the open could otherwise be served with bytes
+/// opened after it (and let an `If-Range` splice the two).
+pub async fn open(path: &std::path::Path) -> Result<tokio::fs::File> {
+    tokio::fs::File::open(path)
         .await
-        .map_err(|_| Error::PackageNotFound)?;
+        .map_err(|_| Error::PackageNotFound)
+}
+
+/// Serve an already-open file, as [`serve_local_file`] does.
+pub async fn serve_open_file(
+    mut file: tokio::fs::File,
+    headers: &HeaderMap,
+    content_type: &'static str,
+    meta: FileMeta<'_>,
+) -> Result<Response> {
     let total = file.metadata().await?.len();
 
     let mut builder = Response::builder()
@@ -59,22 +107,23 @@ pub async fn serve_local_file(
     if let Some(digest) = meta.sha256_base64 {
         builder = builder.header("repr-digest", format!("sha-256=:{digest}:"));
     }
-    // A published id/version is immutable in NuGet, so its bytes can be cached
-    // for as long as the client likes. Telling it so turns repeat restores of a
-    // multi-gigabyte package into a conditional request.
+    // With a validator, a client that already holds the file pays for a
+    // header exchange rather than for the bytes again — for a multi-gigabyte
+    // package, the difference that matters. Whether it may skip even that is
+    // the cache policy's call.
+    let cache_control = meta.cache.header_value();
+    builder = builder.header(header::CACHE_CONTROL, cache_control);
     let quoted = meta.etag.map(|tag| format!("\"{tag}\""));
     if let Some(quoted) = &quoted {
         if if_none_match_hits(headers, quoted) {
             return Response::builder()
                 .status(StatusCode::NOT_MODIFIED)
                 .header(header::ETAG, quoted)
-                .header(header::CACHE_CONTROL, IMMUTABLE)
+                .header(header::CACHE_CONTROL, cache_control)
                 .body(Body::empty())
                 .map_err(internal);
         }
-        builder = builder
-            .header(header::ETAG, quoted)
-            .header(header::CACHE_CONTROL, IMMUTABLE);
+        builder = builder.header(header::ETAG, quoted);
     }
 
     let range = if if_range_holds(headers, quoted.as_deref(), last_modified.as_deref()) {
@@ -125,8 +174,19 @@ enum RangeResult {
     Unsatisfiable,
 }
 
+/// A range position: decimal digits only. `u64::from_str` also takes a leading
+/// `+`, which RFC 9110 does not.
+fn range_pos(s: &str) -> Option<u64> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    s.parse().ok()
+}
+
 /// Parse a single-range `Range: bytes=...` header against a file of `total`
-/// bytes. Multi-range requests are intentionally treated as "serve whole file".
+/// bytes. Multi-range requests are intentionally treated as "serve whole file",
+/// and so is anything that is not a valid range (RFC 9110 §14.2: a server
+/// ignores a `Range` it cannot parse).
 fn parse_range(headers: &HeaderMap, total: u64) -> RangeResult {
     let Some(value) = headers.get(header::RANGE).and_then(|v| v.to_str().ok()) else {
         return RangeResult::None;
@@ -149,34 +209,33 @@ fn parse_range(headers: &HeaderMap, total: u64) -> RangeResult {
 
     match (start_s.trim(), end_s.trim()) {
         // Suffix range: last N bytes.
-        ("", suffix) => match suffix.parse::<u64>() {
-            Ok(0) => RangeResult::Unsatisfiable,
-            Ok(n) => {
+        ("", suffix) => match range_pos(suffix) {
+            Some(0) => RangeResult::Unsatisfiable,
+            Some(n) => {
                 let start = total.saturating_sub(n);
                 RangeResult::Satisfiable { start, end: last }
             }
-            Err(_) => RangeResult::None,
+            None => RangeResult::None,
         },
         // Open-ended range: start to EOF.
-        (start, "") => match start.parse::<u64>() {
-            Ok(start) if start <= last => RangeResult::Satisfiable { start, end: last },
-            Ok(_) => RangeResult::Unsatisfiable,
-            Err(_) => RangeResult::None,
+        (start, "") => match range_pos(start) {
+            Some(start) if start <= last => RangeResult::Satisfiable { start, end: last },
+            Some(_) => RangeResult::Unsatisfiable,
+            None => RangeResult::None,
         },
-        // Explicit range.
-        (start, end) => match (start.parse::<u64>(), end.parse::<u64>()) {
-            (Ok(start), Ok(end)) if start <= end && start <= last => RangeResult::Satisfiable {
+        // Explicit range. A last position before the first is not a range at
+        // all, so the header is ignored rather than answered with 416.
+        (start, end) => match (range_pos(start), range_pos(end)) {
+            (Some(start), Some(end)) if start > end => RangeResult::None,
+            (Some(start), Some(end)) if start <= last => RangeResult::Satisfiable {
                 start,
                 end: end.min(last),
             },
-            (Ok(_), Ok(_)) => RangeResult::Unsatisfiable,
+            (Some(_), Some(_)) => RangeResult::Unsatisfiable,
             _ => RangeResult::None,
         },
     }
 }
-
-/// `Cache-Control` for content that can never change under a given URL.
-const IMMUTABLE: &str = "public, max-age=31536000, immutable";
 
 /// An IMF-fixdate (`Sun, 06 Nov 1994 08:49:37 GMT`), the form HTTP dates take.
 fn http_date(when: DateTime<Utc>) -> String {
@@ -222,8 +281,17 @@ pub fn counts_as_download(method: &axum::http::Method, headers: &HeaderMap) -> b
     }
 }
 
+/// Whether a response carries the file's bytes (`200` or `206`), as opposed to
+/// a `304`, a `416` or an error.
+pub fn sends_content(response: &Response) -> bool {
+    matches!(
+        response.status(),
+        StatusCode::OK | StatusCode::PARTIAL_CONTENT
+    )
+}
+
 /// Whether `If-None-Match` names `quoted` (or is the `*` wildcard).
-fn if_none_match_hits(headers: &HeaderMap, quoted: &str) -> bool {
+pub fn if_none_match_hits(headers: &HeaderMap, quoted: &str) -> bool {
     let Some(raw) = headers
         .get(header::IF_NONE_MATCH)
         .and_then(|v| v.to_str().ok())
@@ -232,8 +300,8 @@ fn if_none_match_hits(headers: &HeaderMap, quoted: &str) -> bool {
     };
     raw.split(',').any(|candidate| {
         let c = candidate.trim();
-        // A weak validator (`W/"…"`) still identifies the same entity here,
-        // because the entity is immutable.
+        // Weak comparison, as RFC 9110 §13.1.2 prescribes for
+        // `If-None-Match`: a `W/` tag names the same entity.
         let c = c.strip_prefix("W/").unwrap_or(c);
         c == "*" || c == quoted
     })
@@ -325,6 +393,32 @@ mod tests {
             parse_range(&headers_with_range("bytes=2000-3000"), 1000),
             RangeResult::Unsatisfiable
         );
+    }
+
+    #[test]
+    fn invalid_ranges_are_ignored_not_refused() {
+        // Last before first is not a range: serve the whole file (RFC 9110).
+        assert_eq!(
+            parse_range(&headers_with_range("bytes=5-3"), 1000),
+            RangeResult::None
+        );
+        // Signs are not part of the grammar.
+        for bad in ["bytes=+5-10", "bytes=5-+10", "bytes=-+5", "bytes=+5-"] {
+            assert_eq!(
+                parse_range(&headers_with_range(bad), 1000),
+                RangeResult::None,
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn cache_policy_headers() {
+        let p = |private, immutable| CachePolicy { private, immutable }.header_value();
+        assert_eq!(p(false, true), "public, max-age=31536000, immutable");
+        assert_eq!(p(true, true), "private, max-age=31536000, immutable");
+        assert_eq!(p(false, false), "public, no-cache");
+        assert_eq!(p(true, false), "private, no-cache");
     }
 
     #[test]

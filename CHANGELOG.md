@@ -12,6 +12,39 @@ expected to change incompatibly at any version.
 
 ## [Unreleased]
 
+**Upgrading from 0.5.x needs attention.** This release follows a full review
+(see [ROADMAP.md](ROADMAP.md)); several changes fail closed where 0.5 was
+lenient:
+
+- An unparseable `YANUGET_*` environment value, a zero rate-limit window, a
+  half-configured TLS certificate/key pair, or mirror Basic and token auth set
+  together now **stop startup** instead of being ignored. `YANUGET_HOST`
+  accepts an IP address or `localhost`.
+- With `base_url` set, a request for any other host is answered `421`; list
+  further names in `allowed_hosts`.
+- Listed `cors_allowed_origins` allow `GET`/`HEAD`/`OPTIONS` only, and a
+  browser request marked `Sec-Fetch-Site: cross-site` cannot push, delete or
+  change anything.
+- Manifests are read as NuGet reads them, capped at 1 MiB; versions follow
+  NuGet's rules (no leading `v`, no leading zeros in numeric pre-release
+  parts, Int32 components, at most 64 characters). Symbol packages must match
+  an assembly in the package they belong to, as on nuget.org.
+- `yanuget migrate` overwrites only with `--overwrite`, no longer following the
+  target feed's `allow_overwrite`.
+- `scripts/Send-YanugetFile.ps1` takes the key as a `SecureString` or from
+  `YANUGET_API_KEY`, and requires https unless `-AllowHttp` is given.
+- The database is migrated on first start, to schema version 7: pre-release
+  keys stored before 0.5.0 are lower-cased, a search index is built, the
+  unused `packages` columns are dropped, and memberships, tags, attached-file
+  rows and symbol mappings get foreign keys to their version. That rebuilds
+  `packages` and four child tables once, which takes a while on a large
+  database. **Back the database up first**: afterwards older releases refuse
+  to open it, and restoring the backup is the only way back. Rows that point at
+  a version which no longer exists are counted in the log and removed; their
+  blobs and PDBs stay on disk, unserved.
+- The container image runs `yanuget healthcheck` and no longer contains
+  `curl`.
+
 ### Added
 
 - The gallery list can be sorted by downloads (still the default), name, or
@@ -69,9 +102,15 @@ expected to change incompatibly at any version.
     works across a server restart). `scripts/Send-YanugetFile.ps1` uploads
     resumably from PowerShell 7. A feed without a push key refuses files.
   - Or dropped over SSH into `[files].inbox_dir` with a `sha256sum` checksum
-    file; the importer moves each file out of the uploader's reach, verifies
-    it, attaches it, and explains a failure in a `.error` file next to it.
-    YANuget runs no SSH server of its own.
+    file; the importer opens each file once, without following links, copies
+    and verifies it through that handle into server-owned staging, attaches
+    it, and explains a failure in a `.error` file next to it. Symbolic links,
+    hard-linked files and anything but a regular file are refused wherever the
+    upload account could plant them — the file, its checksum file, its
+    directories and the `.error` report — so the account cannot make the
+    server read or write outside the inbox. The copy needs as much free space
+    again on the store's volume while it runs. YANuget runs no SSH server of
+    its own.
   - Stored once per content under `.blobs/sha256/`, so versions that attach
     the same image share its bytes; a file goes with its version when it is
     deleted, pruned or moved, and its blob when nothing references it any
@@ -82,6 +121,28 @@ expected to change incompatibly at any version.
     and check them; the admin page lists, downloads and deletes them; the
     stats page counts them; the settings page shows the file limits.
   - Configured under `[files]`. A feed can no longer be named `files`.
+- `reserved_id_prefixes` on a feed: ids under a reserved prefix (`Contoso.`
+  covers `Contoso` and `Contoso.*`) can be pushed, mirrored or migrated only
+  into that feed; every other feed answers `403`. Reservations may not
+  overlap. An id and version are one namespace across all feeds, so this is
+  how a feed keeps a low-trust feed or a public mirror from claiming its names.
+- `allowed_hosts` (`YANUGET_ALLOWED_HOSTS`), `max_connections` (default 4096)
+  and `rate_limit.max_failed_auth` (default 30 failed authentications per
+  window and client).
+- Mirror settings `proxy`, `ca_cert_path`, `download_timeout_secs` (default
+  3600) and `refresh_secs` (default 600); `yanuget migrate` gained
+  `--source-ca-cert`, `--source-password-file`, `--source-token-file` and the
+  `YANUGET_SOURCE_USERNAME`/`_PASSWORD`/`_TOKEN`/`_HEADERS` environment
+  variables, so credentials no longer have to appear on the command line.
+- `yanuget healthcheck`, which the container's `HEALTHCHECK` now runs: it reads
+  the same configuration as the server, so a port or `tls_enabled` set in the
+  TOML file is honoured.
+- The container image is published for `linux/amd64` and `linux/arm64`.
+  Release archives, `SHA256SUMS` and the image carry signed build provenance,
+  and the image is signed with cosign; SECURITY.md explains how to verify
+  them.
+- An orphan sweep, at startup and daily, removes package data no feed
+  references any more.
 
 ### Changed
 
@@ -125,7 +186,53 @@ expected to change incompatibly at any version.
   case-insensitively, and a gallery row shows at most 32. Nothing bounded the
   field but the 16 MiB manifest cap, so one push could put millions of tags on
   every page and search result.
-
+- Retention ranks and protects only versions clients can restore: pending and
+  disabled versions are neither counted towards `keep_latest_*` nor pruned.
+  Unlisted versions still count, since they restore by exact version.
+- An overwriting push keeps the version's listed, enabled and pinned state, its
+  download count and its attached files, and sends new content back to
+  approval in a gated feed. Copy and promote carry the source's listed,
+  enabled and pending state.
+- Search uses an SQLite FTS5 trigram index (still a case-insensitive substring
+  match). `q` is cut to 256 characters, and only the first 4000 characters of a
+  description are searched. The database runs with `synchronous = FULL`.
+- Registration and search show versions as published (original casing and
+  build metadata); embedded icons get an `iconUrl` served by the feed when the
+  web UI is on, and license expressions a `licenses.nuget.org` `licenseUrl`.
+  The standalone registration leaf has the shape the spec gives it.
+- Downloads are counted only for `200`/`206` responses, off the request path.
+- The read-through mirror fetches a requested version on a download miss even
+  outside the newest-N cap, re-lists a package after `refresh_secs`, bounds a
+  whole download by `download_timeout_secs` instead of the 30-second request
+  timeout, caches unknown ids and a failing upstream negatively with backoff,
+  and lets concurrent requests wait for a fetch in progress instead of
+  answering `404`. A version deleted, pruned or moved out of a feed is recorded
+  and never fetched back; pushing it again clears the record.
+- `yanuget migrate` unions search and catalog, reports failed catalog pages and
+  content mismatches as failures, keeps versions the source had unlisted
+  unlisted, and stages each run in its own directory.
+- Outbound TLS (mirror, migrate) trusts the system CA store as well as the
+  bundled roots.
+- The root feed index lists only feeds without a read key.
+- The release workflow runs with least-privilege tokens, SHA-pinned actions, no
+  caches and a protected `release` environment, and publishes to crates.io by
+  trusted publishing. CI adds `cargo deny`, a weekly audit and tests at the
+  MSRV. The docs and media toolchains install from hashed lock files. The
+  image is built on Debian trixie with base images pinned by digest.
+- Symbol packages for assemblies built without a PDB checksum (compilers
+  older than Visual Studio 15.9) are refused, as on nuget.org.
+- Only the manifest (and a declared readme or icon) is opened in a pushed
+  archive, so an unreadable entry elsewhere no longer rejects the package.
+- Every schema change is a numbered migration, run once in its own
+  `BEGIN IMMEDIATE` transaction and recorded in `user_version`, so a changed
+  index or trigger reaches existing databases instead of being kept by
+  `IF NOT EXISTS`. A database newer than the running build is refused.
+- Memberships, tags, attached files and symbol mappings are deleted with their
+  version by foreign key; a symbol push racing a purge fails instead of leaving
+  a mapping nothing owns.
+- The web layer and the SQLite backend are split into modules by concern
+  (`src/web/{protocol,publish,gallery,admin,…}.rs`, `src/web/ui/`,
+  `src/database/sqlite/`), with no change in behaviour.
 - A refused request now says why in its status line, where NuGet and
   Chocolatey print it: every client error's message is also sent as the HTTP/1
   reason phrase (printable ASCII, capped). A push of an id/version the feed
@@ -139,6 +246,11 @@ expected to change incompatibly at any version.
 - A `DELETE` that only unlists (without `hard_delete_enabled`) says so in an
   `X-NuGet-Warning` header, since the client reports "deleted" either way.
 
+### Removed
+
+- The unused `packages` columns `listed`, `enabled`, `downloads` and
+  `version_major` to `version_revision`, and two redundant indexes.
+
 ### Fixed
 
 - An overwrite that had to be refused — another feed holds the version, with
@@ -150,6 +262,111 @@ expected to change incompatibly at any version.
   or `COM1.pdb`, a trailing dot or space, or a control character. A symbol file
   named `c:x.pdb` inside a `.snupkg` could otherwise be written outside the
   store on a Windows host.
+- Retention no longer deletes approved versions in favour of pending ones: in
+  a gated feed with `prune_on_push`, pushing new builds could delete every
+  approved version before any was approved.
+- Versions stored before 0.5.0 with a mixed-case pre-release label could not be
+  downloaded, deleted, unlisted or pruned by exact version; they are migrated.
+- An overwriting push is atomic: it stores the new payload first, swaps the
+  rows in one transaction, and puts the previous build back if anything fails.
+  A failed store no longer loses the version.
+- A purge that failed part-way no longer strands a version whose payload is
+  gone; the leftovers are replaced on the next push or removed by the sweep.
+  Pins set while a cleanup runs are honoured.
+- A client disconnecting no longer interrupts indexing, symbol indexing,
+  attaches or mirror fetches half-way, and no longer leaks upload temp files.
+  Store writes are atomic and synced, and a failed rename no longer falls back
+  to copying over the live file.
+- Deleting a shared attached-file blob can no longer race an attach of the same
+  bytes to another version, and a retried tus `PATCH` can no longer write into
+  an upload that is being finished.
+- Package ids that start with a Windows device name (`Aux.Core`, `Con.Utils`)
+  are refused at push with a clear message, not at store time.
+- Two processes opening the same database no longer race the schema
+  migration.
+- A 304 no longer counts as a download; `Range: bytes=5-3` is ignored as RFC
+  9110 says; the `.nuspec` is streamed and, like the icon, has an `ETag`; an
+  overwrite can no longer pair new bytes with an old `ETag`; the CORS layer's
+  `Vary` is kept.
+- Admin bulk enable, disable, approve, pin and unpin apply in one transaction.
+- Graceful shutdown has a deadline on plain HTTP as it had on TLS; a retention
+  sweep stops between versions, and background tasks are awaited.
+- A credentialed mirror whose upstream redirects downloads to a CDN works.
+- `build.rs` no longer recompiles the crate on every build when `site/` is
+  absent. `chacha20` moves off the yanked 0.10.1.
+- Documentation: the trusted-proxy default, the Compose example, the nginx
+  client-address headers, consistent `base_url` advice, backups (ordering,
+  `tls/`, the full layout), the upload idle timeout, the feeds table, and the
+  systemd unit's `AF_UNIX`.
+- Versions follow NuGet's rules for new input: no leading `v`, no leading
+  zeros in numeric pre-release parts, components up to Int32, validated build
+  metadata, at most 64 characters. `1.0.0-01` and `1.0.0-1` can no longer
+  become two versions. Versions already stored stay readable under the rules
+  they were stored with.
+- An embedded readme or icon over 1 MiB is refused with a clear error instead
+  of being stored cut off (possibly mid-UTF-8) and still marked present.
+- Symbol pushes take the version lock and are all-or-nothing.
+- Autocomplete's `prerelease` defaults to `false`; search `totalDownloads`
+  counts every version; dependency-group `@id`s are percent-encoded.
+- An inbox import is refused, like a push, when it would leave less than
+  `min_free_disk_bytes` free.
+- A database created by the first multi-feed build failed to migrate (its
+  `feed_packages` lacked `downloads`).
+
+### Security
+
+- Read-gated content is served `private` with `Vary: Authorization,
+  X-NuGet-ApiKey` instead of `public`, so a shared cache cannot hand it to
+  anyone; `immutable` is sent only while overwrite is off.
+- Behind a trusted proxy the rate limiter keys on the rightmost untrusted
+  `X-Forwarded-For` hop rather than the client-chosen leftmost; IPv6 clients
+  are counted per /64; failed authentications have their own budget; keys
+  under 32 characters draw a warning. `X-Forwarded-Proto` is honoured only for
+  `http`/`https`.
+- Requests for a host other than `base_url`'s (or `allowed_hosts`) are refused,
+  which stops DNS rebinding from reaching an intranet feed through a browser.
+- Admin CSRF tokens are HMAC-signed with a per-process secret and expire after
+  12 hours; admin pages are `no-store`; key comparison no longer depends on the
+  key's length; read and admin keys are trimmed like push keys.
+- Package ids in URLs are validated before any lookup, and ids are case-folded
+  as ASCII in the database, matching storage and the version lock.
+- Header-read timeout and a connection cap; the plain index page escapes its
+  URL.
+- `/settings` shows only the scheme, host and port of an upstream, and `Debug`
+  output of configuration and credentials is redacted, as are upstream URLs in
+  logs and errors.
+- The mirror checks the addresses every host name resolves to, on every
+  connection and redirect (not only literal IPs), refuses more reserved and
+  embedded-IPv4 ranges and `localhost.`, and ignores `HTTP(S)_PROXY` unless
+  `mirror.proxy` is set. Upstream credentials go only to the upstream's own
+  scheme, host and port; redirects are checked hop by hop and `https` → `http`
+  is refused. Mirror and migrate downloads respect `min_free_disk_bytes`.
+- The license policy normalises SPDX ids (`+`, `-only`/`-or-later`, deprecated
+  ids) on both sides, so `GPL-2.0+` no longer passes a `GPL-2.0` deny rule, and
+  an allow list accepts only known SPDX exceptions after `WITH`.
+- Different content under an id and version the server already stores is
+  reported as a failure (`409`) rather than skipped as a race.
+- Symbol packages are verified against the version they belong to, as on
+  nuget.org: each Portable PDB must match the CodeView entry and PDB checksum
+  of the `.dll`/`.exe` beside it in the stored package. A symbol key is claimed
+  once, under a lock, and stored bytes are never replaced by different ones, so
+  an identical copy of a package pushed to another feed can no longer replace
+  the PDBs the first feed serves, and nobody can claim a key before its owner.
+- The manifest is read the way NuGet's reader reads it: fields only as direct
+  children of `<metadata>`, in its namespace, case-sensitively. Manifests NuGet
+  could read differently are refused — repeated `id`, `version`, `license` and
+  similar fields, elements inside a text field, dependencies outside
+  `metadata/dependencies`, a DOCTYPE or an undeclared prefix — so the feed can
+  no longer index an identity, dependencies or a license other than the one a
+  client sees.
+- A crafted manifest can no longer cost CPU out of proportion to its size: at
+  most 64 attributes per element, manifests capped at 1 MiB (was 16 MiB), and
+  parsing moved off the async runtime.
+- Symbol pushes stream PDBs to disk instead of holding up to 512 MiB in memory,
+  and an oversized PDB is refused rather than stored cut off.
+- A ZIP whose central directory is inconsistent — disagreeing entry counts,
+  ZIP64 records, extra or duplicate records — or that has two root manifests is
+  refused; an archive may hold at most 100 000 entries.
 
 ## [0.5.1] — 2026-09-24
 

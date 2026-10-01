@@ -21,6 +21,9 @@ pub struct UrlBuilder {
     /// about themselves has to stay inside that hive, so it is carried here
     /// rather than threaded through each call.
     registration_segment: &'static str,
+    /// Whether the gallery's icon endpoint is mounted, so that a package with
+    /// an embedded icon can be given an `iconUrl` pointing at it.
+    icons: bool,
 }
 
 /// The URL segment of each registration hive.
@@ -38,7 +41,28 @@ impl UrlBuilder {
             base,
             prefix: String::new(),
             registration_segment: HIVE_SEMVER1,
+            icons: false,
         }
+    }
+
+    /// Return this builder with [`Self::package_icon`] enabled, for a feed
+    /// that serves embedded icons.
+    pub fn with_icons(mut self, served: bool) -> Self {
+        self.icons = served;
+        self
+    }
+
+    /// `/packages/{id}/{version}/icon`: where a package's embedded icon is
+    /// served, or `None` when this feed does not serve icons.
+    pub fn package_icon(&self, lower_id: &str, normalized_version: &str) -> Option<String> {
+        self.icons.then(|| {
+            format!(
+                "{}/packages/{}/{}/icon",
+                self.base,
+                enc(lower_id),
+                enc(&normalized_version.to_lowercase()),
+            )
+        })
     }
 
     /// Return this builder addressing the requested registration hive.
@@ -215,7 +239,7 @@ impl UrlBuilder {
 
 /// Percent-encode a single path segment. Ids/versions are already restricted to
 /// a safe character set, but encoding keeps URLs valid for any stray symbols.
-fn enc(segment: &str) -> String {
+pub(super) fn enc(segment: &str) -> String {
     // Keep the characters legal in NuGet ids/versions readable.
     const KEEP: &percent_encoding::AsciiSet = &NON_ALPHANUMERIC
         .remove(b'.')

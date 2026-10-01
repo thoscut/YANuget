@@ -26,6 +26,20 @@ use crate::version::NuGetVersion;
 
 pub use sqlite::SqliteDatabase;
 
+/// The canonical, case-folded form of a package id: what every table stores
+/// in `lower_id` and what every lookup binds.
+///
+/// ASCII-only on purpose. Storage paths and the per-version lock fold with
+/// `to_ascii_lowercase`, and a valid id is ASCII anyway, so the database has
+/// to agree with them rather than apply Unicode rules of its own. With
+/// `to_lowercase` here, an id containing the Kelvin sign `K` (which folds to an
+/// ASCII `k` under Unicode rules only) matched a row while missing both the
+/// lock and the directory: a delete removed the rows, orphaned the payload and
+/// was not serialised against a concurrent push of the same version.
+pub fn canonical_id(id: &str) -> String {
+    id.to_ascii_lowercase()
+}
+
 /// A search query against the package index.
 #[derive(Debug, Clone)]
 pub struct SearchRequest {
@@ -146,6 +160,10 @@ impl SearchSort {
 #[derive(Debug, Clone)]
 pub struct SearchGroup {
     pub packages: Vec<Package>,
+    /// Downloads of every version of the id this feed serves, whether or not
+    /// the search's filters (pre-release, SemVer2, listed) admitted it: the
+    /// package's total, as `totalDownloads` means on nuget.org.
+    pub total_downloads: u64,
 }
 
 impl SearchGroup {
@@ -171,9 +189,12 @@ impl SearchGroup {
             .unwrap_or_else(|| self.latest())
     }
 
-    /// Total downloads across all versions in the group.
+    /// Total downloads of the package, across all its versions in the feed
+    /// (the `total_downloads` field); never less than what the matching
+    /// versions alone add up to, so a group built without it still counts.
     pub fn total_downloads(&self) -> u64 {
-        self.packages.iter().map(|p| p.downloads).sum()
+        let shown: u64 = self.packages.iter().map(|p| p.downloads).sum();
+        self.total_downloads.max(shown)
     }
 }
 
@@ -225,6 +246,18 @@ impl Membership {
     }
 }
 
+/// A flag change applied to many memberships at once by
+/// [`PackageDatabase::update_memberships`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MembershipChange {
+    /// Set the admin `enabled` flag.
+    Enabled(bool),
+    /// Set the retention pin.
+    Pinned(bool),
+    /// Clear the pending flag.
+    Approve,
+}
+
 /// A package version together with its membership state in one feed. Returned by
 /// admin/retention listings that must see pending, disabled and flagged rows.
 #[derive(Debug, Clone)]
@@ -258,14 +291,37 @@ pub trait PackageDatabase: Send + Sync {
     async fn package_data_exists(&self, id: &str, version: &NuGetVersion) -> Result<bool>;
 
     /// Fetch global package metadata, ignoring feed membership and visibility.
+    ///
+    /// Listing, the admin flag and download counts belong to each feed's
+    /// membership, so the package comes back listed, enabled and with no
+    /// downloads; read a feed for those.
     async fn get_package_data(&self, id: &str, version: &NuGetVersion) -> Result<Option<Package>>;
 
-    /// Hard-delete global metadata (and every feed membership). Returns `true`
-    /// if a row was removed. Caller is responsible for storage/symbol cleanup.
+    /// Hard-delete global metadata and everything recorded against the
+    /// version: every feed membership, its tags, attached-file rows and symbol
+    /// mappings. Returns `true` if a row was removed. The caller deletes the
+    /// stored bytes those rows point at first (payload, file blobs, PDBs).
     async fn delete_package_data(&self, id: &str, version: &NuGetVersion) -> Result<bool>;
 
     /// How many feeds currently contain this version.
     async fn feed_count(&self, id: &str, version: &NuGetVersion) -> Result<i64>;
+
+    /// Insert the global data (if absent) and a membership, in one
+    /// transaction: either both are recorded or neither is. Returns whether the
+    /// global data was new, like [`Self::upsert_package_data`];
+    /// [`Error::PackageAlreadyExists`](crate::error::Error::PackageAlreadyExists)
+    /// when the version is already a member of the feed.
+    async fn add_version(&self, package: &Package, membership: &Membership) -> Result<bool>;
+
+    /// Replace a version's global data with a new build's, and set the
+    /// membership's state, in one transaction. What hangs off the version
+    /// rather than off one build of it stays: attached files, every other
+    /// feed's membership, and this membership's download count.
+    async fn replace_version(&self, package: &Package, membership: &Membership) -> Result<()>;
+
+    /// Up to `limit` versions whose global data no feed holds any more: what a
+    /// purge that failed part-way leaves behind.
+    async fn orphaned_versions(&self, limit: i64) -> Result<Vec<Package>>;
 
     // --- feed membership ---
 
@@ -348,6 +404,17 @@ pub trait PackageDatabase: Send + Sync {
         pinned: bool,
     ) -> Result<bool>;
 
+    /// Apply one flag change to several versions of `id` in `feed`, in a
+    /// single transaction: every row changes, or — if any is missing or a
+    /// write fails — none does. Returns how many rows were updated.
+    async fn update_memberships(
+        &self,
+        feed: &str,
+        id: &str,
+        versions: &[NuGetVersion],
+        change: MembershipChange,
+    ) -> Result<u64>;
+
     /// Whether a version may be served from `feed`: present, enabled and not
     /// pending. (Unlisted-but-enabled versions are still servable by version.)
     async fn is_servable(&self, feed: &str, id: &str, version: &NuGetVersion) -> Result<bool>;
@@ -355,6 +422,16 @@ pub trait PackageDatabase: Send + Sync {
     /// Every version of a package id in `feed` — including unlisted, disabled
     /// **and pending** — sorted ascending. For admin views and retention.
     async fn find_all_versions(&self, feed: &str, id: &str) -> Result<Vec<FeedVersion>>;
+
+    /// [`Self::find_all_versions`] for many ids at once (lower-cased), in a
+    /// few statements rather than one per id. Grouped by id in no particular
+    /// order, each id's versions ascending.
+    async fn find_all_versions_of(&self, feed: &str, ids: &[String]) -> Result<Vec<FeedVersion>>;
+
+    /// For every version of the given ids (lower-cased): how many feeds hold
+    /// it and how many bytes of attached files it has. What deleting it would
+    /// free, for many versions in two statements.
+    async fn version_footprints(&self, ids: &[String]) -> Result<Vec<VersionFootprint>>;
 
     /// Atomically increment the per-feed download counter for a version.
     async fn increment_downloads(&self, feed: &str, id: &str, version: &NuGetVersion)
@@ -407,6 +484,9 @@ pub trait PackageDatabase: Send + Sync {
     /// A version's files, by name.
     async fn files_for(&self, id: &str, version: &NuGetVersion) -> Result<Vec<PackageFile>>;
 
+    /// The files of every version of an id, by version then name.
+    async fn files_for_id(&self, id: &str) -> Result<Vec<PackageFile>>;
+
     /// One of a version's files, by name (ignoring case).
     async fn get_file(
         &self,
@@ -448,15 +528,21 @@ pub trait PackageDatabase: Send + Sync {
 
     // --- symbols (global; keyed by SSQP signature) ---
 
-    /// Record a symbol-file mapping: its SSQP `key`/`filename` and the owning
-    /// package version (for cleanup on delete/retention).
+    /// Claim a symbol-file mapping: its SSQP `key`/`filename` and the owning
+    /// package version (for serving and for cleanup on delete/retention).
+    /// Returns `true` when this call created it. An existing mapping is never
+    /// changed — a key belongs to whichever version claimed it first — so
+    /// `false` means someone else holds it.
     async fn add_symbol(
         &self,
         key: &str,
         filename: &str,
         id: &str,
         version: &NuGetVersion,
-    ) -> Result<()>;
+    ) -> Result<bool>;
+
+    /// Remove one symbol-file mapping (undoing a claim whose push failed).
+    async fn delete_symbol(&self, key: &str, filename: &str) -> Result<()>;
 
     /// Resolve a symbol file by its SSQP key and filename, returning the owning
     /// package's lower-cased id and normalized version when present.
@@ -468,6 +554,18 @@ pub trait PackageDatabase: Send + Sync {
     /// Remove all symbol mappings for a package version. Returns how many rows
     /// were removed.
     async fn delete_symbols(&self, id: &str, version: &NuGetVersion) -> Result<u64>;
+
+    // --- tombstones (per feed) ---
+
+    /// Record that a version was deliberately removed from `feed` (deleted,
+    /// pruned or moved out), so a read-through mirror never fetches it back.
+    async fn add_tombstone(&self, feed: &str, id: &str, version: &NuGetVersion) -> Result<()>;
+
+    /// Whether a version was removed from `feed` and not pushed again since.
+    async fn is_tombstoned(&self, feed: &str, id: &str, version: &NuGetVersion) -> Result<bool>;
+
+    /// Forget a tombstone: a push of the version brings it back on purpose.
+    async fn clear_tombstone(&self, feed: &str, id: &str, version: &NuGetVersion) -> Result<()>;
 }
 
 /// Feed-wide aggregate statistics.
@@ -489,6 +587,18 @@ pub struct DatabaseStats {
     pub file_count: i64,
     /// Their total size, in bytes.
     pub file_bytes: i64,
+}
+
+/// What one version occupies beyond its own membership, from
+/// [`PackageDatabase::version_footprints`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VersionFootprint {
+    pub lower_id: String,
+    pub normalized_version: String,
+    /// Feeds holding the version; its payload is freed only when this is 1.
+    pub feeds: i64,
+    /// Total size of its attached files, in bytes.
+    pub file_bytes: u64,
 }
 
 /// A symbol file's owning package, resolved from an SSQP lookup.

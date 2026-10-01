@@ -1,6 +1,6 @@
 /*
  * The documentation site in the gallery's own look (see STYLE in
- * src/web/ui.rs): a grey floor, carbon ink, one floor-marking yellow, and
+ * src/web/ui/layout.rs): a grey floor, carbon ink, one floor-marking yellow, and
  * Atkinson Hyperlegible Next. Material's palette variables are remapped here
  * rather than its rules rewritten, so a theme update keeps working.
  *

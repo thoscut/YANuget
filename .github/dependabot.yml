@@ -27,6 +27,10 @@ updates:
       - dependency-name: sqlx
         versions: [">=0.9.0"]
 
+  # Every action in the workflows is pinned to a full commit SHA with its
+  # release in a trailing comment (`@<sha> # v7.0.1`). Dependabot understands
+  # that form and proposes the new SHA and comment together, which is what
+  # keeps the pins from turning into a reason not to update.
   - package-ecosystem: github-actions
     directory: /
     schedule:
@@ -35,28 +39,56 @@ updates:
       actions:
         patterns: ["*"]
     ignore:
-      # `dtolnay/rust-toolchain@1.88.0` does not name a version of the action —
-      # that ref *is* the toolchain the action installs, and it is pinned to the
-      # crate's MSRV on purpose. Dependabot cannot tell the two apart and
-      # "upgraded" it to 1.100.0, which would have left a job still called
-      # "Minimum supported Rust (1.88)" installing Rust 1.100 and checking
-      # nothing. It failed loudly that time; a version that existed would have
-      # passed and been worse.
+      # `dtolnay/rust-toolchain`'s refs are not versions of the action: its
+      # branches are named after the toolchain they install, which is how
+      # Dependabot once "upgraded" the MSRV job's `@1.88.0` to `@1.100.0`. It
+      # is now pinned to a commit of its master branch, with the toolchain
+      # given as `toolchain:`, and that commit has no release for Dependabot
+      # to track. Bump it by hand; it is a thin wrapper around rustup.
       - dependency-name: dtolnay/rust-toolchain
 
+  # The docs toolchain (requirements-docs.in, compiled into the hashed
+  # requirements-docs.txt) runs in the release builds and the image build.
+  # Dependabot recompiles the lock, hashes included.
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      docs-toolchain:
+        patterns: ["*"]
+
+  # The media capture's Python (Pillow) and npm (Playwright) dependencies.
+  - package-ecosystem: pip
+    directory: /scripts/media
+    schedule:
+      interval: monthly
+
+  - package-ecosystem: npm
+    directory: /scripts/media
+    schedule:
+      interval: monthly
+
+  # Both base images in the Dockerfile are pinned by digest as well as tag;
+  # this is what moves the digests.
   - package-ecosystem: docker
     directory: /
     schedule:
       interval: monthly
     ignore:
-      # Same trap as `dtolnay/rust-toolchain` above: `rust:1.88-slim` does not
-      # name a version of a dependency, it declares the crate's MSRV. The
-      # builder stage is pinned there on purpose so the image build re-checks
-      # that the crate still compiles at its floor, and it is raised by hand
-      # together with `rust-version` in Cargo.toml. Taking a bump here would
-      # silently retire that check.
+      # Same trap as `dtolnay/rust-toolchain` above: `rust:1.88-slim-trixie`
+      # does not name a version of a dependency, it declares the crate's MSRV.
+      # The builder stage is pinned there on purpose so the image build
+      # re-checks that the crate still compiles at its floor, and it is raised
+      # by hand together with `rust-version` in Cargo.toml. Taking a bump here
+      # would silently retire that check. Only the tag's version is ignored: a
+      # new digest for the same tag (a rebuilt image) is still proposed.
       #
       # `debian` — the runtime base, and the only layer that actually ships —
       # is deliberately not ignored, so the released image keeps getting its
       # security updates.
       - dependency-name: rust
+        update-types:
+          - version-update:semver-major
+          - version-update:semver-minor
+          - version-update:semver-patch

@@ -46,19 +46,24 @@ impl OverwriteMode {
         }
     }
 
-    /// Parse a free-form environment-variable value (lenient; unknown ⇒ off).
-    fn parse_lenient(v: &str) -> OverwriteMode {
+    /// Parse an environment-variable value: the TOML spellings plus the
+    /// boolean ones. Anything else is an error, never a silent "off".
+    fn parse_env(name: &str, v: &str) -> Result<OverwriteMode> {
         match v
             .trim()
             .to_ascii_lowercase()
             .replace(['_', ' '], "-")
             .as_str()
         {
-            "true" | "all" | "enabled" | "yes" | "on" | "1" => OverwriteMode::Enabled,
+            "true" | "all" | "enabled" | "yes" | "on" | "1" => Ok(OverwriteMode::Enabled),
+            "false" | "none" | "disabled" | "no" | "off" | "0" => Ok(OverwriteMode::Disabled),
             "prerelease-only" | "prerelease" | "prereleaseonly" | "pre" => {
-                OverwriteMode::PrereleaseOnly
+                Ok(OverwriteMode::PrereleaseOnly)
             }
-            _ => OverwriteMode::Disabled,
+            _ => Err(env_error(
+                name,
+                &format!("must be true, false or prerelease-only, not {v:?}"),
+            )),
         }
     }
 }
@@ -112,7 +117,10 @@ impl<'de> Deserialize<'de> for OverwriteMode {
 }
 
 /// Top-level server configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Debug` is written out (below) rather than derived, so the keys it holds
+/// never reach a log line or a panic message.
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     /// Interface to bind to.
@@ -153,6 +161,10 @@ pub struct Config {
     /// Refuse an upload that would leave less than this many bytes free on the
     /// storage volume (`507 Insufficient Storage`). `0` turns the check off.
     pub min_free_disk_bytes: u64,
+    /// Concurrent connections the server accepts; one over the cap is closed
+    /// as soon as it is accepted. `0` is unlimited. Bounds the sockets (and
+    /// file descriptors) that slow or idle clients can hold.
+    pub max_connections: usize,
     /// Whether (and which) pushes may overwrite an existing id/version. Off by
     /// default to preserve NuGet's immutability guarantee.
     pub allow_overwrite: OverwriteMode,
@@ -213,6 +225,17 @@ pub struct Config {
     /// had none against a browser. List the origins that genuinely need it, or
     /// `*` to restore the old behaviour deliberately.
     pub cors_allowed_origins: Vec<String>,
+    /// Host names this server answers to. A request whose `Host` (or, from a
+    /// trusted proxy, `X-Forwarded-Host`) names anything else gets `421
+    /// Misdirected Request`. The host of `base_url` is always included, so
+    /// setting `base_url` alone restricts the server to it; with neither set,
+    /// any host is accepted. `*` accepts any host explicitly.
+    ///
+    /// This is what stops DNS rebinding: a hostile page can point a name it
+    /// controls at an intranet feed's address and read it from a browser, but
+    /// the browser still sends the hostile name as `Host`. `/health` and its
+    /// siblings answer whatever the host, for probes that use an address.
+    pub allowed_hosts: Vec<String>,
     /// Hosted feeds. When empty, a single implicit feed named `default` is
     /// served at the server root (the historical single-feed behaviour). When
     /// non-empty, each feed is mounted under `/{name}` and the root serves a
@@ -264,10 +287,11 @@ impl Default for LicensePolicyConfig {
 }
 
 /// Authentication for an upstream mirror. All fields are optional; set the
-/// `username`/`password` pair for HTTP Basic, `token` for a Bearer token, and/or
-/// `headers` for arbitrary custom headers (e.g. a private-feed API key). When
-/// more than one is set they are all sent.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// `username`/`password` pair for HTTP Basic *or* `token` for a Bearer token,
+/// and/or `headers` for arbitrary custom headers (e.g. a private-feed API key).
+/// Headers are sent alongside either. They go only to the upstream's own
+/// scheme, host and port, never to hosts its service index names.
+#[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MirrorAuthConfig {
     /// HTTP Basic username (sent with `password`).
@@ -285,18 +309,60 @@ impl MirrorAuthConfig {
     pub fn is_set(&self) -> bool {
         self.username.is_some() || self.token.is_some() || !self.headers.is_empty()
     }
+
+    /// Reject combinations that cannot all be sent. Basic and Bearer both
+    /// need `Authorization`, and one of them used to be dropped without a
+    /// word — so a token the operator believed was in use never was.
+    pub fn validate(&self) -> Result<()> {
+        if self.username.is_some() && self.token.is_some() {
+            return Err(Error::BadRequest(
+                "mirror auth sets both username (HTTP Basic) and token (Bearer); \
+                 both need the Authorization header, so set only one"
+                    .into(),
+            ));
+        }
+        if self.password.is_some() && self.username.is_none() {
+            return Err(Error::BadRequest(
+                "mirror auth sets a password without a username".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Debug for MirrorAuthConfig {
+    /// Secrets are shown only as present; custom headers by name only, since
+    /// their values are keys.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let redacted = |v: &Option<String>| v.as_ref().map(|_| "<redacted>");
+        f.debug_struct("MirrorAuthConfig")
+            .field("username", &self.username)
+            .field("password", &redacted(&self.password))
+            .field("token", &redacted(&self.token))
+            .field("headers", &self.headers.keys().collect::<Vec<_>>())
+            .finish()
+    }
 }
 
 /// Per-feed upstream mirroring (read-through caching of a public NuGet feed).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MirrorConfig {
     /// Master switch. Off by default.
     pub enabled: bool,
     /// Upstream V3 service index to mirror from.
     pub upstream: String,
-    /// Per-request timeout (seconds) when talking to the upstream.
+    /// Timeout (seconds) for connecting to the upstream, for any silence while
+    /// it answers, and for a whole metadata request.
     pub timeout_secs: u64,
+    /// Deadline (seconds) for one whole `.nupkg` download; `0` removes it. A
+    /// stalled transfer is cut off by `timeout_secs` either way; this bounds
+    /// one that trickles.
+    pub download_timeout_secs: u64,
+    /// How long (seconds) a package's upstream version list is trusted before
+    /// a read lists it again, so new upstream releases appear. It is also how
+    /// long an id the upstream does not have is not asked for again.
+    pub refresh_secs: u64,
     /// Credentials for an authenticated upstream feed (default: none).
     pub auth: MirrorAuthConfig,
     /// Allow upstream URLs that point at loopback/link-local/private addresses.
@@ -315,6 +381,42 @@ pub struct MirrorConfig {
     /// have hundreds of versions and tens of gigabytes behind it; without a
     /// bound one anonymous request for it pulls the lot.
     pub max_versions_per_package: Option<usize>,
+    /// Outbound proxy for upstream requests (`http://proxy:3128`). Unset, the
+    /// mirror connects directly and ignores `HTTP(S)_PROXY` in the environment.
+    pub proxy: Option<String>,
+    /// PEM file of extra CA certificates to trust for the upstream, on top of
+    /// the system store and the bundled Mozilla roots — for an upstream behind
+    /// an internal CA or a TLS-inspecting proxy.
+    pub ca_cert_path: Option<PathBuf>,
+}
+
+impl MirrorConfig {
+    /// Reject a mirror configuration that cannot work as written.
+    pub fn validate(&self) -> Result<()> {
+        self.auth.validate()
+    }
+}
+
+impl std::fmt::Debug for MirrorConfig {
+    /// The upstream and proxy URLs can carry credentials of their own
+    /// (`https://user:token@host/…`), so they are shown without userinfo or
+    /// query.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let redact = crate::mirror::redact_url;
+        f.debug_struct("MirrorConfig")
+            .field("enabled", &self.enabled)
+            .field("upstream", &redact(&self.upstream))
+            .field("timeout_secs", &self.timeout_secs)
+            .field("download_timeout_secs", &self.download_timeout_secs)
+            .field("refresh_secs", &self.refresh_secs)
+            .field("auth", &self.auth)
+            .field("allow_private_upstream", &self.allow_private_upstream)
+            .field("max_package_size_bytes", &self.max_package_size_bytes)
+            .field("max_versions_per_package", &self.max_versions_per_package)
+            .field("proxy", &self.proxy.as_deref().map(redact))
+            .field("ca_cert_path", &self.ca_cert_path)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for MirrorConfig {
@@ -323,10 +425,14 @@ impl Default for MirrorConfig {
             enabled: false,
             upstream: "https://api.nuget.org/v3/index.json".to_string(),
             timeout_secs: 30,
+            download_timeout_secs: 3600,
+            refresh_secs: 600,
             auth: MirrorAuthConfig::default(),
             allow_private_upstream: false,
             max_package_size_bytes: None,
             max_versions_per_package: Some(50),
+            proxy: None,
+            ca_cert_path: None,
         }
     }
 }
@@ -368,6 +474,11 @@ pub struct FeedConfig {
     pub license_policy: LicensePolicyConfig,
     /// Retention for this feed; falls back to the global `[retention]`.
     pub retention: Option<RetentionConfig>,
+    /// Package-id prefixes only this feed may bring in (`Contoso.`): every
+    /// other feed refuses to push, mirror or migrate an id under one. An id and
+    /// version are one namespace across every feed, so without this whoever
+    /// stores a version first claims it in all of them.
+    pub reserved_id_prefixes: Vec<String>,
 }
 
 /// The default feed name used when no `[[feeds]]` are configured.
@@ -375,7 +486,7 @@ pub const DEFAULT_FEED: &str = "default";
 
 /// A feed with all fallbacks resolved against the global config, ready to wire
 /// into an [`AppState`](crate::web::AppState).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ResolvedFeed {
     /// Database key / slug.
     pub name: String,
@@ -392,6 +503,33 @@ pub struct ResolvedFeed {
     pub mirror: MirrorConfig,
     pub license_policy: LicensePolicyConfig,
     pub retention: RetentionConfig,
+    /// This feed's own `reserved_id_prefixes`.
+    pub reserved_id_prefixes: Vec<String>,
+    /// The prefixes every *other* feed reserved, which this one must refuse.
+    pub reserved_elsewhere: Vec<ReservedPrefix>,
+}
+
+/// A package-id prefix reserved by one feed (`reserved_id_prefixes`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReservedPrefix {
+    pub prefix: String,
+    /// The feed it is reserved for.
+    pub feed: String,
+}
+
+impl ReservedPrefix {
+    /// Whether `id` falls under the prefix, ignoring ASCII case. A prefix
+    /// ending in `.` also covers the bare id before it (`Contoso.` covers
+    /// `Contoso` as well as `Contoso.Utils`).
+    pub fn covers(&self, id: &str) -> bool {
+        let id = id.as_bytes();
+        let prefix = self.prefix.as_bytes();
+        let starts = id.len() >= prefix.len() && id[..prefix.len()].eq_ignore_ascii_case(prefix);
+        starts
+            || prefix
+                .strip_suffix(b".")
+                .is_some_and(|bare| id.eq_ignore_ascii_case(bare))
+    }
 }
 
 /// Configuration for the package retention sweep.
@@ -459,6 +597,17 @@ pub struct RateLimitConfig {
     pub max_requests: u32,
     /// Window length in seconds.
     pub window_secs: u64,
+    /// Failed authentications per client per window: responses of `401` to
+    /// requests that carried a credential. Once spent, further credentialed
+    /// requests from that client get `429` until the window rolls over. `0`
+    /// turns this budget off.
+    ///
+    /// Much smaller than `max_requests`, because it only has to clear
+    /// mistakes: a restore that sends the right key never fails, and one that
+    /// sends the wrong key fails on its first request anyway. A `401` to a
+    /// request without credentials — the challenge a NuGet client waits for
+    /// before sending its key — is not counted.
+    pub max_failed_auth: u32,
 }
 
 impl Default for RateLimitConfig {
@@ -467,6 +616,7 @@ impl Default for RateLimitConfig {
             enabled: true,
             max_requests: 10_000,
             window_secs: 60,
+            max_failed_auth: 30,
         }
     }
 }
@@ -538,6 +688,7 @@ impl Default for Config {
             max_package_size_bytes: None,
             upload_idle_timeout_secs: 300,
             min_free_disk_bytes: 2 * 1024 * 1024 * 1024,
+            max_connections: 4096,
             allow_overwrite: OverwriteMode::Disabled,
             hard_delete_enabled: false,
             tls_enabled: true,
@@ -551,6 +702,7 @@ impl Default for Config {
             files: FilesConfig::default(),
             trusted_proxies: Vec::new(),
             cors_allowed_origins: Vec::new(),
+            allowed_hosts: Vec::new(),
             feeds: Vec::new(),
         }
     }
@@ -582,167 +734,238 @@ impl Config {
             }
             None => Config::default(),
         };
-        config.apply_env();
+        config.apply_env()?;
+        config.validate()?;
         Ok(config)
     }
 
-    fn apply_env(&mut self) {
-        if let Ok(v) = std::env::var("YANUGET_HOST") {
-            if let Ok(ip) = v.parse() {
-                self.host = ip;
-            }
-        }
-        if let Ok(v) = std::env::var("YANUGET_PORT") {
-            if let Ok(p) = v.parse() {
-                self.port = p;
-            }
-        }
-        if let Ok(v) = std::env::var("YANUGET_BASE_URL") {
-            self.base_url = Some(v);
-        }
-        if let Ok(v) = std::env::var("YANUGET_DATA_DIR") {
-            self.data_dir = PathBuf::from(v);
-        }
-        if let Ok(v) = std::env::var("YANUGET_STORAGE_PATH") {
-            self.storage_path = Some(PathBuf::from(v));
-        }
-        if let Ok(v) = std::env::var("YANUGET_DATABASE_PATH") {
-            self.database_path = Some(v);
-        }
-        if let Ok(v) = std::env::var("YANUGET_API_KEY") {
-            self.api_key = (!v.is_empty()).then_some(v);
-        }
-        if let Ok(v) = std::env::var("YANUGET_API_KEYS") {
-            self.api_keys = v
-                .split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-                .collect();
-        }
-        if let Ok(v) = std::env::var("YANUGET_ADMIN_API_KEY") {
-            self.admin_api_key = (!v.is_empty()).then_some(v);
-        }
-        if let Ok(v) = std::env::var("YANUGET_GALLERY_PAGE_SIZE") {
-            if let Ok(n) = v.parse::<i64>() {
-                if n > 0 {
-                    self.gallery_page_size = n;
+    fn apply_env(&mut self) -> Result<()> {
+        self.apply_env_from(|name| std::env::var(name))
+    }
+
+    /// Overlay `YANUGET_*` values, read through `var` (the process environment
+    /// in production, a map in tests).
+    ///
+    /// Every value that is set has to parse. Skipping one that does not, as
+    /// this used to, failed *open*: `YANUGET_TLS_ENABLED=enabled` served plain
+    /// HTTP, `YANUGET_MAX_PACKAGE_SIZE_BYTES=10G` meant unlimited, and a typo
+    /// in `YANUGET_RATELIMIT_ENABLED` turned the limiter off — all without a
+    /// word, while the TOML file rejects a misspelled key outright. A setting
+    /// believed on and actually off is worse than a server that refuses to
+    /// start and says why.
+    fn apply_env_from(
+        &mut self,
+        var: impl Fn(&str) -> std::result::Result<String, std::env::VarError>,
+    ) -> Result<()> {
+        let get = |name: &str| -> Result<Option<String>> {
+            match var(name) {
+                Ok(v) => Ok(Some(v)),
+                Err(std::env::VarError::NotPresent) => Ok(None),
+                Err(std::env::VarError::NotUnicode(_)) => {
+                    Err(env_error(name, "is not valid UTF-8"))
                 }
             }
+        };
+        let bool_var = |name: &str| -> Result<Option<bool>> {
+            get(name)?.map(|v| parse_env_bool(name, &v)).transpose()
+        };
+
+        if let Some(v) = get("YANUGET_HOST")? {
+            self.host = parse_env_host("YANUGET_HOST", &v)?;
         }
-        if let Ok(v) = std::env::var("YANUGET_MAX_PACKAGE_SIZE_BYTES") {
-            self.max_package_size_bytes = v.parse().ok();
+        if let Some(v) = get("YANUGET_PORT")? {
+            self.port = parse_env_int("YANUGET_PORT", &v)?;
         }
-        if let Ok(v) = std::env::var("YANUGET_UPLOAD_IDLE_TIMEOUT_SECS") {
-            if let Ok(n) = v.trim().parse() {
-                self.upload_idle_timeout_secs = n;
+        if let Some(v) = get("YANUGET_BASE_URL")? {
+            self.base_url = (!v.trim().is_empty()).then(|| v.trim().to_string());
+        }
+        if let Some(v) = get("YANUGET_DATA_DIR")? {
+            self.data_dir = PathBuf::from(v);
+        }
+        if let Some(v) = get("YANUGET_STORAGE_PATH")? {
+            self.storage_path = Some(PathBuf::from(v));
+        }
+        if let Some(v) = get("YANUGET_DATABASE_PATH")? {
+            self.database_path = Some(v);
+        }
+        if let Some(v) = get("YANUGET_API_KEY")? {
+            self.api_key = (!v.trim().is_empty()).then(|| v.trim().to_string());
+        }
+        if let Some(v) = get("YANUGET_API_KEYS")? {
+            self.api_keys = split_list(&v);
+        }
+        if let Some(v) = get("YANUGET_ADMIN_API_KEY")? {
+            self.admin_api_key = (!v.trim().is_empty()).then(|| v.trim().to_string());
+        }
+        if let Some(v) = get("YANUGET_GALLERY_PAGE_SIZE")? {
+            let n: i64 = parse_env_int("YANUGET_GALLERY_PAGE_SIZE", &v)?;
+            if n < 1 {
+                return Err(env_error("YANUGET_GALLERY_PAGE_SIZE", "must be at least 1"));
             }
+            self.gallery_page_size = n;
         }
-        if let Ok(v) = std::env::var("YANUGET_MIN_FREE_DISK_BYTES") {
-            if let Ok(n) = v.trim().parse() {
-                self.min_free_disk_bytes = n;
-            }
+        if let Some(v) = get("YANUGET_MAX_PACKAGE_SIZE_BYTES")? {
+            self.max_package_size_bytes = parse_env_opt_int("YANUGET_MAX_PACKAGE_SIZE_BYTES", &v)?;
         }
-        if let Ok(v) = std::env::var("YANUGET_ALLOW_OVERWRITE") {
-            self.allow_overwrite = OverwriteMode::parse_lenient(&v);
+        if let Some(v) = get("YANUGET_UPLOAD_IDLE_TIMEOUT_SECS")? {
+            self.upload_idle_timeout_secs = parse_env_int("YANUGET_UPLOAD_IDLE_TIMEOUT_SECS", &v)?;
         }
-        if let Ok(v) = std::env::var("YANUGET_HARD_DELETE_ENABLED") {
-            self.hard_delete_enabled = truthy(&v);
+        if let Some(v) = get("YANUGET_MIN_FREE_DISK_BYTES")? {
+            self.min_free_disk_bytes = parse_env_int("YANUGET_MIN_FREE_DISK_BYTES", &v)?;
         }
-        if let Ok(v) = std::env::var("YANUGET_TLS_ENABLED") {
-            self.tls_enabled = truthy(&v);
+        if let Some(v) = get("YANUGET_MAX_CONNECTIONS")? {
+            self.max_connections = parse_env_int("YANUGET_MAX_CONNECTIONS", &v)?;
         }
-        if let Ok(v) = std::env::var("YANUGET_TLS_CERT_PATH") {
+        if let Some(v) = get("YANUGET_ALLOW_OVERWRITE")? {
+            self.allow_overwrite = OverwriteMode::parse_env("YANUGET_ALLOW_OVERWRITE", &v)?;
+        }
+        if let Some(b) = bool_var("YANUGET_HARD_DELETE_ENABLED")? {
+            self.hard_delete_enabled = b;
+        }
+        if let Some(b) = bool_var("YANUGET_TLS_ENABLED")? {
+            self.tls_enabled = b;
+        }
+        if let Some(v) = get("YANUGET_TLS_CERT_PATH")? {
             self.tls_cert_path = (!v.is_empty()).then(|| PathBuf::from(v));
         }
-        if let Ok(v) = std::env::var("YANUGET_TLS_KEY_PATH") {
+        if let Some(v) = get("YANUGET_TLS_KEY_PATH")? {
             self.tls_key_path = (!v.is_empty()).then(|| PathBuf::from(v));
         }
-        if let Ok(v) = std::env::var("YANUGET_ENABLE_SYMBOL_SERVER") {
-            self.enable_symbol_server = truthy(&v);
+        if let Some(b) = bool_var("YANUGET_ENABLE_SYMBOL_SERVER")? {
+            self.enable_symbol_server = b;
         }
-        if let Ok(v) = std::env::var("YANUGET_ENABLE_WEB_UI") {
-            self.enable_web_ui = truthy(&v);
+        if let Some(b) = bool_var("YANUGET_ENABLE_WEB_UI")? {
+            self.enable_web_ui = b;
         }
-        if let Ok(v) = std::env::var("YANUGET_PRIMARY_CLIENT") {
+        if let Some(v) = get("YANUGET_PRIMARY_CLIENT")? {
             if !v.trim().is_empty() {
                 self.primary_client = v.trim().to_ascii_lowercase();
             }
         }
-        if let Ok(v) = std::env::var("YANUGET_RETENTION_ENABLED") {
-            self.retention.enabled = truthy(&v);
+        if let Some(b) = bool_var("YANUGET_RETENTION_ENABLED")? {
+            self.retention.enabled = b;
         }
-        if let Ok(v) = std::env::var("YANUGET_RETENTION_PRUNE_ON_PUSH") {
-            self.retention.prune_on_push = truthy(&v);
+        if let Some(b) = bool_var("YANUGET_RETENTION_PRUNE_ON_PUSH")? {
+            self.retention.prune_on_push = b;
         }
-        if let Ok(v) = std::env::var("YANUGET_RETENTION_INTERVAL_HOURS") {
-            if let Ok(n) = v.parse() {
-                self.retention.interval_hours = n;
-            }
+        if let Some(v) = get("YANUGET_RETENTION_INTERVAL_HOURS")? {
+            self.retention.interval_hours = parse_env_int("YANUGET_RETENTION_INTERVAL_HOURS", &v)?;
         }
-        if let Ok(v) = std::env::var("YANUGET_RETENTION_KEEP_LATEST_STABLE") {
-            self.retention.keep_latest_stable = v.parse().ok();
+        if let Some(v) = get("YANUGET_RETENTION_KEEP_LATEST_STABLE")? {
+            self.retention.keep_latest_stable =
+                parse_env_opt_int("YANUGET_RETENTION_KEEP_LATEST_STABLE", &v)?;
         }
-        if let Ok(v) = std::env::var("YANUGET_RETENTION_KEEP_LATEST_PRERELEASE") {
-            self.retention.keep_latest_prerelease = v.parse().ok();
+        if let Some(v) = get("YANUGET_RETENTION_KEEP_LATEST_PRERELEASE")? {
+            self.retention.keep_latest_prerelease =
+                parse_env_opt_int("YANUGET_RETENTION_KEEP_LATEST_PRERELEASE", &v)?;
         }
-        if let Ok(v) = std::env::var("YANUGET_RETENTION_MAX_AGE_DAYS") {
-            self.retention.max_age_days = v.parse().ok();
+        if let Some(v) = get("YANUGET_RETENTION_MAX_AGE_DAYS")? {
+            self.retention.max_age_days = parse_env_opt_int("YANUGET_RETENTION_MAX_AGE_DAYS", &v)?;
         }
-        if let Ok(v) = std::env::var("YANUGET_RATELIMIT_ENABLED") {
-            self.rate_limit.enabled = truthy(&v);
+        if let Some(b) = bool_var("YANUGET_RATELIMIT_ENABLED")? {
+            self.rate_limit.enabled = b;
         }
-        if let Ok(v) = std::env::var("YANUGET_RATELIMIT_MAX_REQUESTS") {
-            if let Ok(n) = v.parse() {
-                self.rate_limit.max_requests = n;
-            }
+        if let Some(v) = get("YANUGET_RATELIMIT_MAX_REQUESTS")? {
+            self.rate_limit.max_requests = parse_env_int("YANUGET_RATELIMIT_MAX_REQUESTS", &v)?;
         }
-        if let Ok(v) = std::env::var("YANUGET_RATELIMIT_WINDOW_SECS") {
-            if let Ok(n) = v.parse() {
-                self.rate_limit.window_secs = n;
-            }
+        if let Some(v) = get("YANUGET_RATELIMIT_WINDOW_SECS")? {
+            self.rate_limit.window_secs = parse_env_int("YANUGET_RATELIMIT_WINDOW_SECS", &v)?;
         }
-        if let Ok(v) = std::env::var("YANUGET_FILES_ENABLED") {
-            self.files.enabled = truthy(&v);
+        if let Some(v) = get("YANUGET_RATELIMIT_MAX_FAILED_AUTH")? {
+            self.rate_limit.max_failed_auth =
+                parse_env_int("YANUGET_RATELIMIT_MAX_FAILED_AUTH", &v)?;
         }
-        if let Ok(v) = std::env::var("YANUGET_FILES_MAX_FILE_SIZE_BYTES") {
-            self.files.max_file_size_bytes = v.trim().parse().ok();
+        if let Some(b) = bool_var("YANUGET_FILES_ENABLED")? {
+            self.files.enabled = b;
         }
-        if let Ok(v) = std::env::var("YANUGET_FILES_ALLOWED_EXTENSIONS") {
+        if let Some(v) = get("YANUGET_FILES_MAX_FILE_SIZE_BYTES")? {
+            self.files.max_file_size_bytes =
+                parse_env_opt_int("YANUGET_FILES_MAX_FILE_SIZE_BYTES", &v)?;
+        }
+        if let Some(v) = get("YANUGET_FILES_ALLOWED_EXTENSIONS")? {
             self.files.allowed_extensions = v
                 .split(',')
                 .map(|s| s.trim().trim_start_matches('.').to_string())
                 .filter(|s| !s.is_empty())
                 .collect();
         }
-        if let Ok(v) = std::env::var("YANUGET_FILES_UPLOAD_EXPIRY_HOURS") {
-            if let Ok(n) = v.trim().parse() {
-                self.files.upload_expiry_hours = n;
-            }
+        if let Some(v) = get("YANUGET_FILES_UPLOAD_EXPIRY_HOURS")? {
+            self.files.upload_expiry_hours =
+                parse_env_int("YANUGET_FILES_UPLOAD_EXPIRY_HOURS", &v)?;
         }
-        if let Ok(v) = std::env::var("YANUGET_FILES_INBOX_DIR") {
+        if let Some(v) = get("YANUGET_FILES_INBOX_DIR")? {
             self.files.inbox_dir = (!v.trim().is_empty()).then(|| PathBuf::from(v.trim()));
         }
-        if let Ok(v) = std::env::var("YANUGET_FILES_INBOX_SCAN_SECS") {
-            if let Ok(n) = v.trim().parse() {
-                self.files.inbox_scan_secs = n;
-            }
+        if let Some(v) = get("YANUGET_FILES_INBOX_SCAN_SECS")? {
+            self.files.inbox_scan_secs = parse_env_int("YANUGET_FILES_INBOX_SCAN_SECS", &v)?;
         }
         // Set (even to the empty string) this replaces the list wholesale, so an
         // operator can pin trust to their proxy — or revoke it entirely.
-        if let Ok(v) = std::env::var("YANUGET_TRUSTED_PROXIES") {
-            self.trusted_proxies = v
-                .split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-                .collect();
+        if let Some(v) = get("YANUGET_TRUSTED_PROXIES")? {
+            self.trusted_proxies = split_list(&v);
         }
+        if let Some(v) = get("YANUGET_ALLOWED_HOSTS")? {
+            self.allowed_hosts = split_list(&v);
+        }
+        Ok(())
+    }
+
+    /// Reject combinations that parse but cannot mean what they say.
+    ///
+    /// Runs after both layers, so a TOML value and an environment value are
+    /// held to the same rules.
+    pub fn validate(&self) -> Result<()> {
+        if self.rate_limit.enabled && self.rate_limit.window_secs == 0 {
+            // A zero-length window resets on every request, so no client ever
+            // reaches the limit: the throttle is on in name only.
+            return Err(Error::BadRequest(
+                "rate_limit.window_secs must be at least 1 (set rate_limit.enabled = false \
+                 to turn the limiter off)"
+                    .into(),
+            ));
+        }
+        if self.tls_enabled && self.tls_cert_path.is_some() != self.tls_key_path.is_some() {
+            // Half a pair used to fall back to the self-signed certificate,
+            // silently serving something other than what was configured.
+            return Err(Error::BadRequest(
+                "tls_cert_path and tls_key_path must be set together".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// The resolved set of peers allowed to set forwarding headers.
     pub fn trusted_proxies(&self) -> crate::proxy::TrustedProxies {
         crate::proxy::TrustedProxies::new(self.trusted_proxies.iter().map(String::as_str))
+    }
+
+    /// The host names requests may carry, lower-cased and without a port, or
+    /// `None` when any host is accepted (nothing configured, or `*`).
+    pub fn host_allowlist(&self) -> Option<Vec<String>> {
+        let mut hosts: Vec<String> = self
+            .allowed_hosts
+            .iter()
+            .map(|h| normalize_host(h))
+            .filter(|h| !h.is_empty())
+            .collect();
+        if hosts.iter().any(|h| h == "*") {
+            return None;
+        }
+        if let Some(base) = &self.base_url {
+            let authority = base
+                .split_once("://")
+                .map_or(base.as_str(), |(_, rest)| rest)
+                .split(['/', '?', '#'])
+                .next()
+                .unwrap_or("");
+            // Userinfo is not part of the host.
+            let authority = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+            let host = normalize_host(authority);
+            if !host.is_empty() {
+                hosts.push(host);
+            }
+        }
+        (!hosts.is_empty()).then_some(hosts)
     }
 
     /// The socket address to bind.
@@ -805,6 +1028,9 @@ impl Config {
                 mirror: MirrorConfig::default(),
                 license_policy: LicensePolicyConfig::default(),
                 retention: self.retention.clone(),
+                // A single feed has no other feed to reserve anything from.
+                reserved_id_prefixes: Vec::new(),
+                reserved_elsewhere: Vec::new(),
             }]);
         }
 
@@ -818,6 +1044,9 @@ impl Config {
                     f.name
                 )));
             }
+            f.mirror
+                .validate()
+                .map_err(|e| Error::BadRequest(format!("feed {:?}: {e}", f.name)))?;
             // A feed that sets any push key of its own uses only those; otherwise
             // it falls back to the global keys.
             let feed_keys = combine_keys(&f.api_key, &f.api_keys);
@@ -845,7 +1074,38 @@ impl Config {
                     .retention
                     .clone()
                     .unwrap_or_else(|| self.retention.clone()),
+                reserved_id_prefixes: reserved_prefixes(f)?,
+                reserved_elsewhere: Vec::new(),
             });
+        }
+
+        // Each feed refuses what the others reserved. Two reservations that
+        // overlap would leave the ids under the narrower one to nobody.
+        let all: Vec<ReservedPrefix> = resolved
+            .iter()
+            .flat_map(|f| {
+                f.reserved_id_prefixes.iter().map(|p| ReservedPrefix {
+                    prefix: p.clone(),
+                    feed: f.name.clone(),
+                })
+            })
+            .collect();
+        for (i, a) in all.iter().enumerate() {
+            for b in &all[i + 1..] {
+                if a.feed != b.feed
+                    && (a.covers(&b.prefix)
+                        || b.covers(&a.prefix)
+                        || a.prefix.eq_ignore_ascii_case(&b.prefix))
+                {
+                    return Err(Error::BadRequest(format!(
+                        "feeds {:?} and {:?} reserve overlapping id prefixes {:?} and {:?}",
+                        a.feed, b.feed, a.prefix, b.prefix
+                    )));
+                }
+            }
+        }
+        for f in &mut resolved {
+            f.reserved_elsewhere = all.iter().filter(|r| r.feed != f.name).cloned().collect();
         }
 
         // Promotion targets must reference real feeds.
@@ -861,6 +1121,116 @@ impl Config {
         }
         Ok(resolved)
     }
+}
+
+/// Written in place of a secret by the `Debug` impls below.
+const REDACTED: &str = "<redacted>";
+
+/// Present or not, never the value.
+fn redact_opt(v: &Option<String>) -> Option<&'static str> {
+    v.as_ref().map(|_| REDACTED)
+}
+
+/// Only the scheme, host and port of a URL: what an upstream *is*, without
+/// whatever credentials its userinfo, path or query may carry (`/_auth/TOKEN/`
+/// and `?code=…` are both common). Anything without a scheme is not shown at
+/// all.
+pub fn url_origin(url: &str) -> String {
+    let Some((scheme, rest)) = url.trim().split_once("://") else {
+        return "<not a URL>".to_string();
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    format!("{}://{host}", scheme.to_ascii_lowercase())
+}
+
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("base_url", &self.base_url)
+            .field("data_dir", &self.data_dir)
+            .field("storage_path", &self.storage_path)
+            .field("database_path", &self.database_path)
+            .field("api_key", &redact_opt(&self.api_key))
+            .field("api_keys", &self.api_keys.len())
+            .field("admin_api_key", &redact_opt(&self.admin_api_key))
+            .field("gallery_page_size", &self.gallery_page_size)
+            .field("max_package_size_bytes", &self.max_package_size_bytes)
+            .field("upload_idle_timeout_secs", &self.upload_idle_timeout_secs)
+            .field("min_free_disk_bytes", &self.min_free_disk_bytes)
+            .field("max_connections", &self.max_connections)
+            .field("allow_overwrite", &self.allow_overwrite)
+            .field("hard_delete_enabled", &self.hard_delete_enabled)
+            .field("tls_enabled", &self.tls_enabled)
+            .field("tls_cert_path", &self.tls_cert_path)
+            .field("tls_key_path", &self.tls_key_path)
+            .field("enable_symbol_server", &self.enable_symbol_server)
+            .field("enable_web_ui", &self.enable_web_ui)
+            .field("primary_client", &self.primary_client)
+            .field("retention", &self.retention)
+            .field("rate_limit", &self.rate_limit)
+            .field("files", &self.files)
+            .field("trusted_proxies", &self.trusted_proxies)
+            .field("cors_allowed_origins", &self.cors_allowed_origins)
+            .field("allowed_hosts", &self.allowed_hosts)
+            .field(
+                "feeds",
+                &self
+                    .feeds
+                    .iter()
+                    .map(|f| f.name.as_str())
+                    .collect::<Vec<_>>(),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for ResolvedFeed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResolvedFeed")
+            .field("name", &self.name)
+            .field("prefix", &self.prefix)
+            .field("api_keys", &self.api_keys.len())
+            .field("read_api_key", &redact_opt(&self.read_api_key))
+            .field("admin_api_key", &redact_opt(&self.admin_api_key))
+            .field("allow_overwrite", &self.allow_overwrite)
+            .field("hard_delete_enabled", &self.hard_delete_enabled)
+            .field("requires_approval", &self.requires_approval)
+            .field("promotes_to", &self.promotes_to)
+            .field("mirror_enabled", &self.mirror.enabled)
+            .field("mirror_upstream", &url_origin(&self.mirror.upstream))
+            .field("license_policy", &self.license_policy)
+            .field("retention", &self.retention)
+            .field("reserved_id_prefixes", &self.reserved_id_prefixes)
+            .field("reserved_elsewhere", &self.reserved_elsewhere)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A feed's `reserved_id_prefixes`, checked: made of package-id characters
+/// and starting with a letter, digit or `_`, so each can match real ids.
+fn reserved_prefixes(feed: &FeedConfig) -> Result<Vec<String>> {
+    let mut prefixes = Vec::with_capacity(feed.reserved_id_prefixes.len());
+    for raw in &feed.reserved_id_prefixes {
+        let prefix = raw.trim();
+        let valid = prefix
+            .bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_alphanumeric() || b == b'_')
+            && prefix
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'));
+        if !valid || prefix.len() > crate::validation::MAX_ID_LENGTH {
+            return Err(Error::BadRequest(format!(
+                "feed {:?}: invalid reserved_id_prefixes entry {raw:?}",
+                feed.name
+            )));
+        }
+        prefixes.push(prefix.to_string());
+    }
+    Ok(prefixes)
 }
 
 /// Route path segments a feed may not shadow. A feed is mounted at `/{name}`,
@@ -900,11 +1270,85 @@ fn validate_feed_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn truthy(v: &str) -> bool {
-    matches!(
-        v.trim().to_ascii_lowercase().as_str(),
-        "1" | "true" | "yes" | "on"
-    )
+/// A `Host`-style value reduced to what is compared: lower-case, no port, no
+/// IPv6 brackets, no trailing dot.
+pub fn normalize_host(value: &str) -> String {
+    let v = value.trim();
+    let host = if let Some(rest) = v.strip_prefix('[') {
+        rest.split(']').next().unwrap_or(rest)
+    } else {
+        match v.rsplit_once(':') {
+            // One colon is a port; more is a bare IPv6 address.
+            Some((h, port)) if !h.contains(':') && port.bytes().all(|b| b.is_ascii_digit()) => h,
+            _ => v,
+        }
+    };
+    host.trim_end_matches('.').to_ascii_lowercase()
+}
+
+fn env_error(name: &str, why: &str) -> Error {
+    Error::BadRequest(format!("environment variable {name} {why}"))
+}
+
+/// The spellings a boolean environment variable accepts, case-insensitively.
+/// Anything else is refused rather than read as `false`.
+fn parse_env_bool(name: &str, v: &str) -> Result<bool> {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => Err(env_error(
+            name,
+            &format!("must be one of 1/true/yes/on or 0/false/no/off, not {v:?}"),
+        )),
+    }
+}
+
+/// A plain decimal integer: digits only, so `10G`, `1e9`, `+5` and `-1` are
+/// errors instead of whatever a lenient parse would make of them.
+fn parse_env_int<T: std::str::FromStr>(name: &str, v: &str) -> Result<T> {
+    let t = v.trim();
+    if t.is_empty() || !t.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(env_error(
+            name,
+            &format!("must be a plain whole number, not {v:?}"),
+        ));
+    }
+    t.parse()
+        .map_err(|_| env_error(name, &format!("is out of range: {v:?}")))
+}
+
+/// Like [`parse_env_int`], with the empty string meaning "unset".
+fn parse_env_opt_int<T: std::str::FromStr>(name: &str, v: &str) -> Result<Option<T>> {
+    if v.trim().is_empty() {
+        Ok(None)
+    } else {
+        parse_env_int(name, v).map(Some)
+    }
+}
+
+/// An IP address, or `localhost` for the IPv4 loopback — the one name people
+/// reach for, and the one that used to be dropped for `0.0.0.0`, exposing a
+/// server meant to be local to the whole network.
+fn parse_env_host(name: &str, v: &str) -> Result<IpAddr> {
+    let t = v.trim();
+    if t.eq_ignore_ascii_case("localhost") {
+        return Ok(IpAddr::from([127, 0, 0, 1]));
+    }
+    t.parse().map_err(|_| {
+        env_error(
+            name,
+            &format!("must be an IP address or \"localhost\", not {v:?}"),
+        )
+    })
+}
+
+/// A comma-separated environment list, trimmed, empties dropped.
+fn split_list(v: &str) -> Vec<String> {
+    v.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 /// Combine a single optional key with a list of keys into a deduplicated,
@@ -946,6 +1390,56 @@ mod tests {
             max_request = 5
         "#;
         assert!(toml::from_str::<Config>(nested).is_err());
+    }
+
+    #[test]
+    fn reserved_id_prefixes_are_refused_by_every_other_feed() {
+        let feed = |name: &str, prefixes: &[&str]| FeedConfig {
+            name: name.into(),
+            reserved_id_prefixes: prefixes.iter().map(|p| p.to_string()).collect(),
+            ..Default::default()
+        };
+        let config = Config {
+            feeds: vec![
+                feed("internal", &["Contoso."]),
+                feed("public", &[]),
+                feed("tools", &["Fabrikam.Tools."]),
+            ],
+            ..Default::default()
+        };
+        let feeds = config.resolved_feeds().unwrap();
+        let elsewhere = |name: &str| {
+            let f = feeds.iter().find(|f| f.name == name).unwrap();
+            f.reserved_elsewhere
+                .iter()
+                .map(|r| r.prefix.as_str())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(elsewhere("internal"), ["Fabrikam.Tools."]);
+        assert_eq!(elsewhere("public"), ["Contoso.", "Fabrikam.Tools."]);
+
+        let contoso = ReservedPrefix {
+            prefix: "Contoso.".into(),
+            feed: "internal".into(),
+        };
+        for covered in ["Contoso.Utils", "contoso.utils", "CONTOSO", "contoso.a.b"] {
+            assert!(contoso.covers(covered), "{covered:?}");
+        }
+        for free in ["ContosoUtils", "Contos", "My.Contoso.Utils"] {
+            assert!(!contoso.covers(free), "{free:?}");
+        }
+
+        // Overlapping reservations would leave the narrower ids to nobody.
+        let overlapping = Config {
+            feeds: vec![feed("a", &["Contoso."]), feed("b", &["contoso.internal."])],
+            ..Default::default()
+        };
+        assert!(overlapping.resolved_feeds().is_err());
+        let invalid = Config {
+            feeds: vec![feed("a", &[".Contoso"])],
+            ..Default::default()
+        };
+        assert!(invalid.resolved_feeds().is_err());
     }
 
     #[test]
@@ -1040,15 +1534,16 @@ mod tests {
         assert!(OverwriteMode::PrereleaseOnly.allows(true));
         assert!(!OverwriteMode::PrereleaseOnly.allows(false));
 
-        // Lenient env parsing.
+        // Environment parsing: known spellings only.
         assert_eq!(
-            OverwriteMode::parse_lenient("prerelease"),
+            OverwriteMode::parse_env("X", "prerelease").unwrap(),
             OverwriteMode::PrereleaseOnly
         );
         assert_eq!(
-            OverwriteMode::parse_lenient("garbage"),
+            OverwriteMode::parse_env("X", "off").unwrap(),
             OverwriteMode::Disabled
         );
+        assert!(OverwriteMode::parse_env("X", "garbage").is_err());
     }
 
     #[test]
@@ -1109,6 +1604,164 @@ mod tests {
         assert!(c.retention.has_limits());
     }
 
+    /// Apply `vars` as the environment on top of the defaults.
+    fn with_env(vars: &[(&str, &str)]) -> Result<Config> {
+        let map: std::collections::HashMap<String, String> = vars
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let mut c = Config::default();
+        c.apply_env_from(|name| map.get(name).cloned().ok_or(std::env::VarError::NotPresent))?;
+        c.validate()?;
+        Ok(c)
+    }
+
+    #[test]
+    fn an_environment_value_that_does_not_parse_is_an_error() {
+        // Each of these used to be skipped or read as "off", failing open.
+        for (name, value) in [
+            ("YANUGET_TLS_ENABLED", "enabled"),
+            ("YANUGET_RATELIMIT_ENABLED", "ture"),
+            ("YANUGET_MAX_PACKAGE_SIZE_BYTES", "10G"),
+            ("YANUGET_MAX_PACKAGE_SIZE_BYTES", "+5"),
+            ("YANUGET_PORT", "eighty"),
+            ("YANUGET_PORT", "70000"),
+            ("YANUGET_HOST", "example.com"),
+            ("YANUGET_ALLOW_OVERWRITE", "sometimes"),
+            ("YANUGET_GALLERY_PAGE_SIZE", "0"),
+            ("YANUGET_RETENTION_KEEP_LATEST_STABLE", "-1"),
+        ] {
+            let err = with_env(&[(name, value)]).unwrap_err().to_string();
+            assert!(err.contains(name), "{name}={value}: unhelpful error {err}");
+        }
+    }
+
+    #[test]
+    fn environment_values_in_the_documented_forms_apply() {
+        let c = with_env(&[
+            ("YANUGET_HOST", "localhost"),
+            ("YANUGET_TLS_ENABLED", "Off"),
+            ("YANUGET_RATELIMIT_ENABLED", "1"),
+            ("YANUGET_MAX_PACKAGE_SIZE_BYTES", " 1048576 "),
+            ("YANUGET_ALLOW_OVERWRITE", "prerelease-only"),
+            ("YANUGET_RETENTION_MAX_AGE_DAYS", ""),
+        ])
+        .unwrap();
+        assert_eq!(c.host, IpAddr::from([127, 0, 0, 1]));
+        assert!(!c.tls_enabled);
+        assert!(c.rate_limit.enabled);
+        assert_eq!(c.max_package_size_bytes, Some(1_048_576));
+        assert_eq!(c.allow_overwrite, OverwriteMode::PrereleaseOnly);
+        assert_eq!(c.retention.max_age_days, None);
+    }
+
+    #[test]
+    fn a_zero_window_and_half_a_tls_pair_are_refused() {
+        let err = with_env(&[("YANUGET_RATELIMIT_WINDOW_SECS", "0")]).unwrap_err();
+        assert!(err.to_string().contains("window_secs"), "{err}");
+        // With the limiter off, the window does not matter.
+        assert!(with_env(&[
+            ("YANUGET_RATELIMIT_WINDOW_SECS", "0"),
+            ("YANUGET_RATELIMIT_ENABLED", "false"),
+        ])
+        .is_ok());
+
+        let err = with_env(&[("YANUGET_TLS_CERT_PATH", "/c.pem")]).unwrap_err();
+        assert!(err.to_string().contains("tls_key_path"), "{err}");
+        assert!(with_env(&[
+            ("YANUGET_TLS_CERT_PATH", "/c.pem"),
+            ("YANUGET_TLS_KEY_PATH", "/k.pem"),
+        ])
+        .is_ok());
+    }
+
+    #[test]
+    fn the_host_allowlist_follows_base_url_and_allowed_hosts() {
+        assert_eq!(Config::default().host_allowlist(), None);
+        let c = Config {
+            base_url: Some("https://user:pw@NuGet.Example.com:8443/feed".into()),
+            ..Config::default()
+        };
+        assert_eq!(c.host_allowlist(), Some(vec!["nuget.example.com".into()]));
+        let c = Config {
+            base_url: Some("https://nuget.example.com".into()),
+            allowed_hosts: vec!["localhost".into(), "[::1]:5000".into()],
+            ..Config::default()
+        };
+        assert_eq!(
+            c.host_allowlist(),
+            Some(vec![
+                "localhost".into(),
+                "::1".into(),
+                "nuget.example.com".into()
+            ])
+        );
+        let any = Config {
+            base_url: Some("https://nuget.example.com".into()),
+            allowed_hosts: vec!["*".into()],
+            ..Config::default()
+        };
+        assert_eq!(any.host_allowlist(), None);
+    }
+
+    #[test]
+    fn hosts_normalise_for_comparison() {
+        assert_eq!(normalize_host("Feed.Example.COM:443"), "feed.example.com");
+        assert_eq!(normalize_host("feed.example.com."), "feed.example.com");
+        assert_eq!(normalize_host("[2001:DB8::1]:8443"), "2001:db8::1");
+        assert_eq!(normalize_host("2001:db8::1"), "2001:db8::1");
+        assert_eq!(normalize_host("10.0.0.1:5000"), "10.0.0.1");
+    }
+
+    #[test]
+    fn secrets_never_reach_debug_output() {
+        let mut c = Config {
+            api_key: Some("push-secret".into()),
+            api_keys: vec!["other-push-secret".into()],
+            admin_api_key: Some("admin-secret".into()),
+            ..Config::default()
+        };
+        c.feeds = vec![FeedConfig {
+            name: "stable".into(),
+            read_api_key: Some("read-secret".into()),
+            mirror: MirrorConfig {
+                upstream: "https://u:up-secret@feed.example/_auth/path-secret/index.json".into(),
+                auth: MirrorAuthConfig {
+                    username: Some("ci".into()),
+                    password: Some("basic-secret".into()),
+                    headers: [("X-Api-Key".to_string(), "header-secret".to_string())].into(),
+                    ..MirrorAuthConfig::default()
+                },
+                ..MirrorConfig::default()
+            },
+            ..FeedConfig::default()
+        }];
+        let feeds = c.resolved_feeds().unwrap();
+        let dumps = [
+            format!("{c:?}"),
+            format!("{feeds:?}"),
+            format!("{:?}", c.feeds[0].mirror.auth),
+        ];
+        for dump in &dumps {
+            assert!(!dump.contains("secret"), "{dump}");
+        }
+        assert!(dumps[1].contains("https://feed.example"), "{}", dumps[1]);
+    }
+
+    #[test]
+    fn a_url_origin_carries_no_credentials() {
+        assert_eq!(
+            url_origin("https://ci:s3cret@Feed.example.com:8443/_auth/TOKEN/v3/index.json?k=v"),
+            "https://Feed.example.com:8443"
+        );
+        assert_eq!(
+            url_origin("HTTPS://api.nuget.org/v3/index.json"),
+            "https://api.nuget.org"
+        );
+        assert_eq!(url_origin("https://host?token=x"), "https://host");
+        assert_eq!(url_origin("not a url"), "<not a URL>");
+    }
+
     #[test]
     fn path_overrides_resolve() {
         let c = Config {
@@ -1125,5 +1778,25 @@ mod tests {
         };
         assert_eq!(overridden.storage_path(), PathBuf::from("/mnt/pkgs"));
         assert_eq!(overridden.database_path(), "/mnt/db.sqlite");
+    }
+
+    #[test]
+    fn a_mirror_with_basic_and_bearer_credentials_is_rejected() {
+        // Both need `Authorization`; one used to be dropped without a word.
+        let config: Config = toml::from_str(
+            r#"
+            [[feeds]]
+            name = "up"
+              [feeds.mirror]
+              enabled = true
+                [feeds.mirror.auth]
+                username = "ci"
+                password = "pw"
+                token = "tok"
+            "#,
+        )
+        .unwrap();
+        let err = config.resolved_feeds().unwrap_err().to_string();
+        assert!(err.contains("\"up\"") && err.contains("token"), "{err}");
     }
 }

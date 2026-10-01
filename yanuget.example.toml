@@ -1,14 +1,18 @@
 # YANuget example configuration.
 #
 # Copy to `yanuget.toml` and pass with `--config yanuget.toml`, or set the
-# matching `YANUGET_*` environment variables (which override this file).
+# matching `YANUGET_*` environment variables (which override this file). An
+# environment value that does not parse (a boolean other than 1/true/yes/on or
+# 0/false/no/off, a size like "10G") stops the server rather than being ignored.
 
 # Interface and port to listen on.
 host = "0.0.0.0"            # YANUGET_HOST
 port = 5000                # YANUGET_PORT
 
-# Externally visible base URL. Leave unset to derive it per-request from the
-# Host / X-Forwarded-* headers (recommended behind a reverse proxy).
+# Externally visible base URL, from which every URL handed to clients is built.
+# Set it whenever you know the public address, and always behind a reverse
+# proxy. Unset, it is derived per request from the Host header, and from
+# X-Forwarded-* only when the peer is listed in `trusted_proxies`.
 # base_url = "https://nuget.example.com"   # YANUGET_BASE_URL
 
 # Where all server data lives. The package store and SQLite database default to
@@ -16,6 +20,10 @@ port = 5000                # YANUGET_PORT
 data_dir = "./data"        # YANUGET_DATA_DIR
 # storage_path = "./data/packages"        # YANUGET_STORAGE_PATH
 # database_path = "./data/yanuget.db"     # YANUGET_DATABASE_PATH
+
+# Concurrent connections accepted; one over the cap is closed at once. Bounds
+# the sockets slow or idle clients can hold. 0 = unlimited.
+max_connections = 4096     # YANUGET_MAX_CONNECTIONS
 
 # API key required to push and delete packages. STRONGLY recommended.
 # If unset, those endpoints are unauthenticated.
@@ -115,9 +123,22 @@ trusted_proxies = []
 # being on the intranet would have no protection against a browser.
 #
 # List the origins that genuinely need it, or "*" for a feed that really is
-# public. TOML only; there is no environment variable.
+# public. TOML only; there is no environment variable. Cross-origin access is
+# read-only either way (GET, HEAD, OPTIONS).
 # ---------------------------------------------------------------------------
 cors_allowed_origins = []
+
+# ---------------------------------------------------------------------------
+# Host validation — which host names this server answers to.
+#
+# With base_url set, a request whose Host (or, from a trusted proxy,
+# X-Forwarded-Host) names anything other than base_url's host or one of these
+# gets 421 Misdirected Request. That stops DNS rebinding: a hostile page can
+# point its own name at your feed's address, but the browser still sends that
+# name. Empty with base_url unset accepts any host; "*" accepts any host
+# explicitly. /health and friends answer whatever the host.
+# ---------------------------------------------------------------------------
+allowed_hosts = []            # YANUGET_ALLOWED_HOSTS (comma-separated)
 
 # ---------------------------------------------------------------------------
 # Rate limiting — per-client-IP request throttling (brute-force mitigation).
@@ -129,13 +150,17 @@ cors_allowed_origins = []
 # honours Retry-After — so being throttled mid-restore fails the build. The
 # default is far above anything legitimate while still bounding key guessing.
 #
-# The client IP is taken from X-Forwarded-For / X-Real-IP when the peer is a
-# trusted proxy (see trusted_proxies above) and otherwise the peer address.
+# The client IP is the peer address or, when the peer is a trusted proxy (see
+# trusted_proxies above), the rightmost X-Forwarded-For hop that is not itself
+# a trusted proxy. IPv6 clients are counted per /64.
 # ---------------------------------------------------------------------------
 [rate_limit]
 enabled = true                # YANUGET_RATELIMIT_ENABLED
 max_requests = 10000          # YANUGET_RATELIMIT_MAX_REQUESTS — per IP per window
-window_secs = 60              # YANUGET_RATELIMIT_WINDOW_SECS
+window_secs = 60              # YANUGET_RATELIMIT_WINDOW_SECS — at least 1
+# Failed authentications (401s to requests that carried a key) per IP per
+# window; once spent, that client's credentialed requests get 429. 0 = off.
+max_failed_auth = 30          # YANUGET_RATELIMIT_MAX_FAILED_AUTH
 
 # ---------------------------------------------------------------------------
 # Package retention — automatic pruning of old versions.
@@ -205,11 +230,21 @@ inbox_scan_secs = 30                # YANUGET_FILES_INBOX_SCAN_SECS
 # hard_delete_enabled = false   # falls back to global when unset
 # requires_approval = false     # true = incoming versions are pending until approved
 # promotes_to = "stable"        # the next release ring (must name another feed)
+# # An id and version are ONE package across every feed: whoever stores a
+# # version first owns it everywhere, and different bytes are then refused in
+# # every feed. Reserve the prefixes of your own ids for the feed that
+# # publishes them, and every other feed (pushes, mirror fetches, migrations)
+# # refuses ids under them.
+# reserved_id_prefixes = []     # e.g. ["Contoso."]
 #
 #   [feeds.mirror]              # read-through cache of an upstream V3 feed
 #   enabled = true
 #   upstream = "https://api.nuget.org/v3/index.json"
-#   timeout_secs = 30
+#   timeout_secs = 30              # connect, silence, and each metadata request
+#   download_timeout_secs = 3600   # one whole .nupkg download; 0 = no deadline
+#   # How long a package's upstream version list is trusted before a read lists
+#   # it again (and how long an id the upstream lacks is not asked for again).
+#   refresh_secs = 600
 #   # A mirror fetch is triggered by an ordinary (possibly anonymous) read, so
 #   # it is bounded by default: at most this many versions of one package per
 #   # miss, newest first. Set to a large number, or omit, to fetch everything.
@@ -221,10 +256,17 @@ inbox_scan_secs = 30                # YANUGET_FILES_INBOX_SCAN_SECS
 #   # metadata endpoint. Private/loopback targets are refused unless you opt in
 #   # because your upstream really is on the private network.
 #   allow_private_upstream = false
+#   # Outbound proxy for upstream requests. Unset, the mirror connects directly:
+#   # HTTP(S)_PROXY in the environment is ignored.
+#   # proxy = "http://proxy.internal:3128"
+#   # Extra CA certificates (PEM) for an upstream behind an internal CA. The
+#   # system store and the bundled Mozilla roots are trusted either way.
+#   # ca_cert_path = "/etc/yanuget/internal-ca.pem"
 #
 #     # Credentials for an authenticated upstream (all optional). Set the
-#     # username/password pair for HTTP Basic, token for a Bearer token, and/or
-#     # headers for a custom header (e.g. a private-feed API key).
+#     # username/password pair for HTTP Basic OR token for a Bearer token, plus
+#     # headers for a custom header (e.g. a private-feed API key). They are sent
+#     # only to the upstream's own scheme, host and port.
 #     [feeds.mirror.auth]
 #     # username = "ci"
 #     # password = "secret"

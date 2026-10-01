@@ -14,9 +14,15 @@ cargo build
 
 # The docs site is optional for building — a placeholder page is embedded when
 # MkDocs has not run — but you need it to work on the /docs endpoint.
-pip install -r requirements-docs.txt
+# The lock is hashed; after editing requirements-docs.in, regenerate it as
+# described at the top of that file.
+pip install --require-hashes -r requirements-docs.txt
 mkdocs build
 ```
+
+Cargo notices a new or changed `site/` on the next build, with one exception:
+if the first `mkdocs build` comes after a `cargo build` and the docs sources
+have not changed since, run `touch build.rs` so the site is picked up.
 
 Run the server:
 
@@ -24,8 +30,10 @@ Run the server:
 YANUGET_API_KEY=change-me cargo run
 ```
 
-It listens on `https://0.0.0.0:5000` with a self-signed certificate, so pass
-`-k` / `--insecure` to `curl` and clients while testing.
+It listens on `https://0.0.0.0:5000` with a self-signed certificate. `curl`
+takes `-k` / `--insecure`; `dotnet` and `choco` have no such switch, so for
+them either trust `data/tls/cert.pem` or run with `YANUGET_TLS_ENABLED=false`
+and use `http://` while testing.
 
 ## Before you open a pull request
 
@@ -37,6 +45,14 @@ cargo clippy --all-targets --all-features   # must be warning-free
 cargo test --all-features
 mkdocs build --strict                       # if you touched docs/
 ```
+
+CI also runs `cargo audit` and `cargo deny check licenses bans sources`
+(policy in `deny.toml`): a new dependency under a license not on the list
+there fails the build until someone has looked at it.
+
+Every action in `.github/workflows/` is pinned to a full commit SHA with the
+release in a comment (`uses: actions/checkout@<sha> # v7.0.1`). Keep it that
+way when adding one; Dependabot keeps the pins current.
 
 If you changed anything that a NuGet client can observe — the service index, the
 flat container, registration, search, download URLs, or symbol keys — also run
@@ -87,16 +103,21 @@ your change.
   `Vec<u8>`, or reads an archive end to end to get at a small part of it, will be
   rejected. Stream it, or seek to it.
 - **New backends go behind the existing traits.** Storage and database are
-  `PackageStorage` and `PackageDatabase`; S3, Azure Blob, PostgreSQL and MySQL
-  are all meant to be addable without touching the core.
+  `PackageStorage` and `PackageDatabase`. PostgreSQL or MySQL is a
+  `PackageDatabase` implementation; S3 or Azure Blob also needs a streaming
+  `PackageContent` variant, because downloads, uploads and the inbox work on
+  local paths and `rename` today.
 - **Comments explain why, not what.** Match the density and voice of the code
   around you.
 - **Configuration additions are documented** in `yanuget.example.toml` and
   `docs/configuration.md`, and rejected when misspelled — every config struct
   uses `deny_unknown_fields` so a typo is an error rather than a silent no-op.
+- **Escape at every HTML sink.** The pages are built with `format!`, so
+  nothing is escaped unless the code says so. `src/web/ui/escape.rs` holds the
+  helpers and the rule for which one a value needs.
 - **Keep the web UI dependency-free.** The gallery loads no external CSS, fonts,
   scripts or images, and CI enforces the same for the docs site. Inline assets
-  must be added to the CSP hash list in `src/web/ui.rs`.
+  must be added to the CSP hash list in `src/web/ui/layout.rs`.
 
 ## Commit messages and branches
 
@@ -115,11 +136,17 @@ Branch off `main` and open the pull request against `main`.
 | `src/nuspec.rs`, `src/nupkg.rs` | Manifest parsing; seek-based archive reading |
 | `src/streaming.rs` | Bounded-memory copy-to-disk with incremental SHA-512 |
 | `src/storage/` | `PackageStorage` trait and the filesystem backend |
-| `src/database/` | `PackageDatabase` trait and the SQLite backend |
+| `src/database/` | `PackageDatabase` trait and the SQLite backend, one module per table group under `sqlite/` |
+| `src/database/sqlite/schema.rs` | Numbered schema migrations: a schema change is a new step at the end, never an edit to a shipped one |
 | `src/nuget/` | Protocol: URL generation and JSON response builders |
 | `src/indexing.rs` | Upload → validate → store → record, with rollback |
-| `src/pdb.rs`, `src/symbols.rs` | Portable PDB parsing and `.snupkg` ingest |
-| `src/web/` | axum router, handlers, Range-aware file serving, HTML gallery |
+| `src/pdb.rs`, `src/pe.rs`, `src/symbols.rs` | Portable PDB parsing, the PE debug-directory reader that ties a PDB to its assembly, and `.snupkg` ingest |
+| `src/web/mod.rs` | The axum routers; admin routes sit behind one `route_layer` |
+| `src/web/state.rs`, `src/web/middleware.rs` | Per-feed state; the global and per-feed middleware |
+| `src/web/protocol.rs`, `src/web/publish.rs` | NuGet V3 read endpoints; push, delete and relist |
+| `src/web/gallery.rs`, `src/web/admin.rs` | Gallery and admin-area handlers |
+| `src/web/hosted.rs`, `src/web/files.rs` | Attached files and resumable uploads; Range-aware file serving |
+| `src/web/ui/` | HTML rendering, one module per page family; escaping lives in `ui/escape.rs` |
 | `docs/` | MkDocs sources for the site embedded at `/docs` |
 | `tests/` | Integration tests |
 | `scripts/verify-with-dotnet.sh` | End-to-end check against the real .NET SDK |

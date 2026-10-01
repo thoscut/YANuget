@@ -50,6 +50,33 @@ pub enum PackageContent {
     LocalPath(PathBuf),
 }
 
+/// A server temp file that is removed when this goes out of scope, however
+/// that happens: an error return, a panic, or the future that owns it being
+/// dropped half-way, which is what a client disconnecting does to its
+/// request. Handing the path to the store is fine while this is alive: once
+/// the file has been renamed into place its temp name no longer exists, and
+/// the removal finds nothing. Temp names are unique, so it never removes
+/// anything else.
+#[derive(Debug)]
+pub struct TempPath(PathBuf);
+
+impl TempPath {
+    /// Take charge of removing `path`.
+    pub fn new(path: PathBuf) -> Self {
+        Self(path)
+    }
+
+    pub fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for TempPath {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 /// Storage backend for package payloads and their small sidecar files.
 #[async_trait]
 pub trait PackageStorage: Send + Sync {
@@ -81,6 +108,13 @@ pub trait PackageStorage: Send + Sync {
     /// bounded in size and already in memory, so bytes are passed directly.
     async fn store_symbol(&self, key: &str, filename: &str, bytes: &[u8]) -> Result<()>;
 
+    /// Move an already-written (and synced) temp file into storage as the
+    /// symbol file for `key`/`filename`, atomically: a reader sees the old
+    /// bytes or the new ones, never a partial file. The symbol push extracts
+    /// each PDB to its own temp file rather than into memory, so this is how
+    /// it stores them.
+    async fn store_symbol_file(&self, key: &str, filename: &str, temp_path: PathBuf) -> Result<()>;
+
     /// Resolve a stored symbol file for serving.
     async fn get_symbol(&self, key: &str, filename: &str) -> Result<PackageContent>;
 
@@ -93,6 +127,10 @@ pub trait PackageStorage: Send + Sync {
     /// Read a small auxiliary file.
     async fn get_aux(&self, id: &str, version: &str, kind: AuxFile) -> Result<Vec<u8>>;
 
+    /// Resolve a small auxiliary file for serving as-is, without reading it
+    /// into memory (a manifest can run to megabytes).
+    async fn aux_content(&self, id: &str, version: &str, kind: AuxFile) -> Result<PackageContent>;
+
     /// Delete a package and all of its auxiliary files. Succeeds even if some
     /// files are already gone.
     async fn delete(&self, id: &str, version: &str) -> Result<()>;
@@ -101,6 +139,9 @@ pub trait PackageStorage: Send + Sync {
     /// under its SHA-256 (lower-case hex). When those bytes are already stored,
     /// the temp file is dropped instead: identical files are kept once. Returns
     /// the stored size in bytes.
+    ///
+    /// The caller has computed the hash of `temp_path` itself. Anything but a
+    /// regular file (a link, a device) is refused.
     async fn store_blob(&self, sha256_hex: &str, temp_path: PathBuf) -> Result<u64>;
 
     /// Resolve a stored blob for serving.

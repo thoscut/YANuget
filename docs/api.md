@@ -4,9 +4,12 @@ YANuget implements the [NuGet v3 protocol](https://learn.microsoft.com/en-us/nug
 All resource URLs are advertised by the **service index** so clients discover
 them automatically; the paths below are the defaults YANuget serves.
 
-Base URLs in responses are derived per-request from the `Host` /
-`X-Forwarded-Proto` / `X-Forwarded-Host` headers, or taken from
-`YANUGET_BASE_URL` when set.
+Base URLs in responses are taken from `base_url` (`YANUGET_BASE_URL`) when it
+is set, which is the recommended setup whenever the public address is known.
+Otherwise they are derived per request from the `Host` header, and from
+`X-Forwarded-Proto` / `X-Forwarded-Host` only when the connection comes from a
+peer listed in [`trusted_proxies`](configuration.md#trusted-proxies); from
+anyone else those headers are ignored.
 
 ## Feeds and path prefixes
 
@@ -50,8 +53,43 @@ indexed. Responses:
 | `400 Bad Request` | Malformed package / nuspec / id / version. |
 | `401 Unauthorized` | Missing or wrong API key. |
 | `403 Forbidden` | Rejected by the feed's `license_policy` (`action = "block"`). |
-| `409 Conflict` | Version already exists in this feed (unless `allow_overwrite`). |
+| `409 Conflict` | Version already exists in this feed (unless `allow_overwrite`), or different content is already stored under this id and version (see below). |
 | `413 Payload Too Large` | Exceeds `max_package_size_bytes`. |
+
+The `<version>` must be one the NuGet client itself accepts: up to four numeric
+components of at most `2147483647`, an optional pre-release label and build
+metadata made of dot-separated `[0-9A-Za-z-]` identifiers, no leading zero on a
+numeric pre-release identifier (`1.0.0-01` is refused), no leading `v`, and at
+most 64 characters in all (as on nuget.org). Anything else is a `400`, and so
+is the same from a mirrored upstream (that one version is skipped, not the
+package). Versions an older YANuget release already stored under its laxer
+rules stay readable, and stay addressable in URLs (a URL only looks a version
+up); only a leading `v` in a URL is refused.
+
+The archive itself is refused (`400`) when two readers could see different
+contents in it: an entry name that appears twice, more than one `.nuspec` at the
+root, or a central directory whose record counts, ZIP64 record or end record
+disagree with each other or with the records actually present. More than 100,000
+entries is refused too. Only the `.nuspec` (and a declared readme or icon) is
+ever opened, so an entry the server cannot decompress elsewhere in the package
+does not matter. An embedded readme or icon larger than 1 MiB (nuget.org's limit)
+is refused with a `400` naming the entry, rather than stored cut short.
+
+An id and version name **one** package across the whole server: the payload
+and metadata are stored once and shared by every feed that holds the version.
+Pushing *different* bytes under an id and version the server already stores —
+in any feed — is refused with `409` and logged as a failure; the same bytes
+simply join the feed. Whoever stores a version first therefore claims it
+everywhere, so a low-trust feed (or a mirror feed filled by anonymous reads)
+can take a name another feed expected to publish. `reserved_id_prefixes` on a
+feed (see [Feeds](configuration.md#feeds)) keeps the ids under a prefix for
+that feed alone.
+
+An overwriting push (`allow_overwrite`) replaces the build, not what an admin
+decided about the version: the version keeps its listed, enabled and pinned
+state, its download count and its attached files. New content lands pending
+again in a feed with `requires_approval`. The new payload is stored before the
+old rows are replaced, and a failure part-way puts the previous build back.
 
 In a feed with `requires_approval = true`, a pushed version is still accepted
 (`201`) but lands **pending** — withheld from clients until an admin approves it.
@@ -106,20 +144,33 @@ GET /v3/package/{id}/{version}/{id}.{version}.nupkg
 
 Streams the `.nupkg`. Supports `Range: bytes=...` (responds `206 Partial
 Content` with `Content-Range`); always sends `Accept-Ranges: bytes`. Each
-successful fetch increments the download counter.
+transfer that sends bytes (`200`, or `206` from the first byte) increments the
+download counter; a `HEAD`, a continuation range and a `304` do not.
 
-A published id/version is immutable, so the response carries a strong `ETag`
-(the package's SHA-512 — a content hash of exactly the bytes served) and
-`Cache-Control: public, max-age=31536000, immutable`. Repeating the request with
+The response carries a strong `ETag` (the package's SHA-512 — a content hash
+of exactly the bytes served) and `Last-Modified`. Repeating the request with
 `If-None-Match` returns `304 Not Modified` with an empty body, so a client that
 already holds a multi-gigabyte package pays for a header exchange rather than
-the payload.
+the payload. `Cache-Control` depends on the feed:
+
+| Feed | `Cache-Control` |
+| --- | --- |
+| Overwrite off (the default) | `public, max-age=31536000, immutable` — an id/version never serves other bytes |
+| Overwrite on (`true` or `"prerelease-only"`) | `public, no-cache` — every use revalidates, since a re-push changes the bytes |
+| Read-gated (`read_api_key`) | `private, …` instead of `public, …`, plus `Vary: Authorization, X-NuGet-ApiKey` |
+
+On a read-gated feed every other response (registration, search, the
+gallery) is `Cache-Control: private` as well, so no shared cache or CDN in
+front of the server can hand gated content to someone without the key. The
+`.nuspec` and the gallery's icon endpoint carry `ETag`s derived from the
+same hash and follow the same rules.
 
 ```
 GET /v3/package/{id}/{version}/{id}.nuspec
 ```
 
-Returns the package's `.nuspec` manifest as `application/xml`.
+Returns the package's `.nuspec` manifest as `application/xml`, streamed, as
+an attachment, with the same validators and caching as the package.
 
 ## Registration
 
@@ -150,6 +201,16 @@ Unlisted versions additionally report `published` in the year 1900, per NuGet
 convention. `dependencyGroups` is omitted when a version has no dependencies.
 `404` if unknown.
 
+`catalogEntry.version` is the version as published — the pre-release label in
+its original casing and, in the SemVer2 hive, the build metadata — as on
+nuget.org; every URL, and a page's `lower`/`upper`, use the normalized,
+lower-cased form. A package with an embedded icon gets an `iconUrl` pointing at
+this feed's `/packages/{id}/{version}/icon` (when the web UI, which serves it,
+is enabled), in preference to a `<iconUrl>` in its nuspec. A license expression
+without a `<licenseUrl>` gets `https://licenses.nuget.org/{expression}`, the URL
+`dotnet pack` itself writes. Dependency-group `@id` fragments are
+percent-encoded.
+
 Packages with **fewer than 128 versions** get a single inlined page — the
 whole registration in one response. At 128 versions or more the index instead
 lists external pages of 64 versions each, without inline `items`, and the
@@ -167,7 +228,10 @@ package. It has nothing to do with package *size*.
 GET /v3/registration/{id}/{version}.json
 ```
 
-A single registration leaf for one version.
+A single registration leaf for one version, in the protocol's leaf shape:
+`@id`, `catalogEntry`, `listed`, `published`, `packageContent` and
+`registration` at the top level. `catalogEntry` is a URL rather than an inlined
+object; YANuget has no catalog, so it names the leaf itself.
 
 ## Search
 
@@ -177,7 +241,7 @@ GET /v3/search?q=&skip=&take=&prerelease=&semVerLevel=&packageType=
 
 | Param | Default | Notes |
 | --- | --- | --- |
-| `q` | *(empty = all)* | Matches id, description, tags, title. |
+| `q` | *(empty = all)* | A case-insensitive substring of the id, title, a tag or the first 4000 characters of the description. Only the first 256 characters are used. |
 | `skip` | `0` | Pagination offset (over package ids). |
 | `take` | `20` | Clamped to `1000`. |
 | `prerelease` | `false` | Include pre-release versions. |
@@ -186,6 +250,9 @@ GET /v3/search?q=&skip=&take=&prerelease=&semVerLevel=&packageType=
 
 Returns `{ "@context": {...}, "totalHits": N, "data": [...] }`. Each hit groups
 all matching versions of one package id and is ranked by total downloads.
+`totalDownloads` counts every version the feed serves, including those the
+`prerelease`/`semVerLevel` filters left out of `versions`. Versions are
+displayed as published, like `catalogEntry.version` above.
 
 ## Autocomplete & version enumeration
 
@@ -195,7 +262,8 @@ GET /v3/autocomplete?id={id}&prerelease=     # versions of one package
 ```
 
 Both return `{ "@context": {...}, "totalHits": N, "data": [...] }` — a list of
-package ids, or of versions when `id` is supplied.
+package ids, or of versions when `id` is supplied. `prerelease` defaults to
+`false`, as the protocol specifies (it used to default to `true` here).
 
 ## Symbol server
 
@@ -210,6 +278,23 @@ Streams a `.snupkg` to disk, reads its `.nuspec` to identify the owning package
 PDB** and indexes it by its SSQP key. Responses mirror package push (`201`,
 `400`, `401`, `404`, `413`). Requires `enable_symbol_server` (on by default).
 Native (Windows) PDBs are stored within the `.snupkg` but cannot be indexed.
+Each PDB is extracted to disk rather than into memory; a PDB over 256 MiB, or
+PDBs totalling over 512 MiB, or more than 512 of them, refuse the push with a
+`400` (never a truncated PDB).
+
+As on nuget.org, every Portable PDB must belong to an assembly of the owning
+version's stored `.nupkg`: the `.dll` or `.exe` of the same name in the same
+folder (`lib/net8.0/Foo.pdb` → `lib/net8.0/Foo.dll`) must carry a CodeView
+debug entry with the PDB's id and a `PdbChecksum` entry matching the PDB's hash.
+Any compiler since Visual Studio 15.9 / the .NET Core 2.1 SDK writes both, so
+`dotnet pack --include-symbols -p:SymbolPackageFormat=snupkg` output passes
+unchanged; symbols for older assemblies, or for assemblies the package does not
+contain, are refused with a `400`. A symbol key is claimed once: the first
+version to store it owns it, a re-push of the same bytes is a no-op, and a push
+that would give the key to another package or replace its bytes is refused. The
+push is all-or-nothing — one refused PDB stores none of them — and it holds the
+owning version's lock, so it cannot interleave with a delete or overwrite of that
+version.
 
 ```
 GET /download/symbols/{file}/{key}/{file}
@@ -247,9 +332,11 @@ disabled, not pending). The response is built for resumable clients:
 - `Accept-Ranges: bytes`, single ranges answered with `206`, and `If-Range`
   honoured — a resume against changed content gets the whole file.
 - A strong `ETag` (the SHA-256), `Last-Modified` (the upload time), and
-  `Repr-Digest: sha-256=:…:` (RFC 9530). `Cache-Control: immutable`: a file's
-  URL never serves different bytes, because a file of the same name cannot be
-  replaced, only deleted.
+  `Repr-Digest: sha-256=:…:` (RFC 9530). `Cache-Control: public, no-cache`
+  (`private, no-cache` on a read-gated feed): a file of the same name cannot
+  be replaced in place, but it can be deleted and attached again with other
+  bytes, so a cached copy is revalidated — a cheap `304` — rather than trusted
+  for a year.
 - Always `Content-Type: application/octet-stream`, `Content-Disposition:
   attachment` and `Content-Security-Policy: default-src 'none'`, so no hosted
   file can render in a browser as this origin.
@@ -324,10 +411,17 @@ is a PowerShell 7 function that uploads resumably:
 
 ```powershell
 . ./scripts/Send-YanugetFile.ps1
-Send-YanugetFile -Feed https://nuget.example.com -ApiKey $key `
+# The key comes from $env:YANUGET_API_KEY, from -ApiKey as a SecureString,
+# or from a prompt.
+Send-YanugetFile -Feed https://nuget.example.com `
     -Id Contoso.Images -Version 1.2.0 -Path .\base.wim
 # after an interruption: the same call with -Resume <the URL it printed>
 ```
+
+It sends the key only over https (`-AllowHttp` for a local test server) and
+only to the scheme, host and port of `-Feed`: an upload URL anywhere else,
+whether handed back by the server or passed as `-Resume`, is refused, and
+redirects are not followed.
 
 ### Over SSH
 

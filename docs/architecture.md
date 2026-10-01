@@ -10,7 +10,7 @@ from I/O), and **swappable backends** (storage and database behind traits).
 ```
 src/
 ├── lib.rs            Crate root; re-exports
-├── main.rs           Binary: config load, wiring, axum::serve, graceful shutdown
+├── main.rs           Binary: config load, wiring, background tasks, graceful shutdown
 ├── error.rs          Error enum + IntoResponse (HTTP status mapping)
 ├── version.rs        NuGetVersion: parse / normalize / order / SemVer2
 ├── models.rs         Domain types: Package, Dependency, DependencyGroup, ...
@@ -24,27 +24,52 @@ src/
 ├── policy.rs         Offline license allow/deny evaluation (pure)
 ├── mirror.rs         Upstream read-through mirroring (V3 feed → local feed)
 ├── migrate.rs        `yanuget migrate`: bulk import of a whole source server
-├── pdb.rs            Portable PDB parsing → SSQP symbol key
+├── pdb.rs            Portable PDB parsing → SSQP symbol key, PDB checksum
+├── pe.rs             PE debug-directory reader (ties a PDB to its assembly)
 ├── symbols.rs        `.snupkg` ingest: extract PDBs, index by symbol key
 ├── ratelimit.rs      Per-client-IP fixed-window throttle
 ├── proxy.rs          Trusted-proxy gate for `X-Forwarded-*` / `Forwarded`
 ├── retention.rs      Pure prune policy + feed-scoped version pruning / GC
 ├── locks.rs          Process-global per-version async lock (store/purge races)
+├── server.rs         Serving over HTTP or TLS: header timeout, connection cap, shutdown
 ├── tls.rs            TLS cert loading + cached self-signed generation
 ├── storage/
 │   ├── mod.rs        PackageStorage trait, PackageContent, AuxFile
 │   └── filesystem.rs Streaming filesystem backend (global, deduplicated)
 ├── database/
 │   ├── mod.rs        PackageDatabase trait, Membership, FeedVersion, Search*
-│   └── sqlite.rs     SQLite backend: global `packages` + `feed_packages` membership
+│   └── sqlite/       SQLite backend: global `packages` + `feed_packages` membership
+│       ├── mod.rs    Connection setup; the trait impl, delegating per concern
+│       ├── schema.rs Numbered migrations (`PRAGMA user_version`)
+│       ├── packages.rs, memberships.rs, feeds.rs
+│       │             Global package data; per-feed state; feed-scoped reads
+│       ├── search.rs Search, autocomplete, tag counts (FTS5 index, tag index)
+│       └── files.rs, uploads.rs, symbols.rs, tombstones.rs
 ├── nuget/
 │   ├── mod.rs        JSON response builders (pure)
 │   └── urls.rs       UrlBuilder (absolute resource URLs, feed-prefix aware)
 └── web/
-    ├── mod.rs        AppState, FeedContext, per-feed routers, handlers
-    ├── ui.rs         HTML rendering (gallery, stats, settings, feeds, admin)
+    ├── mod.rs        The routers: build_app, per-feed routes, the admin route_layer
+    ├── state.rs      AppState, FeedContext, FeedMeta
+    ├── middleware.rs Global layers: security headers + CSP, host / cross-site guard,
+    │                 forwarded-header filter, rate limit, CORS; HTML error pages
+    ├── protocol.rs   NuGet V3 reads: service index, flat container, registration,
+    │                 search, autocomplete, symbol download; health probes
+    ├── publish.rs    Push, symbol push, delete/unlist, relist
+    ├── gallery.rs    Gallery handlers: list, package page, icon, tags, stats, settings
+    ├── admin.rs      Admin area: auth gate, CSRF check, version actions, bulk,
+    │                 copy/move/promote, retention
+    ├── hosted.rs     Files attached to versions; resumable (tus) uploads
+    ├── forms.rs      Form-body and lenient query-value parsing
+    ├── helpers.rs    check_id / parse_version, header helpers, detached()
     ├── files.rs      Range-aware streaming file responses
-    └── docs.rs       The embedded documentation site (this page), served at /docs
+    ├── assets.rs     The embedded gallery font
+    ├── docs.rs       The embedded documentation site (this page), served at /docs
+    └── ui/           HTML rendering with format!, one module per page family
+        ├── escape.rs escape_html / safe_href / enc_path, and when each applies
+        ├── layout.rs Shared chrome, inline style + script, the CSP, error page
+        ├── gallery.rs, package.rs, stats.rs, settings.rs, admin.rs
+        └── format.rs Counts, sizes, truncation, key/value rows
 ```
 
 ## Feeds
@@ -62,21 +87,38 @@ path prefix. `main` builds one state per resolved feed and nests their routers.
 
 ```
 PUT /api/v2/package
-  └─ web::push_package
+  └─ web::publish::push_package
        ├─ auth.check_headers              (X-NuGet-ApiKey, constant-time)
        ├─ create temp file under {storage}/.uploads
-       ├─ web::write_upload  ─▶ streaming::stream_to_writer_limited
+       ├─ web::publish::write_upload ─▶ streaming::stream_to_writer_limited
        │     (multipart or raw body → temp file, + SHA-512, + size cap)
        └─ indexing::index_package
             ├─ nupkg::read_archive        (seek to nuspec; never reads payload)
             ├─ nuspec::parse_nuspec
             ├─ validation::validate_package_id
             ├─ build Package (size/hash from the stream summary)
-            ├─ duplicate / overwrite policy
+            ├─ reserved id prefixes, license policy
+            ├─ lock_version                (per id/version, across feeds)
+            ├─ orphan check                (finish a purge that failed part-way)
+            ├─ duplicate / overwrite policy (different bytes under a stored
+            │                                id/version → 409 in any feed)
             ├─ storage.store_package       (atomic rename into place)
             ├─ storage.store_aux           (nuspec / readme / icon sidecars)
-            └─ db.add                       (rollback storage on failure)
+            └─ db.add_version / db.replace_version
+                                           (one transaction; a new version's
+                                            payload is removed if it fails, an
+                                            overwritten one is put back)
 ```
+
+The database keeps a full-text index for search (FTS5, trigram tokenizer)
+next to `packages`, maintained by triggers. Memberships, tags, attached files
+and symbol mappings each have a foreign key to their version in `packages`,
+so deleting the version takes them with it. Every schema change is a numbered
+step in `database/sqlite/schema.rs`, recorded in `PRAGMA user_version`; each
+runs once, in its own `BEGIN IMMEDIATE` transaction, so two processes opening
+the same file never both apply it, and a new database runs every step, so it
+ends up with exactly the schema an upgraded one has. A changed table, index
+or trigger is a new step, never an edit to an old one.
 
 ## Request flow: restore / download
 
@@ -91,11 +133,14 @@ GET /v3/package/{id}/{v}/{f}.nupkg→ storage.get_package → files::serve_local
 ## Trait boundaries
 
 Two traits isolate I/O so the core is testable with in-memory fakes and so new
-backends slot in without touching handlers:
+backends have a seam to go behind:
 
 - **`PackageStorage`** — payload + sidecars. The `PackageContent::LocalPath`
-  return lets the web layer serve files with zero-copy Range support. A future
-  object-store backend adds a streaming variant.
+  return lets the web layer serve files with zero-copy Range support. It is the
+  only variant, and downloads, uploads (`TempPath` renamed into place) and the
+  SSH inbox assume local files, so an object-store backend has to add a
+  streaming variant and teach those paths to use it — not only implement the
+  trait.
 - **`PackageDatabase`** — metadata, listing, download counts, search,
   autocomplete. The SQLite backend stores nested metadata as JSON columns and
   finishes NuGet's pre-release ordering in Rust (SQL can't express it).

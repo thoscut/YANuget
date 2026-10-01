@@ -1,0 +1,8 @@
+# Python packages for the media capture (scripts/capture-media.sh): Pillow
+# assembles the GIFs. `requirements.txt` is the hashed lock compiled from this
+# file, and the capture script installs it with `--require-hashes`, so what runs
+# in the media workflow is exactly what was reviewed. Regenerate after editing:
+#
+#   uv pip compile --universal --generate-hashes --python-version 3.10 \
+#       scripts/media/requirements.in -o scripts/media/requirements.txt
+Pillow>=11,<13

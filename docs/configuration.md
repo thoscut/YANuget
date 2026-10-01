@@ -15,7 +15,8 @@ A fully commented template lives in
 | --- | --- | --- | --- | --- |
 | `host` | `YANUGET_HOST` | IP | `0.0.0.0` | Interface to bind. |
 | `port` | `YANUGET_PORT` | int | `5000` | TCP port. |
-| `base_url` | `YANUGET_BASE_URL` | string | *(per-request)* | External base URL. If unset, derived from `Host`/`X-Forwarded-*`. |
+| `base_url` | `YANUGET_BASE_URL` | string | *(per-request)* | External base URL. Set it whenever you know the public address, and always behind a proxy. If unset, derived from `Host`, and from `X-Forwarded-*` only when the peer is in `trusted_proxies`. When set, requests for any other host get `421` (see [Host validation](#host-validation)). |
+| `allowed_hosts` | `YANUGET_ALLOWED_HOSTS` | string[] | `[]` | Further host names the server answers to (env: comma-separated). `*` accepts any. |
 | `data_dir` | `YANUGET_DATA_DIR` | path | `./data` | Root for all data. |
 | `storage_path` | `YANUGET_STORAGE_PATH` | path | `{data_dir}/packages` | Package store. |
 | `database_path` | `YANUGET_DATABASE_PATH` | path | `{data_dir}/yanuget.db` | SQLite file. |
@@ -25,7 +26,8 @@ A fully commented template lives in
 | `gallery_page_size` | `YANUGET_GALLERY_PAGE_SIZE` | int | `20` | Packages per gallery page (`?take=` overrides). |
 | `max_package_size_bytes` | `YANUGET_MAX_PACKAGE_SIZE_BYTES` | int | *(unlimited)* | Upload cap; streamed either way. |
 | `upload_idle_timeout_secs` | `YANUGET_UPLOAD_IDLE_TIMEOUT_SECS` | int | `300` | Abort an upload after this long without a byte arriving (`408`). Only silence counts; a slow transfer is never cut off. `0` waits forever. |
-| `min_free_disk_bytes` | `YANUGET_MIN_FREE_DISK_BYTES` | int | `2147483648` (2 GiB) | Refuse an upload (`507`) that would leave less than this free on the storage volume. Checked against the declared size when there is one. `0` turns the check off. |
+| `min_free_disk_bytes` | `YANUGET_MIN_FREE_DISK_BYTES` | int | `2147483648` (2 GiB) | Refuse an upload (`507`) that would leave less than this free on the storage volume. Checked against the declared size when there is one. Mirror fetches and `yanuget migrate` downloads are held to it too, against the upstream's `Content-Length`. `0` turns the check off. |
+| `max_connections` | `YANUGET_MAX_CONNECTIONS` | int | `4096` | Concurrent connections accepted; one over the cap is closed at once. `0` is unlimited. |
 | `allow_overwrite` | `YANUGET_ALLOW_OVERWRITE` | bool \| string | `false` | Re-push an existing version: `false`, `true`, or `"prerelease-only"` (overwrite pre-releases only). |
 | `hard_delete_enabled` | `YANUGET_HARD_DELETE_ENABLED` | bool | `false` | DELETE removes vs. unlists. |
 | `tls_enabled` | `YANUGET_TLS_ENABLED` | bool | `true` | Serve HTTPS (self-signed fallback). |
@@ -35,7 +37,22 @@ A fully commented template lives in
 | `enable_web_ui` | `YANUGET_ENABLE_WEB_UI` | bool | `true` | Serve the HTML gallery and the embedded `/docs` site. |
 | `primary_client` | `YANUGET_PRIMARY_CLIENT` | string | `choco` | Install command shown first (`choco`/`dotnet`/`nuget`). |
 
-Booleans accept `1/true/yes/on` (case-insensitive) via environment variables.
+Environment variables are parsed as strictly as the TOML file, and a value that
+does not parse stops the server at startup with the variable's name in the
+error — it is never skipped or read as "off":
+
+- Booleans accept `1`/`true`/`yes`/`on` and `0`/`false`/`no`/`off`
+  (case-insensitive), and nothing else.
+- Numbers are plain decimal integers: `10G`, `1e9`, `+5` and `-1` are errors.
+  For a setting that is unset by default (`YANUGET_MAX_PACKAGE_SIZE_BYTES`,
+  the retention limits), the empty string means unset.
+- `YANUGET_HOST` is an IP address or `localhost` (the IPv4 loopback).
+- `YANUGET_ALLOW_OVERWRITE` is `true`, `false` or `prerelease-only` (or a
+  boolean spelling).
+
+A `tls_cert_path` without `tls_key_path`, or the reverse, is also an error
+while TLS is on, rather than a silent fall-back to the self-signed
+certificate.
 
 ## Rate limiting
 
@@ -48,17 +65,32 @@ parallel, and behind corporate NAT or a CI egress gateway every developer shares
 one bucket. NuGet also treats `429` as terminal — it neither retries nor honours
 `Retry-After` — so being throttled mid-restore fails the build outright. The
 default is far above anything legitimate while still bounding online API-key
-guessing. The client IP is taken from `X-Forwarded-For` /
-`X-Real-IP` **when the connection peer is a trusted proxy** (see
-[Trusted proxies](#trusted-proxies)) and otherwise the peer address; requests
-with no determinable IP are not throttled. For very high read volume, raise the
-limit or disable it and rely on a reverse proxy.
+guessing. The client IP is the connection's peer address, unless that peer is
+a trusted proxy (see [Trusted proxies](#trusted-proxies)): then
+`X-Forwarded-For` is read **from the right**, skipping every hop that is itself
+a trusted proxy, and the first address nobody vouched for is the client. The
+leftmost entry is whatever the client sent — nginx's usual
+`$proxy_add_x_forwarded_for` keeps it — so it never chooses the bucket.
+`X-Real-IP` is used only when there is no `X-Forwarded-For`. IPv6 clients are
+counted per /64, since that is what one subscriber is routinely handed.
+Requests with no determinable IP are not throttled. For very high read
+volume, raise the limit or disable it and rely on a reverse proxy.
+
+Failed authentication has a separate, much smaller budget: a `401` to a
+request that carried a credential (`X-NuGet-ApiKey` or `Authorization`) counts
+against `max_failed_auth`, and once that is spent the client's credentialed
+requests are answered `429` until the window rolls over. A `401` to a request
+*without* credentials is the challenge a NuGet client waits for before it
+sends its key, and is not counted. YANuget also warns at startup about any
+push, read or admin key shorter than 32 characters: the limiter bounds online
+guessing, a long random key makes it pointless.
 
 | TOML key | Env var | Type | Default | Description |
 | --- | --- | --- | --- | --- |
 | `rate_limit.enabled` | `YANUGET_RATELIMIT_ENABLED` | bool | `true` | Master switch. |
 | `rate_limit.max_requests` | `YANUGET_RATELIMIT_MAX_REQUESTS` | int | `10000` | Max requests per IP per window (min 1). |
-| `rate_limit.window_secs` | `YANUGET_RATELIMIT_WINDOW_SECS` | int | `60` | Window length in seconds. |
+| `rate_limit.window_secs` | `YANUGET_RATELIMIT_WINDOW_SECS` | int | `60` | Window length in seconds (min 1; `0` is refused at startup, since it would never limit anything). |
+| `rate_limit.max_failed_auth` | `YANUGET_RATELIMIT_MAX_FAILED_AUTH` | int | `30` | Failed authentications per IP per window before credentialed requests get `429`; `0` turns this budget off. |
 
 ## Trusted proxies
 
@@ -106,6 +138,39 @@ most robust option when you know the public address.
 Responses carry `Vary: Host, X-Forwarded-Host, X-Forwarded-Proto` so a shared
 cache keys on the inputs that determine those URLs.
 
+## Host validation
+
+With `base_url` set, the server answers only requests whose `Host` names the
+host of `base_url`, or one of `allowed_hosts`; anything else gets
+`421 Misdirected Request`. From a trusted proxy, `X-Forwarded-Host` is checked
+instead of `Host`. The comparison ignores case, the port and a trailing dot.
+With neither `base_url` nor `allowed_hosts` set, any host is accepted, as
+before; `allowed_hosts = ["*"]` accepts any host explicitly even with
+`base_url` set.
+
+This is what stops **DNS rebinding**: a hostile web page can point a name it
+controls at your feed's internal address and make a visitor's browser talk to
+it, but the browser still sends the hostile name as `Host`. Without the check
+such a page could read an intranet-only feed, and — on a feed without an API
+key — push or delete.
+
+Behind a proxy, either forward the original host (`proxy_set_header Host
+$host;` in nginx) or send `X-Forwarded-Host` from a trusted proxy. To reach the
+server by another name as well (`localhost` on the box itself, say), list it
+in `allowed_hosts`. `/health`, `/health/live` and `/health/ready` answer
+whatever the host, since container and Kubernetes probes use an address.
+
+Two related guards apply whatever the host settings:
+
+- Cross-origin access (`cors_allowed_origins`, including `*`) allows only
+  `GET`, `HEAD` and `OPTIONS`. A browser page has no business pushing or
+  deleting packages.
+- A `POST`, `PUT`, `PATCH` or `DELETE` that a browser labels
+  `Sec-Fetch-Site: cross-site` is refused with `403`. The relist `POST` needs no
+  CORS preflight, so this is what keeps a hostile page from using a visitor's
+  browser against a feed without an API key. Clients other than browsers do not
+  send the header.
+
 ## Retention
 
 Automatic pruning of old versions, under the `[retention]` table. Retention
@@ -114,6 +179,14 @@ version is pruned when it is beyond the newest *N* of its release channel
 (stable / pre-release) **or** older than `max_age_days`; the newest stable
 version — or newest pre-release when no stable exists — is always kept, so a
 package can never be pruned out of existence.
+
+The rules count only what clients can download. **Pending** and **disabled**
+versions are outside them: they are never deleted by retention, never use up
+one of the "newest *N*", and are never the newest version that is kept — so
+pushing builds into a gated feed cannot prune the approved ones, and disabling
+a broken release does not make it the version retention protects. Unlisted
+versions still count, because a client restoring that exact version still gets
+it.
 
 | TOML key | Env var | Type | Default | Description |
 | --- | --- | --- | --- | --- |
@@ -129,7 +202,9 @@ With no limit set, the sweep does nothing even when `enabled`.
 An admin can **pin** a version in `/admin`; retention then keeps it whatever
 the rules say, and it does not use up one of the "newest *N*" either — a pin is
 kept in addition to what the rules keep. A pin survives an overwriting push and
-moves with a version to another feed; it does not stop an explicit delete.
+moves with a version to another feed; it does not stop an explicit delete. A
+cleanup re-checks each version just before deleting it, so a pin set while one
+is running is honoured.
 
 `/admin/retention` shows these rules, what the last cleanup did, and exactly
 what the next one would delete and why, with a button that deletes that list
@@ -168,10 +243,18 @@ receives the files and YANuget imports them from that directory:
 The feed directories are created on startup (`default` without `[[feeds]]`).
 A file is imported once its `.sha256` file is there, so upload the file first
 and the checksum last; `rsync --partial --append-verify` resumes a broken
-transfer. The importer moves the file out of the inbox before it checks it,
-then attaches it to the version, which the feed must already hold, and removes
-both files. When a file cannot be imported, a `{name}.error` next to it says
-why; the file stays, and removing the `.error` retries it.
+transfer. The importer copies the file into the server's own staging area
+while it checks it, so what is verified is what is stored, then attaches it to
+the version, which the feed must already hold, and removes both files. The
+copy needs as much free space again on the store's volume while it runs, and
+is refused, like a push, when it would leave less than `min_free_disk_bytes`
+free. When
+a file cannot be imported, a `{name}.error` next to it says why; the file
+stays, and removing the `.error` retries it.
+
+Nothing in the inbox is reached through a symbolic link: a linked directory or
+file is ignored, a file with other hard links is refused, and anything at a
+`.error` name that is not a report is replaced rather than written through.
 
 ```bash
 sha256sum base.wim > base.wim.sha256
@@ -209,6 +292,20 @@ with its own mutable state (listed / enabled / pending / flagged / downloads).
 Removing a version from a feed drops that membership; the shared payload is
 deleted only when the **last** feed referencing it lets go.
 
+That makes an id and version **one namespace across every feed**. Whoever
+stores a version first owns it everywhere: pushing different bytes under the
+same id and version is refused (`409`, logged as a failure) in every feed,
+and a mirror fetch of it fails the same way. Package metadata, readmes,
+icons and attached files are shared too, so detaching a file in one feed
+detaches it in all of them. A push key on a low-trust feed, or an anonymous
+read that fills a mirror feed, can therefore claim a version another feed
+meant to publish. `reserved_id_prefixes` closes that for your own ids: a feed
+that reserves `Contoso.` is the only one that may push, mirror or migrate
+`Contoso` or any `Contoso.*` id (matched ignoring case); every other feed
+answers `403`. Reservations of different feeds may not overlap. Copying or
+promoting an existing version into another feed is an admin action and is not
+affected.
+
 | TOML key | Type | Default | Description |
 | --- | --- | --- | --- |
 | `feeds[].name` | string | *(required)* | URL slug + DB key; `[A-Za-z0-9._-]+`, unique. |
@@ -220,15 +317,34 @@ deleted only when the **last** feed referencing it lets go.
 | `feeds[].hard_delete_enabled` | bool | *(global)* | DELETE removes vs. unlists. |
 | `feeds[].requires_approval` | bool | `false` | Incoming versions are pending until approved. |
 | `feeds[].promotes_to` | string | *(none)* | Next release ring (must name another feed). |
+| `feeds[].reserved_id_prefixes` | string[] | `[]` | Id prefixes (e.g. `"Contoso."`) only this feed may bring in; every other feed refuses them. See below. |
 | `feeds[].mirror.enabled` | bool | `false` | Read-through cache of an upstream V3 feed. |
 | `feeds[].mirror.upstream` | string | `https://api.nuget.org/v3/index.json` | Upstream service index. |
-| `feeds[].mirror.timeout_secs` | int | `30` | Per-request upstream timeout. |
+| `feeds[].mirror.timeout_secs` | int | `30` | Connect timeout, the longest the upstream may go silent, and the deadline for one metadata request. |
+| `feeds[].mirror.download_timeout_secs` | int | `3600` | Deadline for one whole `.nupkg` download; `0` removes it. |
+| `feeds[].mirror.refresh_secs` | int | `600` | How long a package's upstream version list is trusted before a read lists it again — and how long an id the upstream lacks is not asked for again. |
 | `feeds[].mirror.auth.username` / `.password` | string | *(none)* | HTTP Basic credentials for the upstream. |
-| `feeds[].mirror.auth.token` | string | *(none)* | Bearer token for the upstream (`Authorization: Bearer …`). |
+| `feeds[].mirror.auth.token` | string | *(none)* | Bearer token for the upstream (`Authorization: Bearer …`). Set this *or* `username`, not both. |
 | `feeds[].mirror.auth.headers` | table | `{}` | Arbitrary extra request headers (e.g. a private-feed API key). |
+
 | `feeds[].mirror.max_versions_per_package` | int | `50` | Newest-first cap on how many versions one read-through miss fetches. |
 | `feeds[].mirror.max_package_size_bytes` | int | *(server-wide cap, else 2 GiB)* | Cap on a single mirrored `.nupkg`. |
 | `feeds[].mirror.allow_private_upstream` | bool | `false` | Permit an upstream on a private/loopback address. |
+| `feeds[].mirror.proxy` | string | *(none)* | Outbound proxy for upstream requests. Unset, the mirror connects directly and ignores `HTTP(S)_PROXY`. |
+| `feeds[].mirror.ca_cert_path` | path | *(none)* | PEM file of extra CA certificates to trust for the upstream, on top of the system store and the bundled Mozilla roots. |
+| `feeds[].license_policy.enabled` | bool | `false` | Evaluate the offline license policy. |
+| `feeds[].license_policy.allowed` | string[] | `[]` | If non-empty, license must match one. |
+| `feeds[].license_policy.blocked` | string[] | `[]` | Always rejected (even if also allowed). |
+| `feeds[].license_policy.allow_unlicensed` | bool | `true` | Allow packages with no declared license. |
+| `feeds[].license_policy.action` | string | `warn` | `warn` (accept + flag) or `block` (reject). |
+| `feeds[].retention` | table | *(global `[retention]`)* | Per-feed retention overrides. |
+
+Upstream credentials are sent only to the service index's own scheme, host and
+port. The resource URLs inside the service index are the upstream's choice, so
+a `PackageBaseAddress`, search or catalog URL on another host — or a redirect
+to one, such as a download handed off to a CDN — is fetched without them. A
+redirect from `https` to `http` is refused. Setting both `username` and `token`,
+or a header that cannot be sent, is a startup error.
 
 Three things bound a read-through miss, because it is started by an
 *unauthenticated read* and writes what it fetches to your disk:
@@ -244,12 +360,43 @@ Three things bound a read-through miss, because it is started by an
   what has been mirrored so far and the remaining versions are fetched on a
   later request. Nothing is lost — a mirror is a cache, and it warms up
   incrementally rather than holding one connection open for the whole job.
-| `feeds[].license_policy.enabled` | bool | `false` | Evaluate the offline license policy. |
-| `feeds[].license_policy.allowed` | string[] | `[]` | If non-empty, license must match one. |
-| `feeds[].license_policy.blocked` | string[] | `[]` | Always rejected (even if also allowed). |
-| `feeds[].license_policy.allow_unlicensed` | bool | `true` | Allow packages with no declared license. |
-| `feeds[].license_policy.action` | string | `warn` | `warn` (accept + flag) or `block` (reject). |
-| `feeds[].retention` | table | *(global `[retention]`)* | Per-feed retention overrides. |
+  A single download is bounded by `download_timeout_secs` instead, and by
+  `timeout_secs` of silence.
+
+How the mirror keeps up, and what it does not repeat:
+
+* **New upstream releases appear.** A package's version list is fetched again
+  once it is older than `refresh_secs` — in the background when the feed
+  already has versions of it, so the read that noticed is not held up.
+* **The version a client asks for is fetched first**, even when it is older
+  than the newest `max_versions_per_package`, so a project pinned to an old
+  version restores.
+* **Misses are not repeated.** An id the upstream does not have is not asked
+  for again within `refresh_secs`; a version that failed (absent, over the size
+  cap, the wrong identity, refused by policy) not for 15 minutes; and an
+  upstream that fails is backed off, from 30 seconds doubling up to 30
+  minutes. A feed with `requires_approval` does not re-list on every read
+  while its mirrored versions wait for approval.
+* **Concurrent requests share one fetch.** A request for a package another
+  request is fetching waits for it (up to a minute) rather than answering
+  `404`, per feed and id.
+
+A version removed from a mirror feed stays removed. Deleting it (from `/admin`,
+a hard `DELETE`, or a retention sweep) or moving it to another feed records a
+tombstone for that feed, id and version, and the mirror never fetches a
+tombstoned version again — so a package pulled as malicious does not come back
+on the next read, and retention and the mirror do not fight over old versions.
+Pushing the version to the feed again clears its tombstone.
+
+The license policy reads SPDX expressions the way SPDX means them. Case, the
+`+` suffix and the deprecated ids are normalised on both sides, so a rule for
+`GPL-2.0` matches `GPL-2.0+`, `GPL-2.0-only` and `GPL-2.0-or-later` alike.
+Against an allow list, `A OR B` needs one side allowed and `A AND B` both;
+`X WITH exception` passes a rule allowing `X` only when the exception is one
+the SPDX list defines (name the whole pair in a rule to accept any other).
+**A deny list on its own is advisory**: a package that declares its license as
+a file, or as a `licenseUrl` the list does not name, passes it. To control
+what comes in, set `allowed`.
 
 ### Read authentication
 
@@ -258,13 +405,27 @@ require a credential, supplied either as an `X-NuGet-ApiKey` header or as the
 password of HTTP Basic credentials (what `dotnet`/`nuget` send). The
 `/v3/index.json` service index stays open so clients can discover the feed.
 
+`read_api_key` exists only on a `[[feeds]]` entry. **The implicit single feed
+served at the root has no read key: with no `[[feeds]]` configured, anyone who
+can reach the server can restore from it.** To require a key for reads,
+configure the feed explicitly — which mounts it at `/{name}/v3/index.json`
+rather than at the root — or keep the server off networks whose clients should
+not read it.
+
+A read-gated feed is left off the feed index at the server root, which anyone
+can read: its name can say as much as its contents, and its users already have
+its address. The index says that such feeds exist, without naming or counting
+them.
+
 ### Release rings & approval
 
 `requires_approval = true` makes every version entering a feed (by push,
 promotion or mirror) **pending** — withheld from clients until an operator
 approves it in `/admin`. Combined with `promotes_to`, feeds form an ordered
 promotion chain (e.g. `dev → stable`): an admin promotes a version into the next
-ring, where it waits for approval if that ring gates. Feeds without
+ring, where it waits for approval if that ring gates. A promoted (or copied)
+version keeps the state it had: one that is unlisted, disabled or still
+pending in the source arrives unlisted, disabled or pending in the target. Feeds without
 `promotes_to` are simply independent sets a version can be added to.
 
 ## Logging
@@ -289,8 +450,9 @@ YANuget serves **HTTPS by default**. Behaviour:
   reject untrusted certificates). For a public feed, supply a real certificate.
 - Set `tls_enabled = false` to serve plain HTTP — appropriate when a reverse
   proxy (nginx, Caddy, Traefik) terminates TLS in front of YANuget. In that
-  case forward `X-Forwarded-Proto`/`X-Forwarded-Host` so generated URLs use the
-  right scheme/host.
+  case set `base_url` to the public address, or forward
+  `X-Forwarded-Proto`/`X-Forwarded-Host` and list the proxy in
+  [`trusted_proxies`](#trusted-proxies) so they are honoured.
 
 When TLS is on and no base URL is configured, generated URLs default to the
 `https` scheme (still overridable by `X-Forwarded-Proto`). With TLS enabled,
@@ -304,23 +466,42 @@ responses also carry a `Strict-Transport-Security` header (one year).
 - The `/admin` area (set `admin_api_key`) and the gallery should only be exposed
   over HTTPS — keep TLS on, or terminate it at a proxy.
 - Admin **state changes** additionally require a CSRF token (embedded in the
-  admin forms, derived from the admin key) and reject a request a browser
-  labels cross-site. HTTP Basic credentials are replayed automatically by the
-  browser, so without this a signed-in operator merely visiting a hostile page
-  would be enough to delete packages. Scripted callers can send the token as an
-  `X-CSRF-Token` header instead of the `_csrf` form field.
+  admin forms) and reject a request a browser labels cross-site. HTTP Basic
+  credentials are replayed automatically by the browser, so without this a
+  signed-in operator merely visiting a hostile page would be enough to delete
+  packages. The token is an HMAC, under a secret drawn at random when the
+  server starts, over the feed's admin key and the time it was issued: it
+  expires after 12 hours, and a restart revokes every token handed out (reload
+  the admin page). Scripted callers can take the token from an admin page and
+  send it as an `X-CSRF-Token` header instead of the `_csrf` form field.
+- Every `/admin` response, the authentication challenge included, carries
+  `Cache-Control: no-store`, so neither the pages nor the token they embed are
+  kept by a browser or a shared cache.
+- Keys are compared in constant time, and surrounding whitespace is dropped
+  from push, read and admin keys alike.
 - Every response carries `X-Content-Type-Options: nosniff`,
   `X-Frame-Options: DENY` and `Referrer-Policy: no-referrer`. Gallery pages also
   carry a `Content-Security-Policy` of `default-src 'none'` whose only permitted
   inline style and script are the two the server itself emits, pinned by
   SHA-256 — so an escaping bug could not become script execution.
+- A client gets 30 seconds to send a request's headers, and at most
+  `max_connections` connections are open at once, so clients that open
+  sockets and trickle bytes cannot hold them indefinitely. (Request bodies are
+  bounded by `upload_idle_timeout_secs` instead.) On shutdown, in-flight
+  requests get 10 seconds, on plain HTTP as on HTTPS, and background work (a
+  retention sweep, an inbox scan) is allowed to finish within the same
+  period rather than being dropped mid-way.
 - `5xx` responses return a generic message; the underlying I/O, SQL or upstream
   detail goes to the log only.
 - Unknown keys in the TOML file are a **hard error**, so a mistyped security
   setting fails loudly instead of silently reverting to its default.
 - A feed with `[feeds.mirror]` follows resource URLs chosen by the
   *upstream*. Non-HTTP schemes and private/loopback targets are refused unless
-  `allow_private_upstream = true`, mirrored downloads are bounded by
+  `allow_private_upstream = true` — checked on the addresses a host name
+  resolves to when each connection is made, so a name pointing at the local
+  network, a redirect to one, or a DNS answer that changes between requests is
+  refused too. Through a configured `proxy`, the proxy resolves names, so its
+  own egress rules apply. Mirrored downloads are bounded by
   `max_package_size_bytes` and `max_versions_per_package`, and a mirrored
   package must declare the id/version that was actually requested — so a
   compromised upstream cannot substitute a different package under a name your
@@ -337,6 +518,11 @@ location / {
     proxy_set_header Host $host;
     proxy_set_header X-Forwarded-Proto $scheme;
     proxy_set_header X-Forwarded-Host $host;
+    # The client's address, for the rate limiter and the logs. Set, not
+    # appended: `$proxy_add_x_forwarded_for` would pass on whatever the client
+    # sent in its own X-Forwarded-For.
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $remote_addr;
 
     client_max_body_size 0;          # no upload size cap at the proxy
     proxy_request_buffering off;     # stream uploads through
@@ -345,7 +531,8 @@ location / {
 }
 ```
 
-The `X-Forwarded-*` headers above are only honoured if this proxy's address is
-covered by `trusted_proxies`. A proxy on the same host or a private network is
-covered by the `private` default; one reaching YANuget from a public address
-needs listing explicitly.
+The forwarding headers above are only honoured if this proxy's address is
+covered by `trusted_proxies`, which is empty by default. List the proxy's
+address (`127.0.0.1` for one on the same host), or `private` if it reaches
+YANuget over a private network that no untrusted client shares. Setting
+`base_url` as well pins the generated URLs regardless of any header.

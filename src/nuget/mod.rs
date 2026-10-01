@@ -220,8 +220,25 @@ pub fn registration_page(urls: &UrlBuilder, id: &str, packages: &[Package]) -> V
 
 /// Build a standalone registration leaf document
 /// (`/v3/registration/{id}/{version}.json`).
+///
+/// This is not the item a registration page inlines: the spec gives the
+/// standalone leaf its own shape, with `catalogEntry` as a URL rather than an
+/// object and `listed`/`published` at the top level. YANuget has no catalog, so
+/// `catalogEntry` names the leaf itself — the one resource describing this
+/// version — as the page items' `catalogEntry.@id` already does.
 pub fn registration_leaf(urls: &UrlBuilder, id: &str, package: &Package) -> Value {
-    registration_leaf_item(urls, &id.to_lowercase(), package)
+    let lower_id = id.to_lowercase();
+    let version = package.normalized_version();
+    let leaf_url = urls.registration_leaf(&lower_id, &version);
+    json!({
+        "@id": leaf_url,
+        "@type": ["Package", "http://schema.nuget.org/catalog#Permalink"],
+        "catalogEntry": leaf_url,
+        "listed": package.listed,
+        "packageContent": urls.package_download(&lower_id, &version),
+        "published": published(package),
+        "registration": urls.registration_index(&lower_id),
+    })
 }
 
 fn registration_leaf_item(urls: &UrlBuilder, lower_id: &str, p: &Package) -> Value {
@@ -238,31 +255,82 @@ fn registration_leaf_item(urls: &UrlBuilder, lower_id: &str, p: &Package) -> Val
     })
 }
 
-fn catalog_entry(urls: &UrlBuilder, lower_id: &str, p: &Package, content_url: &str) -> Value {
-    let version = p.normalized_version();
-    // NuGet signals an unlisted version by reporting a `published` date in the
-    // year 1900, in addition to the explicit `listed: false` flag.
-    let published = if p.listed {
+/// NuGet signals an unlisted version by reporting a `published` date in the
+/// year 1900, in addition to the explicit `listed: false` flag.
+fn published(p: &Package) -> String {
+    if p.listed {
         p.published.to_rfc3339_opts(SecondsFormat::Millis, true)
     } else {
         "1900-01-01T00:00:00.000Z".to_string()
-    };
+    }
+}
+
+/// The icon a client should show: the embedded one, served by this feed, in
+/// preference to an external `<iconUrl>` (as nuget.org does). A package whose
+/// only icon is embedded used to get no `iconUrl` at all.
+fn icon_url(urls: &UrlBuilder, lower_id: &str, p: &Package) -> Option<String> {
+    p.has_embedded_icon
+        .then(|| urls.package_icon(lower_id, &p.normalized_version()))
+        .flatten()
+        .or_else(|| p.icon_url.clone())
+}
+
+/// The license URL a client should link: the nuspec's own, or for a license
+/// expression without one, the expression's page on licenses.nuget.org —
+/// which is the URL `dotnet pack` itself writes into such a nuspec, encoded the
+/// same way (`WebUtility.UrlEncode`). Clients that predate license expressions
+/// only know `licenseUrl`, and showed nothing.
+fn license_url(p: &Package) -> Option<String> {
+    p.license_url.clone().or_else(|| {
+        p.license_expression
+            .as_deref()
+            .map(|expression| format!("https://licenses.nuget.org/{}", url_encode(expression)))
+    })
+}
+
+/// .NET's `WebUtility.UrlEncode`: alphanumerics and `-_.!*()` stay, a space
+/// becomes `+`, everything else is `%XX`.
+fn url_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'a'..=b'z'
+            | b'A'..=b'Z'
+            | b'0'..=b'9'
+            | b'-'
+            | b'_'
+            | b'.'
+            | b'!'
+            | b'*'
+            | b'('
+            | b')' => out.push(b as char),
+            b' ' => out.push('+'),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+fn catalog_entry(urls: &UrlBuilder, lower_id: &str, p: &Package, content_url: &str) -> Value {
+    let version = p.normalized_version();
     let mut entry = json!({
         "@id": urls.registration_leaf(lower_id, &version),
         "@type": "PackageDetails",
         "id": p.id,
-        "version": version,
+        // For display: the publisher's casing and the build metadata, as
+        // nuget.org reports it. URLs keep the normalized, lower-cased form.
+        "version": p.version.to_full_string(),
         "authors": p.authors.join(", "),
         "description": p.description,
-        "iconUrl": p.icon_url,
+        "iconUrl": icon_url(urls, lower_id, p),
         "language": p.language,
         "licenseExpression": p.license_expression,
-        "licenseUrl": p.license_url,
+        "licenseUrl": license_url(p),
         "listed": p.listed,
         "minClientVersion": p.min_client_version,
         "packageContent": content_url,
         "projectUrl": p.project_url,
-        "published": published,
+        "published": published(p),
         "releaseNotes": p.release_notes,
         "requireLicenseAcceptance": p.require_license_acceptance,
         "summary": p.summary,
@@ -287,12 +355,15 @@ fn dependency_groups(
         "{}#dependencygroup",
         urls.registration_leaf(lower_id, version)
     );
+    // The fragments are percent-encoded like any other URL segment: a target
+    // framework such as `portable-net45+win8` or `.NETFramework4.7.2` carries
+    // characters that do not belong raw in a URL.
     let items: Vec<Value> = groups
         .iter()
         .map(|g| {
             let tfm = g.target_framework.clone();
             let group_id = match &tfm {
-                Some(f) => format!("{base}/{}", f.to_lowercase()),
+                Some(f) => format!("{base}/{}", urls::enc(&f.to_lowercase())),
                 None => base.clone(),
             };
             let deps: Vec<Value> = g
@@ -300,7 +371,7 @@ fn dependency_groups(
                 .iter()
                 .map(|d| {
                     json!({
-                        "@id": format!("{group_id}/{}", d.id.to_lowercase()),
+                        "@id": format!("{group_id}/{}", urls::enc(&d.id.to_lowercase())),
                         "@type": "PackageDependency",
                         "id": d.id,
                         // `<dependency id="X" />` with no `version` attribute is
@@ -346,10 +417,9 @@ fn search_result(urls: &UrlBuilder, group: &SearchGroup) -> Value {
         .packages
         .iter()
         .map(|p| {
-            let v = p.normalized_version();
             json!({
-                "@id": urls.registration_leaf(&lower_id, &v),
-                "version": v,
+                "@id": urls.registration_leaf(&lower_id, &p.normalized_version()),
+                "version": p.version.to_full_string(),
                 "downloads": p.downloads,
             })
         })
@@ -368,12 +438,12 @@ fn search_result(urls: &UrlBuilder, group: &SearchGroup) -> Value {
         "@type": "Package",
         "registration": urls.registration_index(&lower_id),
         "id": latest.id,
-        "version": latest.normalized_version(),
+        "version": latest.version.to_full_string(),
         "description": latest.description,
         "summary": latest.summary,
         "title": latest.title,
-        "iconUrl": latest.icon_url,
-        "licenseUrl": latest.license_url,
+        "iconUrl": icon_url(urls, &lower_id, latest),
+        "licenseUrl": license_url(latest),
         "projectUrl": latest.project_url,
         "tags": latest.tags,
         "authors": latest.authors,
@@ -563,6 +633,7 @@ mod tests {
     fn search_response_groups_versions() {
         let group = SearchGroup {
             packages: vec![pkg("Contoso.Utils", "1.0.0"), pkg("Contoso.Utils", "1.1.0")],
+            total_downloads: 0,
         };
         let page = SearchPage {
             total_hits: 1,
@@ -577,6 +648,154 @@ mod tests {
         assert_eq!(item["versions"].as_array().unwrap().len(), 2);
         // Empty package type list defaults to "Dependency".
         assert_eq!(item["packageTypes"][0]["name"], "Dependency");
+    }
+
+    /// `totalDownloads` is the package's total, including versions the
+    /// search's filters left out (pre-releases, say).
+    #[test]
+    fn search_total_downloads_covers_every_version() {
+        let page = SearchPage {
+            total_hits: 1,
+            groups: vec![SearchGroup {
+                packages: vec![pkg("Contoso.Utils", "1.0.0")],
+                total_downloads: 1_000,
+            }],
+        };
+        let resp = search_response(&urls(), &page);
+        assert_eq!(resp["data"][0]["totalDownloads"], 1_000);
+        assert_eq!(resp["data"][0]["versions"][0]["downloads"], 3);
+    }
+
+    /// Display fields carry the version as published — casing and build
+    /// metadata — while every URL keeps the normalized, lower-cased identity.
+    #[test]
+    fn versions_are_displayed_as_published() {
+        let p = pkg("Contoso.Utils", "1.0.0-Beta.1+Build.7");
+        let reg = registration_index(&urls(), "Contoso.Utils", std::slice::from_ref(&p));
+        let leaf = &reg["items"][0]["items"][0];
+        assert_eq!(leaf["catalogEntry"]["version"], "1.0.0-Beta.1+Build.7");
+        assert!(leaf["@id"]
+            .as_str()
+            .unwrap()
+            .ends_with("/1.0.0-beta.1.json"));
+        assert_eq!(reg["items"][0]["lower"], "1.0.0-beta.1");
+
+        let page = SearchPage {
+            total_hits: 1,
+            groups: vec![SearchGroup {
+                packages: vec![p],
+                total_downloads: 0,
+            }],
+        };
+        let item = &search_response(&urls(), &page)["data"][0];
+        assert_eq!(item["version"], "1.0.0-Beta.1+Build.7");
+        assert_eq!(item["versions"][0]["version"], "1.0.0-Beta.1+Build.7");
+        assert!(item["versions"][0]["@id"]
+            .as_str()
+            .unwrap()
+            .ends_with("/1.0.0-beta.1.json"));
+    }
+
+    /// The standalone leaf has the spec's leaf shape, not a page item's.
+    #[test]
+    fn a_standalone_leaf_has_the_leaf_shape() {
+        let mut p = pkg("Contoso.Utils", "1.0.0");
+        let leaf = registration_leaf(&urls(), "Contoso.Utils", &p);
+        let url = "https://nuget.example.com/v3/registration/contoso.utils/1.0.0.json";
+        assert_eq!(leaf["@id"], url);
+        assert_eq!(leaf["catalogEntry"], url, "catalogEntry is a URL here");
+        assert_eq!(leaf["listed"], true);
+        assert!(leaf["published"].as_str().unwrap().ends_with('Z'));
+        assert_eq!(
+            leaf["registration"],
+            "https://nuget.example.com/v3/registration/contoso.utils/index.json"
+        );
+        assert!(leaf["packageContent"]
+            .as_str()
+            .unwrap()
+            .ends_with("/contoso.utils.1.0.0.nupkg"));
+        assert!(leaf["@type"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("Package")));
+
+        p.listed = false;
+        let leaf = registration_leaf(&urls(), "Contoso.Utils", &p);
+        assert_eq!(leaf["listed"], false);
+        assert_eq!(leaf["published"], "1900-01-01T00:00:00.000Z");
+    }
+
+    #[test]
+    fn embedded_icons_get_an_icon_url() {
+        let mut p = pkg("Contoso.Utils", "1.0.0-RC");
+        p.has_embedded_icon = true;
+        p.icon_url = Some("https://example.com/old.png".into());
+        let entry = |urls: &UrlBuilder, p: &Package| {
+            registration_index(urls, "Contoso.Utils", std::slice::from_ref(p))["items"][0]["items"]
+                [0]["catalogEntry"]["iconUrl"]
+                .clone()
+        };
+        // Served by this feed, the embedded icon wins.
+        let served = urls().with_icons(true);
+        assert_eq!(
+            entry(&served, &p),
+            "https://nuget.example.com/packages/contoso.utils/1.0.0-rc/icon"
+        );
+        // Without the gallery (which serves icons), fall back to <iconUrl>.
+        assert_eq!(entry(&urls(), &p), "https://example.com/old.png");
+        p.icon_url = None;
+        assert!(entry(&urls(), &p).is_null());
+    }
+
+    #[test]
+    fn license_expressions_get_a_license_url() {
+        let mut p = pkg("Contoso.Utils", "1.0.0");
+        p.license_expression = Some("MIT OR (Apache-2.0 WITH LLVM-exception)".into());
+        let reg = registration_index(&urls(), "Contoso.Utils", std::slice::from_ref(&p));
+        assert_eq!(
+            reg["items"][0]["items"][0]["catalogEntry"]["licenseUrl"],
+            "https://licenses.nuget.org/MIT+OR+(Apache-2.0+WITH+LLVM-exception)"
+        );
+        // A nuspec's own licenseUrl is kept as written.
+        p.license_url = Some("https://example.com/LICENSE".into());
+        let page = SearchPage {
+            total_hits: 1,
+            groups: vec![SearchGroup {
+                packages: vec![p],
+                total_downloads: 0,
+            }],
+        };
+        assert_eq!(
+            search_response(&urls(), &page)["data"][0]["licenseUrl"],
+            "https://example.com/LICENSE"
+        );
+    }
+
+    #[test]
+    fn dependency_group_ids_are_percent_encoded() {
+        let mut p = pkg("Contoso.Utils", "1.0.0");
+        p.dependencies = vec![DependencyGroup {
+            target_framework: Some("portable-net45+win8".into()),
+            dependencies: vec![crate::models::Dependency {
+                id: "Some.Dep".into(),
+                version_range: None,
+                include: None,
+                exclude: None,
+            }],
+        }];
+        let reg = registration_index(&urls(), "Contoso.Utils", std::slice::from_ref(&p));
+        let group = &reg["items"][0]["items"][0]["catalogEntry"]["dependencyGroups"][0];
+        let id = group["@id"].as_str().unwrap();
+        assert!(
+            id.ends_with("#dependencygroup/portable-net45%2Bwin8"),
+            "{id}"
+        );
+        assert!(group["dependencies"][0]["@id"]
+            .as_str()
+            .unwrap()
+            .ends_with("/portable-net45%2Bwin8/some.dep"));
+        // The framework itself is reported as written.
+        assert_eq!(group["targetFramework"], "portable-net45+win8");
     }
 
     #[test]

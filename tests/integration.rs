@@ -525,8 +525,22 @@ async fn registration_leaf_serves_single_version() {
         .json()
         .await
         .unwrap();
-    assert_eq!(leaf["catalogEntry"]["id"], "Leaf.Pkg");
-    assert_eq!(leaf["catalogEntry"]["version"], "1.2.3");
+    // The standalone leaf has the spec's leaf shape: `catalogEntry` is a URL
+    // (there is no catalog, so it names the leaf), and `listed`/`published`
+    // sit at the top level. It used to repeat a page item's shape.
+    let leaf_url = leaf["@id"].as_str().unwrap();
+    assert!(leaf_url.ends_with("/v3/registration/leaf.pkg/1.2.3.json"));
+    assert_eq!(leaf["catalogEntry"], leaf_url);
+    assert_eq!(leaf["listed"], true);
+    assert!(leaf["published"].is_string());
+    assert!(leaf["packageContent"]
+        .as_str()
+        .unwrap()
+        .ends_with("/v3/package/leaf.pkg/1.2.3/leaf.pkg.1.2.3.nupkg"));
+    assert!(leaf["registration"]
+        .as_str()
+        .unwrap()
+        .ends_with("/v3/registration/leaf.pkg/index.json"));
 }
 
 #[tokio::test]
@@ -727,6 +741,104 @@ fn build_portable_pdb(guid: &[u8; 16]) -> Vec<u8> {
     buf
 }
 
+/// A minimal PE32 assembly that vouches for `pdb` (built by
+/// [`build_portable_pdb`], so its 20-byte id is its last 20 bytes): a CodeView
+/// entry with the PDB's GUID and stamp, and a SHA-256 `PdbChecksum` entry over
+/// the PDB with that id zeroed. The server only accepts symbols an assembly of
+/// the owning package vouches for, as nuget.org does, and this is what
+/// `dotnet pack` puts in a real one.
+fn build_assembly_for(pdb: &[u8]) -> Vec<u8> {
+    use sha2::Digest;
+    let id_at = pdb.len() - 20;
+    let mut zeroed = pdb.to_vec();
+    zeroed[id_at..].fill(0);
+    let checksum = sha2::Sha256::digest(&zeroed);
+    let guid = &pdb[id_at..id_at + 16];
+    let stamp = &pdb[id_at + 16..];
+
+    const RVA: u32 = 0x2000;
+    const RAW: u32 = 0x200;
+    let mut image = vec![0u8; RAW as usize];
+    image[..2].copy_from_slice(b"MZ");
+    image[0x3C..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+    image[0x80..0x84].copy_from_slice(b"PE\0\0");
+    image[0x86..0x88].copy_from_slice(&1u16.to_le_bytes()); // one section
+    image[0x94..0x96].copy_from_slice(&224u16.to_le_bytes()); // optional header size
+    let optional = 0x98;
+    image[optional..optional + 2].copy_from_slice(&0x10Bu16.to_le_bytes()); // PE32
+    image[optional + 92..optional + 96].copy_from_slice(&16u32.to_le_bytes());
+
+    // The section: two debug-directory entries, then their data.
+    let mut codeview = b"RSDS".to_vec();
+    codeview.extend_from_slice(guid);
+    codeview.extend_from_slice(&1u32.to_le_bytes());
+    codeview.extend_from_slice(b"Lib.pdb\0");
+    let mut sum = b"SHA256\0".to_vec();
+    sum.extend_from_slice(&checksum);
+    let mut section = vec![0u8; 56];
+    for (i, (kind, entry_stamp, minor, data)) in [
+        (2u32, stamp, 0x504Du16, &codeview),
+        (19u32, &[0u8; 4][..], 0u16, &sum),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let at = section.len() as u32;
+        section.extend_from_slice(data);
+        let e = &mut section[i * 28..i * 28 + 28];
+        e[4..8].copy_from_slice(entry_stamp);
+        e[8..10].copy_from_slice(&0x0100u16.to_le_bytes());
+        e[10..12].copy_from_slice(&minor.to_le_bytes());
+        e[12..16].copy_from_slice(&kind.to_le_bytes());
+        e[16..20].copy_from_slice(&(data.len() as u32).to_le_bytes());
+        e[20..24].copy_from_slice(&(RVA + at).to_le_bytes());
+        e[24..28].copy_from_slice(&(RAW + at).to_le_bytes());
+    }
+    let debug = optional + 96 + 6 * 8;
+    image[debug..debug + 4].copy_from_slice(&RVA.to_le_bytes());
+    image[debug + 4..debug + 8].copy_from_slice(&56u32.to_le_bytes());
+    let header = optional + 224;
+    image[header..header + 5].copy_from_slice(b".text");
+    let len = (section.len() as u32).to_le_bytes();
+    image[header + 8..header + 12].copy_from_slice(&len);
+    image[header + 12..header + 16].copy_from_slice(&RVA.to_le_bytes());
+    image[header + 16..header + 20].copy_from_slice(&len);
+    image[header + 20..header + 24].copy_from_slice(&RAW.to_le_bytes());
+    image.extend_from_slice(&section);
+    image
+}
+
+/// A package whose `lib/net8.0/` holds the assembly `pdb_name` belongs to
+/// (`x.pdb` → `x.dll`), so that [`build_snupkg`] with the same name and PDB is
+/// accepted for it.
+fn build_nupkg_for_pdb(id: &str, version: &str, pdb_name: &str, pdb: &[u8]) -> Vec<u8> {
+    let nuspec = format!(
+        r#"<?xml version="1.0"?>
+<package xmlns="http://schemas.microsoft.com/packaging/2013/05/nuspec.xsd">
+  <metadata>
+    <id>{id}</id>
+    <version>{version}</version>
+    <authors>Test Author</authors>
+    <description>A package with symbols.</description>
+  </metadata>
+</package>"#
+    );
+    let dll = pdb_name.strip_suffix(".pdb").unwrap_or(pdb_name);
+    let mut cursor = Cursor::new(Vec::new());
+    {
+        let mut zip = zip::ZipWriter::new(&mut cursor);
+        let opts =
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        zip.start_file(format!("{id}.nuspec"), opts).unwrap();
+        zip.write_all(nuspec.as_bytes()).unwrap();
+        zip.start_file(format!("lib/net8.0/{dll}.dll"), opts)
+            .unwrap();
+        zip.write_all(&build_assembly_for(pdb)).unwrap();
+        zip.finish().unwrap();
+    }
+    cursor.into_inner()
+}
+
 /// Build a `.snupkg` (symbol package): a nuspec plus one `.pdb`.
 fn build_snupkg(id: &str, version: &str, pdb_name: &str, pdb: &[u8]) -> Vec<u8> {
     let nuspec = format!(
@@ -772,15 +884,21 @@ async fn push_symbol(server: &TestServer, key: &str, snupkg: Vec<u8>) -> reqwest
 async fn symbol_push_and_download_roundtrip() {
     let server = spawn().await;
 
-    // The owning package must exist before symbols can be pushed.
-    push_multipart(&server, API_KEY, build_nupkg("Sym.Lib", "1.0.0", b"dll")).await;
-
     let guid: [u8; 16] = [
         0xF6, 0x72, 0x7B, 0x49, 0x0A, 0x39, 0xFC, 0x44, 0x87, 0x8E, 0x5A, 0x2D, 0x63, 0xB6, 0xCC,
         0x4B,
     ];
     let pdb = build_portable_pdb(&guid);
     let key = yanuget::pdb::portable_pdb_signature(&pdb).expect("portable pdb key");
+
+    // The owning package — with the assembly this PDB belongs to — must exist
+    // before symbols can be pushed.
+    push_multipart(
+        &server,
+        API_KEY,
+        build_nupkg_for_pdb("Sym.Lib", "1.0.0", "sym.lib.pdb", &pdb),
+    )
+    .await;
     let snupkg = build_snupkg("Sym.Lib", "1.0.0", "sym.lib.pdb", &pdb);
 
     let resp = push_symbol(&server, API_KEY, snupkg).await;
@@ -1033,6 +1151,7 @@ async fn the_gallery_sorts_by_downloads_name_and_last_update() {
         .await
         .unwrap();
     assert!(dl.status().is_success());
+    await_downloads(&server, "zulu.pkg", 1).await;
 
     let order = |html: &str| {
         let mut ids: Vec<(usize, &str)> = ["Alpha.Pkg", "Mike.Pkg", "Zulu.Pkg"]
@@ -1525,6 +1644,7 @@ async fn files_dropped_in_the_inbox_are_verified_and_attached() {
         max_file_size: None,
         feeds: &feeds,
         staging: &staging,
+        min_free_disk_bytes: 0,
     };
     let report = scan.scan().await;
     assert_eq!(
@@ -1826,11 +1946,16 @@ async fn admin_disable_withholds_then_enable_restores() {
 #[tokio::test]
 async fn admin_delete_removes_version_and_symbols() {
     let server = spawn_admin().await;
-    push_multipart(&server, API_KEY, build_nupkg("Del.Pkg", "1.0.0", b"data")).await;
-
-    // Attach symbols, then confirm they are reachable.
     let pdb = build_portable_pdb(&[9u8; 16]);
     let key = yanuget::pdb::portable_pdb_signature(&pdb).unwrap();
+    push_multipart(
+        &server,
+        API_KEY,
+        build_nupkg_for_pdb("Del.Pkg", "1.0.0", "del.pkg.pdb", &pdb),
+    )
+    .await;
+
+    // Attach symbols, then confirm they are reachable.
     push_symbol(
         &server,
         API_KEY,
@@ -3236,6 +3361,7 @@ async fn read_through_mirror_still_gives_up_on_a_slow_download() {
         enabled: true,
         upstream,
         timeout_secs: 1,
+        download_timeout_secs: 1,
         allow_private_upstream: true,
         ..Default::default()
     })
@@ -3327,8 +3453,16 @@ async fn responses_carry_baseline_security_headers() {
     assert_eq!(headers.get("x-content-type-options").unwrap(), "nosniff");
     assert_eq!(headers.get("x-frame-options").unwrap(), "DENY");
     assert_eq!(headers.get("referrer-policy").unwrap(), "no-referrer");
-    let vary = headers.get("vary").unwrap().to_str().unwrap();
-    assert!(vary.contains("X-Forwarded-Host"), "vary was {vary}");
+    // Several `Vary` lines (the CORS layer adds its own), all of which count.
+    let vary: Vec<&str> = headers
+        .get_all("vary")
+        .iter()
+        .map(|v| v.to_str().unwrap())
+        .collect();
+    assert!(
+        vary.iter().any(|v| v.contains("X-Forwarded-Host")),
+        "vary was {vary:?}"
+    );
 
     // The gallery renders package-supplied metadata, so it gets a policy that
     // denies everything except the two inline assets the server itself emits.
@@ -3422,7 +3556,8 @@ async fn admin_actions_require_a_csrf_token() {
     assert_eq!(bad_token.status(), reqwest::StatusCode::BAD_REQUEST);
 
     // A browser that tells us the request came from another site is refused
-    // even when it somehow carries the token.
+    // even when it somehow carries the token — by the server-wide guard on
+    // cross-site writes, before the admin area sees it.
     let cross_site = client
         .post(&url)
         .basic_auth("admin", Some(ADMIN_KEY))
@@ -3432,7 +3567,7 @@ async fn admin_actions_require_a_csrf_token() {
         .send()
         .await
         .unwrap();
-    assert_eq!(cross_site.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(cross_site.status(), reqwest::StatusCode::FORBIDDEN);
 
     // The real thing, as the admin page submits it, still works.
     let good = client
@@ -3573,16 +3708,16 @@ async fn symbols_are_scoped_to_the_feed_that_owns_the_package() {
     .await;
 
     // Publish a package and its symbols into /one only.
+    let pdb = build_portable_pdb(&[42u8; 16]);
     let resp = push_to(
         &server,
         "/one/api/v2/package",
         API_KEY,
-        build_nupkg("Sym.Scoped", "1.0.0", b"x"),
+        build_nupkg_for_pdb("Sym.Scoped", "1.0.0", "sym.scoped.pdb", &pdb),
     )
     .await;
     assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
 
-    let pdb = build_portable_pdb(&[42u8; 16]);
     let snupkg = build_snupkg("Sym.Scoped", "1.0.0", "sym.scoped.pdb", &pdb);
     let part = reqwest::multipart::Part::bytes(snupkg)
         .file_name("symbols.snupkg")
@@ -3820,12 +3955,13 @@ async fn the_semver1_hive_withholds_versions_that_client_cannot_parse() {
         .json()
         .await
         .unwrap();
+    // Displayed as published: the SemVer2 hive keeps the build metadata.
     assert_eq!(
         versions_in(&sv2),
         vec![
             "1.0.0".to_string(),
             "2.0.0-alpha.1".to_string(),
-            "3.0.0".to_string()
+            "3.0.0+build".to_string()
         ]
     );
 
@@ -4036,7 +4172,12 @@ async fn a_package_cannot_claim_another_packages_symbols() {
     let guid = [7u8; 16];
     let victim_pdb = build_portable_pdb(&guid);
     let key = yanuget::pdb::portable_pdb_signature(&victim_pdb).expect("portable pdb key");
-    push_multipart(&server, API_KEY, build_nupkg("Victim.Lib", "1.0.0", b"dll")).await;
+    push_multipart(
+        &server,
+        API_KEY,
+        build_nupkg_for_pdb("Victim.Lib", "1.0.0", "victim.pdb", &victim_pdb),
+    )
+    .await;
     let response = push_symbol(
         &server,
         API_KEY,
@@ -4056,15 +4197,28 @@ async fn a_package_cannot_claim_another_packages_symbols() {
         victim_pdb.as_slice()
     );
 
-    // The attacker publishes their own package, then a symbol package carrying
-    // a PDB with the victim's debug GUID under the victim's PDB name. Both are
-    // public information, readable straight out of the victim's own assembly.
+    // The attacker publishes their own package carrying a copy of the victim's
+    // assembly — it is public, as is the debug GUID and PDB name in it — and
+    // then a symbol package with a PDB under the victim's key and name.
     push_multipart(
         &server,
         API_KEY,
-        build_nupkg("Attacker.Lib", "1.0.0", b"dll"),
+        build_nupkg_for_pdb("Attacker.Lib", "1.0.0", "victim.pdb", &victim_pdb),
     )
     .await;
+
+    // A PDB of their own under that id fails the assembly's checksum...
+    let mut forged_pdb = build_portable_pdb(&guid);
+    forged_pdb[23] = b'9'; // "PDB v1.0" -> "PDB v1.9": other bytes, same id
+    let response = push_symbol(
+        &server,
+        API_KEY,
+        build_snupkg("Attacker.Lib", "1.0.0", "victim.pdb", &forged_pdb),
+    )
+    .await;
+    assert_eq!(response.status(), 400, "a forged PDB must be refused");
+
+    // ...and even the genuine bytes cannot move the key to their package.
     let attacker_pdb = build_portable_pdb(&guid);
     let response = push_symbol(
         &server,
@@ -4148,9 +4302,15 @@ async fn a_symbol_package_with_absurdly_many_pdbs_is_refused_quickly() {
 async fn overwriting_a_version_retires_its_old_symbols() {
     let server = spawn_with(|c| c.allow_overwrite = yanuget::config::OverwriteMode::Enabled).await;
 
-    push_multipart(&server, API_KEY, build_nupkg("Rebuilt.Lib", "1.0.0", b"v1")).await;
     let old_pdb = build_portable_pdb(&[0xA1; 16]);
     let old_key = yanuget::pdb::portable_pdb_signature(&old_pdb).unwrap();
+    let new_pdb = build_portable_pdb(&[0xB2; 16]);
+    push_multipart(
+        &server,
+        API_KEY,
+        build_nupkg_for_pdb("Rebuilt.Lib", "1.0.0", "rebuilt.lib.pdb", &old_pdb),
+    )
+    .await;
     let response = push_symbol(
         &server,
         API_KEY,
@@ -4172,7 +4332,7 @@ async fn overwriting_a_version_retires_its_old_symbols() {
     let response = push_multipart(
         &server,
         API_KEY,
-        build_nupkg("Rebuilt.Lib", "1.0.0", b"v2-different"),
+        build_nupkg_for_pdb("Rebuilt.Lib", "1.0.0", "rebuilt.lib.pdb", &new_pdb),
     )
     .await;
     assert_eq!(response.status(), 201);
@@ -4184,7 +4344,6 @@ async fn overwriting_a_version_retires_its_old_symbols() {
     );
 
     // And the rebuild can publish its own symbols under a new key.
-    let new_pdb = build_portable_pdb(&[0xB2; 16]);
     let new_key = yanuget::pdb::portable_pdb_signature(&new_pdb).unwrap();
     let response = push_symbol(
         &server,
@@ -4508,16 +4667,35 @@ async fn downloads_resume_safely_and_count_once() {
     assert_eq!(stale.bytes().await.unwrap().len() as u64, total);
 
     // HEAD, the continuations and the refused resume are one download.
-    let search: serde_json::Value = server
-        .client
-        .get(server.url("/v3/search?q=resume.pkg"))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(search["data"][0]["totalDownloads"], 1);
+    await_downloads(&server, "resume.pkg", 1).await;
+    // And nothing else lands late.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    await_downloads(&server, "resume.pkg", 1).await;
+}
+
+/// Wait until search reports `expected` downloads of `id`.
+///
+/// Downloads are counted off the request path, so the count can trail the
+/// response that caused it by a moment.
+async fn await_downloads(server: &TestServer, id: &str, expected: u64) {
+    let mut last = serde_json::Value::Null;
+    for _ in 0..100 {
+        let search: serde_json::Value = server
+            .client
+            .get(server.url(&format!("/v3/search?q={id}")))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        last = search["data"][0]["totalDownloads"].clone();
+        if last == expected {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("{id}: expected {expected} downloads, search says {last}");
 }
 
 #[tokio::test]

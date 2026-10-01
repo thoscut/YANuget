@@ -17,21 +17,132 @@
 //! Native (Windows / MSF) PDBs use a different on-disk container and are not
 //! parsed here — [`portable_pdb_signature`] returns `None` for them so the
 //! caller can skip indexing rather than fail the whole push.
+//!
+//! The same id is what ties a PDB to its assembly: the assembly's CodeView
+//! debug-directory entry repeats the GUID and the stamp, and its `PdbChecksum`
+//! entry holds a hash of the PDB taken with the id zeroed ([`pdb_checksum`]).
+//! See [`crate::pe`].
+
+use std::io::{Read, Seek, SeekFrom};
+
+use sha2::Digest;
 
 /// The ECMA-335 metadata root signature, ASCII `"BSJB"`, little-endian.
 const METADATA_SIGNATURE: u32 = 0x424A_5342;
+
+/// How much of a PDB file is read to find the id. The metadata root and the
+/// stream headers sit at the start and take a few hundred bytes; the `#Pdb`
+/// stream itself is read from wherever the headers say it is.
+const HEADER_WINDOW: u64 = 64 * 1024;
+
+/// A Portable PDB's 20-byte id: the GUID and the stamp that the matching
+/// assembly's CodeView entry repeats.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PdbId {
+    pub guid: [u8; 16],
+    pub stamp: u32,
+    /// Where the id sits in the file (it is zeroed for [`pdb_checksum`]).
+    pub offset: u64,
+}
+
+impl PdbId {
+    /// The SSQP key: the GUID as upper-case hex, then the Portable PDB age
+    /// `FFFFFFFF`.
+    pub fn ssqp_key(&self) -> String {
+        format!("{}FFFFFFFF", guid_to_hex(&self.guid))
+    }
+}
 
 /// Compute the SSQP symbol key for a Portable PDB given its raw bytes.
 ///
 /// Returns `None` if the bytes are not a parseable Portable PDB (e.g. a native
 /// PDB, or a truncated/corrupt file).
 pub fn portable_pdb_signature(bytes: &[u8]) -> Option<String> {
-    let guid = portable_pdb_guid(bytes)?;
-    Some(format!("{}FFFFFFFF", guid_to_hex(&guid)))
+    read_pdb_id(&mut std::io::Cursor::new(bytes))
+        .ok()
+        .flatten()
+        .map(|id| id.ssqp_key())
 }
 
-/// Locate the 16-byte GUID at the start of the `#Pdb` stream.
-fn portable_pdb_guid(bytes: &[u8]) -> Option<[u8; 16]> {
+/// Read a Portable PDB's id from the start of `file`, without reading the rest
+/// of it. `Ok(None)` when the file is not a parseable Portable PDB.
+pub fn read_pdb_id(file: &mut (impl Read + Seek)) -> std::io::Result<Option<PdbId>> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut header = Vec::new();
+    Read::by_ref(file)
+        .take(HEADER_WINDOW)
+        .read_to_end(&mut header)?;
+    let Some(offset) = pdb_stream_offset(&header) else {
+        return Ok(None);
+    };
+    let mut id = [0u8; 20];
+    match header.get(offset..offset.saturating_add(20)) {
+        Some(bytes) => id.copy_from_slice(bytes),
+        None => {
+            file.seek(SeekFrom::Start(offset as u64))?;
+            if file.read_exact(&mut id).is_err() {
+                return Ok(None);
+            }
+        }
+    }
+    let mut guid = [0u8; 16];
+    guid.copy_from_slice(&id[..16]);
+    Ok(Some(PdbId {
+        guid,
+        stamp: u32::from_le_bytes([id[16], id[17], id[18], id[19]]),
+        offset: offset as u64,
+    }))
+}
+
+/// The hash a `PdbChecksum` debug-directory entry records for this PDB: the
+/// whole file hashed with its 20-byte id replaced by zeros (the id is itself
+/// derived from content, so it cannot be part of its own hash). `Ok(None)` for
+/// an algorithm the Portable PDB spec does not name.
+pub fn pdb_checksum(
+    file: &mut (impl Read + Seek),
+    id: &PdbId,
+    algorithm: &str,
+) -> std::io::Result<Option<Vec<u8>>> {
+    match algorithm {
+        "SHA256" => hash_without_id::<sha2::Sha256>(file, id).map(Some),
+        "SHA384" => hash_without_id::<sha2::Sha384>(file, id).map(Some),
+        "SHA512" => hash_without_id::<sha2::Sha512>(file, id).map(Some),
+        _ => Ok(None),
+    }
+}
+
+fn hash_without_id<D: Digest>(
+    file: &mut (impl Read + Seek),
+    id: &PdbId,
+) -> std::io::Result<Vec<u8>> {
+    file.seek(SeekFrom::Start(0))?;
+    let id_range = id.offset..id.offset + 20;
+    let mut hasher = D::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut pos: u64 = 0;
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        let chunk = &mut buf[..n];
+        let start = pos;
+        let end = pos + n as u64;
+        // Zero whatever part of the id falls in this chunk.
+        let from = id_range.start.max(start);
+        let to = id_range.end.min(end);
+        if from < to {
+            chunk[(from - start) as usize..(to - start) as usize].fill(0);
+        }
+        hasher.update(&*chunk);
+        pos = end;
+    }
+    Ok(hasher.finalize().to_vec())
+}
+
+/// Locate the `#Pdb` stream from the metadata root and stream headers in
+/// `bytes` (the start of the file).
+fn pdb_stream_offset(bytes: &[u8]) -> Option<usize> {
     // --- Metadata root header (II.24.2.1) ---
     if read_u32(bytes, 0)? != METADATA_SIGNATURE {
         return None;
@@ -62,10 +173,9 @@ fn portable_pdb_guid(bytes: &[u8]) -> Option<[u8; 16]> {
         pos = pos.checked_add(name_len)?;
 
         if name == "#Pdb" {
-            // The PDB id is the first 20 bytes of the stream; the GUID is the
-            // leading 16.
-            let guid = bytes.get(offset..offset.checked_add(16)?)?;
-            return guid.try_into().ok();
+            // The PDB id is the first 20 bytes of the stream: the GUID, then
+            // the stamp.
+            return Some(offset);
         }
     }
     None
@@ -152,6 +262,43 @@ mod tests {
         let key = portable_pdb_signature(&pdb).unwrap();
         // Data1/Data2/Data3 are byte-reversed; Data4 kept as-is; +FFFFFFFF.
         assert_eq!(key, "497B72F6390A44FC878E5A2D63B6CC4BFFFFFFFF");
+    }
+
+    #[test]
+    fn reads_the_whole_id_and_where_it_is() {
+        let mut pdb = make_portable_pdb(&[5u8; 16]);
+        let at = pdb.len() - 4;
+        pdb[at..].copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
+        let id = read_pdb_id(&mut std::io::Cursor::new(&pdb))
+            .unwrap()
+            .unwrap();
+        assert_eq!(id.guid, [5u8; 16]);
+        assert_eq!(id.stamp, 0xDEAD_BEEF);
+        assert_eq!(id.offset as usize, pdb.len() - 20);
+    }
+
+    /// The checksum an assembly records is over the PDB with its id zeroed —
+    /// the id is derived from the content, so it cannot be part of its hash.
+    #[test]
+    fn checksum_zeroes_the_id() {
+        let mut pdb = make_portable_pdb(&[5u8; 16]);
+        pdb.extend_from_slice(&[0xAB; 100_000]); // spans several read chunks
+        let mut cursor = std::io::Cursor::new(&pdb);
+        let id = read_pdb_id(&mut cursor).unwrap().unwrap();
+        let sum = pdb_checksum(&mut cursor, &id, "SHA256").unwrap().unwrap();
+
+        let mut zeroed = pdb.clone();
+        let at = id.offset as usize;
+        zeroed[at..at + 20].fill(0);
+        assert_eq!(sum, sha2::Sha256::digest(&zeroed).to_vec());
+        assert_eq!(
+            pdb_checksum(&mut cursor, &id, "SHA512")
+                .unwrap()
+                .unwrap()
+                .len(),
+            64
+        );
+        assert!(pdb_checksum(&mut cursor, &id, "MD5").unwrap().is_none());
     }
 
     #[test]
