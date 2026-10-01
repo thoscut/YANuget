@@ -238,10 +238,19 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Registry references must be lowercase, and the repository is not
+      # (`thoscut/YANuget`). metadata-action lowercases on its own, cosign
+      # does not, so every step names the image through this one output.
+      - id: image
+        name: Resolve the image name
+        env:
+          REPOSITORY: ${{ github.repository }}
+        run: echo "name=ghcr.io/${REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
       - id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
-          images: ghcr.io/${{ github.repository }}
+          images: ${{ steps.image.outputs.name }}
           tags: |
             type=semver,pattern={{version}},value=${{ needs.guard.outputs.tag }}
             type=semver,pattern={{major}}.{{minor}},value=${{ needs.guard.outputs.tag }}
@@ -267,7 +276,7 @@ jobs:
       - name: Attest the image's provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          subject-name: ghcr.io/${{ github.repository }}
+          subject-name: ${{ steps.image.outputs.name }}
           subject-digest: ${{ steps.build.outputs.digest }}
           push-to-registry: true
 
@@ -279,7 +288,7 @@ jobs:
       # something — tags move.
       - name: Sign the image
         env:
-          IMAGE: ghcr.io/${{ github.repository }}
+          IMAGE: ${{ steps.image.outputs.name }}
           DIGEST: ${{ steps.build.outputs.digest }}
         run: cosign sign --yes "${IMAGE}@${DIGEST}"
 
