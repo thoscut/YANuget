@@ -191,6 +191,11 @@ jobs:
           # exactly as given.
           cp "target/$TARGET/release/$bin" "staging/$name/"
           cp README.md LICENSE CHANGELOG.md yanuget.example.toml "staging/$name/"
+          # The hardened service unit and its system user, next to the binary
+          # they run (see docs/deployment.md#systemd).
+          if [[ "$TARGET" == *-linux-* ]]; then
+            cp contrib/systemd/yanuget.service contrib/systemd/yanuget.sysusers "staging/$name/"
+          fi
           if [[ "$RUNNER" == windows-latest ]]; then
             (cd staging && 7z a "../dist/$name.zip" "$name")
           else

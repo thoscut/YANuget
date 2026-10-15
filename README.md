@@ -88,6 +88,12 @@ Download the archive for your platform from the
 against `SHA256SUMS`, unpack and run. Release binaries ship the full offline
 documentation.
 
+The Linux archives also contain a hardened systemd unit (`yanuget.service`) and
+its system user (`yanuget.sysusers`). The unit runs the server as an
+unprivileged user on a read-only system, and grants it `CAP_NET_BIND_SERVICE`
+and nothing else, so it can listen on port 443 without root. Installing it is
+described under [systemd](docs/deployment.md#systemd).
+
 From 0.6.0 on, the archives and the container image
 (`linux/amd64` and `linux/arm64`) come with signed build provenance, and the
 image is also signed with cosign. `gh attestation verify <archive> --repo
