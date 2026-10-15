@@ -12,6 +12,16 @@ expected to change incompatibly at any version.
 
 ## [Unreleased]
 
+### Added
+
+- The Linux release archives ship a hardened systemd unit, `yanuget.service`,
+  and its system user, `yanuget.sysusers` (also under `contrib/systemd/`). The
+  unit runs as an unprivileged user with `ProtectSystem=strict`, only the data
+  directory writable, and `CAP_NET_BIND_SERVICE` as its one capability, so the
+  server can listen on port 443 without root. The
+  [systemd](docs/deployment.md#systemd) section describes installing it, port
+  443, and the certificate names clients check.
+
 ### Fixed
 
 - Promoting a version looked like it did nothing: the admin page reloaded

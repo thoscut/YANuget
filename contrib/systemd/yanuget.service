@@ -1,0 +1,87 @@
+# YANuget as a hardened systemd service.
+#
+# Install (see docs/deployment.md#systemd for the full walk-through):
+#
+#   install -m 0755 yanuget /usr/local/bin/yanuget
+#   install -m 0644 yanuget.sysusers /usr/lib/sysusers.d/yanuget.conf
+#   systemd-sysusers
+#   install -m 0644 yanuget.service /etc/systemd/system/yanuget.service
+#   install -d -m 0750 -g yanuget /etc/yanuget
+#   install -m 0640 -g yanuget yanuget.example.toml /etc/yanuget/yanuget.toml
+#   systemctl daemon-reload && systemctl enable --now yanuget
+#
+# Adjust paths with `systemctl edit yanuget` rather than editing this file, so
+# an upgrade can replace it.
+
+[Unit]
+Description=YANuget NuGet package server
+Documentation=https://github.com/thoscut/yanuget/blob/main/docs/deployment.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+ExecStart=/usr/local/bin/yanuget --config /etc/yanuget/yanuget.toml
+Restart=on-failure
+RestartSec=5s
+# The server drains for up to ten seconds on SIGTERM before it exits.
+TimeoutStopSec=30s
+
+User=yanuget
+Group=yanuget
+UMask=0027
+
+# /var/lib/yanuget is created and owned by the service user. The data_dir in
+# the TOML file is overridden here so the two cannot disagree; if you move the
+# data elsewhere, change this and ReadWritePaths together.
+StateDirectory=yanuget
+StateDirectoryMode=0750
+WorkingDirectory=/var/lib/yanuget
+Environment=YANUGET_DATA_DIR=/var/lib/yanuget
+# Optional: YANUGET_API_KEY=… and YANUGET_ADMIN_API_KEY=…, root-owned, 0600,
+# so the keys need not sit in the TOML file.
+EnvironmentFile=-/etc/yanuget/secrets.env
+
+# Port 443 (or any port below 1024) as a non-root user. This is the only
+# capability the process ever holds; drop both lines when it listens on 5000
+# or behind a reverse proxy.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+# The whole file system is read-only except the data directory. Add the
+# directories of files.inbox_dir or a data_dir outside /var/lib here.
+ProtectSystem=strict
+ReadWritePaths=/var/lib/yanuget
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+# AF_UNIX because glibc resolves names through local services (nscd,
+# systemd-resolved) over Unix sockets; without it, looking up a mirror
+# upstream or a migration source can fail.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged
+SystemCallErrorNumber=EPERM
+
+# Large uploads and downloads keep many file descriptors open.
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
