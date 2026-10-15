@@ -12,6 +12,16 @@ expected to change incompatibly at any version.
 
 ## [Unreleased]
 
+### Added
+
+- `yanuget backup <dir>` takes a consistent backup of the database, the package
+  store and the self-signed TLS pair while the server runs: a `VACUUM INTO`
+  snapshot, an incremental copy of the store through temp files and renames,
+  and a check that every file the snapshot references made it, retrying when a
+  delete raced the copy. `yanuget restore <dir>` puts a backup back into a
+  stopped server. The documentation gains a page on backups and on moving a
+  server to a new host.
+
 ## [0.6.0] — 2026-10-01
 
 **Upgrading from 0.5.x needs attention.** This release follows a full review
