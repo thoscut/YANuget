@@ -859,6 +859,10 @@ fn spawn_file_tasks(
         return tasks;
     }
     let names: Vec<String> = feeds.iter().map(|f| f.name.clone()).collect();
+    let feed_extensions: std::collections::HashMap<String, Vec<String>> = feeds
+        .iter()
+        .map(|f| (f.name.clone(), f.allowed_extensions.clone()))
+        .collect();
     for name in &names {
         let _ = std::fs::create_dir_all(inbox.join(name));
     }
@@ -880,6 +884,7 @@ fn spawn_file_tasks(
                 storage: storage.as_ref(),
                 db: db.as_ref(),
                 files: &config.files,
+                feed_extensions: &feed_extensions,
                 max_file_size: config.max_file_size_bytes(),
                 feeds: &names,
                 staging: &staging,

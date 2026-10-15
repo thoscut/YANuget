@@ -57,6 +57,9 @@ pub fn check_loaded(config: &Config, report: &mut Report) {
     };
     for feed in &feeds {
         check_feed(feed, report);
+        if config.files.enabled {
+            check_file_types(feed, report);
+        }
     }
     check_tls(config, report);
 
@@ -70,6 +73,30 @@ pub fn check_loaded(config: &Config, report: &mut Report) {
             "data_dir {} does not exist yet; the server creates it",
             config.data_dir.display()
         ));
+    }
+}
+
+/// A file type no file name can have is a typo, and an empty list refuses
+/// every file: both are legal, and both are worth a warning.
+fn check_file_types(feed: &ResolvedFeed, report: &mut Report) {
+    let name = &feed.name;
+    if feed.allowed_extensions.is_empty() {
+        report.warnings.push(format!(
+            "feed {name}: no file types are allowed, so it refuses every attached file"
+        ));
+    }
+    for ext in &feed.allowed_extensions {
+        let bare = ext.trim_start_matches('.');
+        if bare.is_empty()
+            || !bare
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+        {
+            report.warnings.push(format!(
+                "feed {name}: file type {ext:?} can never match a file name \
+                 (letters, digits, '_' and '-' only, without the dot)"
+            ));
+        }
     }
 }
 
@@ -180,6 +207,38 @@ mod tests {
         let mut report = Report::default();
         check_loaded(&config, &mut report);
         report
+    }
+
+    #[test]
+    fn a_feeds_own_file_types_are_checked() {
+        let feed = |name: &str, exts: &[&str]| FeedConfig {
+            name: name.into(),
+            files: crate::config::FeedFilesConfig {
+                allowed_extensions: Some(exts.iter().map(|e| e.to_string()).collect()),
+            },
+            ..Default::default()
+        };
+        let config = Config {
+            tls_enabled: false,
+            feeds: vec![
+                feed("choco", &["exe", ".msi"]),
+                feed("typo", &["exe msi", "."]),
+                feed("none", &[]),
+            ],
+            ..Config::default()
+        };
+        let report = checked(config);
+        assert!(report.is_ok(), "{report:?}");
+        let about = |feed: &str| {
+            report
+                .warnings
+                .iter()
+                .filter(|w| w.starts_with(&format!("feed {feed}: ")) && w.contains("file"))
+                .count()
+        };
+        assert_eq!(about("choco"), 0, "{report:?}");
+        assert_eq!(about("typo"), 2, "{report:?}");
+        assert_eq!(about("none"), 1, "{report:?}");
     }
 
     #[test]

@@ -68,6 +68,7 @@ pub(super) fn feed_ctx(api: Option<&str>, admin: Option<&str>) -> crate::web::Fe
         license_policy: crate::config::LicensePolicyConfig::default(),
         retention: crate::config::RetentionConfig::default(),
         reserved_elsewhere: Vec::new(),
+        allowed_extensions: crate::config::FilesConfig::default().allowed_extensions,
         cleanup: Default::default(),
         counters: Default::default(),
     }

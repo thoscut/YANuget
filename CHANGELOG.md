@@ -12,6 +12,16 @@ expected to change incompatibly at any version.
 
 ## [Unreleased]
 
+### Added
+
+- A feed can set its own file types for attached files in `[feeds.files]`
+  (`allowed_extensions`), replacing `[files].allowed_extensions` for that feed
+  only, over HTTP and through the SSH inbox. An internal Chocolatey feed can
+  take `exe` and `msi` while every other feed keeps the narrower default. The
+  feed's settings page shows its list, and `yanuget config check` warns about
+  an empty list or an entry no file name can match. A feed without the table
+  behaves as before. (`INT-03`)
+
 ## [0.7.0] — 2026-10-15
 
 Upgrading from 0.6.x needs no change to the configuration or the database.

@@ -45,6 +45,9 @@ pub struct FeedContext {
     pub retention: RetentionConfig,
     /// Id prefixes other feeds reserved, which this one refuses.
     pub reserved_elsewhere: Vec<crate::config::ReservedPrefix>,
+    /// The extensions attached files may have here (`[feeds.files]`, else
+    /// `[files]`).
+    pub allowed_extensions: Vec<String>,
     /// The feed's cleanup lock and last report, shared with the background
     /// sweep.
     pub cleanup: Arc<retention::RetentionState>,
@@ -111,6 +114,7 @@ impl FeedContext {
             license_policy: feed.license_policy.clone(),
             retention: feed.retention.clone(),
             reserved_elsewhere: feed.reserved_elsewhere.clone(),
+            allowed_extensions: feed.allowed_extensions.clone(),
             cleanup: Arc::default(),
             counters: FeedCounters::default(),
         })

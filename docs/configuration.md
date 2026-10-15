@@ -321,6 +321,25 @@ Uploading over HTTP needs the feed's push key, and a feed without one refuses
 files even when it accepts package pushes. Whatever a file contains, it is
 served as a download, never as a page.
 
+The default list leaves out executables (`exe`, `msi`) on purpose. A feed that
+should take them, an internal Chocolatey feed for example, sets its own list
+in `[feeds.files]`; every other feed keeps the global one:
+
+```toml
+[[feeds]]
+name = "choco-intake"
+requires_approval = true
+promotes_to = "choco"
+
+  [feeds.files]
+  allowed_extensions = ["exe", "msi", "msix", "msu", "zip"]
+```
+
+The list is checked when a file is attached, in the feed it is attached
+through (over HTTP or the inbox). A file goes wherever its version goes, so
+once promoted or copied it is served from the other feed too, whatever that
+feed's own list says.
+
 ### The SSH inbox
 
 YANuget runs no SSH server. With `files.inbox_dir` set, the host's `sshd`
@@ -409,6 +428,7 @@ affected.
 | `feeds[].requires_approval` | bool | `false` | Incoming versions are pending until approved. |
 | `feeds[].promotes_to` | string | *(none)* | Next release ring (must name another feed). |
 | `feeds[].reserved_id_prefixes` | string[] | `[]` | Id prefixes (e.g. `"Contoso."`) only this feed may bring in; every other feed refuses them. See below. |
+| `feeds[].files.allowed_extensions` | string[] | *(global `files.allowed_extensions`)* | File types attached files may have in this feed, over HTTP and through the inbox. Replaces the global list rather than adding to it. See [Attached files](#attached-files). |
 | `feeds[].mirror.enabled` | bool | `false` | Read-through cache of an upstream V3 feed. |
 | `feeds[].mirror.upstream` | string | `https://api.nuget.org/v3/index.json` | Upstream service index. |
 | `feeds[].mirror.timeout_secs` | int | `30` | Connect timeout, the longest the upstream may go silent, and the deadline for one metadata request. |

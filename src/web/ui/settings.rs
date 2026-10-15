@@ -133,7 +133,7 @@ pub fn settings_page(urls: &UrlBuilder, config: &Config, feed: &crate::web::Feed
                 None => "Unlimited".to_string(),
             },
         ));
-        files.push_str(&kv("File types", &fc.allowed_extensions.join(", ")));
+        files.push_str(&kv("File types", &feed.allowed_extensions.join(", ")));
         files.push_str(&kv(
             "Unfinished uploads kept",
             &format!("{} h", fc.upload_expiry_hours),

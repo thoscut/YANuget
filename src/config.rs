@@ -487,6 +487,19 @@ pub struct FeedConfig {
     /// version are one namespace across every feed, so without this whoever
     /// stores a version first claims it in all of them.
     pub reserved_id_prefixes: Vec<String>,
+    /// Attached files in this feed; unset fields fall back to `[files]`.
+    pub files: FeedFilesConfig,
+}
+
+/// `[feeds.files]`: what one feed changes about attached files.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FeedFilesConfig {
+    /// The file extensions this feed accepts, replacing
+    /// `files.allowed_extensions` for it (not adding to it). Lets one feed,
+    /// say an internal Chocolatey feed, take `exe` and `msi` while the others
+    /// keep the narrower default.
+    pub allowed_extensions: Option<Vec<String>>,
 }
 
 /// The default feed name used when no `[[feeds]]` are configured.
@@ -515,6 +528,8 @@ pub struct ResolvedFeed {
     pub reserved_id_prefixes: Vec<String>,
     /// The prefixes every *other* feed reserved, which this one must refuse.
     pub reserved_elsewhere: Vec<ReservedPrefix>,
+    /// The file extensions attached files may have in this feed.
+    pub allowed_extensions: Vec<String>,
 }
 
 /// A package-id prefix reserved by one feed (`reserved_id_prefixes`).
@@ -700,10 +715,16 @@ impl Default for FilesConfig {
 impl FilesConfig {
     /// Whether `ext` (without the dot) is one of the accepted extensions.
     pub fn allows_extension(&self, ext: &str) -> bool {
-        self.allowed_extensions
-            .iter()
-            .any(|allowed| allowed.trim_start_matches('.').eq_ignore_ascii_case(ext))
+        extension_allowed(&self.allowed_extensions, ext)
     }
+}
+
+/// Whether `ext` (without the dot) is in `allowed`, ignoring ASCII case and a
+/// leading dot on the entries.
+pub fn extension_allowed(allowed: &[String], ext: &str) -> bool {
+    allowed
+        .iter()
+        .any(|a| a.trim_start_matches('.').eq_ignore_ascii_case(ext))
 }
 
 impl Default for Config {
@@ -1130,6 +1151,7 @@ impl Config {
                 // A single feed has no other feed to reserve anything from.
                 reserved_id_prefixes: Vec::new(),
                 reserved_elsewhere: Vec::new(),
+                allowed_extensions: self.files.allowed_extensions.clone(),
             }]);
         }
 
@@ -1175,6 +1197,11 @@ impl Config {
                     .unwrap_or_else(|| self.retention.clone()),
                 reserved_id_prefixes: reserved_prefixes(f)?,
                 reserved_elsewhere: Vec::new(),
+                allowed_extensions: f
+                    .files
+                    .allowed_extensions
+                    .clone()
+                    .unwrap_or_else(|| self.files.allowed_extensions.clone()),
             });
         }
 
@@ -1305,6 +1332,7 @@ impl std::fmt::Debug for ResolvedFeed {
             .field("retention", &self.retention)
             .field("reserved_id_prefixes", &self.reserved_id_prefixes)
             .field("reserved_elsewhere", &self.reserved_elsewhere)
+            .field("allowed_extensions", &self.allowed_extensions)
             .finish_non_exhaustive()
     }
 }

@@ -61,6 +61,9 @@ fn the_documented_multi_feed_shape_parses_and_applies() {
           [feeds.retention]
           enabled = true
           keep_latest_stable = 20
+
+          [feeds.files]
+          allowed_extensions = ["exe", "msi"]
     "#;
     let config: yanuget::config::Config = toml::from_str(toml).expect("documented shape parses");
 
@@ -80,6 +83,12 @@ fn the_documented_multi_feed_shape_parses_and_applies() {
     assert!(!stable.mirror.enabled);
     assert!(stable.license_policy.enabled);
     assert_eq!(stable.retention.keep_latest_stable, Some(20));
+    assert_eq!(stable.allowed_extensions, ["exe", "msi"]);
+    assert_eq!(
+        dev.allowed_extensions,
+        yanuget::config::FilesConfig::default().allowed_extensions,
+        "a feed without [feeds.files] keeps the global list"
+    );
 }
 
 /// The wrong form is now an error rather than a silent no-op.

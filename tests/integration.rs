@@ -1641,6 +1641,7 @@ async fn files_dropped_in_the_inbox_are_verified_and_attached() {
         storage: &storage,
         db: &db,
         files: &files,
+        feed_extensions: &Default::default(),
         max_file_size: None,
         feeds: &feeds,
         staging: &staging,
@@ -5025,5 +5026,204 @@ async fn the_admin_client_promotes_and_approves_across_rings() {
     assert_eq!(
         status_of(&server, "/dev/v3/package/cli.pkg/index.json").await,
         reqwest::StatusCode::NOT_FOUND
+    );
+}
+
+/// PUT `body` as file `name` of `id`/`v` in the feed under `prefix`.
+async fn put_feed_file(
+    server: &TestServer,
+    prefix: &str,
+    id: &str,
+    v: &str,
+    name: &str,
+    body: Vec<u8>,
+) -> reqwest::Response {
+    server
+        .client
+        .put(server.url(&format!("{prefix}/api/v2/files/{id}/{v}/{name}")))
+        .header("X-NuGet-ApiKey", API_KEY)
+        .body(body)
+        .send()
+        .await
+        .unwrap()
+}
+
+/// An intake feed that takes installers, gated, promoting into a gated
+/// production feed that keeps the default file types.
+async fn spawn_intake() -> TestServer {
+    spawn_feeds(|c| {
+        c.api_key = Some(API_KEY.into());
+        c.admin_api_key = Some(ADMIN_KEY.into());
+        let mut intake = feed("intake");
+        intake.requires_approval = true;
+        intake.promotes_to = Some("prod".into());
+        intake.files.allowed_extensions = Some(vec!["exe".into(), ".MSI".into()]);
+        let mut prod = feed("prod");
+        prod.requires_approval = true;
+        c.feeds = vec![intake, prod];
+    })
+    .await
+}
+
+/// `INT-03`: a feed's `[feeds.files] allowed_extensions` replaces the global
+/// list for that feed only.
+#[tokio::test]
+async fn a_feed_can_accept_file_types_the_others_refuse() {
+    let server = spawn_intake().await;
+    for prefix in ["/intake", "/prod"] {
+        let pushed = push_to(
+            &server,
+            &format!("{prefix}/api/v2/package"),
+            API_KEY,
+            build_nupkg("Types.Pkg", "1.0.0", b"x"),
+        )
+        .await;
+        assert_eq!(pushed.status(), reqwest::StatusCode::CREATED, "{prefix}");
+    }
+
+    let exe = |prefix: &'static str| {
+        put_feed_file(
+            &server,
+            prefix,
+            "Types.Pkg",
+            "1.0.0",
+            "setup.exe",
+            image_bytes(1),
+        )
+    };
+    assert_eq!(exe("/intake").await.status(), reqwest::StatusCode::CREATED);
+    assert_eq!(
+        put_feed_file(
+            &server,
+            "/intake",
+            "Types.Pkg",
+            "1.0.0",
+            "Setup.msi",
+            image_bytes(2)
+        )
+        .await
+        .status(),
+        reqwest::StatusCode::CREATED,
+        "case and a leading dot in the list do not matter"
+    );
+    let refused = exe("/prod").await;
+    assert_eq!(refused.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert!(refused.text().await.unwrap().contains("wim"));
+    // The feed's list replaces the global one rather than adding to it.
+    let wim = put_feed_file(
+        &server,
+        "/intake",
+        "Types.Pkg",
+        "1.0.0",
+        "base.wim",
+        image_bytes(3),
+    )
+    .await;
+    assert_eq!(wim.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert!(wim.text().await.unwrap().contains("exe, .MSI"));
+    assert_eq!(
+        put_feed_file(
+            &server,
+            "/prod",
+            "Types.Pkg",
+            "1.0.0",
+            "base.wim",
+            image_bytes(3)
+        )
+        .await
+        .status(),
+        reqwest::StatusCode::CREATED
+    );
+
+    let settings = server
+        .client
+        .get(server.url("/intake/settings"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(settings.contains("exe, .MSI"), "{settings}");
+}
+
+/// `INT-05`: the intake flow the internalizer relies on. A file attached to a
+/// pending version is withheld until the version is approved, in the intake
+/// feed and again in the feed it is promoted to.
+#[tokio::test]
+async fn files_of_a_pending_version_are_withheld_until_approval() {
+    let server = spawn_intake().await;
+    let pushed = push_to(
+        &server,
+        "/intake/api/v2/package",
+        API_KEY,
+        build_nupkg("Intake.Pkg", "1.0.0", b"x"),
+    )
+    .await;
+    assert_eq!(pushed.status(), reqwest::StatusCode::CREATED);
+
+    let installer = image_bytes(7);
+    let attached = put_feed_file(
+        &server,
+        "/intake",
+        "Intake.Pkg",
+        "1.0.0",
+        "setup.exe",
+        installer.clone(),
+    )
+    .await;
+    assert_eq!(
+        attached.status(),
+        reqwest::StatusCode::CREATED,
+        "attach while pending"
+    );
+
+    let file = "files/intake.pkg/1.0.0/setup.exe";
+    let nupkg = "v3/package/intake.pkg/1.0.0/intake.pkg.1.0.0.nupkg";
+    for path in [file, nupkg] {
+        assert_eq!(
+            status_of(&server, &format!("/intake/{path}")).await,
+            reqwest::StatusCode::NOT_FOUND,
+            "{path} is withheld while pending"
+        );
+    }
+
+    let approve = admin_action(&server, "/intake/admin/packages/intake.pkg/1.0.0/approve").await;
+    assert_eq!(approve.status(), reqwest::StatusCode::SEE_OTHER);
+    let download = server
+        .client
+        .get(server.url(&format!("/intake/{file}")))
+        .send()
+        .await
+        .unwrap();
+    assert!(download.status().is_success());
+    assert_eq!(
+        download.bytes().await.unwrap().as_ref(),
+        installer.as_slice()
+    );
+
+    // Promoted into a gated feed, the version and its file are pending there,
+    // even though that feed would not accept the file type itself.
+    let promote = admin_action(&server, "/intake/admin/packages/intake.pkg/1.0.0/promote").await;
+    assert_eq!(promote.status(), reqwest::StatusCode::SEE_OTHER);
+    for path in [file, nupkg] {
+        assert_eq!(
+            status_of(&server, &format!("/prod/{path}")).await,
+            reqwest::StatusCode::NOT_FOUND,
+            "{path} is withheld in prod until approved there"
+        );
+    }
+    let approve = admin_action(&server, "/prod/admin/packages/intake.pkg/1.0.0/approve").await;
+    assert_eq!(approve.status(), reqwest::StatusCode::SEE_OTHER);
+    let download = server
+        .client
+        .get(server.url(&format!("/prod/{file}")))
+        .send()
+        .await
+        .unwrap();
+    assert!(download.status().is_success());
+    assert_eq!(
+        download.bytes().await.unwrap().as_ref(),
+        installer.as_slice()
     );
 }

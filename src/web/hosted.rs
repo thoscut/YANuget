@@ -377,7 +377,7 @@ pub(super) async fn put(
     let headers = request.headers().clone();
     authorize_upload(&state, &headers)?;
     let v = parse_version(&version)?;
-    crate::validation::validate_file_name(&name, &state.config.files)?;
+    crate::validation::validate_file_name(&name, &state.feed.allowed_extensions)?;
     version_in_feed(&state, &id, &v).await?;
     let expected = headers
         .get("x-checksum-sha256")
@@ -580,7 +580,7 @@ pub(super) async fn tus_create(
     check_id(id)?;
     let v = parse_version(field("version")?)?;
     let name = field("filename")?;
-    crate::validation::validate_file_name(name, &state.config.files)?;
+    crate::validation::validate_file_name(name, &state.feed.allowed_extensions)?;
     let expected = meta.get("sha256").map(|s| parse_sha256(s)).transpose()?;
     version_in_feed(&state, id, &v).await?;
     if state.db.get_file(id, &v, name).await?.is_some() {

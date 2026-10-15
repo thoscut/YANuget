@@ -848,7 +848,7 @@ Every server change the tool relies on, in one release (see
   Peak memory must not depend on package size.
   *Done when:* an unchanged rewrite keeps every entry byte-identical, Chocolatey
   CLI installs a rewritten package, and a 5 GB entry passes in constant memory.
-- [ ] **`INT-03` Per-feed `allowed_extensions` for attached files.** `[files]`
+- [x] **`INT-03` Per-feed `allowed_extensions` for attached files.** `[files]`
   is global, and its defaults rightly exclude `exe` and `msi`. Let a feed
   override the list (`[feeds.files]`), so executables are accepted by the
   internal Chocolatey feed only. Typical additions: `exe`, `msi`, `msix`,
@@ -865,7 +865,7 @@ Every server change the tool relies on, in one release (see
   *Done when:* `yanuget config check` accepts the new mode, the old files are
   gone after a replace, a version approved in any feed is refused, and the race
   with a concurrent approve is tested.
-- [ ] **`INT-05` Pin the intake flow with a test.** According to
+- [x] **`INT-05` Pin the intake flow with a test.** According to
   `src/web/hosted.rs`, a file can be attached to a pending version
   (`version_in_feed` checks membership only) and is withheld until approval
   (`download`). Cover it end to end: push to a gated feed, attach, download is

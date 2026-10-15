@@ -370,7 +370,8 @@ configured: a feed left open for package pushes answers `403` rather than take
 multi-gigabyte files from anyone. The version must be in the feed (`404`).
 
 The name is 1–128 characters of `A-Z a-z 0-9 . _ -`, starts with a letter or
-digit, and has one of `[files].allowed_extensions`; anything else is `400`.
+digit, and has one of the feed's allowed extensions (`[feeds.files]`, else
+`[files].allowed_extensions`); anything else is `400`.
 The body is streamed to disk and hashed on the way, and is limited by
 `max_file_size_bytes` (`413`), `min_free_disk_bytes` (`507`) and
 `upload_idle_timeout_secs` (`408`). An optional `X-Checksum-SHA256: <hex>` makes

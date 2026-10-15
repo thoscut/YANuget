@@ -72,7 +72,7 @@ pub const MAX_FILE_NAME_LENGTH: usize = 128;
 /// dash, not a Windows device name, and with one of `allowed` as its
 /// extension. (The stored bytes are addressed by their hash, never by this
 /// name, so it cannot steer where anything is written on the server.)
-pub fn validate_file_name(name: &str, allowed: &crate::config::FilesConfig) -> Result<()> {
+pub fn validate_file_name(name: &str, allowed: &[String]) -> Result<()> {
     let bad = |why: &str| {
         Err(Error::BadRequest(format!(
             "invalid file name {name:?}: {why}"
@@ -97,10 +97,10 @@ pub fn validate_file_name(name: &str, allowed: &crate::config::FilesConfig) -> R
         return bad("that name lists a version's files");
     }
     match name.rsplit_once('.') {
-        Some((_, ext)) if allowed.allows_extension(ext) => Ok(()),
+        Some((_, ext)) if crate::config::extension_allowed(allowed, ext) => Ok(()),
         _ => bad(&format!(
             "the extension must be one of {}",
-            allowed.allowed_extensions.join(", ")
+            allowed.join(", ")
         )),
     }
 }
@@ -111,7 +111,7 @@ mod tests {
 
     #[test]
     fn file_names_are_held_to_what_works_everywhere() {
-        let files = crate::config::FilesConfig::default();
+        let files = crate::config::FilesConfig::default().allowed_extensions;
         for good in ["base.wim", "Base-Image_2.WIM", "disk.part1.swm", "tools.7z"] {
             assert!(validate_file_name(good, &files).is_ok(), "{good:?} refused");
         }
@@ -139,10 +139,7 @@ mod tests {
         let long = format!("{}.wim", "a".repeat(MAX_FILE_NAME_LENGTH));
         assert!(validate_file_name(&long, &files).is_err());
         // The extension list is the operator's.
-        let only_iso = crate::config::FilesConfig {
-            allowed_extensions: vec![".ISO".into()],
-            ..Default::default()
-        };
+        let only_iso = vec![".ISO".to_string()];
         assert!(validate_file_name("dvd.iso", &only_iso).is_ok());
         assert!(validate_file_name("base.wim", &only_iso).is_err());
     }

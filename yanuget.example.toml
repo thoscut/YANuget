@@ -304,3 +304,8 @@ inbox_scan_secs = 30                # YANUGET_FILES_INBOX_SCAN_SECS
 #   [feeds.retention]
 #   enabled = true
 #   keep_latest_stable = 20
+#
+#   # Replaces [files].allowed_extensions for this feed only (not added to
+#   # it), e.g. to take installers in an internal Chocolatey feed.
+#   [feeds.files]
+#   allowed_extensions = ["exe", "msi", "msix", "msu", "zip"]

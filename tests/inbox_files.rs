@@ -141,6 +141,7 @@ struct Inbox {
     storage: FilesystemStorage,
     db: SqliteDatabase,
     files: yanuget::config::FilesConfig,
+    feed_extensions: std::collections::HashMap<String, Vec<String>>,
     feeds: Vec<String>,
     staging: PathBuf,
     reserve: u64,
@@ -156,6 +157,7 @@ impl Inbox {
                 .await
                 .unwrap(),
             files: yanuget::config::FilesConfig::default(),
+            feed_extensions: Default::default(),
             feeds: vec!["default".to_string()],
             staging: data.join("packages/.uploads"),
             reserve: 0,
@@ -175,6 +177,7 @@ impl Inbox {
             storage: &self.storage,
             db: &self.db,
             files: &self.files,
+            feed_extensions: &self.feed_extensions,
             max_file_size: None,
             feeds: &self.feeds,
             staging: &self.staging,
@@ -619,4 +622,38 @@ async fn a_finished_resumable_upload_cannot_be_written_again() {
     assert_eq!(index["files"][0]["sha256"], sha256_hex(&body));
     let left = staging_empties(&server).await;
     assert!(left.is_empty(), "{left:?}");
+}
+
+/// `INT-03`: a feed's own `allowed_extensions` applies to its inbox too.
+#[tokio::test]
+async fn the_inbox_uses_the_feeds_own_file_types() {
+    let server = spawn().await;
+    push(&server, build_nupkg("Drop.Pkg", "1.0.0")).await;
+    let mut inbox = Inbox::new(&server).await;
+    inbox
+        .feed_extensions
+        .insert("default".into(), vec!["exe".into()]);
+    let dir = inbox.version_dir("Drop.Pkg", "1.0.0");
+    for name in ["setup.exe", "base.wim"] {
+        std::fs::write(dir.join(name), name).unwrap();
+        std::fs::write(
+            dir.join(format!("{name}.sha256")),
+            sha256_hex(name.as_bytes()),
+        )
+        .unwrap();
+    }
+
+    assert_eq!(
+        inbox.scan().await,
+        yanuget::inbox::ScanReport {
+            imported: 1,
+            failed: 1
+        }
+    );
+    assert!(download(&server, "drop.pkg", "1.0.0", "setup.exe")
+        .await
+        .status()
+        .is_success());
+    let why = std::fs::read_to_string(dir.join("base.wim.error")).unwrap();
+    assert!(why.contains("the extension must be one of exe"), "{why}");
 }
