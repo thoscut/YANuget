@@ -107,8 +107,9 @@ Configuration choices that matter most:
 ## Verifying a release
 
 Release archives, `SHA256SUMS` and the container image of every release from
-0.6.0 on carry signed build provenance from the release workflow, and the image is
-also signed with cosign (keyless). Check them before you run them:
+0.6.0 on carry signed build provenance from the release workflow, and the image
+of every release from 0.6.1 on is also signed with cosign (keyless). Check them
+before you run them:
 
 ```bash
 # An archive (or SHA256SUMS) downloaded from the GitHub Release.
@@ -119,7 +120,7 @@ gh attestation verify yanuget-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz \
 gh attestation verify oci://ghcr.io/thoscut/yanuget:X.Y.Z --repo thoscut/yanuget
 cosign verify ghcr.io/thoscut/yanuget:X.Y.Z \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-  --certificate-identity-regexp '^https://github\.com/thoscut/yanuget/\.github/workflows/release\.yml@refs/tags/v'
+  --certificate-identity-regexp '^https://github\.com/thoscut/YANuget/\.github/workflows/release\.yml@refs/tags/v'
 ```
 
 Either check failing means the file or image did not come from this
