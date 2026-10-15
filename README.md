@@ -566,7 +566,8 @@ files today, so it also needs a streaming `PackageContent` variant.
 
 What is planned, and the open findings from the latest full review (security,
 correctness, CI, docs and test gaps, each with an id to reference in commits),
-are tracked in [ROADMAP.md](ROADMAP.md).
+are tracked in [ROADMAP.md](ROADMAP.md), including the plan for a Chocolatey
+internalizer ([`INT-…`](ROADMAP.md#chocolatey-internalizer)).
 
 ---
 

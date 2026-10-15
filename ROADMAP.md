@@ -755,3 +755,439 @@ Not yet implemented (contributions welcome):
 - Native (Windows) PDB indexing.
 - Reproducible builds (pinned toolchain, `--remap-path-prefix`, embedded
   timestamps).
+- A Chocolatey internalizer, planned in detail under
+  [Chocolatey internalizer](#chocolatey-internalizer) (`INT-…`).
+
+---
+
+## Chocolatey internalizer
+
+Planned; nothing here is implemented yet. A tool that takes a package from the
+Chocolatey Community Repository (or any v2 or v3 feed), fetches every file its
+scripts download at install time, and publishes a copy into a YANuget feed that
+installs without internet access. Drafted on 2026-10-15 against 0.7.0, whose
+code every reference below was checked against, after reviewing the plan from
+five angles: Chocolatey packaging, security, the YANuget architecture, Windows
+operations, and testing. Items are tagged `INT-…`;
+[Target releases](#target-releases) proposes where they land.
+
+### Decisions
+
+- **A separate binary, `yanuget-internalize`, in a workspace with the server.**
+  The server never runs package content: [SECURITY.md](SECURITY.md) has it
+  store and serve what it is given. The tool runs on a worker of its own (its
+  own machine, or at least its own user) and reaches the server only through
+  the push and attached-file APIs, with an ordinary push key.
+- **Dynamic capture, not static analysis.** Each package runs in a disposable,
+  offline Windows guest with Chocolatey's download and install helpers
+  replaced by recorders. Rust has no usable PowerShell parser, and real scripts
+  build their URLs from splatted hashtables, string interpolation and
+  `$env:ChocolateyPackageVersion`. A static scan stays as a cross-check only
+  (`INT-23`).
+- **KVM first, Windows containers second.** The default sandbox is a Windows
+  Server Core virtual machine under KVM/QEMU on a Linux host: no network
+  device, a throwaway overlay on a golden image, and control through the QEMU
+  guest agent over virtio-serial. It needs no Windows host, runs on the kind of
+  machine YANuget already runs on, isolates as well as Hyper-V, and reduces the
+  network of the validation install (`INT-26`) to nftables rules on a bridge.
+  Windows containers under Hyper-V isolation are the backend for operators who
+  have a Windows host (`INT-29`). Both sit behind the `Sandbox` trait
+  (`INT-10`) and must produce the same capture.
+- **The offline sandbox is the test.** A script that needs the network for
+  anything but a recorded helper call fails there exactly as it would on an
+  internal client, and is reported rather than guessed at.
+- **Rewrite by prelude, not by editing the script.** The internalized
+  `chocolateyInstall.ps1` is a generated prelude (a map from original to
+  internal URL, and wrappers with the helpers' names) followed by the original
+  script, byte for byte. How a script builds its URLs no longer matters, and
+  the diff a reviewer reads is the prelude.
+- **Installers become attached files**, stored once under their SHA-256 and
+  served from `/files/{id}/{version}/{name}`. They are the upstream bytes, so
+  the original checksum still holds. Embedding into the `.nupkg` is a later
+  option for other feeds (`INT-28`).
+- **Same id, same version.** Meta packages pin their `.install` package exactly
+  (`[1.2.3]`), so a copy keeps the upstream id and version. Re-internalizing may
+  replace a version that is still pending (`INT-04`); an approved version is
+  never changed.
+- **Nothing reaches clients unreviewed.** The tool pushes into an intake feed
+  with `requires_approval = true` that `promotes_to` the production feed. Its
+  report travels inside the package (`INT-21`, `INT-30`).
+
+Not goals: parity with Chocolatey for Business, a PowerShell evaluator,
+running package scripts under PowerShell on Linux (they take other branches
+than under Windows PowerShell 5.1 and yield plausible but wrong URLs), a silent
+fall-back to the original URL at install time, and any judgement on whether a
+vendor's license allows redistribution inside an organisation. That stays with
+the operator, and the docs say so.
+
+### Server: 0.8.0
+
+Every server change the tool relies on, in one release (see
+[Target releases](#target-releases)), each useful on its own.
+
+- [ ] **`INT-01` Extract a `yanuget-pkg` crate.** Move `version.rs`,
+  `nuspec.rs`, `nupkg.rs` and the models they use into a workspace crate with
+  no axum or sqlx dependency and its own `thiserror` error type, converted into
+  `crate::error::Error` by the server. Today `nupkg.rs` and `nuspec.rs` return
+  the server's error, which carries `IntoResponse`. `pub use` re-exports keep
+  the server's call sites unchanged. Add a `VersionRange` (parse, normalize,
+  `contains`, best match), which does not exist yet: `Dependency::version_range`
+  is a plain string. Behind a feature, since it brings reqwest: the upstream
+  address policy (`proxy::is_private_ip_addr` and the filtering resolver in
+  `src/mirror.rs`), for `INT-17`. It also holds the report schema of
+  `INT-21`, so the tool that writes `internalizer/report.json` and the server
+  that reads it (`INT-30`) share one definition.
+  *Done when:* the server builds against the crate with no change in
+  behaviour, `cargo deny` and `cargo audit` cover the workspace, and
+  `VersionRange` has property tests over NuGet's interval notation.
+- [ ] **`INT-02` A streaming `.nupkg` rewriter** in `yanuget-pkg`. Copy
+  unchanged entries raw, without recompressing; replace or add named entries;
+  rewrite the `.nuspec`; keep the OPC parts (`[Content_Types].xml`,
+  `_rels/.rels`, the `.psmdcp` core properties) consistent, with a content type
+  for any new extension. Drop `.signature.p7s`, which any change invalidates.
+  Peak memory must not depend on package size.
+  *Done when:* an unchanged rewrite keeps every entry byte-identical, Chocolatey
+  CLI installs a rewritten package, and a 5 GB entry passes in constant memory.
+- [ ] **`INT-03` Per-feed `allowed_extensions` for attached files.** `[files]`
+  is global, and its defaults rightly exclude `exe` and `msi`. Let a feed
+  override the list (`[feeds.files]`), so executables are accepted by the
+  internal Chocolatey feed only. Typical additions: `exe`, `msi`, `msix`,
+  `msu`, `appx`, `vsix`, `ps1`.
+  *Done when:* `yanuget config check`, `yanuget.example.toml` and
+  `docs/configuration.md` cover it, and a feed without the override behaves as
+  today.
+- [ ] **`INT-04` Replace a pending version.** With overwrite off, a second push
+  of the same version is `409` even while the first is pending and has never
+  been served. Add `allow_overwrite = "pending-only"`: a push may replace a
+  version that is pending in every feed holding it, together with its attached
+  files, under the version lock (`src/locks.rs`). A version approved anywhere
+  stays immutable.
+  *Done when:* `yanuget config check` accepts the new mode, the old files are
+  gone after a replace, a version approved in any feed is refused, and the race
+  with a concurrent approve is tested.
+- [ ] **`INT-05` Pin the intake flow with a test.** According to
+  `src/web/hosted.rs`, a file can be attached to a pending version
+  (`version_in_feed` checks membership only) and is withheld until approval
+  (`download`). Cover it end to end: push to a gated feed, attach, download is
+  refused, approve, download succeeds; then the same after `promote`.
+- [ ] **`INT-30` Show the report in the admin area.** The package page of a
+  pending version, which since 0.7.0 says where the version is approved, reads
+  `internalizer/report.json` with the seek-based `nupkg::extract_file` and
+  shows the upstream source, each original URL with
+  its file, the checksum status, the warnings and the prelude. It flags a
+  version whose report lists files that are not attached, so an interrupted run
+  is not approved by accident. The entry is size-capped and escaped like every
+  other sink (`SEC-24`); a package without it renders as today. Tested
+  against fixture reports, because the tool that writes real ones ships after
+  0.8.0.
+- [ ] **`INT-31` Attached files on read-gated feeds.** Chocolatey's helpers do
+  not send source credentials to download URLs *(to verify)*, so a feed with a
+  `read_api_key` cannot serve its files to `choco install`. Proposal: a token in
+  the file URL, an HMAC over feed, id, version and name under a server secret,
+  that the prelude carries. Whoever can read the package can read its files:
+  the same permission, no wider. Rotation needs a list of secrets, because
+  changing the only one breaks every internalized package. The secrets are set
+  like every key since 0.7.0: in TOML, from the environment, or from a file
+  through `_FILE`. On a read-gated feed the answer to an attach
+  (`{name, size, sha256, url}`) carries the URL with its token, so the tool
+  never computes one. Verify the premise first: if the helpers do send source
+  credentials, the item shrinks to a test. Either way, a security review
+  before it is built.
+- [ ] **`INT-32` Read access to pending versions.** A per-feed
+  `preview_api_key` that can download pending packages and their files and do
+  nothing else: no approve, no push. For `INT-26`, and for anyone who wants to
+  test a version before approving it. Set like every other key:
+  `YANUGET_FEED_{NAME}_PREVIEW_API_KEY`, or the same with `_FILE`.
+
+### Internalizer: first version
+
+Goal: internalize the dependency closure of a package into a gated feed, for
+packages whose downloads go through Chocolatey's helpers.
+
+- [ ] **`INT-10` Crate, command line, configuration.** `yanuget-internalize`
+  with `plan` (capture and report, publish nothing) and `run` (capture,
+  download, rewrite, publish). Configuration is layered like the server's
+  (defaults, TOML, `YANUGET_INTERNALIZE_*`, `_FILE` for secrets) with
+  `deny_unknown_fields`, and `config check` checks it the way
+  `yanuget config check` does since 0.7.0 (every value, the target feed,
+  `/dev/kvm`, the golden images), exiting `1` on an error. The sandbox sits
+  behind a `Sandbox` trait with a KVM backend (`INT-15`) and a Windows
+  container backend (`INT-29`), so planning, capture parsing, downloading,
+  rewriting and publishing build and are tested on Linux CI against a fake
+  sandbox. Exit codes tell "done", "needs attention" and "failed" apart for
+  pipelines.
+- [ ] **`INT-11` Upstream client.** The Chocolatey Community Repository over v2
+  OData (`FindPackagesById()`, package download), any v3 feed through its
+  service index, and the auth modes of `[feeds.mirror]`. Each download is
+  verified against the feed's `PackageHash`. A local cache keyed by hash,
+  backoff on `429`, and a low default concurrency: the community repository
+  rate-limits heavy users. Like a mirror since 0.7.0, it logs once when an
+  upstream stops answering and once when it answers again.
+- [ ] **`INT-12` Dependency closure.** Resolve dependencies with
+  `VersionRange` (`INT-01`), extension packages (`*.extension`) included, since
+  scripts call their helpers. Pick the versions Chocolatey CLI v2 would install
+  for the same command *(to verify against the client)*, and skip what the
+  target already holds. `plan` shows the whole closure before anything is
+  downloaded.
+- [ ] **`INT-13` Golden images.** `contrib/internalizer/` builds, unattended
+  and without network access, two qcow2 images from a Windows Server Core ISO
+  (Windows PowerShell 5.1, which package scripts target). The *stock* image has
+  the virtio-win drivers, the QEMU guest agent and a pinned Chocolatey CLI
+  installed from a local `.nupkg`, with no sources configured and the guest's
+  background traffic turned off (Windows Update, time sync, telemetry, LLMNR,
+  NetBIOS, WPAD). The *capture* image is an overlay on it, with the stock image
+  as backing file, that adds the capture helpers of `INT-14`. Updates come
+  from pinned offline packages, not Windows Update. Each image ships with a
+  saved memory state of the booted, idle guest, so a run restores instead of
+  booting. Inputs are pinned by hash (ISO, virtio-win, Chocolatey, updates);
+  the report records the image hash and the Chocolatey version. The guests
+  need a regular Windows license; evaluation media are for development and CI
+  (`INT-34`).
+  *Done when:* a rebuild from the same inputs gives the same results on the
+  regression corpus, and a restored guest answers its first guest-agent
+  command within seconds *(target to verify)*.
+- [ ] **`INT-14` Capture helpers.** Replace, inside the `chocolateyInstaller`
+  module so that calls from other helpers and from extensions are caught too,
+  at least `Get-ChocolateyWebFile`, `Get-WebFile`, `Get-FtpFile`,
+  `Install-ChocolateyPackage`, `Install-ChocolateyZipPackage`,
+  `Install-ChocolateyVsixPackage`, `Install-ChocolateyPowershellCommand`,
+  `Install-ChocolateyInstallPackage` and `Get-ChocolateyUnzip`. Each appends
+  one JSON line (package, URL, 64-bit URL, checksums and their types, file
+  type, target path, and the caller from `Get-PSCallStack`, so a call made from
+  inside an extension module is told apart) and returns a plausible result: a
+  placeholder file where the script expects one, exit code 0. The script then
+  goes on to its next download. Installers never run.
+- [ ] **`INT-15` KVM sandbox runner.** One guest per root package, restored
+  from the capture image's saved state onto a fresh overlay, with no network
+  device at all. The upstream closure arrives as a read-only ISO 9660 image,
+  found in the guest by its volume label; nothing is shared from the host (no
+  virtio-fs, no 9p). The runner sets the guest clock (`guest-set-time`, since
+  the saved state is stale), starts a plain `choco install {id} --version {v}
+  --source {iso} -y` through `guest-exec`, polls `guest-exec-status` under a
+  wall-clock timeout, reads the capture back with the guest agent's file calls
+  under a size cap, then powers off and deletes the overlay whatever happened.
+  Chocolatey sets the environment, installs dependencies and extensions, and
+  runs each script as a client would; captures are attributed through
+  `$env:ChocolateyPackageName`. QEMU runs with `-sandbox on`, CPU and memory
+  limits and a bounded number of guests in parallel. The runner refuses to
+  start without `/dev/kvm`: software emulation is too slow to be useful. QEMU
+  is driven over QMP and the guest-agent socket directly; libvirt only if that
+  proves necessary. Two systemd units in `contrib/systemd/`, modelled on the
+  `yanuget.service` of 0.7.0: `yanuget-internalize.service` holds the push key
+  and the download cache and cannot open `/dev/kvm`; `yanuget-sandbox.service`
+  runs the guests as a user of its own, with `DeviceAllow=/dev/kvm` and no key,
+  and takes jobs over a Unix socket. It cannot keep `PrivateDevices=yes`
+  (`DevicePolicy=closed` instead); whether QEMU under KVM runs with
+  `MemoryDenyWriteExecute=yes` is *(to verify)*.
+- [ ] **`INT-16` Treat the capture as untrusted input.** Untrusted code wrote
+  it: a versioned schema, strict types, caps on line length, entry count and
+  total size, no control characters, `http`/`https` URLs only, and attribution
+  to a package of the closure. Anything else marks the package
+  `needs-override`; nothing is repaired.
+- [ ] **`INT-17` Downloader.** Stream each captured URL to disk while hashing
+  with SHA-256 and with the algorithm the script declares (MD5, SHA-1, SHA-256,
+  SHA-512); a declared checksum that does not match fails the package. A call
+  with no checksum, or only MD5 or SHA-1, is marked trust-on-first-use in the
+  report; the prelude pins SHA-256 either way (`INT-19`). The mirror's address
+  policy applies (`INT-01`): private, loopback and link-local targets are
+  refused unless allow-listed, after every redirect too. The URLs come from
+  untrusted scripts, and a package pointing at an internal host would
+  otherwise get that host's answer published into the feed. Size cap, retries,
+  resume.
+- [ ] **`INT-18` File names.** Attached file names are 1–128 characters of
+  `A-Z a-z 0-9 . _ -` with an allowed extension; upstream names carry spaces
+  and `+`, or there is no name at all (`?product=…&os=win64`). Keep the
+  original name where it is valid; otherwise derive it from
+  `Content-Disposition`, the URL and the captured file type, check the
+  extension against the content (`MZ`, the OLE header of `.msi`, `PK`), and
+  break collisions with a hash prefix. A file the feed's `allowed_extensions`
+  refuses is reported, not renamed to pass.
+- [ ] **`INT-19` Prelude.** The wrappers are proxy commands
+  (`[System.Management.Automation.ProxyCommand]::Create`) generated from the
+  pinned Chocolatey version's helper metadata, so positional calls and
+  parameter aliases bind exactly as they do against the real helpers. A
+  wrapper looks the URL up and calls the original
+  (`chocolateyInstaller\Install-ChocolateyPackage`) with the internal URL and
+  the stored file's SHA-256 as checksum. A URL not in the map stops the install
+  with a message naming the package, never a fall-back to the internet. The map
+  is keyed by the SHA-256 of the original URL, so no text a package controls is
+  ever emitted as PowerShell; the report carries the originals. The server's
+  base URL sits in one variable at the top, overridable by an environment
+  variable for a host move.
+- [ ] **`INT-20` Publish.** Rewrite the package (`INT-02`) with the new
+  `chocolateyInstall.ps1` and the report, push it to the intake feed, attach
+  the files, and check that the feed withholds the version; warn when it is
+  served at once. Attach is idempotent (same content, `200`), so a re-run
+  completes a version whose files are missing. A `409` on push means "already
+  internalized" unless `--replace-pending` (`INT-04`). The tool takes a push key
+  and nothing more. `--replace-pending` needs YANuget 0.8.0: when
+  `/health/status` is reachable the tool checks the server version up front,
+  otherwise its error for a refused replace names the version it needs.
+- [ ] **`INT-21` Report.** Per package: `internalized`, `unchanged` (no
+  downloads: embedded or meta packages), `needs-override` (network use outside
+  the helpers, a script that failed, an unmapped call, a download from inside
+  an extension module) or `failed`, each with reasons. It lists the upstream
+  source and hash, the image hash and Chocolatey version, the captured calls,
+  the files with sizes and hashes, the checksum status and the warnings. As
+  JSON for pipelines, as text for people, and inside the package as
+  `internalizer/report.json`, covered by the package hash and carried along by
+  promotion, copy, `yanuget migrate` and `yanuget backup`. The schema is
+  versioned and defined in `yanuget-pkg` (`INT-01`); version 1 is fixed with
+  YANuget 0.8.0, and a reader ignores fields it does not know.
+- [ ] **`INT-22` Regression corpus and CI.** A pinned list of the most
+  installed community packages (id, version, upstream hash), cached rather than
+  committed, run through `plan` whenever the capture helpers or the prelude
+  change. Each result is compared with the last run, and the share per status
+  is tracked. Golden files for generated preludes; fuzzing for the capture
+  parser and the rewriter. A nightly job runs the KVM backend for real on a
+  KVM-capable Linux runner, with images built from evaluation media. Whether
+  GitHub's hosted Linux runners expose `/dev/kvm` and can cache a Windows image
+  of that size is *(to verify)*; otherwise a self-hosted runner. The container
+  backend (`INT-29`) gets a job on a hosted Windows runner with process
+  isolation, and the release checklist adds one Hyper-V run.
+
+### Internalizer: production
+
+- [ ] **`INT-23` Static cross-check.** Scan every package script for URL-like
+  literals, including `chocolateyUninstall.ps1` and
+  `chocolateyBeforeModify.ps1`, which capture does not run, and warn about each
+  one capture did not see. A regex is enough, since it only ever raises a
+  warning.
+- [ ] **`INT-24` Environment variants.** Capture once per architecture
+  (`$env:ChocolateyForceX86`), configured locale and set of package
+  parameters, and map the union of URLs. A package that picks its installer by
+  system language is internalized for the configured locales only, and the
+  report says so. Locales are variants of the golden images, because changing
+  the system locale needs a reboot, which would throw away the saved state;
+  whether `Set-Culture` before the run is enough for most scripts is
+  *(to verify)*.
+- [ ] **`INT-25` Overrides.** One TOML file per package id
+  (`deny_unknown_fields`): extra URLs, URL rewrites, package parameters for
+  capture, a replacement script, or `skip` with a reason. Every override used
+  is in the report; one that no longer matches a capture is a warning, so stale
+  overrides surface.
+- [ ] **`INT-26` Validation install.** After publishing, restore a guest from
+  the *stock* image, without the capture helpers, and install each new pending
+  version with its real installers. The guest's only network device sits on an
+  isolated bridge whose nftables rules accept the YANuget server's address and
+  port and log and drop everything else; the server's name goes into the
+  guest's `hosts` file, so no DNS is needed. A drop that an idle baseline run
+  of the same image also shows is ignored; any other fails the package, as
+  does a failing exit code from Chocolatey. This catches what capture cannot
+  see: web installers that pass capture and fetch their payload when they run.
+  Needs read access to pending versions (`INT-32`). On the container backend
+  the same restriction needs its own design (`INT-29`).
+- [ ] **`INT-27` Keep feeds current.** A watch list of ids, optionally with
+  ranges; `sync` finds new upstream versions, internalizes them into the intake
+  feed and reports what waits for approval. Meant as a systemd timer on the
+  worker (a scheduled task with the container backend); idempotent and safe to
+  interrupt. Each run writes its counts per status and the age of the oldest
+  pending version in the Prometheus text format of `[monitoring]`, as a file
+  for node_exporter's textfile collector, so a stuck sync shows up next to the
+  server's metrics.
+- [ ] **`INT-28` Embedding for other feeds.** For targets that are not YANuget:
+  store the files under `tools/` in the package, streamed (`INT-02`), with the
+  prelude mapping to paths under the package folder. Whether the helpers take a
+  local path or `file:` URL for `-Url` is *(to verify)*; if not, the wrappers
+  call `Install-ChocolateyInstallPackage` or `Get-ChocolateyUnzip` with the
+  local file. A package over the target's upload limit fails with a clear
+  message.
+- [ ] **`INT-29` Windows container backend.** For operators with a Windows
+  host instead of KVM: a Server Core container image pinned by digest, with the
+  same Chocolatey CLI and capture helpers as the golden images (`INT-13`). One
+  container per root package under Hyper-V isolation (process isolation only
+  in CI), `--network none`, the closure mounted read-only as a folder source,
+  one writable output directory, CPU and memory limits, a wall-clock timeout,
+  and removal whatever happened; Docker Engine API or `docker` CLI is decided
+  in the PR. The regression corpus (`INT-22`) runs against both backends and
+  must give the same capture. A validation install (`INT-26`) on this backend
+  needs a way to restrict a container's network *(to design)*.
+
+### Server: later
+
+- [ ] **`INT-33` Internalization requests.** Admins request a package in the
+  admin area; the worker polls a small JSON API with a dedicated worker key
+  that can read the queue and report status, and pushes with its push key as
+  before. The server still runs nothing; the queue only saves a trip to the
+  worker. Its errors are JSON for a request that asks for `application/json`,
+  as admin errors are since 0.7.0. The queue needs a numbered schema migration
+  (`src/database/sqlite/schema.rs`) and reports its length and oldest request
+  in `/metrics` and `/health/status`. Whether it is built at all is open (see
+  *Open questions*).
+
+### Documentation
+
+- [ ] **`INT-34` Documentation and threat model.** `docs/internalizer.md` in
+  the MkDocs nav: the intake feed and approving with `yanuget admin approve`,
+  the worker host with KVM or Windows containers and the two systemd units of
+  `INT-15`, building the golden images, the Windows license the guests need,
+  overrides, and the operator's responsibility for the licenses of packaged
+  software. A section in SECURITY.md: the worker is its own trust zone, holds a
+  push key for the intake feed only, runs guests as a user that holds no key,
+  and what it produces is reviewed before it reaches clients.
+
+### Open questions
+
+- **Fixing an approved version.** It cannot be replaced, and the package fix
+  version (`1.2.3.20261015`) breaks the exact pin of a meta package on its
+  `.install` package. Re-internalize the dependents with the pin rewritten, or
+  allow a documented delete-and-repush? Decide before `INT-27`.
+- **Downloads from extension modules.** The prelude only redirects calls made
+  by the package's own script. A helper inside an extension that downloads
+  (the Visual Studio extension's bootstrapper, for example) is captured but not
+  redirected, and ends as `needs-override`. Is a supported way to intercept
+  those worth its complexity?
+- **Supported Chocolatey CLI versions.** The wrappers are generated from one
+  version's helpers. Which client versions must an internalized package
+  support, and how is that tested?
+- **Releases.** [Target releases](#target-releases) assumes the tool is
+  versioned on its own. Open: a tag prefix for it (`internalize-v*` next to
+  `v*`), crates.io trusted publishing per crate, whether `yanuget-pkg` is
+  published at all, and a changelog of its own or a section in `CHANGELOG.md`.
+  RELEASING.md and the release workflow follow from the answers.
+- **Licensing the guests.** Which Windows license covers a golden image that
+  is restored thousands of times a month, and may evaluation media run in CI?
+  The answer decides whether KVM can be the default for every operator, and is
+  needed before `INT-13` ships in a release.
+- **Requests on the server or in the watch list?** `INT-33` needs a schema
+  migration (step 8 in `src/database/sqlite/schema.rs`), after which older
+  builds refuse the database (`check_known`), and it widens `PackageDatabase`
+  for every future backend. The watch list of `INT-27`, kept in a reviewed
+  repository, covers the same need without touching the server; what is lost
+  is a request button in the admin area.
+- **Names.** `yanuget-internalize` and `yanuget-pkg` are placeholders.
+
+### Target releases
+
+A proposal on top of 0.7.0, in the order the items depend on each other.
+
+| Release | Items | Notes |
+| --- | --- | --- |
+| YANuget 0.8.0 | `INT-01`–`INT-05`, `INT-30`–`INT-32` | Every server change the tool needs. Additive: upgrading from 0.7.x should need no change to the configuration or the database. Blocked by the security review of `INT-31` and by version 1 of the report schema (`INT-21`). |
+| internalizer 0.1.0 | `INT-10`–`INT-22` | KVM backend; needs YANuget 0.8.0. |
+| internalizer 0.2.0 | `INT-23`–`INT-28` | Needs nothing beyond YANuget 0.8.0. |
+| internalizer 0.3.0 | `INT-29` | Optional. |
+| YANuget, later | `INT-33` | Only if the open question is answered for it; needs a schema migration. |
+
+`INT-34` is not a release of its own: each release ships the part of
+`docs/internalizer.md` and SECURITY.md that covers it.
+
+### Sizing
+
+Rough, for one developer who knows the codebase and Chocolatey packaging:
+
+| Part | Person-weeks |
+| --- | --- |
+| Server, 0.8.0 (`INT-01`–`INT-05`, `INT-30`–`INT-32`) | 5–7 |
+| First version (`INT-10`–`INT-22`) | 10–12 |
+| Production (`INT-23`–`INT-28`) | 6–8 |
+| Windows container backend (`INT-29`), optional | 2–3 |
+| Server, later (`INT-33`) | 1–2 |
+
+The KVM backend costs about two weeks more in the first version than
+containers would have, mostly for the unattended image build and the guest
+agent; the validation network of `INT-26` gets cheaper in return. 0.7.0
+changes none of this: the systemd split in `INT-15` and the `config check`
+of `INT-10` fit inside the ranges. Documentation (`INT-34`) is inside each
+row. Bringing `INT-30`–`INT-32` forward into 0.8.0 changes when that work
+happens, not how much of it there is.
