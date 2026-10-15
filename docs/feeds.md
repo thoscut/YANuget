@@ -93,8 +93,8 @@ feed; it stays in the source feed as well. Over HTTP it is
 POST /{feed}/admin/packages/{id}/{version}/promote
 ```
 
-with the admin credentials and the CSRF token, as described under
-[Admin area](api.md#admin-area-http-basic-auth).
+with the admin credentials and the CSRF token; see
+[Scripting promotion and approval](#scripting-promotion-and-approval).
 
 * The version must be a member of the feed it is promoted from.
 * The target's gate and license policy apply as for a push: in a gated target
@@ -126,6 +126,47 @@ own cannot without both.
 Feeds without `promotes_to` are simply independent sets of packages between
 which versions can be copied or moved.
 
+### Scripting promotion and approval
+
+Every button in the admin area is a plain `POST`, so a release pipeline can
+promote and approve with `curl`. Each request needs:
+
+* HTTP Basic credentials: any user name, the admin key as the password;
+* a CSRF token in the `X-CSRF-Token` header. The admin pages embed it as the
+  `_csrf` form field. A token is valid for twelve hours, for every feed with
+  the same admin key, until the server restarts;
+* ids and versions in the URL as the gallery shows them; lower case is safest.
+
+A successful action answers `303 See Other` (back to the package page). Use
+`curl -f` without `-L`, so a refusal (`400`, `401`, `404`) fails the step.
+
+```bash
+B=https://nuget.example.com
+AUTH="admin:$YANUGET_ADMIN_KEY"
+
+# Fetch a CSRF token from any package page of the admin area.
+csrf() {
+  curl -fsS -u "$AUTH" "$B/$1/admin/packages/$2" |
+    grep -o 'name="_csrf" value="[^"]*"' | head -n1 | cut -d'"' -f4
+}
+
+# Promote Contoso.Utils 1.4.0 from stage into its promotes_to feed.
+curl -fsS -o /dev/null -u "$AUTH" -X POST -H "X-CSRF-Token: $(csrf stage contoso.utils)" \
+     "$B/stage/admin/packages/contoso.utils/1.4.0/promote"
+
+# Approve it in the gated production feed.
+curl -fsS -o /dev/null -u "$AUTH" -X POST -H "X-CSRF-Token: $(csrf production contoso.utils)" \
+     "$B/production/admin/packages/contoso.utils/1.4.0/approve"
+
+# Check that clients see it now.
+curl -fsS "$B/production/v3/package/contoso.utils/index.json"
+```
+
+The same pattern works for `disable`, `enable`, `pin`, `unpin` and `delete`,
+and for several versions at once through `POST /{feed}/admin/packages/{id}`
+with `op=…&v=…&v=…`. All actions are listed under
+[Admin area](api.md#admin-area-http-basic-auth).
+
 ## Mirroring an upstream feed
 
 A feed with a mirror is a read-through cache: a request for a package it does
@@ -147,6 +188,50 @@ and with a license policy to flag or block licenses you do not accept. A
 version deleted from a mirror feed is not fetched again. Limits, credentials for
 private upstreams and refresh behaviour are under
 [Configuration → Feeds](configuration.md#feeds).
+
+### An upstream behind an internal CA
+
+When the upstream is another server on your network (a second YANuget, a
+BaGetter or Artifactory instance), its certificate is often issued by an
+internal CA. Give the mirror that CA, and credentials if the upstream needs
+them:
+
+```toml
+[[feeds]]
+name = "upstream-cache"
+
+  [feeds.mirror]
+  enabled = true
+  upstream = "https://nuget-hub.example.com/production/v3/index.json"
+  ca_cert_path = "/etc/yanuget/internal-ca.pem"   # PEM, one or more CA certificates
+  allow_private_upstream = true                   # the upstream has a private address
+  auth.token = "…"                                # or auth.username / auth.password
+```
+
+`ca_cert_path` adds to the system store and the bundled Mozilla roots; it does
+not replace them. The upstream's certificate has to carry the host name used in
+`upstream` (see [Names on the certificate](clients.md#names-on-the-certificate)).
+
+### When the upstream moves
+
+The mirror settings live in each server's own configuration file, so moving the
+upstream to a new host is a change on **every** YANuget server that mirrors it:
+
+1. Make sure the new upstream serves the same packages (for example with
+   [`yanuget migrate`](migrate.md)), and that its certificate carries the new
+   name.
+2. On each mirroring server, change `upstream`, and `ca_cert_path` and the
+   credentials if they differ, in every `[feeds.mirror]` that points at the old
+   host. Restart the server.
+3. Check each one: request a package the mirror does not hold yet and look for
+   upstream errors in the log.
+
+Packages a mirror already stored are served from its own disk and are not
+fetched again, so they keep working throughout. Only packages it has not seen
+yet, and new versions, depend on the upstream. A server that still points at an
+old, switched-off host therefore looks healthy until someone needs a new
+package. Keep a list of the servers that mirror each upstream, or manage their
+configuration from one place (Ansible, Puppet), so none is missed.
 
 ## License policy
 

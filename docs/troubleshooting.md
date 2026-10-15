@@ -28,8 +28,11 @@ generic message to the client and the cause in the server log
 
 The client does not trust the server's certificate. With the default
 self-signed certificate, see [Trusting the default certificate](clients.md#trusting-the-default-certificate).
-If the certificate is trusted but the name does not match, the certificate was
-generated before `base_url` was set: delete `{data_dir}/tls/` and restart.
+If the certificate is trusted but the name does not match, the name the client
+used is not on the certificate; see
+[Names on the certificate](clients.md#names-on-the-certificate). With the
+generated certificate, it was probably created before `base_url` was set:
+delete `{data_dir}/tls/` and restart.
 
 ### Restore works, but URLs point at the wrong host or `http://`
 
@@ -76,7 +79,8 @@ refused by an older one; restore the backup taken before the upgrade.
 ### Admin actions answer `400`
 
 Admin `POST`s need the CSRF token the admin page embeds. Scripts must send it as
-`X-CSRF-Token`; see [CSRF](api.md#csrf). Copying or moving into a feed other
+`X-CSRF-Token`; see [CSRF](api.md#csrf) and the
+[`curl` example](feeds.md#scripting-promotion-and-approval). Copying or moving into a feed other
 than this feed's `promotes_to` target also needs credentials valid for that
 feed.
 

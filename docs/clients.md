@@ -58,6 +58,29 @@ The generated certificate is valid for `localhost` and for the host name in
 later, delete `{data_dir}/tls/` and restart so a certificate with the new name
 is generated, then trust that one.
 
+### Names on the certificate
+
+NuGet clients check that the name they connect to is on the certificate, and
+they check it strictly. Every name a client uses must be listed as a subject
+alternative name (SAN): the fully qualified name (`nuget.example.com`), a short
+name some machines use (`nuget`), and the IP address if anything connects by
+address. A name that is missing fails the TLS handshake even when the
+certificate is otherwise trusted.
+
+The generated certificate only carries `localhost` and the `base_url` host.
+When clients reach the server under other names, give it a certificate of your
+own (`tls_cert_path`, `tls_key_path`) that lists them all, for example from your
+internal CA, and check it before rolling it out:
+
+```bash
+openssl x509 -in cert.pem -noout -ext subjectAltName
+# X509v3 Subject Alternative Name:
+#     DNS:nuget.example.com, DNS:nuget, IP Address:10.0.0.15
+```
+
+Better still, give every client the same name, the one in `base_url`: the
+URLs in the service index are built from it, so clients end up there anyway.
+
 ## dotnet CLI
 
 ```bash
