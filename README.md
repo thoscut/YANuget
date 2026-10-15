@@ -333,11 +333,17 @@ pip install -r requirements-docs.txt
 mkdocs build      # outputs site/, embedded at compile time
 ```
 
-It covers the [HTTP API](docs/api.md), every
-[configuration option](docs/configuration.md),
+It has guides for [connecting clients](docs/clients.md) (`dotnet`, `nuget.exe`,
+Chocolatey, Visual Studio, certificates, read keys, symbols),
+[feeds and release rings](docs/feeds.md), the
+[gallery and admin area](docs/administration.md) and
+[troubleshooting](docs/troubleshooting.md); a reference for the
+[HTTP API](docs/api.md), every [configuration option](docs/configuration.md)
+and the [command line](docs/cli.md); and covers
 [deploying it as a service](docs/deployment.md) (systemd, Compose, Kubernetes
-probes, backup/restore, upgrades), the [architecture](docs/architecture.md) and
-the [large-package design](docs/large-packages.md).
+probes, backup/restore, upgrades), [bulk migration](docs/migrate.md), the
+[architecture](docs/architecture.md) and the
+[large-package design](docs/large-packages.md).
 
 Release binaries and the container image ship the rendered docs; a plain
 `cargo build` without MkDocs still compiles (a small placeholder page is embedded
