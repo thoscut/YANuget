@@ -67,6 +67,12 @@ expected to change incompatibly at any version.
   promote, copy or move did in the target feed, links to where a pending version
   is approved, and marks each version the `promotes_to` feed already holds
   instead of offering a Promote that would change nothing.
+- The release workflow now signs the container image. It named the image
+  `ghcr.io/thoscut/YANuget`, which cosign refuses because registry references
+  are lowercase, so the 0.6.0 image was published and attested but not signed.
+  The `cosign verify` command in SECURITY.md now matches the workflow identity
+  as GitHub spells it (`thoscut/YANuget`), and says the signature starts with
+  0.6.1.
 
 ## [0.6.0] — 2026-10-01
 
