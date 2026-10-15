@@ -54,6 +54,11 @@ pub fn admin_dashboard_page(urls: &UrlBuilder, ids: &[String]) -> String {
 pub struct AdminPackageExtras<'a> {
     /// The next release ring, when this feed has one.
     pub promote_target: Option<&'a str>,
+    /// The versions the promotion target already holds (normalized), each
+    /// with whether it is still pending there.
+    pub in_target: &'a [(String, bool)],
+    /// What the last copy, move or promotion did, right after one.
+    pub notice: Option<&'a TransferNotice>,
     /// The other feeds this admin may copy or move versions into; with none,
     /// the page offers neither.
     pub transfer_targets: &'a [String],
@@ -63,6 +68,119 @@ pub struct AdminPackageExtras<'a> {
     pub files_enabled: bool,
     /// The files attached to any of the versions.
     pub files: &'a [PackageFile],
+}
+
+/// Which cross-feed action a [`TransferNotice`] reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransferOp {
+    Promote,
+    Copy,
+    Move,
+}
+
+impl TransferOp {
+    /// The query value that names this action.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Promote => "promote",
+            Self::Copy => "copy",
+            Self::Move => "move",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "promote" => Self::Promote,
+            "copy" => Self::Copy,
+            "move" => Self::Move,
+            _ => return None,
+        })
+    }
+}
+
+/// What a copy, move or promotion into another feed did, shown at the top of
+/// the package page afterwards.
+#[derive(Debug, Clone)]
+pub struct TransferNotice {
+    pub op: TransferOp,
+    /// The feed the versions went to.
+    pub target: String,
+    /// That feed's admin page for the package, where pending versions are
+    /// approved.
+    pub target_admin: String,
+    /// The version, for a single promotion.
+    pub version: Option<String>,
+    /// Added and live there (as live as they are here).
+    pub added: usize,
+    /// Added, but waiting for approval there.
+    pub pending: usize,
+    /// Already there; left as they were.
+    pub present: usize,
+}
+
+impl TransferNotice {
+    fn render(&self, id: &str) -> String {
+        let target = escape_html(&self.target);
+        let approve = format!(
+            "<a href=\"{}\">approve {} in {target}</a>",
+            escape_html(&self.target_admin),
+            if self.pending == 1 { "it" } else { "them" },
+        );
+        let (text, warn) = match (&self.version, self.op) {
+            (Some(v), TransferOp::Promote) => {
+                let what = format!("{} {}", escape_html(id), escape_html(v));
+                if self.present > 0 {
+                    (
+                        format!("{target} already holds {what}, so nothing changed there."),
+                        true,
+                    )
+                } else if self.pending > 0 {
+                    (
+                        format!(
+                            "Promoted {what} to {target}. It is pending there and clients \
+                             cannot see it until you {approve}."
+                        ),
+                        false,
+                    )
+                } else {
+                    (format!("Promoted {what} to {target}."), false)
+                }
+            }
+            _ => {
+                let total = self.added + self.pending + self.present;
+                let verb = match self.op {
+                    TransferOp::Promote => "Promoted",
+                    TransferOp::Copy => "Copied",
+                    TransferOp::Move => "Moved",
+                };
+                let mut text = format!(
+                    "{verb} {total} version{} to {target}.",
+                    plural(total as i64)
+                );
+                if self.present > 0 {
+                    text.push_str(&format!(
+                        " {} {} already there and kept {} state there.",
+                        self.present,
+                        if self.present == 1 { "was" } else { "were" },
+                        if self.present == 1 { "its" } else { "their" },
+                    ));
+                }
+                if self.pending > 0 {
+                    text.push_str(&format!(
+                        " {} {} pending there; clients cannot see {} until you {approve}.",
+                        self.pending,
+                        if self.pending == 1 { "is" } else { "are" },
+                        if self.pending == 1 { "it" } else { "them" },
+                    ));
+                }
+                (text, false)
+            }
+        };
+        format!(
+            "<p class=\"notice{}\" role=\"status\">{text}</p>",
+            if warn { " warn" } else { "" }
+        )
+    }
 }
 
 /// The per-package admin page: every version (incl. disabled, pending and
@@ -140,11 +258,23 @@ pub fn admin_package_page(
             actions.push_str(&button(&v, "approve", "Approve"));
         }
         if let Some(target) = extras.promote_target {
-            actions.push_str(&button(
-                &v,
-                "promote",
-                &format!("Promote \u{2192} {}", escape_html(target)),
-            ));
+            // Promoting what the target already holds changes nothing there,
+            // so the row says where it is instead of offering the button.
+            match extras.in_target.iter().find(|(tv, _)| *tv == v) {
+                Some((_, true)) => status.push_str(&format!(
+                    " <span class=\"badge pre\">pending in {}</span>",
+                    escape_html(target)
+                )),
+                Some((_, false)) => status.push_str(&format!(
+                    " <span class=\"badge ok\">in {}</span>",
+                    escape_html(target)
+                )),
+                None => actions.push_str(&button(
+                    &v,
+                    "promote",
+                    &format!("Promote \u{2192} {}", escape_html(target)),
+                )),
+            }
         }
         // Enable/disable and pin/unpin toggle with the current state.
         if p.enabled {
@@ -249,7 +379,7 @@ pub fn admin_package_page(
         "<nav class=\"crumbs\" aria-label=\"Breadcrumb\">\
          <a href=\"{admin}\">Admin</a> <span aria-hidden=\"true\">/</span> <span>{eid}</span></nav>\
          <div class=\"bar\"><h1 class=\"title\">{eid}</h1>\
-         <a href=\"{gallery}\">Open in the gallery</a></div>\
+         <a href=\"{gallery}\">Open in the gallery</a></div>{notice}\
          <p class=\"muted\">Disabled and pending versions are hidden from clients and not \
          downloadable. A pinned version is never deleted by retention. Delete removes this \
          feed's membership; moving keeps the files, since the other feed then holds them.</p>\
@@ -261,6 +391,7 @@ pub fn admin_package_page(
         admin = escape_html(&urls.app("/admin")),
         gallery = escape_html(&urls.app(&format!("/packages/{}", enc_path(&lower)))),
         eid = escape_html(id),
+        notice = extras.notice.map(|n| n.render(id)).unwrap_or_default(),
         files = admin_files(urls, id, extras, &csrf),
     );
     layout(urls, &format!("Admin \u{2014} {id}"), ADMIN_NAV, &body)
@@ -863,5 +994,88 @@ mod tests {
         assert!(pkg.contains("/promote"));
         assert!(pkg.contains("pending"));
         assert!(pkg.contains("flagged"));
+    }
+
+    #[test]
+    fn a_version_the_target_holds_says_so_instead_of_offering_promote() {
+        let urls = UrlBuilder::new("https://host");
+        let versions = vec![feed_version(sample(), false, false)];
+        let page = |in_target: &[(String, bool)]| {
+            admin_package_page(
+                &urls,
+                "Contoso.Utils",
+                &versions,
+                &AdminPackageExtras {
+                    promote_target: Some("stable"),
+                    in_target,
+                    ..Default::default()
+                },
+                "tok",
+            )
+        };
+        let v = sample().normalized_version();
+        let pending = page(&[(v.clone(), true)]);
+        assert!(pending.contains("pending in stable"), "{pending}");
+        assert!(!pending.contains("/promote"));
+        let live = page(&[(v, false)]);
+        assert!(live.contains(">in stable<"), "{live}");
+        assert!(!live.contains("/promote"));
+        assert!(page(&[]).contains("/promote"));
+    }
+
+    #[test]
+    fn a_promotion_into_a_gated_feed_says_where_to_approve_it() {
+        let urls = UrlBuilder::new("https://host");
+        let versions = vec![feed_version(sample(), false, false)];
+        let page = |notice: &TransferNotice| {
+            admin_package_page(
+                &urls,
+                "Contoso.Utils",
+                &versions,
+                &AdminPackageExtras {
+                    notice: Some(notice),
+                    ..Default::default()
+                },
+                "tok",
+            )
+        };
+        let mut notice = TransferNotice {
+            op: TransferOp::Promote,
+            target: "stable".into(),
+            target_admin: "/stable/admin/packages/contoso.utils".into(),
+            version: Some("1.0.0".into()),
+            added: 0,
+            pending: 1,
+            present: 0,
+        };
+        let pending = page(&notice);
+        assert!(
+            pending.contains("Promoted Contoso.Utils 1.0.0 to stable. It is pending there"),
+            "{pending}"
+        );
+        assert!(pending.contains("href=\"/stable/admin/packages/contoso.utils\""));
+
+        notice.pending = 0;
+        notice.added = 1;
+        assert!(page(&notice).contains("Promoted Contoso.Utils 1.0.0 to stable.</p>"));
+
+        notice.added = 0;
+        notice.present = 1;
+        assert!(page(&notice).contains("stable already holds Contoso.Utils 1.0.0"));
+
+        let bulk = TransferNotice {
+            op: TransferOp::Move,
+            version: None,
+            added: 1,
+            pending: 2,
+            present: 1,
+            ..notice
+        };
+        let moved = page(&bulk);
+        assert!(
+            moved.contains("Moved 4 versions to stable. 1 was already there"),
+            "{moved}"
+        );
+        assert!(moved.contains("2 are pending there"), "{moved}");
     }
 }

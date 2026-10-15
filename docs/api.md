@@ -519,6 +519,13 @@ the version to be a member of the current feed. The POST actions return
 `303 See Other` back to the package page; without credentials they return `401`
 with a `WWW-Authenticate: Basic` challenge.
 
+After a `promote`, `copy` or `move` the package page says what happened in the
+target: added, added but **pending** there (with a link to the target's admin
+page, where it is approved), or already there and left unchanged. Each version
+row also shows whether the `promotes_to` feed already holds it (`in stable`,
+`pending in stable`); such a row has no Promote button, since promoting it again
+would change nothing.
+
 `POST /admin/packages/{id}` applies one action to every version it names — how a
 whole package is disabled, deleted or moved. The form fields are `op` (`enable`,
 `disable`, `approve`, `pin`, `unpin`, `delete`, `copy` or `move`), one `v` per

@@ -109,10 +109,54 @@ pub(super) async fn admin_dashboard(
     Ok(Html(ui::admin_dashboard_page(&urls, &ids)))
 }
 
+/// What the package page reports after a copy, move or promotion (see
+/// [`transfer_report_url`]).
+#[derive(Debug, Default, Deserialize)]
+pub(super) struct AdminPackageQuery {
+    #[serde(default)]
+    done: Option<String>,
+    #[serde(default)]
+    to: Option<String>,
+    #[serde(default)]
+    v: Option<String>,
+    #[serde(default)]
+    added: Option<String>,
+    #[serde(default)]
+    pending: Option<String>,
+    #[serde(default)]
+    present: Option<String>,
+}
+
+impl AdminPackageQuery {
+    /// The notice to show, when the query names an operation and a feed that
+    /// exists. Anything else in the query is dropped, never echoed.
+    fn notice(&self, state: &AppState, id: &str) -> Option<ui::TransferNotice> {
+        let op = ui::TransferOp::parse(self.done.as_deref()?)?;
+        let target = state
+            .feeds
+            .iter()
+            .find(|m| Some(m.name.as_str()) == self.to.as_deref())?;
+        Some(ui::TransferNotice {
+            op,
+            target: target.name.clone(),
+            target_admin: admin_package_url(&target.prefix, id),
+            version: self
+                .v
+                .as_deref()
+                .and_then(|v| NuGetVersion::parse(v).ok())
+                .map(|v| v.normalized()),
+            added: lenient(self.added.as_deref()).unwrap_or(0),
+            pending: lenient(self.pending.as_deref()).unwrap_or(0),
+            present: lenient(self.present.as_deref()).unwrap_or(0),
+        })
+    }
+}
+
 pub(super) async fn admin_package(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<String>,
+    Query(q): Query<AdminPackageQuery>,
 ) -> Result<Html<String>> {
     check_id(&id)?;
     let versions = state.db.find_all_versions(state.feed(), &id).await?;
@@ -142,12 +186,26 @@ pub(super) async fn admin_package(
             files.extend(all.extract_if(.., |f| f.normalized_version == v));
         }
     }
+    // Which of these versions the promotion target already holds, so a row
+    // says so instead of offering a promotion that would change nothing.
+    let in_target = match &state.feed.promotes_to {
+        Some(target) => state
+            .db
+            .find_all_versions(target, &id)
+            .await?
+            .into_iter()
+            .map(|fv| (fv.package.normalized_version(), fv.pending))
+            .collect(),
+        None => Vec::new(),
+    };
     Ok(Html(ui::admin_package_page(
         &urls,
         display_id,
         &versions,
         &ui::AdminPackageExtras {
             promote_target: state.feed.promotes_to.as_deref(),
+            in_target: &in_target,
+            notice: q.notice(&state, &id).as_ref(),
             transfer_targets: &targets,
             retention_plan: &plan,
             files_enabled: state.config.files.enabled,
@@ -197,6 +255,20 @@ enum Transfer {
     Move,
 }
 
+/// What [`transfer_version`] did in the target feed, so the admin page can
+/// say so: without it a promotion into a gated feed looks like nothing
+/// happened, since the version is withheld there until someone approves it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Arrival {
+    /// Added to the target with the state it has here.
+    Added,
+    /// Added to the target, but pending there until an admin of that feed
+    /// approves it.
+    Pending,
+    /// The target already held it; its state there is unchanged.
+    AlreadyThere,
+}
+
 /// Copy or move one version of this feed into `target`.
 ///
 /// The target's license policy and approval gate apply, exactly as for a push
@@ -213,7 +285,7 @@ async fn transfer_version(
     id: &str,
     v: &NuGetVersion,
     mode: Transfer,
-) -> Result<()> {
+) -> Result<Arrival> {
     // You can only hand on what *this* feed holds — not any globally-known
     // version that happens to live in some other feed. Checked again under
     // the lock below; this first look keeps such a version from being judged
@@ -262,10 +334,12 @@ async fn transfer_version(
         pinned: mode == Transfer::Move && here.pinned,
         ..Membership::active(&target.name, &package)
     };
-    match state.db.add_membership(&membership).await {
-        Ok(()) | Err(Error::PackageAlreadyExists) => {}
+    let arrival = match state.db.add_membership(&membership).await {
+        Ok(()) if membership.pending => Arrival::Pending,
+        Ok(()) => Arrival::Added,
+        Err(Error::PackageAlreadyExists) => Arrival::AlreadyThere,
         Err(e) => return Err(e),
-    }
+    };
     if mode == Transfer::Move {
         state.db.remove_membership(state.feed(), id, v).await?;
         // Moved out on purpose: this feed's mirror must not fetch it back.
@@ -273,7 +347,57 @@ async fn transfer_version(
             tracing::error!(feed = %state.feed(), %id, error = %e, "could not record the move");
         }
     }
-    Ok(())
+    Ok(arrival)
+}
+
+/// How many versions of a copy, move or promotion landed in which way.
+#[derive(Clone, Copy, Debug, Default)]
+struct Tally {
+    added: usize,
+    pending: usize,
+    present: usize,
+}
+
+impl Tally {
+    fn count(&mut self, arrival: Arrival) {
+        match arrival {
+            Arrival::Added => self.added += 1,
+            Arrival::Pending => self.pending += 1,
+            Arrival::AlreadyThere => self.present += 1,
+        }
+    }
+}
+
+/// The package's admin page, reporting what a copy, move or promotion into
+/// `target` did. Only numbers, a feed name and a version travel in the query,
+/// and [`admin_package`] checks each of them before showing anything.
+fn transfer_report_url(
+    prefix: &str,
+    id: &str,
+    op: ui::TransferOp,
+    target: &str,
+    version: Option<&NuGetVersion>,
+    tally: Tally,
+) -> String {
+    use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
+    // Feed names and normalized versions are `[A-Za-z0-9._-]`; keep them
+    // readable in the address bar and encode anything else.
+    const KEEP: &percent_encoding::AsciiSet =
+        &NON_ALPHANUMERIC.remove(b'.').remove(b'-').remove(b'_');
+    let mut url = format!(
+        "{}?done={}&to={}&added={}&pending={}&present={}",
+        admin_package_url(prefix, id),
+        op.as_str(),
+        utf8_percent_encode(target, KEEP),
+        tally.added,
+        tally.pending,
+        tally.present,
+    );
+    if let Some(v) = version {
+        url.push_str("&v=");
+        url.push_str(&utf8_percent_encode(&v.normalized(), KEEP).to_string());
+    }
+    url
 }
 
 /// What the admin page's selection form asks for.
@@ -331,6 +455,7 @@ pub(super) async fn admin_bulk(
     if versions.is_empty() {
         return Ok(back);
     }
+    let mut report = None;
     for v in &versions {
         if !state.db.exists(state.feed(), &id, v).await? {
             return Err(Error::PackageNotFound);
@@ -403,8 +528,9 @@ pub(super) async fn admin_bulk(
             } else {
                 Transfer::Copy
             };
+            let mut tally = Tally::default();
             for v in &versions {
-                transfer_version(&state, target, &id, v, mode).await?;
+                tally.count(transfer_version(&state, target, &id, v, mode).await?);
             }
             tracing::info!(
                 from = %state.feed(),
@@ -414,6 +540,19 @@ pub(super) async fn admin_bulk(
                 moved = mode == Transfer::Move,
                 "transferred versions"
             );
+            let op = if mode == Transfer::Move {
+                ui::TransferOp::Move
+            } else {
+                ui::TransferOp::Copy
+            };
+            report = Some(transfer_report_url(
+                &state.feed.prefix,
+                &id,
+                op,
+                &target.name,
+                None,
+                tally,
+            ));
         }
     }
 
@@ -426,7 +565,10 @@ pub(super) async fn admin_bulk(
     {
         return Ok(Redirect::to(&format!("{}/admin", state.feed.prefix)).into_response());
     }
-    Ok(back)
+    Ok(match report {
+        Some(url) => Redirect::to(&url).into_response(),
+        None => back,
+    })
 }
 
 pub(super) async fn admin_disable(
@@ -499,9 +641,19 @@ pub(super) async fn admin_promote(
         .iter()
         .find(|m| &m.name == target)
         .ok_or_else(|| Error::BadRequest(format!("unknown promotion target {target:?}")))?;
-    transfer_version(&state, target_meta, &id, &v, Transfer::Copy).await?;
-    tracing::info!(from = %state.feed(), to = %target, %id, version = %v.normalized(), "promoted version");
-    Ok(Redirect::to(&admin_package_url(&state.feed.prefix, &id)).into_response())
+    let arrival = transfer_version(&state, target_meta, &id, &v, Transfer::Copy).await?;
+    tracing::info!(from = %state.feed(), to = %target, %id, version = %v.normalized(), ?arrival, "promoted version");
+    let mut tally = Tally::default();
+    tally.count(arrival);
+    Ok(Redirect::to(&transfer_report_url(
+        &state.feed.prefix,
+        &id,
+        ui::TransferOp::Promote,
+        target,
+        Some(&v),
+        tally,
+    ))
+    .into_response())
 }
 
 pub(super) async fn admin_delete(
