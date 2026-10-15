@@ -50,9 +50,10 @@ honoured; see [Reverse proxy](configuration.md#reverse-proxy).
 
 ### A promoted version does not appear in the next feed
 
-Promotion adds the version to the feed named in `promotes_to`. If that feed has
-`requires_approval`, the version waits there as pending; approve it in that
-feed's admin area. A version that was unlisted or disabled in the source feed
+Promotion adds the version to the feed named in `promotes_to`. The notice on
+the package page after promoting says which: added, pending in the target, or
+already there. If that feed has `requires_approval`, the version waits there as
+pending; the notice links to the target's admin page, where it is approved. A version that was unlisted or disabled in the source feed
 keeps that state. See [Release rings](feeds.md#release-rings).
 
 ### The mirror does not return a package

@@ -1,7 +1,8 @@
 # Command line
 
 YANuget is a single binary, `yanuget`. Without a sub-command it runs the
-server; two sub-commands cover a one-off import and container health checks.
+server; the sub-commands import packages, back up and restore the data, act on
+versions in a running server, check a configuration and probe health.
 
 ```text
 yanuget [--config <path>] [<command>]
@@ -9,6 +10,10 @@ yanuget [--config <path>] [<command>]
 Commands:
   migrate      Copy every package from another NuGet server into a feed
   healthcheck  Exit 0 if the local server is ready, 1 if not
+  backup       Back up database, packages and TLS pair while the server runs
+  restore      Restore a backup into the data directory (server stopped)
+  admin        Promote, approve, enable, disable, pin, unpin or delete a version
+  config       Work with the configuration (config check)
   help         Print help for the server or a command
 
 Options:
@@ -17,8 +22,17 @@ Options:
   -V, --version        Print the version
 ```
 
-`--config` applies to every command, so `migrate` and `healthcheck` read the
-same file, and the same `YANUGET_*` overrides, as the server.
+`--config` applies to every command and goes before it
+(`yanuget --config x.toml backup …`), so every command reads the same file,
+and the same `YANUGET_*` overrides, as the server.
+
+| Command | Reference |
+| --- | --- |
+| `migrate` | [Bulk migration](migrate.md) |
+| `healthcheck` | [below](#yanuget-healthcheck) |
+| `backup`, `restore` | [Backup, restore and moving hosts](backup.md) |
+| `admin` | [Admin command line](admin-cli.md#acting-on-a-version) |
+| `config check` | [Admin command line](admin-cli.md#checking-a-configuration) |
 
 ## Running the server
 
@@ -84,4 +98,34 @@ yanuget --config /etc/yanuget/yanuget.toml healthcheck || echo "not ready"
 ```
 
 For Kubernetes, probe the HTTP endpoints directly; see
-[Kubernetes probes](deployment.md#kubernetes-probes).
+[Kubernetes probes](deployment.md#kubernetes-probes). For a status with detail
+(mirror upstreams, for one) and Prometheus metrics, see
+[Monitoring](configuration.md#monitoring).
+
+## `yanuget backup` and `yanuget restore`
+
+`backup` copies the database, the package store and the self-signed TLS pair
+into a directory while the server keeps running; run again into the same
+directory, it copies only what changed. `restore` puts such a backup back into
+the configured data directory, with the server stopped. Both, and moving a
+server to a new host with them, are described in
+[Backup, restore and moving hosts](backup.md).
+
+## `yanuget admin`
+
+Promotes, approves, enables, disables, pins, unpins or deletes a version through
+a running server's admin area, from a shell or a pipeline:
+
+```bash
+yanuget admin --feed stage promote Contoso.Utils 1.4.0
+```
+
+See [Admin command line](admin-cli.md).
+
+## `yanuget config check`
+
+Loads the configuration as the server would and checks what it points at (the
+TLS certificate and key belong together and carry the configured host, mirror CA
+bundles parse, promotion targets exist), then exits `1` on any error. Run it
+before restarting with a changed configuration; see
+[Checking a configuration](admin-cli.md#checking-a-configuration).

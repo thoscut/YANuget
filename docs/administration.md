@@ -66,7 +66,10 @@ for all of them.
 * **Disable / enable** a version to withdraw it from clients and bring it back.
 * **Approve** a pending version in a gated feed.
 * **Promote** a version into the feed named by `promotes_to`, or **copy** or
-  **move** versions to another feed. See [Feeds and release rings](feeds.md#release-rings).
+  **move** versions to another feed. The page then says what happened in the
+  target (added, pending there with a link to approve it, or already there),
+  and each row shows whether the next feed holds the version (`in stable`,
+  `pending in stable`). See [Feeds and release rings](feeds.md#release-rings).
 * **Pin / unpin** a version to keep it from retention.
 * **Delete** a version from this feed. When no other feed holds it, its
   package, symbols and attached files are removed from disk. A delete cannot be
@@ -76,9 +79,10 @@ for all of them.
 
 To remove a whole package, tick all its versions and delete them.
 
-Every admin action is a `POST` with a CSRF token, so it can be scripted too;
-see [Admin area](api.md#admin-area-http-basic-auth) for the fields and a `curl`
-example.
+Every admin action can be scripted: with [`yanuget admin`](admin-cli.md), or as
+a `POST` with a CSRF token (see
+[Scripting promotion and approval](feeds.md#scripting-promotion-and-approval)
+and [Admin area](api.md#admin-area-http-basic-auth)).
 
 ## Retention
 

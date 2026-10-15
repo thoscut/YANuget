@@ -28,14 +28,16 @@ on an air-gapped network.
 - **[Configuration](configuration.md)**: all settings and `YANUGET_*`
   environment variables, including TLS, rate limiting, multiple API keys,
   retention, and multi-feed / mirroring / license-policy options.
-- **[Command line](cli.md)**: running the server, `migrate` and `healthcheck`.
+- **[Command line](cli.md)**: running the server and every sub-command.
 - **[Admin command line](admin-cli.md)**: `yanuget admin`, promoting,
   approving or deleting a version from a script; `yanuget config check`.
 
 **Operations and internals**
 
 - **[Deployment](deployment.md)**: running it as a service: systemd, Docker
-  Compose, Kubernetes probes, backup/restore and upgrades.
+  Compose, Kubernetes probes, monitoring and upgrades.
+- **[Backup and moving hosts](backup.md)**: `yanuget backup` and `restore`,
+  and moving a server to a new host.
 - **[Bulk migration](migrate.md)**: `yanuget migrate`, importing every
   package from another server in one pass.
 - **[Architecture](architecture.md)**: the module map and trait boundaries.
