@@ -423,7 +423,9 @@ them.
 promotion or mirror) **pending** — withheld from clients until an operator
 approves it in `/admin`. Combined with `promotes_to`, feeds form an ordered
 promotion chain (e.g. `dev → stable`): an admin promotes a version into the next
-ring, where it waits for approval if that ring gates. A promoted (or copied)
+ring, where it waits for approval if that ring gates. The source feed's admin
+page then says so and links to the target's admin page, where the version is
+approved; its row shows `pending in stable` until then. A promoted (or copied)
 version keeps the state it had: one that is unlisted, disabled or still
 pending in the source arrives unlisted, disabled or pending in the target. Feeds without
 `promotes_to` are simply independent sets a version can be added to.

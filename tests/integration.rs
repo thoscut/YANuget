@@ -2753,6 +2753,11 @@ async fn promotion_moves_a_version_into_the_next_ring() {
         .await
         .unwrap();
     assert_eq!(promote.status(), reqwest::StatusCode::SEE_OTHER);
+    let location = promote.headers()["location"].to_str().unwrap();
+    assert!(
+        location.starts_with("/dev/admin/packages/prom.pkg?done=promote&to=stable"),
+        "{location}"
+    );
 
     // Now present in both rings (shared payload, two memberships).
     assert!(server
@@ -2771,6 +2776,100 @@ async fn promotion_moves_a_version_into_the_next_ring() {
         .unwrap()
         .status()
         .is_success());
+}
+
+/// Promoting into a feed that gates arrivals used to look like nothing
+/// happened: the button sent the admin back to the same page, and the version
+/// sat pending in the target, invisible to clients. The page now says what
+/// happened and where to approve it, and marks the version as held there.
+#[tokio::test]
+async fn promotion_into_a_gated_feed_is_reported_on_the_admin_page() {
+    let server = spawn_feeds(|c| {
+        c.api_key = Some(API_KEY.into());
+        c.admin_api_key = Some(ADMIN_KEY.into());
+        let mut dev = feed("dev");
+        dev.promotes_to = Some("stable".into());
+        let mut stable = feed("stable");
+        stable.requires_approval = true;
+        c.feeds = vec![dev, stable];
+    })
+    .await;
+    push_to(
+        &server,
+        "/dev/api/v2/package",
+        API_KEY,
+        build_nupkg("Gate.Pkg", "1.0.0", b"x"),
+    )
+    .await;
+    let promote_path = "/dev/admin/packages/gate.pkg/1.0.0/promote";
+    let first = admin_action(&server, promote_path).await;
+    assert_eq!(first.status(), reqwest::StatusCode::SEE_OTHER);
+    let shown = admin_page(&server, first.headers()["location"].to_str().unwrap()).await;
+    assert!(
+        shown.contains("Promoted Gate.Pkg 1.0.0 to stable. It is pending there"),
+        "{shown}"
+    );
+    assert!(shown.contains("href=\"/stable/admin/packages/gate.pkg\""));
+    assert!(shown.contains("pending in stable"));
+    assert!(!shown.contains("/promote\""), "nothing left to promote");
+    assert_eq!(
+        status_of(&server, "/stable/v3/package/gate.pkg/index.json").await,
+        reqwest::StatusCode::NOT_FOUND,
+        "pending until stable approves it"
+    );
+
+    // A second promotion (a stale page, a script) changes nothing and says so.
+    let again = admin_action(&server, promote_path).await;
+    let shown = admin_page(&server, again.headers()["location"].to_str().unwrap()).await;
+    assert!(
+        shown.contains("stable already holds Gate.Pkg 1.0.0"),
+        "{shown}"
+    );
+
+    // Approved in stable, the dev page shows it as live there.
+    let approve = admin_action(&server, "/stable/admin/packages/gate.pkg/1.0.0/approve").await;
+    assert_eq!(approve.status(), reqwest::StatusCode::SEE_OTHER);
+    assert!(status_of(&server, "/stable/v3/package/gate.pkg/index.json")
+        .await
+        .is_success());
+    let dev = admin_page(&server, "/dev/admin/packages/gate.pkg").await;
+    assert!(dev.contains(">in stable<"), "{dev}");
+
+    // Whatever the query claims, only a real feed is named, and nothing else
+    // from it is echoed.
+    let forged = admin_page(
+        &server,
+        "/dev/admin/packages/gate.pkg?done=promote&to=%3Cb%3E&v=1.0.0&pending=1",
+    )
+    .await;
+    assert!(!forged.contains("Promoted"), "{forged}");
+}
+
+/// POST an admin action (`approve`, `promote`, …) at `path`, not following
+/// the redirect.
+async fn admin_action(server: &TestServer, path: &str) -> reqwest::Response {
+    no_redirect()
+        .post(server.url(path))
+        .basic_auth("admin", Some(ADMIN_KEY))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(admin_body(ADMIN_KEY))
+        .send()
+        .await
+        .unwrap()
+}
+
+/// GET an admin page as the admin.
+async fn admin_page(server: &TestServer, path: &str) -> String {
+    server
+        .client
+        .get(server.url(path))
+        .basic_auth("admin", Some(ADMIN_KEY))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap()
 }
 
 /// POST the admin page's selection form for `id` under `prefix`.
