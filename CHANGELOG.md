@@ -12,6 +12,15 @@ expected to change incompatibly at any version.
 
 ## [Unreleased]
 
+### Fixed
+
+- Promoting a version looked like it did nothing: the admin page reloaded
+  unchanged, and in a target feed with `requires_approval` the version sat
+  pending there, invisible to clients. The package page now reports what a
+  promote, copy or move did in the target feed, links to where a pending version
+  is approved, and marks each version the `promotes_to` feed already holds
+  instead of offering a Promote that would change nothing.
+
 ## [0.6.0] — 2026-10-01
 
 **Upgrading from 0.5.x needs attention.** This release follows a full review
