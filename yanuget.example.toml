@@ -163,6 +163,18 @@ window_secs = 60              # YANUGET_RATELIMIT_WINDOW_SECS — at least 1
 max_failed_auth = 30          # YANUGET_RATELIMIT_MAX_FAILED_AUTH
 
 # ---------------------------------------------------------------------------
+# Monitoring — GET /metrics (Prometheus text format) and GET /health/status
+# (JSON): package counts per feed, pushes, promotions, downloads, and whether
+# each mirror's upstream answers. Off by default, because both name every feed
+# and each mirror's upstream host. /health, /health/live and /health/ready are
+# always served.
+# ---------------------------------------------------------------------------
+[monitoring]
+enabled = false               # YANUGET_MONITORING_ENABLED
+# When set, both endpoints require "Authorization: Bearer <token>".
+# token = "a-long-random-scrape-token"   # YANUGET_MONITORING_TOKEN
+
+# ---------------------------------------------------------------------------
 # Package retention — automatic pruning of old versions.
 #
 # Retention HARD-deletes versions (payload, sidecars and symbols), so it is
@@ -262,6 +274,10 @@ inbox_scan_secs = 30                # YANUGET_FILES_INBOX_SCAN_SECS
 #   # Extra CA certificates (PEM) for an upstream behind an internal CA. The
 #   # system store and the bundled Mozilla roots are trusted either way.
 #   # ca_cert_path = "/etc/yanuget/internal-ca.pem"
+#   # Ask the upstream for its service index every N seconds (and at startup),
+#   # so an outage shows in the log and in /health/status before a client
+#   # needs the upstream. 0 = off.
+#   probe_interval_secs = 300
 #
 #     # Credentials for an authenticated upstream (all optional). Set the
 #     # username/password pair for HTTP Basic OR token for a Bearer token, plus

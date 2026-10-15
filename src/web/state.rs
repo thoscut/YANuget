@@ -3,6 +3,7 @@
 //! every handler receives.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use axum::http::{header, HeaderMap};
@@ -47,6 +48,25 @@ pub struct FeedContext {
     /// The feed's cleanup lock and last report, shared with the background
     /// sweep.
     pub cleanup: Arc<retention::RetentionState>,
+    /// What `/metrics` counts for this feed since startup.
+    pub counters: FeedCounters,
+}
+
+/// Events `/metrics` counts per feed, since the process started.
+#[derive(Debug, Default)]
+pub struct FeedCounters {
+    /// Packages pushed and indexed.
+    pub pushes: AtomicU64,
+    /// Versions promoted from this feed into its `promotes_to` feed.
+    pub promotions: AtomicU64,
+    /// Package downloads served, counted like the gallery's download counts.
+    pub downloads: AtomicU64,
+}
+
+impl FeedCounters {
+    pub(super) fn count(counter: &AtomicU64) {
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 impl FeedContext {
@@ -75,6 +95,7 @@ impl FeedContext {
         if let Some(client) = mirror.as_mut() {
             client.set_default_size_limit(config.max_package_size_bytes);
             client.set_min_free_disk_bytes(config.min_free_disk_bytes);
+            client.set_feed_name(&feed.name);
         }
         Ok(Self {
             name: feed.name.clone(),
@@ -91,6 +112,7 @@ impl FeedContext {
             retention: feed.retention.clone(),
             reserved_elsewhere: feed.reserved_elsewhere.clone(),
             cleanup: Arc::default(),
+            counters: FeedCounters::default(),
         })
     }
 }

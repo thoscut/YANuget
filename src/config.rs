@@ -192,6 +192,8 @@ pub struct Config {
     pub rate_limit: RateLimitConfig,
     /// Large files (disk images, archives) attached to package versions.
     pub files: FilesConfig,
+    /// `/metrics` (Prometheus) and `/health/status` (JSON). Off by default.
+    pub monitoring: MonitoringConfig,
     /// Peers whose `X-Forwarded-*`/`X-Real-IP` headers are honoured. Those
     /// headers decide the base URL of every absolute package URL handed to
     /// clients and the identity the rate limiter throttles, so they are only
@@ -388,6 +390,10 @@ pub struct MirrorConfig {
     /// the system store and the bundled Mozilla roots — for an upstream behind
     /// an internal CA or a TLS-inspecting proxy.
     pub ca_cert_path: Option<PathBuf>,
+    /// How often (seconds) the server asks the upstream for its service
+    /// index on its own, so an unreachable upstream shows in the log and in
+    /// `/health/status` before a client needs it. `0` turns the probe off.
+    pub probe_interval_secs: u64,
 }
 
 impl MirrorConfig {
@@ -415,6 +421,7 @@ impl std::fmt::Debug for MirrorConfig {
             .field("max_versions_per_package", &self.max_versions_per_package)
             .field("proxy", &self.proxy.as_deref().map(redact))
             .field("ca_cert_path", &self.ca_cert_path)
+            .field("probe_interval_secs", &self.probe_interval_secs)
             .finish_non_exhaustive()
     }
 }
@@ -433,6 +440,7 @@ impl Default for MirrorConfig {
             max_versions_per_package: Some(50),
             proxy: None,
             ca_cert_path: None,
+            probe_interval_secs: 300,
         }
     }
 }
@@ -621,6 +629,32 @@ impl Default for RateLimitConfig {
     }
 }
 
+/// The monitoring endpoints: `GET /metrics` in the Prometheus text format and
+/// `GET /health/status` as JSON, with per-feed package counts and the state of
+/// each mirror's upstream.
+///
+/// Off by default, because both name every feed (read-gated ones included)
+/// and each mirror's upstream host, which an anonymous visitor otherwise never
+/// learns. `/health`, `/health/live` and `/health/ready` are always served.
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MonitoringConfig {
+    /// Serve `/metrics` and `/health/status`.
+    pub enabled: bool,
+    /// When set, both endpoints require `Authorization: Bearer <token>`.
+    /// Unset, anyone who can reach the server can read them.
+    pub token: Option<String>,
+}
+
+impl std::fmt::Debug for MonitoringConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MonitoringConfig")
+            .field("enabled", &self.enabled)
+            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
 /// Files attached to package versions: the disk images (`.wim`) and archives
 /// a package's install script fetches, resumably, at install time.
 ///
@@ -700,6 +734,7 @@ impl Default for Config {
             retention: RetentionConfig::default(),
             rate_limit: RateLimitConfig::default(),
             files: FilesConfig::default(),
+            monitoring: MonitoringConfig::default(),
             trusted_proxies: Vec::new(),
             cors_allowed_origins: Vec::new(),
             allowed_hosts: Vec::new(),
@@ -861,6 +896,12 @@ impl Config {
         }
         if let Some(v) = get("YANUGET_RETENTION_MAX_AGE_DAYS")? {
             self.retention.max_age_days = parse_env_opt_int("YANUGET_RETENTION_MAX_AGE_DAYS", &v)?;
+        }
+        if let Some(b) = bool_var("YANUGET_MONITORING_ENABLED")? {
+            self.monitoring.enabled = b;
+        }
+        if let Some(v) = get("YANUGET_MONITORING_TOKEN")? {
+            self.monitoring.token = (!v.trim().is_empty()).then(|| v.trim().to_string());
         }
         if let Some(b) = bool_var("YANUGET_RATELIMIT_ENABLED")? {
             self.rate_limit.enabled = b;
@@ -1172,6 +1213,7 @@ impl std::fmt::Debug for Config {
             .field("retention", &self.retention)
             .field("rate_limit", &self.rate_limit)
             .field("files", &self.files)
+            .field("monitoring", &self.monitoring)
             .field("trusted_proxies", &self.trusted_proxies)
             .field("cors_allowed_origins", &self.cors_allowed_origins)
             .field("allowed_hosts", &self.allowed_hosts)

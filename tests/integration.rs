@@ -4734,3 +4734,112 @@ async fn an_upload_that_would_fill_the_disk_is_refused() {
         reqwest::StatusCode::NOT_FOUND
     );
 }
+
+// ---------------------------------------------------------------------------
+// Monitoring: /metrics and /health/status
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn monitoring_endpoints_are_off_unless_enabled() {
+    let server = spawn().await;
+    for path in ["/metrics", "/health/status"] {
+        let resp = server.client.get(server.url(path)).send().await.unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND, "{path}");
+    }
+    // The plain probes are always there.
+    let resp = server
+        .client
+        .get(server.url("/health"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+}
+
+#[tokio::test]
+async fn metrics_count_pushes_and_downloads_per_feed() {
+    let server = spawn_with(|c| c.monitoring.enabled = true).await;
+    let resp = push_multipart(&server, API_KEY, build_nupkg("Metrics.Pkg", "1.0.0", b"x")).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+    let resp = server
+        .client
+        .get(server.url("/v3/package/metrics.pkg/1.0.0/metrics.pkg.1.0.0.nupkg"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    resp.bytes().await.unwrap();
+
+    let resp = server
+        .client
+        .get(server.url("/metrics"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert!(resp.headers()["content-type"]
+        .to_str()
+        .unwrap()
+        .starts_with("text/plain; version=0.0.4"));
+    let body = resp.text().await.unwrap();
+    for line in [
+        "yanuget_database_up 1",
+        "yanuget_pushes_total{feed=\"default\"} 1",
+        "yanuget_downloads_total{feed=\"default\"} 1",
+        "yanuget_feed_packages{feed=\"default\"} 1",
+        "yanuget_feed_versions{feed=\"default\"} 1",
+    ] {
+        assert!(
+            body.lines().any(|l| l == line),
+            "missing {line:?} in\n{body}"
+        );
+    }
+    // No mirror, no mirror metrics.
+    assert!(!body.contains("yanuget_mirror_"));
+
+    let status: serde_json::Value = server
+        .client
+        .get(server.url("/health/status"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(status["status"], "ok");
+    assert_eq!(status["database"], "ok");
+    assert_eq!(status["feeds"][0]["name"], "default");
+    assert_eq!(status["feeds"][0]["pushes"], 1);
+    assert_eq!(status["feeds"][0]["packages"], 1);
+    assert!(status["feeds"][0].get("mirror").is_none());
+}
+
+#[tokio::test]
+async fn a_monitoring_token_is_required_when_set() {
+    let server = spawn_with(|c| {
+        c.monitoring.enabled = true;
+        c.monitoring.token = Some("scrape-me".into());
+    })
+    .await;
+    for path in ["/metrics", "/health/status"] {
+        let resp = server.client.get(server.url(path)).send().await.unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED, "{path}");
+        assert_eq!(resp.headers()["www-authenticate"], "Bearer");
+        let resp = server
+            .client
+            .get(server.url(path))
+            .bearer_auth("wrong")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED, "{path}");
+        let resp = server
+            .client
+            .get(server.url(path))
+            .bearer_auth("scrape-me")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK, "{path}");
+    }
+}

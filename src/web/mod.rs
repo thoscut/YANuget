@@ -12,6 +12,7 @@
 //! * `middleware` — the global and per-feed layers (security headers, host
 //!   and cross-site guard, forwarded-header filtering, HTML error pages)
 //! * `protocol` — the NuGet V3 read endpoints and the health probes
+//! * `monitoring` — `/metrics` and `/health/status`, behind `[monitoring]`
 //! * `publish` — push, symbol push, delete/unlist, relist
 //! * `gallery` — the human-facing pages; their HTML is rendered by `ui`
 //! * `admin` — the admin area, all of it behind one `route_layer`
@@ -29,13 +30,14 @@ mod gallery;
 mod helpers;
 pub(crate) mod hosted;
 mod middleware;
+mod monitoring;
 mod protocol;
 mod publish;
 mod state;
 mod ui;
 
 pub use hosted::sweep_expired_uploads;
-pub use state::{AppState, FeedContext, FeedMeta};
+pub use state::{AppState, FeedContext, FeedCounters, FeedMeta};
 
 use axum::response::Html;
 use axum::routing::{delete, get, head, post, put};
@@ -66,7 +68,9 @@ use publish::{delete_package, push_package, push_symbol_package, relist_package}
 /// their `/{name}` prefix with a feed index at the root.
 pub fn build_app(states: Vec<AppState>) -> Router {
     let layers = GlobalLayers::from_states(&states);
-    let mut top = health_routes(&states).merge(assets::routes());
+    let mut top = health_routes(&states)
+        .merge(monitoring::routes(&states))
+        .merge(assets::routes());
 
     if states.len() == 1 && states[0].feed.prefix.is_empty() {
         top = top.merge(feed_routes(states.into_iter().next().expect("one state")));
@@ -104,6 +108,7 @@ pub fn router(state: AppState) -> Router {
     let states = std::slice::from_ref(&state);
     let layers = GlobalLayers::from_states(states);
     let app = health_routes(states)
+        .merge(monitoring::routes(states))
         .merge(assets::routes())
         .merge(feed_routes(state));
     apply_global_layers(app, layers)

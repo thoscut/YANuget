@@ -224,6 +224,12 @@ restarted in a loop.
 Use `scheme: HTTP` instead if you set `tls_enabled = false` to terminate TLS at
 an ingress.
 
+Outside Kubernetes the same endpoints serve as checks: point an uptime monitor
+or load balancer at `/health` rather than at a feed's `/v3/index.json`, which
+answers even when the database does not. For package counts, push and
+promotion rates and mirror upstream status, enable
+[`[monitoring]`](configuration.md#monitoring) and scrape `/metrics`.
+
 ## Behind a reverse proxy
 
 See [Reverse proxy](configuration.md#reverse-proxy) for the nginx configuration.

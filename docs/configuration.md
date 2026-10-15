@@ -92,6 +92,57 @@ guessing, a long random key makes it pointless.
 | `rate_limit.window_secs` | `YANUGET_RATELIMIT_WINDOW_SECS` | int | `60` | Window length in seconds (min 1; `0` is refused at startup, since it would never limit anything). |
 | `rate_limit.max_failed_auth` | `YANUGET_RATELIMIT_MAX_FAILED_AUTH` | int | `30` | Failed authentications per IP per window before credentialed requests get `429`; `0` turns this budget off. |
 
+## Monitoring
+
+`GET /metrics` (Prometheus text format) and `GET /health/status` (JSON), under
+the `[monitoring]` table. Both report whether the database answers, the
+packages, versions and bytes each feed serves, the pushes, promotions and
+downloads since startup, and for every mirrored feed whether its upstream
+answers. They are **off by default**, because both name every feed (read-gated
+ones included) and each mirror's upstream host. The probes `/health`,
+`/health/live` and `/health/ready` are always served and unaffected; see
+[Health](api.md#health) for what each endpoint returns.
+
+| TOML key | Env var | Type | Default | Description |
+| --- | --- | --- | --- | --- |
+| `monitoring.enabled` | `YANUGET_MONITORING_ENABLED` | bool | `false` | Serve `/metrics` and `/health/status`. |
+| `monitoring.token` | `YANUGET_MONITORING_TOKEN` | string | *(none)* | When set, both endpoints require `Authorization: Bearer <token>`. Unset, anyone who can reach the server can read them. |
+
+Like the health probes, `/metrics` answers whatever the `Host`, so a scraper
+can use the server's address. A Prometheus job:
+
+```yaml
+scrape_configs:
+  - job_name: yanuget
+    scheme: https
+    authorization: { credentials: a-long-random-scrape-token }
+    static_configs:
+      - targets: ["nuget.example.com:443"]
+```
+
+### Mirror upstream reachability
+
+Every request a mirror sends is recorded: an upstream that cannot be reached,
+answers `5xx`, or refuses the credentials (`401`, `403`, `407`) or rate-limits
+(`429`) counts as failing; any other answer, a `404` included, as reachable.
+The first failure logs a warning (`mirror upstream unreachable`) and the first
+success after it an info line (`mirror upstream reachable again`). Each mirror
+also asks its upstream for the service index at startup and every
+`probe_interval_secs` (default 300), and while the outage lasts each probe logs
+`mirror upstream still unreachable`, so a feed whose clients only restore what
+it already holds does not hide an outage until the next new package.
+
+An unreachable upstream does **not** fail `/health` or `/health/ready`: the
+feed still serves everything it holds, and restarting it would not bring the
+upstream back. It turns `/health/status` to `"degraded"` and sets
+`yanuget_mirror_upstream_up` to `0`, which is what to alert on:
+
+```yaml
+- alert: YanugetMirrorUpstreamDown
+  expr: yanuget_mirror_upstream_up == 0
+  for: 10m
+```
+
 ## Trusted proxies
 
 `X-Forwarded-Host`, `X-Forwarded-Proto`, `X-Forwarded-For`, `X-Real-IP` and
@@ -332,6 +383,7 @@ affected.
 | `feeds[].mirror.allow_private_upstream` | bool | `false` | Permit an upstream on a private/loopback address. |
 | `feeds[].mirror.proxy` | string | *(none)* | Outbound proxy for upstream requests. Unset, the mirror connects directly and ignores `HTTP(S)_PROXY`. |
 | `feeds[].mirror.ca_cert_path` | path | *(none)* | PEM file of extra CA certificates to trust for the upstream, on top of the system store and the bundled Mozilla roots. |
+| `feeds[].mirror.probe_interval_secs` | int | `300` | Ask the upstream for its service index at startup and then every N seconds, so an outage is logged (and shown in [`/health/status`](#monitoring)) before a client needs the upstream. `0` turns the probe off. |
 | `feeds[].license_policy.enabled` | bool | `false` | Evaluate the offline license policy. |
 | `feeds[].license_policy.allowed` | string[] | `[]` | If non-empty, license must match one. |
 | `feeds[].license_policy.blocked` | string[] | `[]` | Always rejected (even if also allowed). |

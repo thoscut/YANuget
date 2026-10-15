@@ -189,7 +189,8 @@ async fn filter_forwarded_headers(
 /// `421 Misdirected Request`. That is what defeats DNS rebinding: a hostile
 /// page can point a name it controls at an intranet feed's address and make
 /// the browser talk to it, but the browser still sends the hostile name. The
-/// health probes are exempt, since orchestrators probe by address.
+/// health probes and `/metrics` are exempt, since orchestrators and scrapers
+/// probe by address.
 ///
 /// **Cross-site writes.** A browser labels every request with
 /// `Sec-Fetch-Site`, and a `POST`, `PUT`, `PATCH` or `DELETE` from another
@@ -204,7 +205,8 @@ async fn request_guard(
 ) -> Response {
     use axum::http::Method;
     if let Some(allowed) = &allowed {
-        if !req.uri().path().starts_with("/health") {
+        let path = req.uri().path();
+        if !(path.starts_with("/health") || path == "/metrics") {
             let host = forwarded(req.headers(), "x-forwarded-host").or_else(|| {
                 req.headers()
                     .get(header::HOST)

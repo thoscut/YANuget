@@ -312,6 +312,18 @@ fn basic_password(value: &str) -> Option<String> {
         .map(|(_, pass)| pass.trim().to_string())
 }
 
+/// Whether the request carries `Authorization: Bearer <expected>`.
+pub fn bearer_matches(headers: &HeaderMap, expected: &str) -> bool {
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| {
+            let (scheme, token) = v.trim().split_once(' ')?;
+            scheme.eq_ignore_ascii_case("bearer").then(|| token.trim())
+        })
+        .is_some_and(|token| constant_time_eq(token.as_bytes(), expected.as_bytes()))
+}
+
 /// Compare a presented secret with the expected one in time that depends on
 /// neither's content nor length.
 ///

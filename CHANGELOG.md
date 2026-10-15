@@ -12,6 +12,19 @@ expected to change incompatibly at any version.
 
 ## [Unreleased]
 
+### Added
+
+- `[monitoring]`, off by default: `GET /metrics` in the Prometheus text format
+  and `GET /health/status` as JSON, optionally behind a bearer token. Both
+  report the database, packages, versions and bytes per feed, pushes,
+  promotions and downloads since startup, and each mirror's upstream status.
+- Mirrors record whether their upstream answers. The first failure logs
+  `mirror upstream unreachable`, recovery logs `mirror upstream reachable
+  again`, and each mirror probes its upstream's service index at startup and
+  every `probe_interval_secs` (default 300, `0` off), so an outage is visible
+  before a client needs the upstream. `/health` and `/health/ready` are
+  unaffected by it.
+
 ## [0.6.0] — 2026-10-01
 
 **Upgrading from 0.5.x needs attention.** This release follows a full review

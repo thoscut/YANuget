@@ -69,6 +69,7 @@ pub(super) fn feed_ctx(api: Option<&str>, admin: Option<&str>) -> crate::web::Fe
         retention: crate::config::RetentionConfig::default(),
         reserved_elsewhere: Vec::new(),
         cleanup: Default::default(),
+        counters: Default::default(),
     }
 }
 

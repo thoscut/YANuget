@@ -591,7 +591,73 @@ GET /health/live    → 200 "OK"   (liveness: this process only)
 `/health` returns `503` with `database unavailable` when the store cannot be
 reached — the case an orchestrator has to act on, and one a static `OK` would
 hide. `/health/live` touches nothing else, so a slow dependency cannot trigger
-a restart loop through it.
+a restart loop through it. A mirror's upstream being unreachable affects
+neither: the feed keeps serving what it holds.
+
+With [`[monitoring]`](configuration.md#monitoring) enabled, two more endpoints
+report details (with `Authorization: Bearer <token>` when `monitoring.token` is
+set, `404` when monitoring is off):
+
+```
+GET /health/status  → 200 JSON, "status": "ok" | "degraded"; 503 "unavailable"
+GET /metrics        → 200 Prometheus text format
+```
+
+```json
+{
+  "status": "degraded",
+  "version": "0.6.0",
+  "uptime_seconds": 86400,
+  "database": "ok",
+  "feeds": [
+    {
+      "name": "production",
+      "pushes": 0, "promotions": 0, "downloads": 1520,
+      "packages": 812, "versions": 4410, "size_bytes": 55834574848,
+      "mirror": {
+        "upstream": "https://nuget.internal.example/production/v3/index.json",
+        "status": "unreachable",
+        "last_success": "2026-10-15T09:12:03Z",
+        "last_failure": "2026-10-15T09:17:03Z",
+        "last_error": "upstream service index https://nuget.internal.example/production/v3/index.json answered 503 Service Unavailable",
+        "failing_since": "2026-10-15T09:14:41Z",
+        "consecutive_failures": 3,
+        "mirrored": 27
+      }
+    },
+    { "name": "stage", "promotes_to": "production", "pushes": 14, "promotions": 6, "downloads": 88, "packages": 140, "versions": 802, "size_bytes": 9126805504 }
+  ]
+}
+```
+
+`status` is `degraded` while any mirror's upstream fails, and `unavailable`
+(with `503`) when the database does not answer. A mirror's `status` is
+`unknown` until its upstream was first asked for anything. Counters
+(`pushes`, `promotions`, `downloads`, `mirrored`) start at zero with the
+process; `packages`, `versions` and `size_bytes` come from the database and
+leave out pending and disabled versions.
+
+| Metric | Type | Labels | Meaning |
+| --- | --- | --- | --- |
+| `yanuget_build_info` | gauge | `version` | Always `1`. |
+| `yanuget_uptime_seconds` | gauge | | Seconds since startup. |
+| `yanuget_database_up` | gauge | | `1` while the database answers. |
+| `yanuget_feed_packages` | gauge | `feed` | Distinct package ids. |
+| `yanuget_feed_versions` | gauge | `feed` | Versions served. |
+| `yanuget_feed_listed_versions` | gauge | `feed` | Versions that are listed. |
+| `yanuget_feed_size_bytes` | gauge | `feed` | Bytes of `.nupkg` files served. |
+| `yanuget_feed_package_downloads` | gauge | `feed` | Download counts stored in the database. |
+| `yanuget_pushes_total` | counter | `feed` | Packages pushed. |
+| `yanuget_downloads_total` | counter | `feed` | Package downloads served. |
+| `yanuget_promotions_total` | counter | `feed`, `target` | Versions promoted into `promotes_to` (feeds with a target only). |
+| `yanuget_mirror_upstream_info` | gauge | `feed`, `upstream` | Always `1`; the upstream each mirror reads through to. |
+| `yanuget_mirror_upstream_up` | gauge | `feed` | `1` if the upstream answered its last request, `0` if not; absent until the first request. |
+| `yanuget_mirror_upstream_consecutive_failures` | gauge | `feed` | Failed requests since the last success. |
+| `yanuget_mirror_upstream_last_success_timestamp_seconds` | gauge | `feed` | Unix time of the last success. |
+| `yanuget_mirror_upstream_requests_total` | counter | `feed` | Requests sent upstream. |
+| `yanuget_mirror_upstream_failures_total` | counter | `feed` | Requests that failed. |
+| `yanuget_mirror_packages_total` | counter | `feed` | Versions fetched into the feed. |
+| `yanuget_mirror_package_failures_total` | counter | `feed` | Versions that failed to download or index. |
 
 ## Response headers
 
