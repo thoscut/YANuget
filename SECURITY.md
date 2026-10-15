@@ -6,8 +6,8 @@ YANuget is pre-1.0. Only the latest released version receives security fixes.
 
 | Version | Supported |
 | --- | --- |
-| 0.6.x | ✅ |
-| < 0.6 | ❌ |
+| 0.7.x | ✅ |
+| < 0.7 | ❌ |
 
 ## Reporting a vulnerability
 
@@ -108,7 +108,7 @@ Configuration choices that matter most:
 
 Release archives, `SHA256SUMS` and the container image of every release from
 0.6.0 on carry signed build provenance from the release workflow, and the image
-of every release from 0.6.1 on is also signed with cosign (keyless). Check them
+of every release from 0.7.0 on is also signed with cosign (keyless). Check them
 before you run them:
 
 ```bash

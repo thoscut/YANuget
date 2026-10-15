@@ -96,7 +96,7 @@ described under [systemd](docs/deployment.md#systemd).
 
 From 0.6.0 on, the archives and the container image
 (`linux/amd64` and `linux/arm64`) come with signed build provenance, and from
-0.6.1 on the image is also signed with cosign. `gh attestation verify <archive> --repo
+0.7.0 on the image is also signed with cosign. `gh attestation verify <archive> --repo
 thoscut/yanuget` checks that a download was built by this repository's release
 workflow; [SECURITY.md](SECURITY.md#verifying-a-release) has the commands for
 the image.
