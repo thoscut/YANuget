@@ -478,6 +478,14 @@ impl Server {
 }
 
 async fn spawn_mirror(upstream: &Upstream, customize: impl FnOnce(&mut FeedConfig)) -> Server {
+    spawn_mirror_with(upstream, customize, |_| {}).await
+}
+
+async fn spawn_mirror_with(
+    upstream: &Upstream,
+    customize: impl FnOnce(&mut FeedConfig),
+    configure: impl FnOnce(&mut Config),
+) -> Server {
     let dir = tempfile::tempdir().unwrap();
     let mut feed = FeedConfig {
         name: "mirror".into(),
@@ -485,13 +493,14 @@ async fn spawn_mirror(upstream: &Upstream, customize: impl FnOnce(&mut FeedConfi
         ..Default::default()
     };
     customize(&mut feed);
-    let config = Config {
+    let mut config = Config {
         data_dir: dir.path().to_path_buf(),
         api_key: Some(API_KEY.into()),
         tls_enabled: false,
         feeds: vec![feed],
         ..Config::default()
     };
+    configure(&mut config);
     let storage = Arc::new(FilesystemStorage::new(config.storage_path()).await.unwrap());
     let db = Arc::new(
         SqliteDatabase::connect(&config.database_path())
@@ -910,6 +919,111 @@ async fn a_failing_upstream_is_backed_off() {
         assert!(server.versions("down.pkg").await.is_none());
     }
     assert_eq!(upstream.hits("/flat/down.pkg/index.json"), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Upstream reachability in /health/status and /metrics
+// ---------------------------------------------------------------------------
+
+impl Server {
+    async fn status(&self) -> serde_json::Value {
+        let resp = self
+            .client
+            .get(format!("{}/health/status", self.base))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        resp.json().await.unwrap()
+    }
+
+    async fn metrics(&self) -> String {
+        let resp = self
+            .client
+            .get(format!("{}/metrics", self.base))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        resp.text().await.unwrap()
+    }
+}
+
+#[tokio::test]
+async fn an_unreachable_upstream_shows_in_status_and_metrics_until_it_answers() {
+    let upstream = Upstream::start().await;
+    upstream.publish("Up.Pkg", "1.0.0");
+    upstream.behave(|b| b.fail_listing = true);
+    let server = spawn_mirror_with(&upstream, |_| {}, |c| c.monitoring.enabled = true).await;
+
+    // Nothing asked of the upstream yet: unknown, and not a degradation.
+    let status = server.status().await;
+    assert_eq!(status["status"], "ok");
+    assert_eq!(status["feeds"][0]["mirror"]["status"], "unknown");
+    assert!(!server
+        .metrics()
+        .await
+        .contains("yanuget_mirror_upstream_up{"));
+
+    assert!(server.versions("up.pkg").await.is_none());
+    let status = server.status().await;
+    assert_eq!(status["status"], "degraded");
+    let mirror = &status["feeds"][0]["mirror"];
+    assert_eq!(mirror["status"], "unreachable");
+    assert_eq!(mirror["upstream"], upstream.index_url());
+    assert!(mirror["last_error"].as_str().unwrap().contains("500"));
+    assert!(mirror["failing_since"].is_string());
+    let metrics = server.metrics().await;
+    assert!(
+        metrics.contains("yanuget_mirror_upstream_up{feed=\"mirror\"} 0"),
+        "{metrics}"
+    );
+    assert!(metrics.contains("yanuget_mirror_upstream_failures_total{feed=\"mirror\"} 1"));
+
+    // A different package, once the upstream answers again.
+    upstream.behave(|b| b.fail_listing = false);
+    upstream.publish("Other.Pkg", "2.0.0");
+    assert_eq!(server.versions("other.pkg").await.unwrap(), ["2.0.0"]);
+    let status = server.status().await;
+    assert_eq!(status["status"], "ok");
+    let mirror = &status["feeds"][0]["mirror"];
+    assert_eq!(mirror["status"], "ok");
+    assert_eq!(mirror["consecutive_failures"], 0);
+    assert_eq!(mirror["mirrored"], 1);
+    assert_eq!(status["feeds"][0]["versions"], 1);
+    let metrics = server.metrics().await;
+    assert!(
+        metrics.contains("yanuget_mirror_upstream_up{feed=\"mirror\"} 1"),
+        "{metrics}"
+    );
+    assert!(metrics.contains("yanuget_mirror_packages_total{feed=\"mirror\"} 1"));
+    assert!(metrics.contains("yanuget_feed_versions{feed=\"mirror\"} 1"));
+}
+
+#[tokio::test]
+async fn the_probe_notices_an_upstream_nobody_asked_for_anything() {
+    let upstream = Upstream::start().await;
+    let client = yanuget::mirror::MirrorClient::from_config(&mirror_config(&upstream)).unwrap();
+    client.probe().await.unwrap();
+    assert_eq!(client.upstream_status().reachable(), Some(true));
+
+    // A port nothing listens on.
+    let closed = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let port = closed.local_addr().unwrap().port();
+    drop(closed);
+    let client = yanuget::mirror::MirrorClient::from_config(&MirrorConfig {
+        upstream: format!("http://127.0.0.1:{port}/v3/index.json"),
+        ..mirror_config(&upstream)
+    })
+    .unwrap();
+    assert!(client.probe().await.is_err());
+    let status = client.upstream_status();
+    assert_eq!(status.reachable(), Some(false));
+    assert_eq!((status.consecutive_failures, status.failures), (1, 1));
+    // The service-index cache is not what the probe reads: asking again asks
+    // the upstream again.
+    assert!(client.probe().await.is_err());
+    assert_eq!(client.upstream_status().consecutive_failures, 2);
 }
 
 #[tokio::test]

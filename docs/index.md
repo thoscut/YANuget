@@ -10,17 +10,36 @@ on an air-gapped network.
 
 ## Where to go next
 
-- **[HTTP API](api.md)** — every endpoint YANuget exposes (service index, push,
-  download, registration, search, autocomplete, symbols).
-- **[Configuration](configuration.md)** — all settings and `YANUGET_*`
+**Guides**
+
+- **[Connecting clients](clients.md)**: `dotnet`, `nuget.exe`, Chocolatey and
+  Visual Studio, trusting the default certificate, read-gated feeds and symbols.
+- **[Feeds and release rings](feeds.md)**: several feeds on one server,
+  promotion and approval, mirroring nuget.org, license policies.
+- **[Gallery and admin area](administration.md)**: browsing packages, version
+  states, moderation, pinning and retention.
+- **[Troubleshooting](troubleshooting.md)**: what each status code means and
+  how to fix the common problems.
+
+**Reference**
+
+- **[HTTP API](api.md)**: every endpoint YANuget exposes (service index, push,
+  download, registration, search, autocomplete, symbols, attached files, admin).
+- **[Configuration](configuration.md)**: all settings and `YANUGET_*`
   environment variables, including TLS, rate limiting, multiple API keys,
   retention, and multi-feed / mirroring / license-policy options.
-- **[Deployment](deployment.md)** — running it as a service: systemd, Docker
+- **[Command line](cli.md)**: running the server, `migrate` and `healthcheck`.
+- **[Admin command line](admin-cli.md)**: `yanuget admin`, promoting,
+  approving or deleting a version from a script; `yanuget config check`.
+
+**Operations and internals**
+
+- **[Deployment](deployment.md)**: running it as a service: systemd, Docker
   Compose, Kubernetes probes, backup/restore and upgrades.
-- **[Bulk migration](migrate.md)** — `yanuget migrate`: importing every
+- **[Bulk migration](migrate.md)**: `yanuget migrate`, importing every
   package from another server in one pass.
-- **[Architecture](architecture.md)** — the module map and trait boundaries.
-- **[Large packages](large-packages.md)** — the bounded-memory streaming design.
+- **[Architecture](architecture.md)**: the module map and trait boundaries.
+- **[Large packages](large-packages.md)**: the bounded-memory streaming design.
 
 ## Quick start
 

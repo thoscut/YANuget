@@ -7,6 +7,8 @@ use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
+mod cli;
+
 use yanuget::config::{Config, MirrorAuthConfig, MirrorConfig, OverwriteMode};
 use yanuget::database::SqliteDatabase;
 use yanuget::migrate::MigrateOptions;
@@ -37,6 +39,36 @@ enum Command {
     /// (the configured port and scheme) and exit 0 when it is ready, 1 when
     /// it is not. Meant for container health checks.
     Healthcheck,
+    /// Back up the database, the package store and the self-signed TLS pair
+    /// into a directory while the server keeps running. Re-running into the
+    /// same directory copies only what changed.
+    Backup(BackupArgs),
+    /// Restore a backup taken by `yanuget backup` into the configured data
+    /// directory. The server must be stopped.
+    Restore(RestoreArgs),
+    /// Act on a version through a running server's admin area: promote,
+    /// approve, enable, disable, pin, unpin or delete.
+    Admin(Box<cli::AdminArgs>),
+    /// Work with the configuration without starting the server.
+    Config(cli::ConfigArgs),
+}
+
+/// Arguments for `yanuget backup`.
+#[derive(Debug, Args)]
+struct BackupArgs {
+    /// Directory to write the backup to; created if needed.
+    dest: std::path::PathBuf,
+}
+
+/// Arguments for `yanuget restore`.
+#[derive(Debug, Args)]
+struct RestoreArgs {
+    /// Directory holding a backup written by `yanuget backup`.
+    src: std::path::PathBuf,
+    /// Replace an existing database and package store. Files the backup does
+    /// not have are removed from the store.
+    #[arg(long)]
+    force: bool,
 }
 
 /// Arguments for `yanuget migrate`.
@@ -144,6 +176,10 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Some(Command::Migrate(args)) => run_migrate(cli.config.as_deref(), *args).await,
         Some(Command::Healthcheck) => run_healthcheck(cli.config.as_deref()).await,
+        Some(Command::Backup(args)) => run_backup(cli.config.as_deref(), args).await,
+        Some(Command::Restore(args)) => run_restore(cli.config.as_deref(), args).await,
+        Some(Command::Admin(args)) => cli::run_admin(cli.config.as_deref(), *args).await,
+        Some(Command::Config(args)) => cli::run_config(cli.config.as_deref(), args),
         None => {
             init_tracing();
             run_server(cli.config.as_deref()).await
@@ -210,7 +246,49 @@ async fn run_server(config_path: Option<&str>) -> anyhow::Result<()> {
         // Shared with the admin page, so a sweep and a manual cleanup never
         // run at once and the page can say when the last one ran.
         let cleanup = state.feed.cleanup.clone();
+        let probed = state.feed.clone();
         states.push(state);
+
+        // Ask the mirror's upstream whether it answers, at startup and then
+        // every `probe_interval_secs`, so an outage is in the log (and in
+        // `/health/status`) before a restore runs into it.
+        if probed.mirror.is_some() && feed.mirror.probe_interval_secs > 0 {
+            let period = Duration::from_secs(feed.mirror.probe_interval_secs);
+            let mut shutdown = shutdown_rx.clone();
+            background.push(tokio::spawn(async move {
+                let Some(client) = &probed.mirror else {
+                    return;
+                };
+                let mut tick = tokio::time::interval(period);
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    tokio::select! {
+                        _ = tick.tick() => {}
+                        _ = shutdown.changed() => break,
+                    }
+                    let was_failing = client.upstream_status().consecutive_failures > 0;
+                    let probe = tokio::select! {
+                        probe = client.probe() => probe,
+                        _ = shutdown.changed() => break,
+                    };
+                    // The first failure is logged where it is recorded; this
+                    // repeats it while the outage lasts.
+                    if let Err(e) = probe {
+                        if was_failing {
+                            let status = client.upstream_status();
+                            tracing::warn!(
+                                feed = %probed.name,
+                                upstream = %yanuget::mirror::redact_url(client.upstream()),
+                                error = %e,
+                                failures = status.consecutive_failures,
+                                since = %status.failing_since.map(|t| t.to_rfc3339()).unwrap_or_default(),
+                                "mirror upstream still unreachable"
+                            );
+                        }
+                    }
+                }
+            }));
+        }
 
         // Background retention sweep per feed, when enabled.
         if feed.retention.enabled
@@ -351,8 +429,7 @@ async fn run_server(config_path: Option<&str>) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Keys shorter than this are guessable online at the rate limiter's pace.
-const MIN_KEY_CHARS: usize = 32;
+use yanuget::config_check::MIN_KEY_CHARS;
 
 /// Warn about each short key a feed accepts, naming its role but never the key.
 ///
@@ -468,21 +545,94 @@ async fn run_healthcheck(config_path: Option<&str>) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Back up the server's data into `args.dest` while it runs.
+async fn run_backup(config_path: Option<&str>, args: BackupArgs) -> anyhow::Result<()> {
+    init_tracing_quiet();
+    let config = Config::load(config_path)?;
+    let s = yanuget::backup::backup(&config, &args.dest, indicatif::ProgressDrawTarget::stderr())
+        .await?;
+    let m = &s.manifest;
+    println!(
+        "Backed up {} package versions, {} files ({}) to {}: {} copied ({}), {} removed.",
+        m.packages,
+        m.files,
+        indicatif::HumanBytes(m.bytes),
+        args.dest.display(),
+        s.copied,
+        indicatif::HumanBytes(s.copied_bytes),
+        s.removed,
+    );
+    if !m.missing.is_empty() {
+        eprintln!(
+            "warning: {} file(s) the database references are missing from the live store too:",
+            m.missing.len()
+        );
+        for path in m.missing.iter().take(20) {
+            eprintln!("  {path}");
+        }
+    }
+    if config.tls_pair().is_some() {
+        eprintln!("note: the configured TLS certificate and key are not included; back them up separately.");
+    }
+    Ok(())
+}
+
+/// Restore a backup into the configured data directory, refusing while a
+/// server answers on the configured port.
+async fn run_restore(config_path: Option<&str>, args: RestoreArgs) -> anyhow::Result<()> {
+    init_tracing_quiet();
+    let config = Config::load(config_path)?;
+    let url = healthcheck_url(&config);
+    let probe = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .timeout(Duration::from_secs(4))
+        .no_proxy()
+        .build()?;
+    // Any answer at all means a server holds the database open.
+    if probe.get(&url).send().await.is_ok() {
+        anyhow::bail!("a server answers at {url}; stop it before restoring");
+    }
+    let s = yanuget::backup::restore(
+        &config,
+        &args.src,
+        args.force,
+        indicatif::ProgressDrawTarget::stderr(),
+    )
+    .await?;
+    println!(
+        "Restored the backup of {} ({} package versions, {} files): {} copied, {} removed.",
+        s.manifest.created.format("%Y-%m-%d %H:%M:%S UTC"),
+        s.manifest.packages,
+        s.manifest.files,
+        s.copied,
+        s.removed,
+    );
+    Ok(())
+}
+
 /// The readiness URL of the server this configuration describes, on this
 /// machine. A wildcard bind is reached through loopback of the same family;
 /// a server bound to one address is only reachable there.
 fn healthcheck_url(config: &Config) -> String {
+    format!("{}/health/ready", local_base_url(config))
+}
+
+/// Where the server this configuration describes is reached from this
+/// machine: `scheme://address:port`, without a trailing slash.
+fn local_base_url(config: &Config) -> String {
+    format!("{}://{}", config.scheme(), local_addr(config))
+}
+
+/// The address the server this configuration describes is reached at from
+/// this machine: loopback of the same family for a wildcard bind.
+fn local_addr(config: &Config) -> std::net::SocketAddr {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
     let ip = match config.host {
         IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
         IpAddr::V6(ip) if ip.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
         ip => ip,
     };
-    format!(
-        "{}://{}/health/ready",
-        config.scheme(),
-        SocketAddr::new(ip, config.port)
-    )
+    SocketAddr::new(ip, config.port)
 }
 
 fn init_tracing() {
@@ -637,6 +787,8 @@ fn build_source_config(args: &MigrateArgs) -> anyhow::Result<MirrorConfig> {
         // The shell's `HTTP(S)_PROXY` applies, as it would to `curl`.
         proxy: None,
         ca_cert_path: args.source_ca_cert.clone(),
+        // A migration is one run, not a server watching its upstream.
+        probe_interval_secs: 0,
     })
 }
 

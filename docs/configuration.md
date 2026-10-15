@@ -54,6 +54,46 @@ A `tls_cert_path` without `tls_key_path`, or the reverse, is also an error
 while TLS is on, rather than a silent fall-back to the self-signed
 certificate.
 
+Check a configuration without starting the server with
+[`yanuget config check`](admin-cli.md#checking-a-configuration): it loads the
+file and the environment exactly as the server does, and also opens the TLS
+certificate and key and the mirror CA bundles.
+
+### Keys from the environment or a file
+
+Every key can be kept out of the TOML file, so `yanuget.toml` can be
+world-readable, managed by Puppet or committed, while the keys come from a
+secret store:
+
+- **Global keys** are `YANUGET_API_KEY`, `YANUGET_API_KEYS` and
+  `YANUGET_ADMIN_API_KEY` (above).
+- **A feed's keys** are `YANUGET_FEED_{NAME}_API_KEY`, `..._API_KEYS`,
+  `..._READ_API_KEY`, `..._ADMIN_API_KEY`, and for its mirror
+  `..._MIRROR_PASSWORD` and `..._MIRROR_TOKEN`. `{NAME}` is the feed's name
+  upper-cased, with `-` and `.` written as `_`: feed `stage` is
+  `YANUGET_FEED_STAGE_API_KEY`, feed `pre-prod` is
+  `YANUGET_FEED_PRE_PROD_API_KEY`. They override a feed the TOML declares;
+  they do not add feeds. Two feeds whose names share a spelling (`pre-prod`
+  and `pre.prod`) cannot be set this way: the server refuses to start rather
+  than guess which one was meant.
+- **Any of these read from a file** when `_FILE` is appended to its name:
+  `YANUGET_FEED_STAGE_API_KEY_FILE=/run/credentials/yanuget.service/stage-push`
+  reads the key from that file (without its trailing newline). A file for a
+  key list holds one key per line, or comma-separated keys. Setting both the
+  variable and its `_FILE` is an error, and so is a file that is missing or
+  empty: an empty push key would otherwise open the feed to anyone.
+
+With systemd, `LoadCredential=` puts the files where only the service can
+read them:
+
+```ini
+[Service]
+LoadCredential=stage-push:/etc/yanuget/keys/stage-push
+LoadCredential=admin:/etc/yanuget/keys/admin
+Environment=YANUGET_FEED_STAGE_API_KEY_FILE=%d/stage-push
+Environment=YANUGET_ADMIN_API_KEY_FILE=%d/admin
+```
+
 ## Rate limiting
 
 Per-client-IP request throttling under the `[rate_limit]` table. A fixed window
@@ -91,6 +131,57 @@ guessing, a long random key makes it pointless.
 | `rate_limit.max_requests` | `YANUGET_RATELIMIT_MAX_REQUESTS` | int | `10000` | Max requests per IP per window (min 1). |
 | `rate_limit.window_secs` | `YANUGET_RATELIMIT_WINDOW_SECS` | int | `60` | Window length in seconds (min 1; `0` is refused at startup, since it would never limit anything). |
 | `rate_limit.max_failed_auth` | `YANUGET_RATELIMIT_MAX_FAILED_AUTH` | int | `30` | Failed authentications per IP per window before credentialed requests get `429`; `0` turns this budget off. |
+
+## Monitoring
+
+`GET /metrics` (Prometheus text format) and `GET /health/status` (JSON), under
+the `[monitoring]` table. Both report whether the database answers, the
+packages, versions and bytes each feed serves, the pushes, promotions and
+downloads since startup, and for every mirrored feed whether its upstream
+answers. They are **off by default**, because both name every feed (read-gated
+ones included) and each mirror's upstream host. The probes `/health`,
+`/health/live` and `/health/ready` are always served and unaffected; see
+[Health](api.md#health) for what each endpoint returns.
+
+| TOML key | Env var | Type | Default | Description |
+| --- | --- | --- | --- | --- |
+| `monitoring.enabled` | `YANUGET_MONITORING_ENABLED` | bool | `false` | Serve `/metrics` and `/health/status`. |
+| `monitoring.token` | `YANUGET_MONITORING_TOKEN` | string | *(none)* | When set, both endpoints require `Authorization: Bearer <token>`. Unset, anyone who can reach the server can read them. |
+
+Like the health probes, `/metrics` answers whatever the `Host`, so a scraper
+can use the server's address. A Prometheus job:
+
+```yaml
+scrape_configs:
+  - job_name: yanuget
+    scheme: https
+    authorization: { credentials: a-long-random-scrape-token }
+    static_configs:
+      - targets: ["nuget.example.com:443"]
+```
+
+### Mirror upstream reachability
+
+Every request a mirror sends is recorded: an upstream that cannot be reached,
+answers `5xx`, or refuses the credentials (`401`, `403`, `407`) or rate-limits
+(`429`) counts as failing; any other answer, a `404` included, as reachable.
+The first failure logs a warning (`mirror upstream unreachable`) and the first
+success after it an info line (`mirror upstream reachable again`). Each mirror
+also asks its upstream for the service index at startup and every
+`probe_interval_secs` (default 300), and while the outage lasts each probe logs
+`mirror upstream still unreachable`, so a feed whose clients only restore what
+it already holds does not hide an outage until the next new package.
+
+An unreachable upstream does **not** fail `/health` or `/health/ready`: the
+feed still serves everything it holds, and restarting it would not bring the
+upstream back. It turns `/health/status` to `"degraded"` and sets
+`yanuget_mirror_upstream_up` to `0`, which is what to alert on:
+
+```yaml
+- alert: YanugetMirrorUpstreamDown
+  expr: yanuget_mirror_upstream_up == 0
+  for: 10m
+```
 
 ## Trusted proxies
 
@@ -332,6 +423,7 @@ affected.
 | `feeds[].mirror.allow_private_upstream` | bool | `false` | Permit an upstream on a private/loopback address. |
 | `feeds[].mirror.proxy` | string | *(none)* | Outbound proxy for upstream requests. Unset, the mirror connects directly and ignores `HTTP(S)_PROXY`. |
 | `feeds[].mirror.ca_cert_path` | path | *(none)* | PEM file of extra CA certificates to trust for the upstream, on top of the system store and the bundled Mozilla roots. |
+| `feeds[].mirror.probe_interval_secs` | int | `300` | Ask the upstream for its service index at startup and then every N seconds, so an outage is logged (and shown in [`/health/status`](#monitoring)) before a client needs the upstream. `0` turns the probe off. |
 | `feeds[].license_policy.enabled` | bool | `false` | Evaluate the offline license policy. |
 | `feeds[].license_policy.allowed` | string[] | `[]` | If non-empty, license must match one. |
 | `feeds[].license_policy.blocked` | string[] | `[]` | Always rejected (even if also allowed). |
@@ -423,7 +515,9 @@ them.
 promotion or mirror) **pending** — withheld from clients until an operator
 approves it in `/admin`. Combined with `promotes_to`, feeds form an ordered
 promotion chain (e.g. `dev → stable`): an admin promotes a version into the next
-ring, where it waits for approval if that ring gates. A promoted (or copied)
+ring, where it waits for approval if that ring gates. The source feed's admin
+page then says so and links to the target's admin page, where the version is
+approved; its row shows `pending in stable` until then. A promoted (or copied)
 version keeps the state it had: one that is unlisted, disabled or still
 pending in the source arrives unlisted, disabled or pending in the target. Feeds without
 `promotes_to` are simply independent sets a version can be added to.
@@ -453,6 +547,12 @@ YANuget serves **HTTPS by default**. Behaviour:
   case set `base_url` to the public address, or forward
   `X-Forwarded-Proto`/`X-Forwarded-Host` and list the proxy in
   [`trusted_proxies`](#trusted-proxies) so they are honoured.
+
+Clients check the certificate against the name they connect with, so it must
+name every one they use (the FQDN, a short name, an IP address) as a subject
+alternative name. `yanuget config check` reports each name in `base_url` and
+`allowed_hosts` that the configured certificate does not cover, and refuses a
+key that does not belong to the certificate.
 
 When TLS is on and no base URL is configured, generated URLs default to the
 `https` scheme (still overridable by `X-Forwarded-Proto`). With TLS enabled,

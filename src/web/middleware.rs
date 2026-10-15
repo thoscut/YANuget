@@ -189,7 +189,8 @@ async fn filter_forwarded_headers(
 /// `421 Misdirected Request`. That is what defeats DNS rebinding: a hostile
 /// page can point a name it controls at an intranet feed's address and make
 /// the browser talk to it, but the browser still sends the hostile name. The
-/// health probes are exempt, since orchestrators probe by address.
+/// health probes and `/metrics` are exempt, since orchestrators and scrapers
+/// probe by address.
 ///
 /// **Cross-site writes.** A browser labels every request with
 /// `Sec-Fetch-Site`, and a `POST`, `PUT`, `PATCH` or `DELETE` from another
@@ -204,7 +205,8 @@ async fn request_guard(
 ) -> Response {
     use axum::http::Method;
     if let Some(allowed) = &allowed {
-        if !req.uri().path().starts_with("/health") {
+        let path = req.uri().path();
+        if !(path.starts_with("/health") || path == "/metrics") {
             let host = forwarded(req.headers(), "x-forwarded-host").or_else(|| {
                 req.headers()
                     .get(header::HOST)
@@ -334,6 +336,25 @@ pub(super) async fn gated_feed_headers(request: Request, next: axum::middleware:
     response
 }
 
+/// Whether the request asked for JSON and not for HTML. Browsers put
+/// `text/html` in every navigation's and form post's `Accept`.
+fn wants_json_only(headers: &axum::http::HeaderMap) -> bool {
+    let accept = headers
+        .get_all(header::ACCEPT)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .map(|t| {
+            t.split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase()
+        })
+        .collect::<Vec<_>>();
+    accept.iter().any(|t| t == "application/json") && !accept.iter().any(|t| t == "text/html")
+}
+
 /// Re-render an error from a gallery route as an HTML page.
 ///
 /// These routes are read in a browser, and every one of them could answer with
@@ -354,6 +375,11 @@ pub(super) async fn html_errors(
     let response = next.run(request).await;
     let status = response.status();
     if !(status.is_client_error() || status.is_server_error()) {
+        return response;
+    }
+    // A script that asks for JSON (`yanuget admin`, curl) gets the error's
+    // own message rather than a page a browser would show.
+    if wants_json_only(&headers) {
         return response;
     }
     // Keep whatever headers the error already carried — notably the

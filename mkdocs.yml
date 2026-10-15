@@ -61,9 +61,20 @@ markdown_extensions:
 
 nav:
   - Home: index.md
-  - HTTP API: api.md
-  - Configuration: configuration.md
-  - Deployment: deployment.md
-  - Bulk migration: migrate.md
-  - Architecture: architecture.md
-  - Large packages: large-packages.md
+  - Guides:
+      - Connecting clients: clients.md
+      - Feeds and release rings: feeds.md
+      - Gallery and admin area: administration.md
+      - Troubleshooting: troubleshooting.md
+  - Reference:
+      - HTTP API: api.md
+      - Configuration: configuration.md
+      - Command line: cli.md
+      - Admin command line: admin-cli.md
+  - Operations:
+      - Deployment: deployment.md
+      - Backup and moving hosts: backup.md
+      - Bulk migration: migrate.md
+  - Internals:
+      - Architecture: architecture.md
+      - Large packages: large-packages.md

@@ -79,91 +79,116 @@ cross-filesystem rename would turn every push into a full second copy.
 
 ## Backup and restore
 
+Use `yanuget backup`: it takes a consistent copy of the database, the package
+store and the self-signed TLS pair while the server runs, incrementally on
+every run after the first, and `yanuget restore` puts it back. See
+[Backup, restore and moving hosts](backup.md), which also covers moving the
+server to a new host.
+
 The database and the package store must be backed up **together and
-consistently** — a database referencing a payload that is not in the backup is
-worse than either one missing.
-
-The database is in WAL mode, so copying `yanuget.db` while the server runs can
-capture a torn state. Either stop the server, or use SQLite's online backup:
-
-```bash
-# Consistent database snapshot without stopping the server.
-sqlite3 /var/lib/yanuget/yanuget.db ".backup '/backup/yanuget.db'"
-
-# Then the payloads, and the certificate pair.
-rsync -a /var/lib/yanuget/packages/ /backup/packages/
-rsync -a /var/lib/yanuget/tls/ /backup/tls/
-```
-
-Taking the database first and the files second is the right order, but it is
-not airtight while the server runs. New pushes only add files, so they can only
-leave extra files in the backup. Anything that *removes* a file between the two
-steps — a delete, an overwrite of an existing version (`allow_overwrite`), a
-retention run, a file detached from a version — takes away a payload the
-snapshot still references, and the backup has a database row whose file is
-missing. For a backup that is consistent by construction, either stop the
-server for the duration, or copy from a filesystem snapshot (LVM, ZFS, btrfs)
-of the whole data directory taken at one instant — with the database inside it
-copied by `.backup` from that snapshot, or the server stopped when it is taken.
-`.uploads/` and `.migrate/` hold only work in progress and can be left out
-(a resumable upload that was unfinished at backup time then starts over).
-
-Restore by putting everything back and starting the server; no import step is
-needed.
-
-Back up `tls/` too if the server uses its self-signed pair. A missing pair is
-regenerated on start, but as a *new* certificate: every client that was told to
-trust the old one stops connecting until it is told again. (With
-`tls_cert_path`/`tls_key_path` the certificate lives wherever those point —
-back that up instead.)
+consistently**. Copying the data directory with `cp` or `rsync` while the
+server runs is not a backup: the database is in WAL mode and can be captured
+torn, and a delete between copying the database and the files leaves rows
+whose payloads are missing. A filesystem snapshot (LVM, ZFS, btrfs) of the
+whole data directory, taken at one instant, is consistent too.
 
 ## systemd
 
-```ini
-# /etc/systemd/system/yanuget.service
-[Unit]
-Description=YANuget package server
-After=network-online.target
-Wants=network-online.target
+The Linux release archives ship a hardened unit, `yanuget.service`, and the
+system user it runs as, `yanuget.sysusers` (both also in the repository under
+`contrib/systemd/`). From the unpacked archive:
 
-[Service]
-Type=exec
-ExecStart=/usr/local/bin/yanuget
-Restart=on-failure
-RestartSec=5s
+```bash
+install -m 0755 yanuget /usr/local/bin/yanuget
+install -m 0644 yanuget.sysusers /usr/lib/sysusers.d/yanuget.conf
+systemd-sysusers                       # creates the yanuget user and group
 
-User=yanuget
-Group=yanuget
-StateDirectory=yanuget
-Environment=YANUGET_DATA_DIR=/var/lib/yanuget
-Environment=YANUGET_BASE_URL=https://nuget.example.com
-EnvironmentFile=/etc/yanuget/secrets.env
+install -d -m 0750 -g yanuget /etc/yanuget
+install -m 0640 -g yanuget yanuget.example.toml /etc/yanuget/yanuget.toml
+install -m 0644 yanuget.service /etc/systemd/system/yanuget.service
 
-# The server needs its state directory and nothing else.
-NoNewPrivileges=yes
-PrivateTmp=yes
-PrivateDevices=yes
-ProtectSystem=strict
-ProtectHome=yes
-ProtectKernelTunables=yes
-ProtectKernelModules=yes
-ProtectControlGroups=yes
-# AF_UNIX because glibc resolves names through local services (nscd,
-# systemd-resolved) over Unix sockets; without it, looking up a mirror
-# upstream or a migration source can fail.
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
-LockPersonality=yes
-
-# Large uploads and downloads keep many file descriptors open.
-LimitNOFILE=65536
-
-[Install]
-WantedBy=multi-user.target
+systemctl daemon-reload
+systemctl enable --now yanuget
 ```
 
-Put `YANUGET_API_KEY=…` and `YANUGET_ADMIN_API_KEY=…` in
-`/etc/yanuget/secrets.env`, owned by root and mode `0600`, so the keys are not
-visible in `systemctl show` or the process environment of other users.
+What the unit sets up:
+
+- **Unprivileged user.** The server runs as `yanuget`, never as root.
+- **Data in `/var/lib/yanuget`.** systemd creates it (`StateDirectory=`) owned
+  by the service user, and the unit sets `YANUGET_DATA_DIR` to it, so the
+  `data_dir` in the TOML file is ignored.
+- **Configuration in `/etc/yanuget/yanuget.toml`**, read-only to the service.
+  Keys can stay out of that file: put `YANUGET_API_KEY=…` and
+  `YANUGET_ADMIN_API_KEY=…` in `/etc/yanuget/secrets.env`, owned by root and
+  mode `0600`. systemd reads it before dropping privileges, and the keys are not
+  visible in `systemctl show`.
+- **Read-only system.** `ProtectSystem=strict` mounts the whole file system
+  read-only for the service, with `ReadWritePaths=/var/lib/yanuget` the one
+  exception. Home directories, devices, kernel settings and most system calls
+  are out of reach, and `/tmp` is private to the service; `systemd-analyze
+  security yanuget` rates the unit "OK".
+- **Port 443 without root**, see below.
+
+Change it with `systemctl edit yanuget` (a drop-in under
+`/etc/systemd/system/yanuget.service.d/`) rather than editing the file, so an
+upgrade can replace the unit. The usual changes:
+
+```ini
+[Service]
+# Data on another volume: both lines together.
+Environment=YANUGET_DATA_DIR=/srv/yanuget
+ReadWritePaths=/srv/yanuget
+# files.inbox_dir must be writable too, since imported files leave it.
+ReadWritePaths=/srv/yanuget-inbox
+```
+
+A directory outside `/var/lib/yanuget` is not created for you: create it owned
+by `yanuget` first. The binary itself is upgraded by replacing
+`/usr/local/bin/yanuget` and restarting; see [Upgrading](#upgrading).
+
+`yanuget healthcheck` works as a check under systemd too, run as the service
+user so it reads the same configuration:
+
+```bash
+sudo -u yanuget yanuget --config /etc/yanuget/yanuget.toml healthcheck
+```
+
+### Port 443 as a non-root user
+
+Ports below 1024 normally need root. The unit instead grants the process the
+single capability for binding them:
+
+```ini
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+```
+
+so serving clients on the standard HTTPS port is only a configuration change:
+
+```toml
+# /etc/yanuget/yanuget.toml
+port = 443
+base_url = "https://nuget.example.com"
+tls_cert_path = "/etc/yanuget/tls/fullchain.pem"
+tls_key_path = "/etc/yanuget/tls/key.pem"
+```
+
+The capability is all the process can ever hold: `CapabilityBoundingSet`
+removes every other one, and `NoNewPrivileges` stops it gaining more. When
+YANuget listens on its default port 5000, or behind a reverse proxy, delete both
+lines in a drop-in (`AmbientCapabilities=` and `CapabilityBoundingSet=` set
+empty).
+
+Outside systemd, the same capability can be put on the binary instead:
+`setcap cap_net_bind_service=+ep /usr/local/bin/yanuget`. It is lost whenever
+the file is replaced, so it has to be repeated on every upgrade, which is why
+the unit is the better place for it.
+
+The certificate and key must be readable by the service user: owned by root,
+group `yanuget`, mode `0640`. Clients check the name strictly, so the
+certificate's subject alternative names must cover every name they use to reach
+the server: the fully qualified name, a short host name if clients use one, and
+the IP address if any client connects by address.
 
 ## Docker Compose
 
@@ -224,6 +249,12 @@ restarted in a loop.
 Use `scheme: HTTP` instead if you set `tls_enabled = false` to terminate TLS at
 an ingress.
 
+Outside Kubernetes the same endpoints serve as checks: point an uptime monitor
+or load balancer at `/health` rather than at a feed's `/v3/index.json`, which
+answers even when the database does not. For package counts, push and
+promotion rates and mirror upstream status, enable
+[`[monitoring]`](configuration.md#monitoring) and scrape `/metrics`.
+
 ## Behind a reverse proxy
 
 See [Reverse proxy](configuration.md#reverse-proxy) for the nginx configuration.
@@ -236,7 +267,7 @@ default `client_max_body_size` will reject the push outright.
 
 1. Read the [changelog](https://github.com/thoscut/yanuget/blob/main/CHANGELOG.md)
    for the versions you are skipping.
-2. Back up as above. This is the step people skip.
+2. Back up with `yanuget backup`. This is the step people skip.
 3. Replace the binary or pull the new image and restart.
 
 Schema changes are applied automatically at startup and are additive, so an

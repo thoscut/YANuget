@@ -88,9 +88,15 @@ Download the archive for your platform from the
 against `SHA256SUMS`, unpack and run. Release binaries ship the full offline
 documentation.
 
+The Linux archives also contain a hardened systemd unit (`yanuget.service`) and
+its system user (`yanuget.sysusers`). The unit runs the server as an
+unprivileged user on a read-only system, and grants it `CAP_NET_BIND_SERVICE`
+and nothing else, so it can listen on port 443 without root. Installing it is
+described under [systemd](docs/deployment.md#systemd).
+
 From 0.6.0 on, the archives and the container image
-(`linux/amd64` and `linux/arm64`) come with signed build provenance, and the
-image is also signed with cosign. `gh attestation verify <archive> --repo
+(`linux/amd64` and `linux/arm64`) come with signed build provenance, and from
+0.6.1 on the image is also signed with cosign. `gh attestation verify <archive> --repo
 thoscut/yanuget` checks that a download was built by this repository's release
 workflow; [SECURITY.md](SECURITY.md#verifying-a-release) has the commands for
 the image.
@@ -165,6 +171,10 @@ The essentials:
 | Rate limit | `YANUGET_RATELIMIT_*` | on, 10000/60s | Per-IP throttle; returns `429`. |
 | Trusted proxies | `YANUGET_TRUSTED_PROXIES` | *(none)* | Peers whose `X-Forwarded-*` is honoured. Set behind a proxy. |
 | CORS origins | *(TOML only)* | *(none)* | Browser origins allowed to read the feed. |
+
+Every key, global or per feed (`YANUGET_FEED_{NAME}_API_KEY`, …), can also be
+read from a file by appending `_FILE` to its variable, so none has to sit in
+the TOML file.
 
 ---
 
@@ -333,10 +343,16 @@ pip install -r requirements-docs.txt
 mkdocs build      # outputs site/, embedded at compile time
 ```
 
-It covers the [HTTP API](docs/api.md), every
-[configuration option](docs/configuration.md),
+It has guides for [connecting clients](docs/clients.md) (`dotnet`, `nuget.exe`,
+Chocolatey, Visual Studio, certificates, read keys, symbols),
+[feeds and release rings](docs/feeds.md), the
+[gallery and admin area](docs/administration.md) and
+[troubleshooting](docs/troubleshooting.md); a reference for the
+[HTTP API](docs/api.md), every [configuration option](docs/configuration.md)
+and the [command line](docs/cli.md); and covers
 [deploying it as a service](docs/deployment.md) (systemd, Compose, Kubernetes
-probes, backup/restore, upgrades), the [architecture](docs/architecture.md) and
+probes, upgrades), [backup, restore and moving hosts](docs/backup.md),
+[bulk migration](docs/migrate.md), the [architecture](docs/architecture.md) and
 the [large-package design](docs/large-packages.md).
 
 Release binaries and the container image ship the rendered docs; a plain
@@ -360,6 +376,19 @@ so retention never deletes it, and `/admin/retention` shows exactly what the nex
 cleanup would delete and why — with a button that deletes that list and nothing
 else. The area is only mounted when an admin key is configured, and the settings
 page says how to turn it on.
+
+The same actions are scriptable with `yanuget admin` (see
+[docs/admin-cli.md](docs/admin-cli.md)):
+
+```bash
+yanuget admin --feed stage promote Contoso.Utils 1.4.0       # on the server
+yanuget admin --url https://nuget.example.com --feed production \
+    approve Contoso.Utils 1.4.0                              # key from YANUGET_ADMIN_KEY
+```
+
+`yanuget config check` validates a configuration (including that the TLS key
+belongs to the certificate and that it names the configured hosts) before the
+server is started with it.
 
 ## Attached files (disk images)
 
@@ -477,6 +506,20 @@ and `--source-token-file`, rather than as arguments: anything on the command
 line is visible to other users in `ps` and stays in shell history, and
 `"$TOKEN"` does not help — the shell expands it into the argument list. See
 [Bulk migration](docs/migrate.md).
+
+### Backup and restore
+
+`yanuget backup` takes a consistent copy of the database, the package store and
+the self-signed TLS pair **while the server runs**, and re-running it into the
+same directory copies only what changed. `yanuget restore` puts it back into a
+stopped server. Together they are also the way to move a server to a new host:
+
+```bash
+yanuget --config /etc/yanuget/yanuget.toml backup /srv/backup/yanuget
+yanuget --config /etc/yanuget/yanuget.toml restore /srv/backup/yanuget
+```
+
+See [Backup, restore and moving hosts](docs/backup.md).
 
 ### Offline license policy
 

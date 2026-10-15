@@ -1,0 +1,3 @@
+# The system user the YANuget service runs as. Install as
+# /usr/lib/sysusers.d/yanuget.conf and run `systemd-sysusers`.
+u yanuget - "YANuget package server" /var/lib/yanuget

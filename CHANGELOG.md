@@ -12,6 +12,68 @@ expected to change incompatibly at any version.
 
 ## [Unreleased]
 
+### Added
+
+- The Linux release archives ship a hardened systemd unit, `yanuget.service`,
+  and its system user, `yanuget.sysusers` (also under `contrib/systemd/`). The
+  unit runs as an unprivileged user with `ProtectSystem=strict`, only the data
+  directory writable, and `CAP_NET_BIND_SERVICE` as its one capability, so the
+  server can listen on port 443 without root. The
+  [systemd](docs/deployment.md#systemd) section describes installing it, port
+  443, and the certificate names clients check.
+- `yanuget backup <dir>` takes a consistent backup of the database, the package
+  store and the self-signed TLS pair while the server runs: a `VACUUM INTO`
+  snapshot, an incremental copy of the store through temp files and renames,
+  and a check that every file the snapshot references made it, retrying when a
+  delete raced the copy. `yanuget restore <dir>` puts a backup back into a
+  stopped server. The documentation gains a page on backups and on moving a
+  server to a new host.
+- `[monitoring]`, off by default: `GET /metrics` in the Prometheus text format
+  and `GET /health/status` as JSON, optionally behind a bearer token. Both
+  report the database, packages, versions and bytes per feed, pushes,
+  promotions and downloads since startup, and each mirror's upstream status.
+- Mirrors record whether their upstream answers. The first failure logs
+  `mirror upstream unreachable`, recovery logs `mirror upstream reachable
+  again`, and each mirror probes its upstream's service index at startup and
+  every `probe_interval_secs` (default 300, `0` off), so an outage is visible
+  before a client needs the upstream. `/health` and `/health/ready` are
+  unaffected by it.
+- `yanuget admin` promotes, approves, enables, disables, pins, unpins or
+  deletes a version through a running server's admin area, so a promotion
+  can be scripted. On the server's machine it needs no arguments beyond the
+  feed; elsewhere `--url` and the admin key (`YANUGET_ADMIN_KEY` or
+  `--admin-key-file`).
+- `yanuget config check` checks a configuration before the server starts with
+  it: every value, the TLS certificate and key (that they parse, that the key
+  belongs to the certificate, and that the certificate names the configured
+  hosts), mirror CA bundles and promotion targets. It exits `1` on an error.
+- A feed's keys can be set from the environment
+  (`YANUGET_FEED_{NAME}_API_KEY`, `..._READ_API_KEY`, `..._ADMIN_API_KEY`,
+  `..._MIRROR_PASSWORD`, …), and every key variable, global or per feed, can
+  be read from a file named by the same variable with `_FILE` appended, such
+  as a systemd credential.
+
+### Changed
+
+- An admin or gallery error answered to a request that asks for
+  `application/json` (and not `text/html`) keeps its JSON body with the
+  reason, instead of the HTML error page.
+
+### Fixed
+
+- Promoting a version looked like it did nothing: the admin page reloaded
+  unchanged, and in a target feed with `requires_approval` the version sat
+  pending there, invisible to clients. The package page now reports what a
+  promote, copy or move did in the target feed, links to where a pending version
+  is approved, and marks each version the `promotes_to` feed already holds
+  instead of offering a Promote that would change nothing.
+- The release workflow now signs the container image. It named the image
+  `ghcr.io/thoscut/YANuget`, which cosign refuses because registry references
+  are lowercase, so the 0.6.0 image was published and attested but not signed.
+  The `cosign verify` command in SECURITY.md now matches the workflow identity
+  as GitHub spells it (`thoscut/YANuget`), and says the signature starts with
+  0.6.1.
+
 ## [0.6.0] — 2026-10-01
 
 **Upgrading from 0.5.x needs attention.** This release follows a full review
