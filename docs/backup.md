@@ -50,6 +50,8 @@ at a different moment from the database can miss a package either way.
    file, which is harmless. A delete, an overwrite or a retention run in that
    window can take away a file the snapshot still lists, and then the pass
    runs again: a fresh snapshot and an incremental copy, which takes seconds.
+   (The check compares sizes, not hashes, to stay cheap on a large store: an
+   overwrite with exactly the same size during the copy goes unnoticed.)
 4. **Put the snapshot in place**, remove files the server no longer has, copy
    the TLS pair, and write `backup.json`.
 
