@@ -96,6 +96,12 @@ POST /{feed}/admin/packages/{id}/{version}/promote
 with the admin credentials and the CSRF token; see
 [Scripting promotion and approval](#scripting-promotion-and-approval).
 
+After the click, the package page says what happened in the target feed: the
+version was added, was added but is **pending** there (with a link to the
+target's admin page, where it is approved), or was already there and left
+unchanged. Each version row also shows whether the next feed already holds it
+(`in test`, `pending in test`); such a row has no Promote button.
+
 * The version must be a member of the feed it is promoted from.
 * The target's gate and license policy apply as for a push: in a gated target
   the version waits as pending; a target whose `license_policy` blocks the
@@ -128,8 +134,18 @@ which versions can be copied or moved.
 
 ### Scripting promotion and approval
 
-Every button in the admin area is a plain `POST`, so a release pipeline can
-promote and approve with `curl`. Each request needs:
+The simplest way is [`yanuget admin`](admin-cli.md), which handles the
+credentials and the CSRF token itself and says when a promoted version is
+pending in the target:
+
+```bash
+export YANUGET_ADMIN_KEY="$(cat ~/.config/yanuget/admin.key)"
+yanuget admin --url https://nuget.example.com --feed stage promote Contoso.Utils 1.4.0
+yanuget admin --url https://nuget.example.com --feed production approve Contoso.Utils 1.4.0
+```
+
+Without the binary at hand, every button in the admin area is a plain `POST`,
+so a pipeline can do the same with `curl`. Each request needs:
 
 * HTTP Basic credentials: any user name, the admin key as the password;
 * a CSRF token in the `X-CSRF-Token` header. The admin pages embed it as the
@@ -223,15 +239,20 @@ upstream to a new host is a change on **every** YANuget server that mirrors it:
 2. On each mirroring server, change `upstream`, and `ca_cert_path` and the
    credentials if they differ, in every `[feeds.mirror]` that points at the old
    host. Restart the server.
-3. Check each one: request a package the mirror does not hold yet and look for
-   upstream errors in the log.
+3. Check each one with `yanuget config check`, which also parses the mirror's
+   CA bundle, then request a package the mirror does not hold yet. A mirror
+   whose upstream cannot be reached logs `mirror upstream unreachable`, and,
+   with [monitoring](configuration.md#monitoring) on, reports `degraded` in
+   `/health/status` and `yanuget_mirror_upstream_up 0`.
 
 Packages a mirror already stored are served from its own disk and are not
 fetched again, so they keep working throughout. Only packages it has not seen
 yet, and new versions, depend on the upstream. A server that still points at an
 old, switched-off host therefore looks healthy until someone needs a new
-package. Keep a list of the servers that mirror each upstream, or manage their
-configuration from one place (Ansible, Puppet), so none is missed.
+package, unless something watches the upstream probe: alert on
+`yanuget_mirror_upstream_up == 0`. Keep a list of the servers that mirror each
+upstream, or manage their configuration from one place (Ansible, Puppet), so
+none is missed.
 
 ## License policy
 

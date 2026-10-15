@@ -349,7 +349,8 @@ Chocolatey, Visual Studio, certificates, read keys, symbols),
 [gallery and admin area](docs/administration.md) and
 [troubleshooting](docs/troubleshooting.md); a reference for the
 [HTTP API](docs/api.md), every [configuration option](docs/configuration.md)
-and the [command line](docs/cli.md); and covers
+the [command line](docs/cli.md) and the
+[admin command line](docs/admin-cli.md); and covers
 [deploying it as a service](docs/deployment.md) (systemd, Compose, Kubernetes
 probes, upgrades), [backup, restore and moving hosts](docs/backup.md),
 [bulk migration](docs/migrate.md), the [architecture](docs/architecture.md) and
