@@ -124,6 +124,80 @@ async fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// What [`check_pair`] found in a usable certificate/key pair.
+#[derive(Debug, Default)]
+pub struct PairCheck {
+    /// Certificates in the chain file (the server's own first).
+    pub chain_len: usize,
+    /// The names asked about that the certificate does not cover. A client
+    /// that reaches the server by one of them refuses the connection.
+    pub uncovered: Vec<String>,
+}
+
+/// Check, without starting a server, that `cert` and `key` are a pair TLS
+/// can serve: both parse, the key is one rustls can sign with, and it belongs
+/// to the first certificate of the chain. Each of `hosts` (a DNS name or an
+/// IP address) is checked against the certificate's subject alternative
+/// names, as a client would.
+///
+/// The error is a sentence for the operator.
+pub fn check_pair(
+    cert: &Path,
+    key: &Path,
+    hosts: &[String],
+) -> std::result::Result<PairCheck, String> {
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+
+    let chain: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(cert)
+        .and_then(|certs| certs.collect())
+        .map_err(|e| format!("TLS certificate {}: {e}", cert.display()))?;
+    let Some(leaf) = chain.first().cloned() else {
+        return Err(format!(
+            "TLS certificate {} holds no certificate",
+            cert.display()
+        ));
+    };
+    let private =
+        PrivateKeyDer::from_pem_file(key).map_err(|e| format!("TLS key {}: {e}", key.display()))?;
+    let signing = rustls::crypto::ring::sign::any_supported_type(&private)
+        .map_err(|e| format!("TLS key {}: {e}", key.display()))?;
+    let chain_len = chain.len();
+    let certified = rustls::sign::CertifiedKey::new(chain, signing);
+    match certified.keys_match() {
+        Ok(()) => {}
+        Err(rustls::Error::InconsistentKeys(rustls::InconsistentKeys::KeyMismatch)) => {
+            return Err(format!(
+                "TLS key {} does not belong to the certificate {} (the first certificate \
+                 in the file must be the server's own)",
+                key.display(),
+                cert.display()
+            ));
+        }
+        // rustls cannot tell for this key type; the handshake will.
+        Err(rustls::Error::InconsistentKeys(rustls::InconsistentKeys::Unknown)) => {}
+        Err(e) => return Err(format!("TLS certificate {}: {e}", cert.display())),
+    }
+
+    let parsed = rustls::server::ParsedCertificate::try_from(&leaf)
+        .map_err(|e| format!("TLS certificate {}: {e}", cert.display()))?;
+    let uncovered = hosts
+        .iter()
+        .filter(|host| {
+            let name = host.trim_start_matches('[').trim_end_matches(']');
+            match ServerName::try_from(name) {
+                Ok(name) => rustls::client::verify_server_name(&parsed, &name).is_err(),
+                Err(_) => true,
+            }
+        })
+        .cloned()
+        .collect();
+    Ok(PairCheck {
+        chain_len,
+        uncovered,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -190,5 +264,56 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(err, Error::BadRequest(_)));
+    }
+
+    fn write_pair(dir: &Path, name: &str, sans: &[&str]) -> (PathBuf, PathBuf) {
+        let sans: Vec<String> = sans.iter().map(|s| s.to_string()).collect();
+        let (cert, key) = generate_self_signed(&sans).unwrap();
+        let cert_path = dir.join(format!("{name}.crt"));
+        let key_path = dir.join(format!("{name}.key"));
+        std::fs::write(&cert_path, cert).unwrap();
+        std::fs::write(&key_path, key).unwrap();
+        (cert_path, key_path)
+    }
+
+    #[test]
+    fn a_matching_pair_passes_and_names_are_checked_like_a_client() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cert, key) = write_pair(dir.path(), "a", &["nuget.example.com", "nuget", "10.0.0.5"]);
+        let hosts: Vec<String> = [
+            "nuget.example.com",
+            "nuget",
+            "10.0.0.5",
+            "other.example.com",
+            "10.0.0.6",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let check = check_pair(&cert, &key, &hosts).unwrap();
+        assert_eq!(check.chain_len, 1);
+        assert_eq!(check.uncovered, vec!["other.example.com", "10.0.0.6"]);
+    }
+
+    #[test]
+    fn a_key_from_another_pair_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cert, _) = write_pair(dir.path(), "a", &["localhost"]);
+        let (_, other_key) = write_pair(dir.path(), "b", &["localhost"]);
+        let err = check_pair(&cert, &other_key, &[]).unwrap_err();
+        assert!(err.contains("does not belong to the certificate"), "{err}");
+    }
+
+    #[test]
+    fn files_that_are_not_pem_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cert, key) = write_pair(dir.path(), "a", &["localhost"]);
+        let junk = dir.path().join("junk");
+        std::fs::write(&junk, "not a certificate").unwrap();
+        assert!(check_pair(&junk, &key, &[])
+            .unwrap_err()
+            .contains("holds no certificate"));
+        assert!(check_pair(&cert, &junk, &[]).is_err());
+        assert!(check_pair(&dir.path().join("missing"), &key, &[]).is_err());
     }
 }

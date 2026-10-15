@@ -70,6 +70,7 @@ nav:
       - HTTP API: api.md
       - Configuration: configuration.md
       - Command line: cli.md
+      - Admin command line: admin-cli.md
   - Operations:
       - Deployment: deployment.md
       - Backup and moving hosts: backup.md

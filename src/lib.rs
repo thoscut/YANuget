@@ -11,9 +11,11 @@
 //! More modules (models, storage, database, protocol, web) are wired in as the
 //! server is built up.
 
+pub mod admin_client;
 pub mod auth;
 pub mod backup;
 pub mod config;
+pub mod config_check;
 pub mod database;
 pub mod error;
 pub mod inbox;
