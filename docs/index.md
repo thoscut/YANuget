@@ -29,6 +29,8 @@ on an air-gapped network.
   environment variables, including TLS, rate limiting, multiple API keys,
   retention, and multi-feed / mirroring / license-policy options.
 - **[Command line](cli.md)**: running the server, `migrate` and `healthcheck`.
+- **[Admin command line](admin-cli.md)**: `yanuget admin`, promoting,
+  approving or deleting a version from a script; `yanuget config check`.
 
 **Operations and internals**
 

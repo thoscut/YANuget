@@ -7,6 +7,8 @@ use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
+mod cli;
+
 use yanuget::config::{Config, MirrorAuthConfig, MirrorConfig, OverwriteMode};
 use yanuget::database::SqliteDatabase;
 use yanuget::migrate::MigrateOptions;
@@ -44,6 +46,11 @@ enum Command {
     /// Restore a backup taken by `yanuget backup` into the configured data
     /// directory. The server must be stopped.
     Restore(RestoreArgs),
+    /// Act on a version through a running server's admin area: promote,
+    /// approve, enable, disable, pin, unpin or delete.
+    Admin(Box<cli::AdminArgs>),
+    /// Work with the configuration without starting the server.
+    Config(cli::ConfigArgs),
 }
 
 /// Arguments for `yanuget backup`.
@@ -171,6 +178,8 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Healthcheck) => run_healthcheck(cli.config.as_deref()).await,
         Some(Command::Backup(args)) => run_backup(cli.config.as_deref(), args).await,
         Some(Command::Restore(args)) => run_restore(cli.config.as_deref(), args).await,
+        Some(Command::Admin(args)) => cli::run_admin(cli.config.as_deref(), *args).await,
+        Some(Command::Config(args)) => cli::run_config(cli.config.as_deref(), args),
         None => {
             init_tracing();
             run_server(cli.config.as_deref()).await
@@ -420,8 +429,7 @@ async fn run_server(config_path: Option<&str>) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Keys shorter than this are guessable online at the rate limiter's pace.
-const MIN_KEY_CHARS: usize = 32;
+use yanuget::config_check::MIN_KEY_CHARS;
 
 /// Warn about each short key a feed accepts, naming its role but never the key.
 ///
@@ -606,17 +614,25 @@ async fn run_restore(config_path: Option<&str>, args: RestoreArgs) -> anyhow::Re
 /// machine. A wildcard bind is reached through loopback of the same family;
 /// a server bound to one address is only reachable there.
 fn healthcheck_url(config: &Config) -> String {
+    format!("{}/health/ready", local_base_url(config))
+}
+
+/// Where the server this configuration describes is reached from this
+/// machine: `scheme://address:port`, without a trailing slash.
+fn local_base_url(config: &Config) -> String {
+    format!("{}://{}", config.scheme(), local_addr(config))
+}
+
+/// The address the server this configuration describes is reached at from
+/// this machine: loopback of the same family for a wildcard bind.
+fn local_addr(config: &Config) -> std::net::SocketAddr {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
     let ip = match config.host {
         IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
         IpAddr::V6(ip) if ip.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
         ip => ip,
     };
-    format!(
-        "{}://{}/health/ready",
-        config.scheme(),
-        SocketAddr::new(ip, config.port)
-    )
+    SocketAddr::new(ip, config.port)
 }
 
 fn init_tracing() {
