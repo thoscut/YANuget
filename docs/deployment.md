@@ -79,43 +79,18 @@ cross-filesystem rename would turn every push into a full second copy.
 
 ## Backup and restore
 
+Use `yanuget backup`: it takes a consistent copy of the database, the package
+store and the self-signed TLS pair while the server runs, incrementally on
+every run after the first, and `yanuget restore` puts it back. See
+[Backup, restore and moving hosts](backup.md), which also covers moving the
+server to a new host.
+
 The database and the package store must be backed up **together and
-consistently** — a database referencing a payload that is not in the backup is
-worse than either one missing.
-
-The database is in WAL mode, so copying `yanuget.db` while the server runs can
-capture a torn state. Either stop the server, or use SQLite's online backup:
-
-```bash
-# Consistent database snapshot without stopping the server.
-sqlite3 /var/lib/yanuget/yanuget.db ".backup '/backup/yanuget.db'"
-
-# Then the payloads, and the certificate pair.
-rsync -a /var/lib/yanuget/packages/ /backup/packages/
-rsync -a /var/lib/yanuget/tls/ /backup/tls/
-```
-
-Taking the database first and the files second is the right order, but it is
-not airtight while the server runs. New pushes only add files, so they can only
-leave extra files in the backup. Anything that *removes* a file between the two
-steps — a delete, an overwrite of an existing version (`allow_overwrite`), a
-retention run, a file detached from a version — takes away a payload the
-snapshot still references, and the backup has a database row whose file is
-missing. For a backup that is consistent by construction, either stop the
-server for the duration, or copy from a filesystem snapshot (LVM, ZFS, btrfs)
-of the whole data directory taken at one instant — with the database inside it
-copied by `.backup` from that snapshot, or the server stopped when it is taken.
-`.uploads/` and `.migrate/` hold only work in progress and can be left out
-(a resumable upload that was unfinished at backup time then starts over).
-
-Restore by putting everything back and starting the server; no import step is
-needed.
-
-Back up `tls/` too if the server uses its self-signed pair. A missing pair is
-regenerated on start, but as a *new* certificate: every client that was told to
-trust the old one stops connecting until it is told again. (With
-`tls_cert_path`/`tls_key_path` the certificate lives wherever those point —
-back that up instead.)
+consistently**. Copying the data directory with `cp` or `rsync` while the
+server runs is not a backup: the database is in WAL mode and can be captured
+torn, and a delete between copying the database and the files leaves rows
+whose payloads are missing. A filesystem snapshot (LVM, ZFS, btrfs) of the
+whole data directory, taken at one instant, is consistent too.
 
 ## systemd
 
@@ -286,7 +261,7 @@ default `client_max_body_size` will reject the push outright.
 
 1. Read the [changelog](https://github.com/thoscut/yanuget/blob/main/CHANGELOG.md)
    for the versions you are skipping.
-2. Back up as above. This is the step people skip.
+2. Back up with `yanuget backup`. This is the step people skip.
 3. Replace the binary or pull the new image and restart.
 
 Schema changes are applied automatically at startup and are additive, so an

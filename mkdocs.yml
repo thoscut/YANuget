@@ -72,6 +72,7 @@ nav:
       - Command line: cli.md
   - Operations:
       - Deployment: deployment.md
+      - Backup and moving hosts: backup.md
       - Bulk migration: migrate.md
   - Internals:
       - Architecture: architecture.md

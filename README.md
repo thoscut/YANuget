@@ -347,9 +347,9 @@ Chocolatey, Visual Studio, certificates, read keys, symbols),
 [HTTP API](docs/api.md), every [configuration option](docs/configuration.md)
 and the [command line](docs/cli.md); and covers
 [deploying it as a service](docs/deployment.md) (systemd, Compose, Kubernetes
-probes, backup/restore, upgrades), [bulk migration](docs/migrate.md), the
-[architecture](docs/architecture.md) and the
-[large-package design](docs/large-packages.md).
+probes, upgrades), [backup, restore and moving hosts](docs/backup.md),
+[bulk migration](docs/migrate.md), the [architecture](docs/architecture.md) and
+the [large-package design](docs/large-packages.md).
 
 Release binaries and the container image ship the rendered docs; a plain
 `cargo build` without MkDocs still compiles (a small placeholder page is embedded
@@ -489,6 +489,20 @@ and `--source-token-file`, rather than as arguments: anything on the command
 line is visible to other users in `ps` and stays in shell history, and
 `"$TOKEN"` does not help — the shell expands it into the argument list. See
 [Bulk migration](docs/migrate.md).
+
+### Backup and restore
+
+`yanuget backup` takes a consistent copy of the database, the package store and
+the self-signed TLS pair **while the server runs**, and re-running it into the
+same directory copies only what changed. `yanuget restore` puts it back into a
+stopped server. Together they are also the way to move a server to a new host:
+
+```bash
+yanuget --config /etc/yanuget/yanuget.toml backup /srv/backup/yanuget
+yanuget --config /etc/yanuget/yanuget.toml restore /srv/backup/yanuget
+```
+
+See [Backup, restore and moving hosts](docs/backup.md).
 
 ### Offline license policy
 

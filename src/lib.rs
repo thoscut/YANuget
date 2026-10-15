@@ -12,6 +12,7 @@
 //! server is built up.
 
 pub mod auth;
+pub mod backup;
 pub mod config;
 pub mod database;
 pub mod error;

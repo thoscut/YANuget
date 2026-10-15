@@ -37,6 +37,31 @@ enum Command {
     /// (the configured port and scheme) and exit 0 when it is ready, 1 when
     /// it is not. Meant for container health checks.
     Healthcheck,
+    /// Back up the database, the package store and the self-signed TLS pair
+    /// into a directory while the server keeps running. Re-running into the
+    /// same directory copies only what changed.
+    Backup(BackupArgs),
+    /// Restore a backup taken by `yanuget backup` into the configured data
+    /// directory. The server must be stopped.
+    Restore(RestoreArgs),
+}
+
+/// Arguments for `yanuget backup`.
+#[derive(Debug, Args)]
+struct BackupArgs {
+    /// Directory to write the backup to; created if needed.
+    dest: std::path::PathBuf,
+}
+
+/// Arguments for `yanuget restore`.
+#[derive(Debug, Args)]
+struct RestoreArgs {
+    /// Directory holding a backup written by `yanuget backup`.
+    src: std::path::PathBuf,
+    /// Replace an existing database and package store. Files the backup does
+    /// not have are removed from the store.
+    #[arg(long)]
+    force: bool,
 }
 
 /// Arguments for `yanuget migrate`.
@@ -144,6 +169,8 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Some(Command::Migrate(args)) => run_migrate(cli.config.as_deref(), *args).await,
         Some(Command::Healthcheck) => run_healthcheck(cli.config.as_deref()).await,
+        Some(Command::Backup(args)) => run_backup(cli.config.as_deref(), args).await,
+        Some(Command::Restore(args)) => run_restore(cli.config.as_deref(), args).await,
         None => {
             init_tracing();
             run_server(cli.config.as_deref()).await
@@ -465,6 +492,71 @@ async fn run_healthcheck(config_path: Option<&str>) -> anyhow::Result<()> {
     if !status.is_success() {
         anyhow::bail!("{url}: {status}");
     }
+    Ok(())
+}
+
+/// Back up the server's data into `args.dest` while it runs.
+async fn run_backup(config_path: Option<&str>, args: BackupArgs) -> anyhow::Result<()> {
+    init_tracing_quiet();
+    let config = Config::load(config_path)?;
+    let s = yanuget::backup::backup(&config, &args.dest, indicatif::ProgressDrawTarget::stderr())
+        .await?;
+    let m = &s.manifest;
+    println!(
+        "Backed up {} package versions, {} files ({}) to {}: {} copied ({}), {} removed.",
+        m.packages,
+        m.files,
+        indicatif::HumanBytes(m.bytes),
+        args.dest.display(),
+        s.copied,
+        indicatif::HumanBytes(s.copied_bytes),
+        s.removed,
+    );
+    if !m.missing.is_empty() {
+        eprintln!(
+            "warning: {} file(s) the database references are missing from the live store too:",
+            m.missing.len()
+        );
+        for path in m.missing.iter().take(20) {
+            eprintln!("  {path}");
+        }
+    }
+    if config.tls_pair().is_some() {
+        eprintln!("note: the configured TLS certificate and key are not included; back them up separately.");
+    }
+    Ok(())
+}
+
+/// Restore a backup into the configured data directory, refusing while a
+/// server answers on the configured port.
+async fn run_restore(config_path: Option<&str>, args: RestoreArgs) -> anyhow::Result<()> {
+    init_tracing_quiet();
+    let config = Config::load(config_path)?;
+    let url = healthcheck_url(&config);
+    let probe = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .timeout(Duration::from_secs(4))
+        .no_proxy()
+        .build()?;
+    // Any answer at all means a server holds the database open.
+    if probe.get(&url).send().await.is_ok() {
+        anyhow::bail!("a server answers at {url}; stop it before restoring");
+    }
+    let s = yanuget::backup::restore(
+        &config,
+        &args.src,
+        args.force,
+        indicatif::ProgressDrawTarget::stderr(),
+    )
+    .await?;
+    println!(
+        "Restored the backup of {} ({} package versions, {} files): {} copied, {} removed.",
+        s.manifest.created.format("%Y-%m-%d %H:%M:%S UTC"),
+        s.manifest.packages,
+        s.manifest.files,
+        s.copied,
+        s.removed,
+    );
     Ok(())
 }
 
