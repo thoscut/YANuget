@@ -10,7 +10,7 @@ use futures::StreamExt;
 use super::helpers::{
     check_id, content_length, detached, map_upload_err, parse_version, to_io_err,
 };
-use super::AppState;
+use super::{AppState, FeedCounters};
 use crate::error::{Error, Result};
 use crate::indexing::{self, IndexOptions};
 use crate::retention::{self, RetentionPolicy};
@@ -43,6 +43,7 @@ pub(super) async fn push_package(
             &options,
         )
         .await?;
+        FeedCounters::count(&state.feed.counters.pushes);
         // Pushing a deleted version back is how it is un-deleted for the
         // mirror.
         if let Err(e) = state

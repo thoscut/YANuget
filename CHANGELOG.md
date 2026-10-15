@@ -28,6 +28,16 @@ expected to change incompatibly at any version.
   delete raced the copy. `yanuget restore <dir>` puts a backup back into a
   stopped server. The documentation gains a page on backups and on moving a
   server to a new host.
+- `[monitoring]`, off by default: `GET /metrics` in the Prometheus text format
+  and `GET /health/status` as JSON, optionally behind a bearer token. Both
+  report the database, packages, versions and bytes per feed, pushes,
+  promotions and downloads since startup, and each mirror's upstream status.
+- Mirrors record whether their upstream answers. The first failure logs
+  `mirror upstream unreachable`, recovery logs `mirror upstream reachable
+  again`, and each mirror probes its upstream's service index at startup and
+  every `probe_interval_secs` (default 300, `0` off), so an outage is visible
+  before a client needs the upstream. `/health` and `/health/ready` are
+  unaffected by it.
 
 ### Fixed
 

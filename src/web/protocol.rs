@@ -9,7 +9,7 @@ use axum::response::{Html, IntoResponse, Json, Response};
 use serde::Deserialize;
 
 use super::helpers::{check_id, is_semver2_level, parse_stored_version, parse_version};
-use super::{files, ui, AppState};
+use super::{files, ui, AppState, FeedCounters};
 use crate::database::SearchRequest;
 use crate::error::{Error, Result};
 use crate::nuget;
@@ -243,6 +243,7 @@ pub(super) async fn download_package(
     // it already has them. The write runs off the request path, so a busy
     // database never holds up the file.
     if files::counts_as_download(&method, &headers) && files::sends_content(&response) {
+        FeedCounters::count(&state.feed.counters.downloads);
         let (db, feed) = (state.db.clone(), state.feed.name.clone());
         tokio::spawn(async move {
             if let Err(e) = db.increment_downloads(&feed, &id, &version).await {

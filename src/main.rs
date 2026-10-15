@@ -237,7 +237,49 @@ async fn run_server(config_path: Option<&str>) -> anyhow::Result<()> {
         // Shared with the admin page, so a sweep and a manual cleanup never
         // run at once and the page can say when the last one ran.
         let cleanup = state.feed.cleanup.clone();
+        let probed = state.feed.clone();
         states.push(state);
+
+        // Ask the mirror's upstream whether it answers, at startup and then
+        // every `probe_interval_secs`, so an outage is in the log (and in
+        // `/health/status`) before a restore runs into it.
+        if probed.mirror.is_some() && feed.mirror.probe_interval_secs > 0 {
+            let period = Duration::from_secs(feed.mirror.probe_interval_secs);
+            let mut shutdown = shutdown_rx.clone();
+            background.push(tokio::spawn(async move {
+                let Some(client) = &probed.mirror else {
+                    return;
+                };
+                let mut tick = tokio::time::interval(period);
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    tokio::select! {
+                        _ = tick.tick() => {}
+                        _ = shutdown.changed() => break,
+                    }
+                    let was_failing = client.upstream_status().consecutive_failures > 0;
+                    let probe = tokio::select! {
+                        probe = client.probe() => probe,
+                        _ = shutdown.changed() => break,
+                    };
+                    // The first failure is logged where it is recorded; this
+                    // repeats it while the outage lasts.
+                    if let Err(e) = probe {
+                        if was_failing {
+                            let status = client.upstream_status();
+                            tracing::warn!(
+                                feed = %probed.name,
+                                upstream = %yanuget::mirror::redact_url(client.upstream()),
+                                error = %e,
+                                failures = status.consecutive_failures,
+                                since = %status.failing_since.map(|t| t.to_rfc3339()).unwrap_or_default(),
+                                "mirror upstream still unreachable"
+                            );
+                        }
+                    }
+                }
+            }));
+        }
 
         // Background retention sweep per feed, when enabled.
         if feed.retention.enabled
@@ -729,6 +771,8 @@ fn build_source_config(args: &MigrateArgs) -> anyhow::Result<MirrorConfig> {
         // The shell's `HTTP(S)_PROXY` applies, as it would to `curl`.
         proxy: None,
         ca_cert_path: args.source_ca_cert.clone(),
+        // A migration is one run, not a server watching its upstream.
+        probe_interval_secs: 0,
     })
 }
 

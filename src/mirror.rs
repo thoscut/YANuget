@@ -13,6 +13,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex as StdMutex;
 use std::time::{Duration, Instant};
 
@@ -55,6 +56,10 @@ pub struct MirrorClient {
     refresh: Duration,
     resources: OnceCell<MirrorResources>,
     tracker: Tracker,
+    /// Whether the upstream answers, and what the mirror fetched from it.
+    health: UpstreamHealth,
+    /// The feed this client fills, for log lines. Empty outside the server.
+    feed: String,
 }
 
 impl std::fmt::Debug for MirrorClient {
@@ -338,6 +343,8 @@ impl MirrorClient {
             refresh: Duration::from_secs(config.refresh_secs),
             resources: OnceCell::new(),
             tracker: Tracker::default(),
+            health: UpstreamHealth::default(),
+            feed: String::new(),
         })
     }
 
@@ -437,7 +444,30 @@ impl MirrorClient {
     /// are for — instead of being stored as the redirect's body.
     ///
     /// `deadline` bounds the whole exchange, every hop and the body included.
+    ///
+    /// Every outcome is recorded in the client's [`UpstreamStatus`]: an
+    /// upstream that cannot be reached, or answers with a server error or a
+    /// refusal of the credentials, counts as failing.
     async fn send(
+        &self,
+        url: &str,
+        what: &str,
+        deadline: Option<Duration>,
+    ) -> Result<reqwest::Response> {
+        let result = self.send_unrecorded(url, what, deadline).await;
+        match &result {
+            Ok(resp) if upstream_failed(resp.status()) => self.record_failure(&format!(
+                "upstream {what} {} answered {}",
+                redact_url(resp.url().as_str()),
+                resp.status()
+            )),
+            Ok(_) => self.record_success(),
+            Err(e) => self.record_failure(&e.to_string()),
+        };
+        result
+    }
+
+    async fn send_unrecorded(
         &self,
         url: &str,
         what: &str,
@@ -595,6 +625,66 @@ impl MirrorClient {
                 redact_url(url)
             ))
         })
+    }
+
+    /// Name the feed this client fills, so its log lines say which one.
+    pub fn set_feed_name(&mut self, feed: &str) {
+        self.feed = feed.to_string();
+    }
+
+    /// Whether the upstream answers, as far as this process has seen.
+    pub fn upstream_status(&self) -> UpstreamStatus {
+        self.health.status()
+    }
+
+    /// Ask the upstream for its service index, outside any client request.
+    ///
+    /// Read-through traffic alone only notices an outage when someone asks
+    /// for a package the feed lacks, which on a feed that already holds what
+    /// its clients restore can be days later. The server runs this every
+    /// `probe_interval_secs` so the status (and the log) stays current.
+    /// The cached resources are left alone: this only asks whether the
+    /// upstream answers.
+    pub async fn probe(&self) -> Result<()> {
+        match self.get_json(&self.upstream, "service index").await {
+            Ok(Some(_)) => Ok(()),
+            Ok(None) => {
+                let e = not_found("service index", &self.upstream);
+                self.record_failure(&e.to_string());
+                Err(e)
+            }
+            Err(e) => {
+                // A body that is not JSON passed `send` as an answer; it is
+                // still not a usable upstream.
+                if self.health.status().consecutive_failures == 0 {
+                    self.record_failure(&e.to_string());
+                }
+                Err(e)
+            }
+        }
+    }
+
+    fn record_success(&self) {
+        if let Some((failures, since)) = self.health.succeed() {
+            tracing::info!(
+                feed = %self.feed,
+                upstream = %redact_url(&self.upstream),
+                failures,
+                down_since = %since.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                "mirror upstream reachable again"
+            );
+        }
+    }
+
+    fn record_failure(&self, error: &str) {
+        if self.health.fail(error) {
+            tracing::warn!(
+                feed = %self.feed,
+                upstream = %redact_url(&self.upstream),
+                %error,
+                "mirror upstream unreachable; the feed serves only what it already holds"
+            );
+        }
     }
 
     /// The upstream service-index URL this client mirrors from.
@@ -1081,6 +1171,105 @@ impl Backoff {
 
     fn succeed(&mut self) {
         *self = Self::default();
+    }
+}
+
+/// Whether an upstream answer means the upstream is not usable: a server
+/// error, a refusal of the credentials, or a rate limit. A `404` is a normal
+/// answer (the upstream lacks that package), and so is anything else.
+fn upstream_failed(status: reqwest::StatusCode) -> bool {
+    status.is_server_error() || matches!(status.as_u16(), 401 | 403 | 407 | 429)
+}
+
+/// Whether the upstream answers, for `/health/status`, `/metrics` and the
+/// log: the outcome of every request the client sent, plus counters of what
+/// it fetched.
+#[derive(Default)]
+struct UpstreamHealth {
+    state: StdMutex<UpstreamStatus>,
+    /// Versions downloaded and indexed into the feed.
+    mirrored: AtomicU64,
+    /// Versions that failed to download or index.
+    mirror_failures: AtomicU64,
+}
+
+/// A snapshot of an upstream's reachability and of what was fetched from it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UpstreamStatus {
+    /// The last answer the upstream gave that was not a failure.
+    pub last_success: Option<chrono::DateTime<chrono::Utc>>,
+    /// The last failed request.
+    pub last_failure: Option<chrono::DateTime<chrono::Utc>>,
+    /// What the last failure was, redacted like every upstream log line.
+    pub last_error: Option<String>,
+    /// Failed requests since the last success; `0` while the upstream answers.
+    pub consecutive_failures: u64,
+    /// The first failure of the current run of failures.
+    pub failing_since: Option<chrono::DateTime<chrono::Utc>>,
+    /// Requests sent to the upstream since startup.
+    pub requests: u64,
+    /// Requests that failed since startup.
+    pub failures: u64,
+    /// Versions mirrored into the feed since startup.
+    pub mirrored: u64,
+    /// Versions that failed to download or index since startup.
+    pub mirror_failures: u64,
+}
+
+impl UpstreamStatus {
+    /// `Some(true)` while the upstream answers, `Some(false)` while it fails,
+    /// `None` before anything was asked of it.
+    pub fn reachable(&self) -> Option<bool> {
+        if self.consecutive_failures > 0 {
+            Some(false)
+        } else if self.last_success.is_some() {
+            Some(true)
+        } else {
+            None
+        }
+    }
+}
+
+impl UpstreamHealth {
+    fn lock(&self) -> std::sync::MutexGuard<'_, UpstreamStatus> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn status(&self) -> UpstreamStatus {
+        UpstreamStatus {
+            mirrored: self.mirrored.load(Ordering::Relaxed),
+            mirror_failures: self.mirror_failures.load(Ordering::Relaxed),
+            ..self.lock().clone()
+        }
+    }
+
+    /// Record a success. Returns how many failures in a row it ends, and
+    /// since when, when it ends any.
+    fn succeed(&self) -> Option<(u64, chrono::DateTime<chrono::Utc>)> {
+        let mut state = self.lock();
+        state.requests += 1;
+        state.last_success = Some(chrono::Utc::now());
+        let ended = state
+            .failing_since
+            .take()
+            .map(|since| (state.consecutive_failures, since));
+        state.consecutive_failures = 0;
+        ended
+    }
+
+    /// Record a failure. Returns whether it is the first of a run, which is
+    /// when the log says so.
+    fn fail(&self, error: &str) -> bool {
+        let now = chrono::Utc::now();
+        let mut state = self.lock();
+        state.requests += 1;
+        state.failures += 1;
+        state.consecutive_failures += 1;
+        state.last_failure = Some(now);
+        state.last_error = Some(error.to_string());
+        let first = state.failing_since.is_none();
+        state.failing_since.get_or_insert(now);
+        first
     }
 }
 
@@ -1587,6 +1776,10 @@ impl MirrorTarget<'_> {
             Err(e) => {
                 let _ = tokio::fs::remove_file(&temp_path).await;
                 self.remember_bad(lower_id, version);
+                self.client
+                    .health
+                    .mirror_failures
+                    .fetch_add(1, Ordering::Relaxed);
                 return Fetched::DownloadFailed(e);
             }
         };
@@ -1620,6 +1813,7 @@ impl MirrorTarget<'_> {
         {
             Ok(_) => {
                 tracing::info!(%feed, id = %lower_id, version = %normalized, pending = options.requires_approval, "mirrored package");
+                self.client.health.mirrored.fetch_add(1, Ordering::Relaxed);
                 Fetched::Mirrored
             }
             // A concurrent fetch in another feed, or a push, got there first.
@@ -1635,6 +1829,10 @@ impl MirrorTarget<'_> {
             Err(e) => {
                 tracing::warn!(%feed, id = %lower_id, version = %normalized, error = %e, "mirror index failed");
                 self.remember_bad(lower_id, version);
+                self.client
+                    .health
+                    .mirror_failures
+                    .fetch_add(1, Ordering::Relaxed);
                 Fetched::NotMirrored
             }
         }
