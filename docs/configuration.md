@@ -54,6 +54,46 @@ A `tls_cert_path` without `tls_key_path`, or the reverse, is also an error
 while TLS is on, rather than a silent fall-back to the self-signed
 certificate.
 
+Check a configuration without starting the server with
+[`yanuget config check`](admin-cli.md#checking-a-configuration): it loads the
+file and the environment exactly as the server does, and also opens the TLS
+certificate and key and the mirror CA bundles.
+
+### Keys from the environment or a file
+
+Every key can be kept out of the TOML file, so `yanuget.toml` can be
+world-readable, managed by Puppet or committed, while the keys come from a
+secret store:
+
+- **Global keys** are `YANUGET_API_KEY`, `YANUGET_API_KEYS` and
+  `YANUGET_ADMIN_API_KEY` (above).
+- **A feed's keys** are `YANUGET_FEED_{NAME}_API_KEY`, `..._API_KEYS`,
+  `..._READ_API_KEY`, `..._ADMIN_API_KEY`, and for its mirror
+  `..._MIRROR_PASSWORD` and `..._MIRROR_TOKEN`. `{NAME}` is the feed's name
+  upper-cased, with `-` and `.` written as `_`: feed `stage` is
+  `YANUGET_FEED_STAGE_API_KEY`, feed `pre-prod` is
+  `YANUGET_FEED_PRE_PROD_API_KEY`. They override a feed the TOML declares;
+  they do not add feeds. Two feeds whose names share a spelling (`pre-prod`
+  and `pre.prod`) cannot be set this way: the server refuses to start rather
+  than guess which one was meant.
+- **Any of these read from a file** when `_FILE` is appended to its name:
+  `YANUGET_FEED_STAGE_API_KEY_FILE=/run/credentials/yanuget.service/stage-push`
+  reads the key from that file (without its trailing newline). A file for a
+  key list holds one key per line, or comma-separated keys. Setting both the
+  variable and its `_FILE` is an error, and so is a file that is missing or
+  empty: an empty push key would otherwise open the feed to anyone.
+
+With systemd, `LoadCredential=` puts the files where only the service can
+read them:
+
+```ini
+[Service]
+LoadCredential=stage-push:/etc/yanuget/keys/stage-push
+LoadCredential=admin:/etc/yanuget/keys/admin
+Environment=YANUGET_FEED_STAGE_API_KEY_FILE=%d/stage-push
+Environment=YANUGET_ADMIN_API_KEY_FILE=%d/admin
+```
+
 ## Rate limiting
 
 Per-client-IP request throttling under the `[rate_limit]` table. A fixed window
@@ -453,6 +493,12 @@ YANuget serves **HTTPS by default**. Behaviour:
   case set `base_url` to the public address, or forward
   `X-Forwarded-Proto`/`X-Forwarded-Host` and list the proxy in
   [`trusted_proxies`](#trusted-proxies) so they are honoured.
+
+Clients check the certificate against the name they connect with, so it must
+name every one they use (the FQDN, a short name, an IP address) as a subject
+alternative name. `yanuget config check` reports each name in `base_url` and
+`allowed_hosts` that the configured certificate does not cover, and refuses a
+key that does not belong to the certificate.
 
 When TLS is on and no base URL is configured, generated URLs default to the
 `https` scheme (still overridable by `X-Forwarded-Proto`). With TLS enabled,

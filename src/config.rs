@@ -788,15 +788,20 @@ impl Config {
         if let Some(v) = get("YANUGET_DATABASE_PATH")? {
             self.database_path = Some(v);
         }
-        if let Some(v) = get("YANUGET_API_KEY")? {
-            self.api_key = (!v.trim().is_empty()).then(|| v.trim().to_string());
+        // Keys also come from a file named by `{NAME}_FILE` (a systemd
+        // credential, a Docker or Kubernetes secret), so none has to sit in
+        // the TOML or in the unit's environment.
+        let secret = |name: &str| secret_var(name, &get);
+        if let Some(v) = secret("YANUGET_API_KEY")? {
+            self.api_key = optional_key(&v);
         }
-        if let Some(v) = get("YANUGET_API_KEYS")? {
-            self.api_keys = split_list(&v);
+        if let Some(v) = secret("YANUGET_API_KEYS")? {
+            self.api_keys = split_keys(&v);
         }
-        if let Some(v) = get("YANUGET_ADMIN_API_KEY")? {
-            self.admin_api_key = (!v.trim().is_empty()).then(|| v.trim().to_string());
+        if let Some(v) = secret("YANUGET_ADMIN_API_KEY")? {
+            self.admin_api_key = optional_key(&v);
         }
+        self.apply_feed_env(&secret)?;
         if let Some(v) = get("YANUGET_GALLERY_PAGE_SIZE")? {
             let n: i64 = parse_env_int("YANUGET_GALLERY_PAGE_SIZE", &v)?;
             if n < 1 {
@@ -906,6 +911,59 @@ impl Config {
         }
         if let Some(v) = get("YANUGET_ALLOWED_HOSTS")? {
             self.allowed_hosts = split_list(&v);
+        }
+        Ok(())
+    }
+
+    /// Overlay each configured feed's keys from `YANUGET_FEED_{NAME}_*` (see
+    /// [`feed_env_name`]), each also readable from a `..._FILE`.
+    ///
+    /// Only feeds the TOML declares are looked up: the environment overrides
+    /// a feed's secrets, it does not invent feeds.
+    fn apply_feed_env(&mut self, secret: &impl Fn(&str) -> Result<Option<String>>) -> Result<()> {
+        // `a-b` and `a.b` share a name in the environment; a value set there
+        // could be meant for either, so it is refused rather than guessed.
+        let mut seen: std::collections::HashMap<String, &str> = Default::default();
+        let mut ambiguous = Vec::new();
+        for f in &self.feeds {
+            let env = feed_env_name(&f.name);
+            if let Some(other) = seen.insert(env.clone(), &f.name) {
+                ambiguous.push((env, other.to_string(), f.name.clone()));
+            }
+        }
+        for (env, a, b) in ambiguous {
+            for suffix in FEED_ENV_SUFFIXES {
+                let name = format!("YANUGET_FEED_{env}_{suffix}");
+                if secret(&name)?.is_some() {
+                    return Err(env_error(
+                        &name,
+                        &format!("could be meant for feed {a:?} or {b:?}; rename one of them"),
+                    ));
+                }
+            }
+        }
+
+        for f in &mut self.feeds {
+            let var =
+                |suffix: &str| secret(&format!("YANUGET_FEED_{}_{suffix}", feed_env_name(&f.name)));
+            if let Some(v) = var("API_KEY")? {
+                f.api_key = optional_key(&v);
+            }
+            if let Some(v) = var("API_KEYS")? {
+                f.api_keys = split_keys(&v);
+            }
+            if let Some(v) = var("READ_API_KEY")? {
+                f.read_api_key = optional_key(&v);
+            }
+            if let Some(v) = var("ADMIN_API_KEY")? {
+                f.admin_api_key = optional_key(&v);
+            }
+            if let Some(v) = var("MIRROR_PASSWORD")? {
+                f.mirror.auth.password = optional_key(&v);
+            }
+            if let Some(v) = var("MIRROR_TOKEN")? {
+                f.mirror.auth.token = optional_key(&v);
+            }
         }
         Ok(())
     }
@@ -1343,6 +1401,78 @@ fn parse_env_host(name: &str, v: &str) -> Result<IpAddr> {
 }
 
 /// A comma-separated environment list, trimmed, empties dropped.
+/// The per-feed secrets the environment can set, as `YANUGET_FEED_{NAME}_{SUFFIX}`.
+const FEED_ENV_SUFFIXES: [&str; 6] = [
+    "API_KEY",
+    "API_KEYS",
+    "READ_API_KEY",
+    "ADMIN_API_KEY",
+    "MIRROR_PASSWORD",
+    "MIRROR_TOKEN",
+];
+
+/// A feed's name as it appears in its environment variables: upper-cased,
+/// with `-` and `.` (which a variable name cannot hold) as `_`. Feed `stage`
+/// is `YANUGET_FEED_STAGE_*`, feed `pre-prod` is `YANUGET_FEED_PRE_PROD_*`.
+pub fn feed_env_name(feed: &str) -> String {
+    feed.chars()
+        .map(|c| match c {
+            '-' | '.' => '_',
+            c => c.to_ascii_uppercase(),
+        })
+        .collect()
+}
+
+/// A secret from the environment variable `name`, or from the file named by
+/// `{name}_FILE`; setting both is refused, since only one can win and the
+/// operator meant one of them.
+///
+/// A file's trailing newline is not part of the secret. An empty or
+/// unreadable file is an error rather than "no key": for a push key that
+/// would quietly open the feed to anyone.
+fn secret_var(name: &str, get: &impl Fn(&str) -> Result<Option<String>>) -> Result<Option<String>> {
+    let file_var = format!("{name}_FILE");
+    match (get(name)?, get(&file_var)?) {
+        (Some(_), Some(_)) => Err(env_error(
+            name,
+            &format!("and {file_var} are both set; set only one"),
+        )),
+        (Some(v), None) => Ok(Some(v)),
+        (None, Some(path)) => {
+            let raw = std::fs::read_to_string(&path).map_err(|e| {
+                env_error(
+                    &file_var,
+                    &format!("names {path:?}, which cannot be read: {e}"),
+                )
+            })?;
+            let value = raw.trim_end_matches(['\r', '\n']);
+            if value.trim().is_empty() {
+                return Err(env_error(
+                    &file_var,
+                    &format!("names {path:?}, which is empty"),
+                ));
+            }
+            Ok(Some(value.to_string()))
+        }
+        (None, None) => Ok(None),
+    }
+}
+
+/// A single key from the environment: blank clears it.
+fn optional_key(v: &str) -> Option<String> {
+    (!v.trim().is_empty()).then(|| v.trim().to_string())
+}
+
+/// A key list from the environment or a key file: comma- or line-separated,
+/// so a file can hold one key per line.
+fn split_keys(v: &str) -> Vec<String> {
+    v.split([',', '\n'])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 fn split_list(v: &str) -> Vec<String> {
     v.split(',')
         .map(str::trim)
@@ -1798,5 +1928,115 @@ mod tests {
         .unwrap();
         let err = config.resolved_feeds().unwrap_err().to_string();
         assert!(err.contains("\"up\"") && err.contains("token"), "{err}");
+    }
+
+    /// Apply `vars` as the environment on top of `config`.
+    fn env_over(mut c: Config, vars: &[(&str, &str)]) -> Result<Config> {
+        let map: std::collections::HashMap<String, String> = vars
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        c.apply_env_from(|name| map.get(name).cloned().ok_or(std::env::VarError::NotPresent))?;
+        Ok(c)
+    }
+
+    fn two_feeds() -> Config {
+        Config {
+            feeds: vec![
+                FeedConfig {
+                    name: "stage".into(),
+                    api_key: Some("from-toml".into()),
+                    ..Default::default()
+                },
+                FeedConfig {
+                    name: "pre-prod".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn feed_keys_come_from_the_environment_or_a_key_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let admin = dir.path().join("admin");
+        std::fs::write(&admin, "admin-from-file\n").unwrap();
+        let keys = dir.path().join("keys");
+        std::fs::write(&keys, "one\ntwo\n\n").unwrap();
+        let c = env_over(
+            two_feeds(),
+            &[
+                ("YANUGET_FEED_STAGE_API_KEY", "from-env"),
+                (
+                    "YANUGET_FEED_PRE_PROD_ADMIN_API_KEY_FILE",
+                    admin.to_str().unwrap(),
+                ),
+                (
+                    "YANUGET_FEED_PRE_PROD_API_KEYS_FILE",
+                    keys.to_str().unwrap(),
+                ),
+                ("YANUGET_FEED_PRE_PROD_READ_API_KEY", "reader"),
+                ("YANUGET_FEED_PRE_PROD_MIRROR_TOKEN", "upstream-token"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(c.feeds[0].api_key.as_deref(), Some("from-env"));
+        assert_eq!(c.feeds[1].admin_api_key.as_deref(), Some("admin-from-file"));
+        assert_eq!(c.feeds[1].api_keys, vec!["one", "two"]);
+        assert_eq!(c.feeds[1].read_api_key.as_deref(), Some("reader"));
+        assert_eq!(
+            c.feeds[1].mirror.auth.token.as_deref(),
+            Some("upstream-token")
+        );
+    }
+
+    #[test]
+    fn global_keys_come_from_a_key_file_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = dir.path().join("admin");
+        std::fs::write(&key, "global-admin\r\n").unwrap();
+        let c = env_over(
+            Config::default(),
+            &[("YANUGET_ADMIN_API_KEY_FILE", key.to_str().unwrap())],
+        )
+        .unwrap();
+        assert_eq!(c.admin_api_key.as_deref(), Some("global-admin"));
+    }
+
+    #[test]
+    fn a_key_file_that_is_empty_missing_or_doubled_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let empty = dir.path().join("empty");
+        std::fs::write(&empty, "\n").unwrap();
+        let missing = dir.path().join("missing");
+        for vars in [
+            vec![("YANUGET_API_KEY_FILE", empty.to_str().unwrap())],
+            vec![("YANUGET_FEED_STAGE_API_KEY_FILE", missing.to_str().unwrap())],
+            vec![
+                ("YANUGET_FEED_STAGE_API_KEY", "a"),
+                ("YANUGET_FEED_STAGE_API_KEY_FILE", empty.to_str().unwrap()),
+            ],
+        ] {
+            assert!(env_over(two_feeds(), &vars).is_err(), "{vars:?}");
+        }
+    }
+
+    #[test]
+    fn a_feed_variable_two_feeds_could_claim_is_refused() {
+        let mut c = two_feeds();
+        c.feeds.push(FeedConfig {
+            name: "pre.prod".into(),
+            ..Default::default()
+        });
+        // Unset, the shared spelling is harmless.
+        assert!(env_over(c.clone(), &[]).is_ok());
+        let err = env_over(c, &[("YANUGET_FEED_PRE_PROD_API_KEY", "k")])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("pre-prod") && err.contains("pre.prod"),
+            "{err}"
+        );
     }
 }

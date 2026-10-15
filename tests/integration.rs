@@ -4734,3 +4734,88 @@ async fn an_upload_that_would_fill_the_disk_is_refused() {
         reqwest::StatusCode::NOT_FOUND
     );
 }
+
+/// `yanuget admin` drives the same routes as the admin page: it reads the
+/// CSRF token off the package's admin page and posts the action with it.
+#[tokio::test]
+async fn the_admin_client_promotes_and_approves_across_rings() {
+    use yanuget::admin_client::{Action, AdminClient, CertPolicy};
+    let server = spawn_feeds(|c| {
+        c.api_key = Some(API_KEY.into());
+        c.admin_api_key = Some(ADMIN_KEY.into());
+        let mut dev = feed("dev");
+        dev.promotes_to = Some("stable".into());
+        let mut stable = feed("stable");
+        stable.requires_approval = true;
+        c.feeds = vec![dev, stable];
+    })
+    .await;
+    push_to(
+        &server,
+        "/dev/api/v2/package",
+        API_KEY,
+        build_nupkg("Cli.Pkg", "1.0.0", b"x"),
+    )
+    .await;
+    let client = |feed: &str, key: &str| {
+        AdminClient::new(&server.url(feed), key, CertPolicy::System).unwrap()
+    };
+
+    let promoted = client("/dev", ADMIN_KEY)
+        .run(Action::Promote, "Cli.Pkg", "1.0.0")
+        .await
+        .unwrap();
+    assert!(promoted.starts_with("promoted Cli.Pkg 1.0.0"), "{promoted}");
+    assert_eq!(
+        status_of(&server, "/stable/v3/package/cli.pkg/index.json").await,
+        reqwest::StatusCode::NOT_FOUND,
+        "pending in stable until approved"
+    );
+    let approved = client("/stable", ADMIN_KEY)
+        .run(Action::Approve, "Cli.Pkg", "1.0.0")
+        .await
+        .unwrap();
+    assert_eq!(approved, "approved Cli.Pkg 1.0.0");
+    assert!(status_of(&server, "/stable/v3/package/cli.pkg/index.json")
+        .await
+        .is_success());
+
+    // The server's own reason comes through.
+    let err = client("/stable", ADMIN_KEY)
+        .run(Action::Promote, "Cli.Pkg", "1.0.0")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("no promotion target"), "{err}");
+
+    let err = client("/dev", "wrong-key")
+        .run(Action::Disable, "Cli.Pkg", "1.0.0")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("admin key was refused"), "{err}");
+
+    let err = client("/dev", ADMIN_KEY)
+        .run(Action::Disable, "No.Such.Pkg", "1.0.0")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("No.Such.Pkg is not in the feed"), "{err}");
+
+    let err = client("/nowhere", ADMIN_KEY)
+        .run(Action::Disable, "Cli.Pkg", "1.0.0")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("has no admin area"), "{err}");
+
+    let disabled = client("/dev", ADMIN_KEY)
+        .run(Action::Disable, "Cli.Pkg", "1.0.0")
+        .await
+        .unwrap();
+    assert_eq!(disabled, "disabled Cli.Pkg 1.0.0");
+    assert_eq!(
+        status_of(&server, "/dev/v3/package/cli.pkg/index.json").await,
+        reqwest::StatusCode::NOT_FOUND
+    );
+}

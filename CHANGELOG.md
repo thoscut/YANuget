@@ -12,6 +12,29 @@ expected to change incompatibly at any version.
 
 ## [Unreleased]
 
+### Added
+
+- `yanuget admin` promotes, approves, enables, disables, pins, unpins or
+  deletes a version through a running server's admin area, so a promotion
+  can be scripted. On the server's machine it needs no arguments beyond the
+  feed; elsewhere `--url` and the admin key (`YANUGET_ADMIN_KEY` or
+  `--admin-key-file`).
+- `yanuget config check` checks a configuration before the server starts with
+  it: every value, the TLS certificate and key (that they parse, that the key
+  belongs to the certificate, and that the certificate names the configured
+  hosts), mirror CA bundles and promotion targets. It exits `1` on an error.
+- A feed's keys can be set from the environment
+  (`YANUGET_FEED_{NAME}_API_KEY`, `..._READ_API_KEY`, `..._ADMIN_API_KEY`,
+  `..._MIRROR_PASSWORD`, …), and every key variable, global or per feed, can
+  be read from a file named by the same variable with `_FILE` appended, such
+  as a systemd credential.
+
+### Changed
+
+- An admin or gallery error answered to a request that asks for
+  `application/json` (and not `text/html`) keeps its JSON body with the
+  reason, instead of the HTML error page.
+
 ## [0.6.0] — 2026-10-01
 
 **Upgrading from 0.5.x needs attention.** This release follows a full review

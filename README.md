@@ -166,6 +166,10 @@ The essentials:
 | Trusted proxies | `YANUGET_TRUSTED_PROXIES` | *(none)* | Peers whose `X-Forwarded-*` is honoured. Set behind a proxy. |
 | CORS origins | *(TOML only)* | *(none)* | Browser origins allowed to read the feed. |
 
+Every key, global or per feed (`YANUGET_FEED_{NAME}_API_KEY`, …), can also be
+read from a file by appending `_FILE` to its variable, so none has to sit in
+the TOML file.
+
 ---
 
 ## API
@@ -360,6 +364,19 @@ so retention never deletes it, and `/admin/retention` shows exactly what the nex
 cleanup would delete and why — with a button that deletes that list and nothing
 else. The area is only mounted when an admin key is configured, and the settings
 page says how to turn it on.
+
+The same actions are scriptable with `yanuget admin` (see
+[docs/admin-cli.md](docs/admin-cli.md)):
+
+```bash
+yanuget admin --feed stage promote Contoso.Utils 1.4.0       # on the server
+yanuget admin --url https://nuget.example.com --feed production \
+    approve Contoso.Utils 1.4.0                              # key from YANUGET_ADMIN_KEY
+```
+
+`yanuget config check` validates a configuration (including that the TLS key
+belongs to the certificate and that it names the configured hosts) before the
+server is started with it.
 
 ## Attached files (disk images)
 
