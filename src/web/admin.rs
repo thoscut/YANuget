@@ -16,7 +16,7 @@ use serde::Deserialize;
 
 use super::forms::{form_field, form_fields, lenient};
 use super::helpers::{check_id, parse_version};
-use super::{hosted, ui, AppState, FeedMeta};
+use super::{hosted, ui, AppState, FeedCounters, FeedMeta};
 use crate::database::{Membership, MembershipChange};
 use crate::error::{Error, Result};
 use crate::retention::{self, RetentionPolicy};
@@ -642,6 +642,7 @@ pub(super) async fn admin_promote(
         .find(|m| &m.name == target)
         .ok_or_else(|| Error::BadRequest(format!("unknown promotion target {target:?}")))?;
     let arrival = transfer_version(&state, target_meta, &id, &v, Transfer::Copy).await?;
+    FeedCounters::count(&state.feed.counters.promotions);
     tracing::info!(from = %state.feed(), to = %target, %id, version = %v.normalized(), ?arrival, "promoted version");
     let mut tally = Tally::default();
     tally.count(arrival);
