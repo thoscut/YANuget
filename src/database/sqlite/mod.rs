@@ -217,6 +217,19 @@ impl PackageDatabase for SqliteDatabase {
         packages::replace_version(self, package, membership).await
     }
 
+    async fn replace_pending_version(
+        &self,
+        package: &Package,
+        membership: &Membership,
+        drop_files: bool,
+    ) -> Result<Vec<PackageFile>> {
+        packages::replace_pending_version(self, package, membership, drop_files).await
+    }
+
+    async fn approved_in(&self, id: &str, version: &NuGetVersion) -> Result<Vec<String>> {
+        packages::approved_in(self, id, version).await
+    }
+
     async fn orphaned_versions(&self, limit: i64) -> Result<Vec<Package>> {
         packages::orphaned_versions(self, limit).await
     }

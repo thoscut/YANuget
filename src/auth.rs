@@ -83,6 +83,12 @@ impl ReadAuth {
         self.expected.is_some()
     }
 
+    /// Whether the request carries this key. Unlike
+    /// [`Self::check_headers`], an unset key is never presented.
+    pub fn presented(&self, headers: &HeaderMap) -> bool {
+        self.expected.is_some() && self.check_headers(headers)
+    }
+
     /// Validate the credentials carried in request headers.
     pub fn check_headers(&self, headers: &HeaderMap) -> bool {
         let Some(expected) = &self.expected else {

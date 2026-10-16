@@ -29,6 +29,7 @@
 //! the store, so writing to it later through a handle still open changes
 //! nothing.
 
+use std::collections::HashMap;
 use std::io::Read;
 use std::path::Path;
 
@@ -55,6 +56,9 @@ pub struct Inbox<'a> {
     pub storage: &'a dyn PackageStorage,
     pub db: &'a dyn PackageDatabase,
     pub files: &'a FilesConfig,
+    /// Feeds whose `[feeds.files] allowed_extensions` replaces
+    /// `files.allowed_extensions`; a feed not listed uses the global list.
+    pub feed_extensions: &'a HashMap<String, Vec<String>>,
     pub max_file_size: Option<u64>,
     /// The configured feeds; a directory named otherwise is ignored.
     pub feeds: &'a [String],
@@ -152,7 +156,11 @@ impl Inbox<'_> {
         name: &str,
         dir: &dir::InboxDir,
     ) -> Result<()> {
-        crate::validation::validate_file_name(name, self.files)?;
+        let allowed = self
+            .feed_extensions
+            .get(feed)
+            .unwrap_or(&self.files.allowed_extensions);
+        crate::validation::validate_file_name(name, allowed)?;
         let marker = format!("{name}.sha256");
         let expected = read_marker(open_regular(dir, &marker)?)?;
         if !self.db.exists(feed, id, v).await? {

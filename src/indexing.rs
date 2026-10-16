@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use chrono::Utc;
 
 use crate::config::{LicensePolicyConfig, OverwriteMode, ReservedPrefix};
-use crate::database::{Membership, PackageDatabase};
+use crate::database::{Membership, PackageDatabase, PackageFile};
 use crate::error::{Error, Result};
 use crate::models::Package;
 use crate::nuspec::{self, Nuspec};
@@ -261,7 +261,18 @@ async fn index_inner(
     };
 
     // 5c. The version is already in this feed: honour the overwrite policy.
-    if !options.overwrite.allows(version.is_prerelease()) {
+    //     Under "pending-only" that depends on its state in every feed: a
+    //     version nobody has approved has never been served, so replacing it
+    //     (in every feed that holds it) changes nothing a client has seen.
+    let pending_only = options.overwrite == OverwriteMode::PendingOnly;
+    if pending_only {
+        let approved = db.approved_in(&id, &version).await?;
+        if !approved.is_empty() {
+            return Err(Error::VersionExists(crate::database::approved_refusal(
+                &existing, &approved,
+            )));
+        }
+    } else if !options.overwrite.allows(version.is_prerelease()) {
         return Err(Error::VersionExists(already_here(
             &id,
             &version,
@@ -271,7 +282,8 @@ async fn index_inner(
     }
     // Another feed holding this version pins its payload: the stored bytes
     // cannot be replaced from here, so only an identical re-push can succeed.
-    if !same_content && db.feed_count(&id, &version).await? > 1 {
+    // Not so while every feed holding it is still waiting for approval.
+    if !same_content && !pending_only && db.feed_count(&id, &version).await? > 1 {
         return Err(taken(feed, &id, &version));
     }
     // An overwrite replaces the build, not the operator's decisions about the
@@ -291,13 +303,23 @@ async fn index_inner(
         pending: membership.pending,
         ..result
     };
+    // Under "pending-only" a new build takes the old one's attached files
+    // with it: they belong to the build they were fetched for. The same
+    // build keeps them, so a re-run can complete what an earlier one left.
+    let swap = if pending_only {
+        Swap::PendingOnly {
+            drop_files: !same_content,
+        }
+    } else {
+        Swap::Any
+    };
     if same_content && payload_present {
         // Nothing to store: the bytes on disk are these bytes.
         let _ = tokio::fs::remove_file(temp_path).await;
-        db.replace_version(&existing, &membership).await?;
+        swap.replace(db, &existing, &membership).await?;
         return Ok(result);
     }
-    overwrite(
+    let dropped = overwrite(
         storage,
         db,
         temp_path,
@@ -305,8 +327,13 @@ async fn index_inner(
         &existing,
         &membership,
         &sidecars,
+        swap,
     )
     .await?;
+    if !dropped.is_empty() {
+        delete_unreferenced_blobs(storage, db, &dropped).await;
+        tracing::info!(%feed, %id, version = %normalized, files = dropped.len(), "replaced a pending version and dropped its attached files");
+    }
     // Only once the replacement is recorded: the previous build's PDBs have
     // different SSQP keys, so leaving their mappings behind would keep serving
     // them to anyone debugging the new build — the mappings still resolve to an
@@ -315,6 +342,57 @@ async fn index_inner(
         crate::retention::purge_symbols(storage, db, &id, &version).await?;
     }
     Ok(result)
+}
+
+/// How an overwrite swaps the rows.
+#[derive(Clone, Copy)]
+enum Swap {
+    /// Whatever state the version is in.
+    Any,
+    /// Only while no feed has approved it, checked in the swap's transaction.
+    PendingOnly { drop_files: bool },
+}
+
+impl Swap {
+    /// Swap the rows, returning the attached files dropped with them.
+    async fn replace(
+        self,
+        db: &dyn PackageDatabase,
+        package: &Package,
+        membership: &Membership,
+    ) -> Result<Vec<PackageFile>> {
+        match self {
+            Swap::Any => db
+                .replace_version(package, membership)
+                .await
+                .map(|()| Vec::new()),
+            Swap::PendingOnly { drop_files } => {
+                db.replace_pending_version(package, membership, drop_files)
+                    .await
+            }
+        }
+    }
+}
+
+/// Delete the blobs of dropped files that nothing references any more. A
+/// failure only leaves an unreferenced blob behind, so it is logged.
+async fn delete_unreferenced_blobs(
+    storage: &dyn PackageStorage,
+    db: &dyn PackageDatabase,
+    files: &[PackageFile],
+) {
+    let mut blobs: Vec<&str> = files.iter().map(|f| f.sha256.as_str()).collect();
+    blobs.sort_unstable();
+    blobs.dedup();
+    for sha in blobs {
+        let _blob = crate::locks::lock_blob(sha).await;
+        let unused = matches!(db.blob_references(sha).await, Ok(0));
+        if unused {
+            if let Err(e) = storage.delete_blob(sha).await {
+                tracing::warn!(sha256 = %sha, error = %e, "could not delete the blob of a dropped file");
+            }
+        }
+    }
 }
 
 /// The small files stored next to a payload.
@@ -371,6 +449,9 @@ async fn store_sidecars(
 /// filesystem without hard links the previous bytes cannot be kept aside
 /// without copying them; the store is still an atomic rename, so only a
 /// failure after it can leave the two out of step, and that is logged.
+// The previous build's parts and the new one's, kept as separate arguments so
+// each call site reads as what it passes.
+#[allow(clippy::too_many_arguments)]
 async fn overwrite(
     storage: &dyn PackageStorage,
     db: &dyn PackageDatabase,
@@ -379,7 +460,8 @@ async fn overwrite(
     existing: &Package,
     membership: &Membership,
     sidecars: &Sidecars<'_>,
-) -> Result<()> {
+    swap: Swap,
+) -> Result<Vec<PackageFile>> {
     let id = &package.id;
     let normalized = package.normalized_version();
     let backup = keep_aside(storage, id, &normalized, temp_path).await;
@@ -406,14 +488,17 @@ async fn overwrite(
     }
     let swapped = async {
         store_sidecars(storage, id, &normalized, sidecars).await?;
-        db.replace_version(package, membership).await
+        swap.replace(db, package, membership).await
     }
     .await;
-    let Err(e) = swapped else {
-        if let Some(backup) = backup {
-            let _ = tokio::fs::remove_file(backup).await;
+    let e = match swapped {
+        Ok(dropped) => {
+            if let Some(backup) = backup {
+                let _ = tokio::fs::remove_file(backup).await;
+            }
+            return Ok(dropped);
         }
-        return Ok(());
+        Err(e) => e,
     };
 
     // Put the previous build back, so the rows (which the failed swap left
@@ -986,11 +1071,20 @@ mod tests {
     struct FailingSidecars {
         inner: FilesystemStorage,
         fail: AtomicBool,
+        /// Approve the version in this database and feed when the next
+        /// payload is stored: an admin approving in the middle of an
+        /// overwrite, after its checks and before its rows are swapped.
+        approve_midway: std::sync::Mutex<Option<(SqliteDatabase, &'static str)>>,
     }
 
     #[async_trait::async_trait]
     impl PackageStorage for FailingSidecars {
         async fn store_package(&self, id: &str, version: &str, temp: PathBuf) -> Result<u64> {
+            let approve = self.approve_midway.lock().unwrap().take();
+            if let Some((db, feed)) = approve {
+                let v = NuGetVersion::parse(version).unwrap();
+                assert!(db.approve_membership(feed, id, &v).await.unwrap());
+            }
             self.inner.store_package(id, version, temp).await
         }
         async fn get_package(&self, id: &str, version: &str) -> Result<PackageContent> {
@@ -1051,6 +1145,7 @@ mod tests {
         let storage = FailingSidecars {
             inner: FilesystemStorage::new(store_dir.path()).await.unwrap(),
             fail: AtomicBool::new(false),
+            approve_midway: Default::default(),
         };
         let db = SqliteDatabase::in_memory().await.unwrap();
         push(&storage, &db, FEED, false, &overwriting())
@@ -1138,5 +1233,205 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, Error::Conflict(_)), "{err:?}");
         assert_eq!(err.status(), axum::http::StatusCode::CONFLICT);
+    }
+
+    // --- allow_overwrite = "pending-only" (INT-04) ---
+
+    fn pending_only(pending: bool) -> IndexOptions {
+        IndexOptions {
+            overwrite: OverwriteMode::PendingOnly,
+            pending,
+            ..Default::default()
+        }
+    }
+
+    /// Attach a file with a real blob to contoso.utils 1.2.3.
+    async fn attach(
+        storage: &dyn PackageStorage,
+        db: &dyn PackageDatabase,
+        name: &str,
+        bytes: &[u8],
+    ) -> String {
+        use sha2::Digest;
+        let sha = hex::encode(sha2::Sha256::digest(bytes));
+        let dir = tempfile::tempdir().unwrap();
+        let temp = dir.path().join("blob");
+        std::fs::write(&temp, bytes).unwrap();
+        storage.store_blob(&sha, temp).await.unwrap();
+        db.add_file(&PackageFile {
+            lower_id: "contoso.utils".into(),
+            normalized_version: "1.2.3".into(),
+            name: name.into(),
+            sha256: sha.clone(),
+            size: bytes.len() as u64,
+            uploaded: Utc::now(),
+            downloads: 0,
+        })
+        .await
+        .unwrap();
+        sha
+    }
+
+    #[tokio::test]
+    async fn a_pending_version_is_replaced_with_its_files() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let storage = FilesystemStorage::new(store_dir.path()).await.unwrap();
+        let db = SqliteDatabase::in_memory().await.unwrap();
+        push(&storage, &db, FEED, false, &pending_only(true))
+            .await
+            .unwrap();
+        let sha = attach(&storage, &db, "setup.exe", b"old installer").await;
+
+        // The same build again keeps what was attached, so a re-run can
+        // complete a version whose files are missing.
+        push(&storage, &db, FEED, false, &pending_only(true))
+            .await
+            .unwrap();
+        assert_eq!(
+            db.files_for("contoso.utils", &v123()).await.unwrap().len(),
+            1
+        );
+
+        // A new build replaces the old one and takes its files with it.
+        let replaced = push(&storage, &db, FEED, true, &pending_only(true))
+            .await
+            .unwrap();
+        assert!(replaced.pending);
+        let found = db
+            .get_package_data("contoso.utils", &v123())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(found.has_readme, "the new build is recorded");
+        assert!(db
+            .files_for("contoso.utils", &v123())
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(
+            storage.get_blob(&sha).await.is_err(),
+            "the old file's blob is gone"
+        );
+        assert!(!db
+            .is_servable(FEED, "contoso.utils", &v123())
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn an_approved_version_is_never_replaced() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let storage = FilesystemStorage::new(store_dir.path()).await.unwrap();
+        let db = SqliteDatabase::in_memory().await.unwrap();
+        // A feed without a gate approves on arrival.
+        push(&storage, &db, FEED, false, &pending_only(false))
+            .await
+            .unwrap();
+        let before = stored_bytes(&storage).await;
+        let err = push(&storage, &db, FEED, true, &pending_only(false))
+            .await
+            .unwrap_err();
+        let Error::VersionExists(why) = &err else {
+            panic!("{err:?}");
+        };
+        assert!(why.contains("approved in default"), "{why}");
+        assert!(why.contains("pending-only"), "{why}");
+        assert_eq!(stored_bytes(&storage).await, before);
+    }
+
+    #[tokio::test]
+    async fn every_feed_holding_the_version_must_still_be_waiting() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let storage = FilesystemStorage::new(store_dir.path()).await.unwrap();
+        let db = SqliteDatabase::in_memory().await.unwrap();
+        push(&storage, &db, "intake", false, &pending_only(true))
+            .await
+            .unwrap();
+        push(&storage, &db, "prod", false, &pending_only(true))
+            .await
+            .unwrap();
+
+        // Pending in both: a new build replaces it for both.
+        push(&storage, &db, "intake", true, &pending_only(true))
+            .await
+            .unwrap();
+        let prod = db
+            .get_membership("prod", "contoso.utils", &v123())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(prod.pending);
+        assert!(
+            db.get_package_data("contoso.utils", &v123())
+                .await
+                .unwrap()
+                .unwrap()
+                .has_readme
+        );
+
+        // Approved in prod: intake can no longer replace it.
+        db.approve_membership("prod", "contoso.utils", &v123())
+            .await
+            .unwrap();
+        let err = push(&storage, &db, "intake", false, &pending_only(true))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("approved in prod"), "{err}");
+        assert!(
+            db.get_package_data("contoso.utils", &v123())
+                .await
+                .unwrap()
+                .unwrap()
+                .has_readme
+        );
+    }
+
+    #[tokio::test]
+    async fn an_approval_during_the_replace_wins() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let storage = FailingSidecars {
+            inner: FilesystemStorage::new(store_dir.path()).await.unwrap(),
+            fail: AtomicBool::new(false),
+            approve_midway: Default::default(),
+        };
+        let db = SqliteDatabase::in_memory().await.unwrap();
+        push(&storage, &db, FEED, false, &pending_only(true))
+            .await
+            .unwrap();
+        attach(&storage, &db, "setup.exe", b"installer").await;
+        let before = stored_bytes(&storage.inner).await;
+        let hash = db
+            .get_package_data("contoso.utils", &v123())
+            .await
+            .unwrap()
+            .unwrap()
+            .package_hash;
+
+        // The push checks while the version is pending; the admin approves
+        // after that check and before the rows are swapped.
+        *storage.approve_midway.lock().unwrap() = Some((db.clone(), FEED));
+        let err = push(&storage, &db, FEED, true, &pending_only(true))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::VersionExists(_)), "{err:?}");
+
+        // The approved version is the build that was approved: rows, bytes
+        // and attached files.
+        assert!(db
+            .is_servable(FEED, "contoso.utils", &v123())
+            .await
+            .unwrap());
+        let found = db
+            .get_package_data("contoso.utils", &v123())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.package_hash, hash);
+        assert!(!found.has_readme);
+        assert_eq!(stored_bytes(&storage.inner).await, before);
+        assert_eq!(
+            db.files_for("contoso.utils", &v123()).await.unwrap().len(),
+            1
+        );
     }
 }

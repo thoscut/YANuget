@@ -2,7 +2,7 @@
 //! actions, and the retention page.
 
 use super::escape::{enc_path, escape_html};
-use super::format::{group_digits, human_size, kv, plural};
+use super::format::{group_digits, human_size, kv, kv_html, plural};
 use super::layout::{layout, Nav};
 use crate::database::PackageFile;
 use crate::nuget::UrlBuilder;
@@ -68,6 +68,71 @@ pub struct AdminPackageExtras<'a> {
     pub files_enabled: bool,
     /// The files attached to any of the versions.
     pub files: &'a [PackageFile],
+    /// The internalizer reports of pending versions that carry one.
+    pub reports: &'a [VersionReport],
+}
+
+/// A pending version's internalizer report, as far as it could be read.
+#[derive(Debug)]
+pub struct VersionReport {
+    /// The normalized version.
+    pub version: String,
+    pub view: ReportView,
+}
+
+#[derive(Debug)]
+pub enum ReportView {
+    Read {
+        report: Box<crate::report::Report>,
+        /// The prelude's text, or why it could not be read; `None` when the
+        /// report names none.
+        prelude: Option<Result<String, String>>,
+    },
+    /// The package has a report, and this is why it could not be read.
+    Unreadable(String),
+}
+
+impl VersionReport {
+    /// What stands in the way of approving the version: files the report
+    /// says are attached but are not (or differ), a prelude it names but the
+    /// package lacks, a report that cannot be read. An interrupted or
+    /// half-repeated run looks like this, and its install would fail.
+    pub fn problems(&self, attached: &[PackageFile]) -> Vec<String> {
+        let (report, prelude) = match &self.view {
+            ReportView::Unreadable(e) => return vec![format!("the report cannot be read: {e}")],
+            ReportView::Read { report, prelude } => (report, prelude),
+        };
+        let mut problems = Vec::new();
+        if let Some(Err(e)) = prelude {
+            problems.push(format!("the prelude cannot be read: {e}"));
+        }
+        let ours = |name: &str| {
+            attached
+                .iter()
+                .find(|f| f.normalized_version == self.version && f.name.eq_ignore_ascii_case(name))
+        };
+        for d in &report.downloads {
+            let Some(name) = d.file.as_deref() else {
+                continue;
+            };
+            match ours(name) {
+                None => problems.push(format!("{name} is not attached")),
+                Some(f) => {
+                    let sha_differs = d
+                        .sha256
+                        .as_deref()
+                        .is_some_and(|h| !h.eq_ignore_ascii_case(&f.sha256));
+                    let size_differs = d.size.is_some_and(|s| s != f.size);
+                    if sha_differs || size_differs {
+                        problems.push(format!(
+                            "the attached {name} is not the file the report describes"
+                        ));
+                    }
+                }
+            }
+        }
+        problems
+    }
 }
 
 /// Which cross-feed action a [`TransferNotice`] reports.
@@ -254,8 +319,25 @@ pub fn admin_package_page(
                 escape_html(&urls.package_download(&lower, &v)),
             ));
         }
+        let report = extras.reports.iter().find(|r| r.version == v);
+        let problems = report.map(|r| r.problems(extras.files)).unwrap_or_default();
         if fv.pending {
-            actions.push_str(&button(&v, "approve", "Approve"));
+            if problems.is_empty() {
+                actions.push_str(&button(&v, "approve", "Approve"));
+            } else {
+                // Not refused: the reviewer may know better (a file attached
+                // under another name, a report from an older run). Asked.
+                actions.push_str(&format!(
+                    "<form method=\"post\" action=\"{a}\" data-confirm=\"{confirm}\">{csrf}\
+                     <button type=\"submit\">Approve</button></form>",
+                    a = action(&v, "approve"),
+                    confirm = escape_html(&format!(
+                        "The internalizer report of {id} {v} does not match the package: {}. \
+                         Approve it anyway?",
+                        problems.join("; ")
+                    )),
+                ));
+            }
         }
         if let Some(target) = extras.promote_target {
             // Promoting what the target already holds changes nothing there,
@@ -310,6 +392,19 @@ pub fn admin_package_page(
             (true, Some(r)) => format!("<div class=\"meta\">{}</div>", escape_html(r)),
             _ => String::new(),
         };
+        if let Some(r) = report {
+            let what = if problems.is_empty() {
+                "Internalized; the report is below.".to_string()
+            } else {
+                format!("Do not approve yet: {}.", problems.join("; "))
+            };
+            notes.push_str(&format!(
+                "<div class=\"meta{cls}\"><a href=\"#report-{anchor}\">{what}</a></div>",
+                cls = if problems.is_empty() { "" } else { " doomed" },
+                anchor = escape_html(&r.version),
+                what = escape_html(&what),
+            ));
+        }
         if let Some(planned) = extras
             .retention_plan
             .iter()
@@ -387,14 +482,173 @@ pub fn admin_package_page(
          <thead><tr><th class=\"pick\"><input type=\"checkbox\" class=\"all\" \
          aria-label=\"Select every version\" hidden></th>\
          <th>Version</th><th>Status</th><th>Downloads</th><th>Actions</th></tr></thead>\
-         <tbody>{rows}</tbody></table></div>{bulk}</div>{files}",
+         <tbody>{rows}</tbody></table></div>{bulk}</div>{reports}{files}",
         admin = escape_html(&urls.app("/admin")),
         gallery = escape_html(&urls.app(&format!("/packages/{}", enc_path(&lower)))),
         eid = escape_html(id),
         notice = extras.notice.map(|n| n.render(id)).unwrap_or_default(),
+        reports = admin_reports(id, extras),
         files = admin_files(urls, id, extras, &csrf),
     );
     layout(urls, &format!("Admin \u{2014} {id}"), ADMIN_NAV, &body)
+}
+
+/// The internalizer reports of the pending versions: where the package came
+/// from, each original URL with the file that replaces it, whether a checksum
+/// vouched for it, the warnings and the prelude. Every value is the report's,
+/// which is the package's, so all of it is escaped and no URL is a link.
+fn admin_reports(id: &str, extras: &AdminPackageExtras) -> String {
+    let mut out = String::new();
+    for vr in extras.reports {
+        let v = escape_html(&vr.version);
+        let problems = vr.problems(extras.files);
+        let warn = if problems.is_empty() {
+            String::new()
+        } else {
+            let items: String = problems
+                .iter()
+                .map(|p| format!("<li>{}</li>", escape_html(p)))
+                .collect();
+            format!(
+                "<div class=\"notice warn\" role=\"status\">This version does not match its \
+                 report, so its install would fail. A run that was interrupted leaves it like \
+                 this; run it again, or attach the files, before approving.<ul>{items}</ul></div>"
+            )
+        };
+        let body = match &vr.view {
+            ReportView::Unreadable(_) => String::new(),
+            ReportView::Read { report, prelude } => {
+                report_body(id, &vr.version, report, prelude.as_ref(), extras.files)
+            }
+        };
+        out.push_str(&format!(
+            "<div class=\"card\" id=\"report-{v}\"><h2>Internalizer report: {v}</h2>{warn}{body}</div>"
+        ));
+    }
+    out
+}
+
+fn report_body(
+    id: &str,
+    version: &str,
+    report: &crate::report::Report,
+    prelude: Option<&Result<String, String>>,
+    attached: &[PackageFile],
+) -> String {
+    use crate::report::ChecksumStatus;
+    let mut rows = String::new();
+    rows.push_str(&kv("Status", report.status.as_str()));
+    for reason in &report.reasons {
+        rows.push_str(&kv("Reason", reason));
+    }
+    if !report.package.id.eq_ignore_ascii_case(id)
+        || crate::version::NuGetVersion::parse(&report.package.version)
+            .map(|rv| rv.normalized() != version)
+            .unwrap_or(true)
+    {
+        rows.push_str(&kv_html(
+            "Written for",
+            &format!(
+                "<span class=\"doomed\">{} {}, not this version</span>",
+                escape_html(&report.package.id),
+                escape_html(&report.package.version)
+            ),
+        ));
+    }
+    rows.push_str(&kv_html(
+        "Upstream",
+        &format!("<code>{}</code>", escape_html(&report.upstream.source)),
+    ));
+    if let Some(sha) = &report.upstream.sha512 {
+        rows.push_str(&kv_html(
+            "Upstream SHA-512",
+            &format!("<code>{}</code>", escape_html(sha)),
+        ));
+    }
+    if let Some(env) = &report.environment {
+        for (label, value) in [
+            ("Chocolatey", &env.chocolatey_version),
+            ("Image SHA-256", &env.image_sha256),
+            ("Internalizer", &env.tool_version),
+        ] {
+            if let Some(value) = value {
+                rows.push_str(&kv_html(
+                    label,
+                    &format!("<code>{}</code>", escape_html(value)),
+                ));
+            }
+        }
+    }
+    if let Some(at) = &report.generated_at {
+        rows.push_str(&kv("Written", at));
+    }
+    let mut out = format!("<div class=\"kv\">{rows}</div>");
+
+    if !report.downloads.is_empty() {
+        let mut rows = String::new();
+        for d in &report.downloads {
+            let file = match d.file.as_deref() {
+                None => "<span class=\"muted\">not attached</span>".to_string(),
+                Some(name) => {
+                    let here = attached.iter().any(|f| {
+                        f.normalized_version == version && f.name.eq_ignore_ascii_case(name)
+                    });
+                    if here {
+                        escape_html(name)
+                    } else {
+                        format!(
+                            "<span class=\"doomed\">{} (missing)</span>",
+                            escape_html(name)
+                        )
+                    }
+                }
+            };
+            let checksum = match (d.checksum.status, d.checksum.algorithm.as_deref()) {
+                (ChecksumStatus::Verified, Some(alg)) => {
+                    format!("<span class=\"badge ok\">verified</span> {}", escape_html(alg))
+                }
+                (ChecksumStatus::Verified, None) => "<span class=\"badge ok\">verified</span>".into(),
+                (ChecksumStatus::TrustOnFirstUse, alg) => format!(
+                    "<span class=\"badge pre\" title=\"No checksum, or only MD5 or SHA-1: what the URL \
+                     served on the day of the capture is what was pinned\">trust on first use</span>{}",
+                    alg.map(|a| format!(" {}", escape_html(a))).unwrap_or_default()
+                ),
+                (ChecksumStatus::Unknown, _) => "<span class=\"badge\">unknown</span>".into(),
+            };
+            rows.push_str(&format!(
+                "<tr><td><code>{url}</code>{helper}</td><td>{file}</td><td class=\"muted\">{size}</td>\
+                 <td>{checksum}</td></tr>",
+                url = escape_html(&d.url),
+                helper = d
+                    .helper
+                    .as_deref()
+                    .map(|h| format!("<div class=\"meta\">{}</div>", escape_html(h)))
+                    .unwrap_or_default(),
+                size = d.size.map(human_size).unwrap_or_default(),
+            ));
+        }
+        out.push_str(&format!(
+            "<h3>Downloads</h3><div class=\"scroll\"><table class=\"atbl\"><thead><tr>\
+             <th>Original URL</th><th>File</th><th>Size</th><th>Checksum</th></tr></thead>\
+             <tbody>{rows}</tbody></table></div>"
+        ));
+    }
+    if !report.warnings.is_empty() {
+        let items: String = report
+            .warnings
+            .iter()
+            .map(|w| format!("<li>{}</li>", escape_html(w)))
+            .collect();
+        out.push_str(&format!("<h3>Warnings</h3><ul>{items}</ul>"));
+    }
+    if let (Some(entry), Some(Ok(text))) = (report.prelude.as_deref(), prelude) {
+        out.push_str(&format!(
+            "<details><summary>Prelude <code>{}</code></summary><pre>{}</pre></details>",
+            escape_html(entry),
+            escape_html(text)
+        ));
+    }
+    out
 }
 
 /// The admin page's list of a package's attached files, each downloadable and

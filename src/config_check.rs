@@ -57,6 +57,9 @@ pub fn check_loaded(config: &Config, report: &mut Report) {
     };
     for feed in &feeds {
         check_feed(feed, report);
+        if config.files.enabled {
+            check_file_types(feed, report);
+        }
     }
     check_tls(config, report);
 
@@ -73,8 +76,56 @@ pub fn check_loaded(config: &Config, report: &mut Report) {
     }
 }
 
+/// A file type no file name can have is a typo, and an empty list refuses
+/// every file: both are legal, and both are worth a warning.
+fn check_file_types(feed: &ResolvedFeed, report: &mut Report) {
+    let name = &feed.name;
+    if feed.allowed_extensions.is_empty() {
+        report.warnings.push(format!(
+            "feed {name}: no file types are allowed, so it refuses every attached file"
+        ));
+    }
+    for ext in &feed.allowed_extensions {
+        let bare = ext.trim_start_matches('.');
+        if bare.is_empty()
+            || !bare
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+        {
+            report.warnings.push(format!(
+                "feed {name}: file type {ext:?} can never match a file name \
+                 (letters, digits, '_' and '-' only, without the dot)"
+            ));
+        }
+    }
+}
+
 fn check_feed(feed: &ResolvedFeed, report: &mut Report) {
     let name = &feed.name;
+    if let Some(preview) = &feed.preview_api_key {
+        let reused = feed.read_api_key.as_deref() == Some(preview.as_str())
+            || feed.api_keys.contains(preview)
+            || feed.admin_api_key.as_deref() == Some(preview.as_str());
+        if reused {
+            report.warnings.push(format!(
+                "feed {name}: the preview key is also another key of the feed; give it \
+                 its own, or everyone holding that one can download pending versions"
+            ));
+        }
+        if !feed.requires_approval {
+            report.notes.push(format!(
+                "feed {name}: a preview key without requires_approval only matters for \
+                 versions promoted in while pending"
+            ));
+        }
+    }
+    if feed.allow_overwrite == crate::config::OverwriteMode::PendingOnly && !feed.requires_approval
+    {
+        report.warnings.push(format!(
+            "feed {name}: allow_overwrite = \"pending-only\" without requires_approval; \
+             only versions promoted in while pending elsewhere can be replaced"
+        ));
+    }
     if feed.api_keys.is_empty() {
         report.warnings.push(format!(
             "feed {name}: no push key, so push and delete are open to anyone who can reach it"
@@ -89,6 +140,10 @@ fn check_feed(feed: &ResolvedFeed, report: &mut Report) {
     for (role, is_short) in [
         ("push", feed.api_keys.iter().any(|k| short(k))),
         ("read", feed.read_api_key.as_deref().is_some_and(short)),
+        (
+            "preview",
+            feed.preview_api_key.as_deref().is_some_and(short),
+        ),
         ("admin", feed.admin_api_key.as_deref().is_some_and(short)),
     ] {
         if is_short {
@@ -180,6 +235,64 @@ mod tests {
         let mut report = Report::default();
         check_loaded(&config, &mut report);
         report
+    }
+
+    #[test]
+    fn pending_only_without_a_gate_is_warned_about() {
+        use crate::config::OverwriteMode;
+        let feed = |name: &str, gated: bool| FeedConfig {
+            name: name.into(),
+            allow_overwrite: Some(OverwriteMode::PendingOnly),
+            requires_approval: gated,
+            ..Default::default()
+        };
+        let config = Config {
+            tls_enabled: false,
+            feeds: vec![feed("intake", true), feed("open", false)],
+            ..Config::default()
+        };
+        let report = checked(config);
+        assert!(report.is_ok(), "{report:?}");
+        let pending = |f: &str| {
+            report
+                .warnings
+                .iter()
+                .any(|w| w.starts_with(&format!("feed {f}: ")) && w.contains("pending-only"))
+        };
+        assert!(!pending("intake"), "{report:?}");
+        assert!(pending("open"), "{report:?}");
+    }
+
+    #[test]
+    fn a_feeds_own_file_types_are_checked() {
+        let feed = |name: &str, exts: &[&str]| FeedConfig {
+            name: name.into(),
+            files: crate::config::FeedFilesConfig {
+                allowed_extensions: Some(exts.iter().map(|e| e.to_string()).collect()),
+            },
+            ..Default::default()
+        };
+        let config = Config {
+            tls_enabled: false,
+            feeds: vec![
+                feed("choco", &["exe", ".msi"]),
+                feed("typo", &["exe msi", "."]),
+                feed("none", &[]),
+            ],
+            ..Config::default()
+        };
+        let report = checked(config);
+        assert!(report.is_ok(), "{report:?}");
+        let about = |feed: &str| {
+            report
+                .warnings
+                .iter()
+                .filter(|w| w.starts_with(&format!("feed {feed}: ")) && w.contains("file"))
+                .count()
+        };
+        assert_eq!(about("choco"), 0, "{report:?}");
+        assert_eq!(about("typo"), 2, "{report:?}");
+        assert_eq!(about("none"), 1, "{report:?}");
     }
 
     #[test]

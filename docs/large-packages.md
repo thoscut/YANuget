@@ -35,7 +35,7 @@ stream, so the multipart envelope never forces buffering either.
 ### Manifest read → seek, don't scan
 
 A `.nupkg` is a ZIP, and a ZIP's *central directory* lives at the **end** of the
-file. [`nupkg::read_archive`](https://github.com/thoscut/yanuget/blob/main/src/nupkg.rs) opens the temp file and lets the
+file. [`nupkg::read_archive`](https://github.com/thoscut/yanuget/blob/main/crates/yanuget-pkg/src/nupkg.rs) opens the temp file and lets the
 `zip` crate **seek** to that directory and then to the single `.nuspec` entry.
 A 25 GB archive is therefore touched in two tiny reads (directory + manifest),
 never scanned front-to-back. The blocking ZIP work runs on a

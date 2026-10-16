@@ -1641,6 +1641,7 @@ async fn files_dropped_in_the_inbox_are_verified_and_attached() {
         storage: &storage,
         db: &db,
         files: &files,
+        feed_extensions: &Default::default(),
         max_file_size: None,
         feeds: &feeds,
         staging: &staging,
@@ -5026,4 +5027,481 @@ async fn the_admin_client_promotes_and_approves_across_rings() {
         status_of(&server, "/dev/v3/package/cli.pkg/index.json").await,
         reqwest::StatusCode::NOT_FOUND
     );
+}
+
+/// PUT `body` as file `name` of `id`/`v` in the feed under `prefix`.
+async fn put_feed_file(
+    server: &TestServer,
+    prefix: &str,
+    id: &str,
+    v: &str,
+    name: &str,
+    body: Vec<u8>,
+) -> reqwest::Response {
+    server
+        .client
+        .put(server.url(&format!("{prefix}/api/v2/files/{id}/{v}/{name}")))
+        .header("X-NuGet-ApiKey", API_KEY)
+        .body(body)
+        .send()
+        .await
+        .unwrap()
+}
+
+/// An intake feed that takes installers, gated, promoting into a gated
+/// production feed that keeps the default file types.
+async fn spawn_intake() -> TestServer {
+    spawn_feeds(|c| {
+        c.api_key = Some(API_KEY.into());
+        c.admin_api_key = Some(ADMIN_KEY.into());
+        let mut intake = feed("intake");
+        intake.requires_approval = true;
+        intake.promotes_to = Some("prod".into());
+        intake.files.allowed_extensions = Some(vec!["exe".into(), ".MSI".into()]);
+        let mut prod = feed("prod");
+        prod.requires_approval = true;
+        c.feeds = vec![intake, prod];
+    })
+    .await
+}
+
+/// `INT-03`: a feed's `[feeds.files] allowed_extensions` replaces the global
+/// list for that feed only.
+#[tokio::test]
+async fn a_feed_can_accept_file_types_the_others_refuse() {
+    let server = spawn_intake().await;
+    for prefix in ["/intake", "/prod"] {
+        let pushed = push_to(
+            &server,
+            &format!("{prefix}/api/v2/package"),
+            API_KEY,
+            build_nupkg("Types.Pkg", "1.0.0", b"x"),
+        )
+        .await;
+        assert_eq!(pushed.status(), reqwest::StatusCode::CREATED, "{prefix}");
+    }
+
+    let exe = |prefix: &'static str| {
+        put_feed_file(
+            &server,
+            prefix,
+            "Types.Pkg",
+            "1.0.0",
+            "setup.exe",
+            image_bytes(1),
+        )
+    };
+    assert_eq!(exe("/intake").await.status(), reqwest::StatusCode::CREATED);
+    assert_eq!(
+        put_feed_file(
+            &server,
+            "/intake",
+            "Types.Pkg",
+            "1.0.0",
+            "Setup.msi",
+            image_bytes(2)
+        )
+        .await
+        .status(),
+        reqwest::StatusCode::CREATED,
+        "case and a leading dot in the list do not matter"
+    );
+    let refused = exe("/prod").await;
+    assert_eq!(refused.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert!(refused.text().await.unwrap().contains("wim"));
+    // The feed's list replaces the global one rather than adding to it.
+    let wim = put_feed_file(
+        &server,
+        "/intake",
+        "Types.Pkg",
+        "1.0.0",
+        "base.wim",
+        image_bytes(3),
+    )
+    .await;
+    assert_eq!(wim.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert!(wim.text().await.unwrap().contains("exe, .MSI"));
+    assert_eq!(
+        put_feed_file(
+            &server,
+            "/prod",
+            "Types.Pkg",
+            "1.0.0",
+            "base.wim",
+            image_bytes(3)
+        )
+        .await
+        .status(),
+        reqwest::StatusCode::CREATED
+    );
+
+    let settings = server
+        .client
+        .get(server.url("/intake/settings"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(settings.contains("exe, .MSI"), "{settings}");
+}
+
+/// `INT-05`: the intake flow the internalizer relies on. A file attached to a
+/// pending version is withheld until the version is approved, in the intake
+/// feed and again in the feed it is promoted to.
+#[tokio::test]
+async fn files_of_a_pending_version_are_withheld_until_approval() {
+    let server = spawn_intake().await;
+    let pushed = push_to(
+        &server,
+        "/intake/api/v2/package",
+        API_KEY,
+        build_nupkg("Intake.Pkg", "1.0.0", b"x"),
+    )
+    .await;
+    assert_eq!(pushed.status(), reqwest::StatusCode::CREATED);
+
+    let installer = image_bytes(7);
+    let attached = put_feed_file(
+        &server,
+        "/intake",
+        "Intake.Pkg",
+        "1.0.0",
+        "setup.exe",
+        installer.clone(),
+    )
+    .await;
+    assert_eq!(
+        attached.status(),
+        reqwest::StatusCode::CREATED,
+        "attach while pending"
+    );
+
+    let file = "files/intake.pkg/1.0.0/setup.exe";
+    let nupkg = "v3/package/intake.pkg/1.0.0/intake.pkg.1.0.0.nupkg";
+    for path in [file, nupkg] {
+        assert_eq!(
+            status_of(&server, &format!("/intake/{path}")).await,
+            reqwest::StatusCode::NOT_FOUND,
+            "{path} is withheld while pending"
+        );
+    }
+
+    let approve = admin_action(&server, "/intake/admin/packages/intake.pkg/1.0.0/approve").await;
+    assert_eq!(approve.status(), reqwest::StatusCode::SEE_OTHER);
+    let download = server
+        .client
+        .get(server.url(&format!("/intake/{file}")))
+        .send()
+        .await
+        .unwrap();
+    assert!(download.status().is_success());
+    assert_eq!(
+        download.bytes().await.unwrap().as_ref(),
+        installer.as_slice()
+    );
+
+    // Promoted into a gated feed, the version and its file are pending there,
+    // even though that feed would not accept the file type itself.
+    let promote = admin_action(&server, "/intake/admin/packages/intake.pkg/1.0.0/promote").await;
+    assert_eq!(promote.status(), reqwest::StatusCode::SEE_OTHER);
+    for path in [file, nupkg] {
+        assert_eq!(
+            status_of(&server, &format!("/prod/{path}")).await,
+            reqwest::StatusCode::NOT_FOUND,
+            "{path} is withheld in prod until approved there"
+        );
+    }
+    let approve = admin_action(&server, "/prod/admin/packages/intake.pkg/1.0.0/approve").await;
+    assert_eq!(approve.status(), reqwest::StatusCode::SEE_OTHER);
+    let download = server
+        .client
+        .get(server.url(&format!("/prod/{file}")))
+        .send()
+        .await
+        .unwrap();
+    assert!(download.status().is_success());
+    assert_eq!(
+        download.bytes().await.unwrap().as_ref(),
+        installer.as_slice()
+    );
+}
+
+const PREVIEW_KEY: &str = "preview-key-of-the-intake-feed";
+
+/// `INT-32`: the preview key downloads a pending version and its files, and
+/// nothing else.
+#[tokio::test]
+async fn the_preview_key_downloads_pending_versions_and_nothing_else() {
+    let server = spawn_feeds(|c| {
+        c.api_key = Some(API_KEY.into());
+        c.admin_api_key = Some(ADMIN_KEY.into());
+        let mut intake = feed("intake");
+        intake.requires_approval = true;
+        intake.read_api_key = Some("reader-key".into());
+        intake.preview_api_key = Some(PREVIEW_KEY.into());
+        c.feeds = vec![intake];
+    })
+    .await;
+    let pushed = push_to(
+        &server,
+        "/intake/api/v2/package",
+        API_KEY,
+        build_nupkg("Preview.Pkg", "1.0.0", b"x"),
+    )
+    .await;
+    assert_eq!(pushed.status(), reqwest::StatusCode::CREATED);
+    let image = image_bytes(9);
+    assert_eq!(
+        put_feed_file(
+            &server,
+            "/intake",
+            "Preview.Pkg",
+            "1.0.0",
+            "base.wim",
+            image.clone()
+        )
+        .await
+        .status(),
+        reqwest::StatusCode::CREATED
+    );
+
+    let get = |path: &str, key: &str| {
+        server
+            .client
+            .get(server.url(path))
+            .header("X-NuGet-ApiKey", key)
+            .send()
+    };
+    let nupkg = "/intake/v3/package/preview.pkg/1.0.0/preview.pkg.1.0.0.nupkg";
+    let nuspec = "/intake/v3/package/preview.pkg/1.0.0/preview.pkg.nuspec";
+    let file = "/intake/files/preview.pkg/1.0.0/base.wim";
+    let index = "/intake/files/preview.pkg/1.0.0/index.json";
+
+    // Readers do not see it while it is pending.
+    for path in [nupkg, nuspec, file, index] {
+        assert_eq!(
+            get(path, "reader-key").await.unwrap().status(),
+            reqwest::StatusCode::NOT_FOUND,
+            "{path}"
+        );
+    }
+    // The preview key does, kept out of shared caches.
+    for path in [nupkg, nuspec, file, index] {
+        let r = get(path, PREVIEW_KEY).await.unwrap();
+        assert!(r.status().is_success(), "{path}: {}", r.status());
+        let cache = r.headers()["cache-control"].to_str().unwrap().to_string();
+        assert!(cache.starts_with("private"), "{path}: {cache}");
+        assert!(!cache.contains("immutable"), "{path}: {cache}");
+        let vary: Vec<_> = r
+            .headers()
+            .get_all("vary")
+            .iter()
+            .map(|v| v.to_str().unwrap().to_string())
+            .collect();
+        assert!(
+            vary.iter().any(|v| v.contains("X-NuGet-ApiKey")),
+            "{path}: {vary:?}"
+        );
+    }
+    let bytes = get(file, PREVIEW_KEY).await.unwrap().bytes().await.unwrap();
+    assert_eq!(bytes.as_ref(), image.as_slice());
+    // Basic credentials work as for the read key.
+    let basic = server
+        .client
+        .get(server.url(nupkg))
+        .basic_auth("anyone", Some(PREVIEW_KEY))
+        .send()
+        .await
+        .unwrap();
+    assert!(basic.status().is_success());
+
+    // And nothing else: no listing, search, push or admin.
+    for path in [
+        "/intake/v3/package/preview.pkg/index.json",
+        "/intake/v3/search?q=preview",
+        "/intake/v3/registration/preview.pkg/index.json",
+    ] {
+        assert_eq!(
+            get(path, PREVIEW_KEY).await.unwrap().status(),
+            reqwest::StatusCode::UNAUTHORIZED,
+            "{path}"
+        );
+    }
+    let push = push_to(
+        &server,
+        "/intake/api/v2/package",
+        PREVIEW_KEY,
+        build_nupkg("Preview.Other", "1.0.0", b"y"),
+    )
+    .await;
+    assert_eq!(push.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let approve = no_redirect()
+        .post(server.url("/intake/admin/packages/preview.pkg/1.0.0/approve"))
+        .basic_auth("admin", Some(PREVIEW_KEY))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(admin_body(PREVIEW_KEY))
+        .send()
+        .await
+        .unwrap();
+    assert!(approve.status().is_client_error(), "{}", approve.status());
+    assert_eq!(
+        get(nupkg, "reader-key").await.unwrap().status(),
+        reqwest::StatusCode::NOT_FOUND,
+        "still pending"
+    );
+
+    // A disabled version stays withheld from the preview key too.
+    let disable = admin_action(&server, "/intake/admin/packages/preview.pkg/1.0.0/disable").await;
+    assert_eq!(disable.status(), reqwest::StatusCode::SEE_OTHER);
+    assert_eq!(
+        get(nupkg, PREVIEW_KEY).await.unwrap().status(),
+        reqwest::StatusCode::NOT_FOUND
+    );
+}
+
+/// A package carrying extra entries next to its manifest, such as an
+/// internalizer report and its prelude.
+fn build_nupkg_with_entries(id: &str, version: &str, entries: &[(&str, &[u8])]) -> Vec<u8> {
+    let base = build_nupkg(id, version, b"x");
+    let mut archive = zip::ZipArchive::new(Cursor::new(base)).unwrap();
+    let mut cursor = Cursor::new(Vec::new());
+    {
+        let mut zip = zip::ZipWriter::new(&mut cursor);
+        for i in 0..archive.len() {
+            zip.raw_copy_file(archive.by_index(i).unwrap()).unwrap();
+        }
+        let opts =
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        for (name, bytes) in entries {
+            zip.start_file(*name, opts).unwrap();
+            zip.write_all(bytes).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+    cursor.into_inner()
+}
+
+/// `INT-30`: a pending version's internalizer report is on its admin page,
+/// escaped, and a file it lists but the version lacks holds up the approval.
+#[tokio::test]
+async fn the_admin_page_shows_a_pending_versions_report() {
+    let server = spawn_intake().await;
+    let setup = image_bytes(7);
+    let report = format!(
+        r#"{{"schema": 1, "package": {{"id": "Report.Pkg", "version": "1.0"}},
+            "status": "internalized",
+            "upstream": {{"source": "https://community.chocolatey.org/api/v2/"}},
+            "environment": {{"chocolatey_version": "2.4.3"}},
+            "downloads": [
+              {{"url": "https://vendor.example/setup.exe?a=1&b=<2>", "helper": "Install-ChocolateyPackage",
+                "file": "setup.exe", "size": {size}, "sha256": "{sha}",
+                "checksum": {{"status": "verified", "algorithm": "sha256"}}}},
+              {{"url": "https://vendor.example/extra.msi", "file": "extra.msi",
+                "checksum": {{"status": "trust-on-first-use"}}}}
+            ],
+            "warnings": ["<script>alert(1)</script>"],
+            "prelude": "tools/prelude.ps1",
+            "a_later_field": true}}"#,
+        size = setup.len(),
+        sha = sha256_hex(&setup),
+    );
+    let nupkg = build_nupkg_with_entries(
+        "Report.Pkg",
+        "1.0.0",
+        &[
+            ("internalizer/report.json", report.as_bytes()),
+            ("tools/prelude.ps1", b"$base = 'https://feed' # <b>"),
+        ],
+    );
+    let pushed = push_to(&server, "/intake/api/v2/package", API_KEY, nupkg).await;
+    assert_eq!(pushed.status(), reqwest::StatusCode::CREATED);
+    // A version without a report renders as before.
+    let plain = push_to(
+        &server,
+        "/intake/api/v2/package",
+        API_KEY,
+        build_nupkg("Report.Pkg", "0.9.0", b"y"),
+    )
+    .await;
+    assert_eq!(plain.status(), reqwest::StatusCode::CREATED);
+    let put = put_feed_file(
+        &server,
+        "/intake",
+        "Report.Pkg",
+        "1.0.0",
+        "setup.exe",
+        setup,
+    )
+    .await;
+    assert_eq!(put.status(), reqwest::StatusCode::CREATED);
+
+    let page = || async {
+        let resp = server
+            .client
+            .get(server.url("/intake/admin/packages/report.pkg"))
+            .basic_auth("admin", Some(ADMIN_KEY))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        resp.text().await.unwrap()
+    };
+    let html = page().await;
+    assert!(html.contains("Internalizer report: 1.0.0"), "{html}");
+    assert!(!html.contains("Internalizer report: 0.9.0"));
+    assert!(html.contains("setup.exe?a=1&amp;b=&lt;2&gt;"));
+    assert!(html.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
+    assert!(!html.contains("<script>alert(1)"));
+    assert!(html.contains("tools/prelude.ps1"));
+    assert!(html.contains("https://feed") && html.contains("# &lt;b&gt;"));
+    assert!(html.contains("2.4.3"));
+    assert!(html.contains("trust on first use"));
+    assert!(html.contains("extra.msi is not attached"), "{html}");
+    assert!(html.contains("Approve it anyway?"));
+
+    // Attached, nothing stands in the way any more.
+    let put = put_feed_file(
+        &server,
+        "/intake",
+        "Report.Pkg",
+        "1.0.0",
+        "extra.msi",
+        image_bytes(8),
+    )
+    .await;
+    assert_eq!(put.status(), reqwest::StatusCode::CREATED);
+    let html = page().await;
+    assert!(!html.contains("is not attached"), "{html}");
+    assert!(!html.contains("Approve it anyway?"));
+    assert!(html.contains("Internalized; the report is below."));
+}
+
+/// `INT-30`: a report the server cannot read says so instead of hiding.
+#[tokio::test]
+async fn an_unreadable_report_is_shown_as_such() {
+    let server = spawn_intake().await;
+    let nupkg = build_nupkg_with_entries(
+        "Broken.Report",
+        "1.0.0",
+        &[(
+            "internalizer/report.json",
+            br#"{"schema": 2, "anything": "new"}"#,
+        )],
+    );
+    let pushed = push_to(&server, "/intake/api/v2/package", API_KEY, nupkg).await;
+    assert_eq!(pushed.status(), reqwest::StatusCode::CREATED);
+    let html = server
+        .client
+        .get(server.url("/intake/admin/packages/broken.report"))
+        .basic_auth("admin", Some(ADMIN_KEY))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(html.contains("schema version 2"), "{html}");
+    assert!(html.contains("Approve it anyway?"));
 }

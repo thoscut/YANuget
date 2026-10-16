@@ -12,6 +12,53 @@ expected to change incompatibly at any version.
 
 ## [Unreleased]
 
+### Added
+
+- A feed can set its own file types for attached files in `[feeds.files]`
+  (`allowed_extensions`), replacing `[files].allowed_extensions` for that feed
+  only, over HTTP and through the SSH inbox. An internal Chocolatey feed can
+  take `exe` and `msi` while every other feed keeps the narrower default. The
+  feed's settings page shows its list, and `yanuget config check` warns about
+  an empty list or an entry no file name can match. A feed without the table
+  behaves as before. (`INT-03`)
+- `allow_overwrite = "pending-only"` (also `YANUGET_ALLOW_OVERWRITE=pending-only`
+  and per feed): a push may replace a version while it is pending in every feed
+  that holds it, and the old build's attached files are deleted with it. A
+  version approved in any feed stays immutable; the check runs in the same
+  transaction as the replacement, so an approval racing a push is never lost.
+  Downloads stay `immutable` under it. `yanuget config check` warns when a
+  feed sets it without `requires_approval`. (`INT-04`)
+- A per-feed `preview_api_key` (also `YANUGET_FEED_{NAME}_PREVIEW_API_KEY`,
+  with `_FILE`) downloads pending versions and their attached files from the
+  flat container and the file URLs, and does nothing else: no search, push,
+  approve or admin. Its responses are private, never `immutable`, and not
+  counted as downloads. (`INT-32`)
+- The admin page of a package shows the internalizer report
+  (`internalizer/report.json`, schema version 1) of each pending version that
+  carries one: upstream, downloads with their files and checksum status,
+  warnings and prelude, all escaped. A report listing files that are not
+  attached, or that differ, is flagged and its **Approve** asks for
+  confirmation. The schema lives in `yanuget-pkg` as `report::Report`.
+  (`INT-30`)
+- `yanuget-pkg` can rewrite a `.nupkg` (`rewrite::Rewrite`): replace, add or
+  remove entries and the manifest while every other entry is copied raw,
+  without recompressing, in memory that does not grow with the package. It
+  completes `[Content_Types].xml` for new extensions, writes the core
+  properties anew from a replaced manifest, and drops `.signature.p7s`.
+  Copies are checked against the source after writing, and entries of 4 GiB
+  and more keep their sizes. (`INT-02`)
+
+### Changed
+
+- Package handling moved into a workspace crate, `yanuget-pkg`
+  (`crates/yanuget-pkg/`): NuGet versions, the `.nuspec` parser, `.nupkg`
+  reading and the upstream address policy, with no axum or sqlx dependency and
+  an error type of its own. The server re-exports the modules under their old
+  paths and behaves as before. The crate adds `VersionRange`, NuGet's interval
+  notation (parse, normalize, `contains`, best match), for tools that resolve
+  dependencies. A release that publishes to crates.io publishes `yanuget-pkg`
+  first; see RELEASING.md. (`INT-01`)
+
 ## [0.7.0] — 2026-10-15
 
 Upgrading from 0.6.x needs no change to the configuration or the database.

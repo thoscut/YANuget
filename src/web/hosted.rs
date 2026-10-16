@@ -39,6 +39,7 @@ use super::helpers::{
     check_id, content_length, detached, map_upload_err, parse_stored_version, parse_version,
     to_io_err,
 };
+use super::state::Access;
 use super::{files, AppState};
 use crate::database::{PackageFile, UploadSession};
 use crate::error::{Error, Result};
@@ -61,18 +62,30 @@ pub(super) async fn download(
     Path((id, version, name)): Path<(String, String, String)>,
 ) -> Result<Response> {
     check_id(&id)?;
-    state.require_read(&headers)?;
+    if !state.feed.preview_auth.presented(&headers) {
+        state.require_read(&headers)?;
+    }
     if !state.config.files.enabled {
         return Err(Error::PackageNotFound);
     }
     let v = parse_version(&version)?;
     // Only what a client may fetch here: a disabled or pending version's files
-    // are withheld like its package.
-    if !state.db.is_servable(state.feed(), &id, &v).await? {
-        return Err(Error::PackageNotFound);
-    }
+    // are withheld like its package (pending ones are served to the feed's
+    // preview key).
+    let access = state
+        .download_access(&headers, &id, &v)
+        .await?
+        .ok_or(Error::PackageNotFound)?;
     if name.eq_ignore_ascii_case("index.json") {
-        return index(&state, &headers, &id, &v).await;
+        let mut response = index(&state, &headers, &id, &v).await?;
+        if access == Access::Preview {
+            response.headers_mut().insert(
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("private, no-store"),
+            );
+        }
+        access.mark(&mut response);
+        return Ok(response);
     }
     let file = state
         .db
@@ -94,9 +107,12 @@ pub(super) async fn download(
             sha256_base64: digest.as_deref(),
             // A name can be detached and attached again with other bytes, so
             // never `immutable`; the content-hash ETag makes revalidating cheap.
-            cache: files::CachePolicy {
-                private: state.feed.read_auth.is_enabled(),
-                immutable: false,
+            cache: match access {
+                Access::Public => files::CachePolicy {
+                    private: state.feed.read_auth.is_enabled(),
+                    immutable: false,
+                },
+                Access::Preview => access.cache(&state.feed),
             },
         },
     )
@@ -109,8 +125,12 @@ pub(super) async fn download(
         HeaderValue::from_static("default-src 'none'"),
     );
     // Counted like a package download: once per transfer, only when bytes go
-    // out, and off the request path.
-    if files::counts_as_download(&method, &headers) && files::sends_content(&response) {
+    // out, and off the request path; a preview is not counted.
+    access.mark(&mut response);
+    if access == Access::Public
+        && files::counts_as_download(&method, &headers)
+        && files::sends_content(&response)
+    {
         let db = state.db.clone();
         tokio::spawn(async move {
             if let Err(e) = db.increment_file_downloads(&id, &v, &name).await {
@@ -377,7 +397,7 @@ pub(super) async fn put(
     let headers = request.headers().clone();
     authorize_upload(&state, &headers)?;
     let v = parse_version(&version)?;
-    crate::validation::validate_file_name(&name, &state.config.files)?;
+    crate::validation::validate_file_name(&name, &state.feed.allowed_extensions)?;
     version_in_feed(&state, &id, &v).await?;
     let expected = headers
         .get("x-checksum-sha256")
@@ -580,7 +600,7 @@ pub(super) async fn tus_create(
     check_id(id)?;
     let v = parse_version(field("version")?)?;
     let name = field("filename")?;
-    crate::validation::validate_file_name(name, &state.config.files)?;
+    crate::validation::validate_file_name(name, &state.feed.allowed_extensions)?;
     let expected = meta.get("sha256").map(|s| parse_sha256(s)).transpose()?;
     version_in_feed(&state, id, &v).await?;
     if state.db.get_file(id, &v, name).await?.is_some() {

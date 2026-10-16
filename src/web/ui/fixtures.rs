@@ -59,6 +59,7 @@ pub(super) fn feed_ctx(api: Option<&str>, admin: Option<&str>) -> crate::web::Fe
         prefix: String::new(),
         auth: crate::auth::ApiKeyAuth::new(api.map(str::to_string)),
         read_auth: crate::auth::ReadAuth::new(None),
+        preview_auth: crate::auth::ReadAuth::new(None),
         admin: crate::auth::AdminAuth::new(admin.map(str::to_string)),
         allow_overwrite: crate::config::OverwriteMode::Disabled,
         hard_delete_enabled: false,
@@ -68,6 +69,7 @@ pub(super) fn feed_ctx(api: Option<&str>, admin: Option<&str>) -> crate::web::Fe
         license_policy: crate::config::LicensePolicyConfig::default(),
         retention: crate::config::RetentionConfig::default(),
         reserved_elsewhere: Vec::new(),
+        allowed_extensions: crate::config::FilesConfig::default().allowed_extensions,
         cleanup: Default::default(),
         counters: Default::default(),
     }

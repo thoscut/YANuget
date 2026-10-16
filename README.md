@@ -166,7 +166,7 @@ The essentials:
 | Data directory | `YANUGET_DATA_DIR` | `./data` | Holds the package store and SQLite DB. |
 | Base URL | `YANUGET_BASE_URL` | *(per-request)* | Derived from `Host`/`X-Forwarded-*` (trusted peers only) if unset. |
 | Max upload size | `YANUGET_MAX_PACKAGE_SIZE_BYTES` | *(unlimited)* | Streams to disk regardless. |
-| Overwrite | `YANUGET_ALLOW_OVERWRITE` | `false` | `false`/`true`/`prerelease-only`. |
+| Overwrite | `YANUGET_ALLOW_OVERWRITE` | `false` | `false`/`true`/`prerelease-only`/`pending-only`. |
 | Hard delete | `YANUGET_HARD_DELETE_ENABLED` | `false` | Otherwise DELETE unlists. |
 | Rate limit | `YANUGET_RATELIMIT_*` | on, 10000/60s | Per-IP throttle; returns `429`. |
 | Trusted proxies | `YANUGET_TRUSTED_PROXIES` | *(none)* | Peers whose `X-Forwarded-*` is honoured. Set behind a proxy. |
@@ -240,9 +240,9 @@ HTTP (axum)  ──▶  indexing pipeline  ──▶  PackageStorage (trait)  �
 ## Development
 
 ```bash
-cargo test            # unit + integration tests
-cargo clippy --all-targets   # lints (CI requires zero warnings)
-cargo fmt --check     # formatting
+cargo test --workspace                   # unit + integration tests
+cargo clippy --workspace --all-targets   # lints (CI requires zero warnings)
+cargo fmt --all --check                  # formatting
 
 # End-to-end against the real .NET SDK (downloads it on first run).
 cargo build --release && scripts/verify-with-dotnet.sh
@@ -566,7 +566,8 @@ files today, so it also needs a streaming `PackageContent` variant.
 
 What is planned, and the open findings from the latest full review (security,
 correctness, CI, docs and test gaps, each with an id to reference in commits),
-are tracked in [ROADMAP.md](ROADMAP.md).
+are tracked in [ROADMAP.md](ROADMAP.md), including the plan for a Chocolatey
+internalizer ([`INT-…`](ROADMAP.md#chocolatey-internalizer)).
 
 ---
 

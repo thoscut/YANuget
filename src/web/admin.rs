@@ -198,6 +198,7 @@ pub(super) async fn admin_package(
             .collect(),
         None => Vec::new(),
     };
+    let reports = pending_reports(&state, &id, &versions).await;
     Ok(Html(ui::admin_package_page(
         &urls,
         display_id,
@@ -210,9 +211,82 @@ pub(super) async fn admin_package(
             retention_plan: &plan,
             files_enabled: state.config.files.enabled,
             files: &files,
+            reports: &reports,
         },
         &state.feed.admin.csrf_token().unwrap_or_default(),
     )))
+}
+
+/// How many pending versions the page reads a report for, newest first. Each
+/// read opens the package, so a package with a long queue of pending versions
+/// costs a bounded amount per page view.
+const MAX_REPORTS_PER_PAGE: usize = 10;
+
+/// The largest prelude the page shows. A real one is a few KiB of generated
+/// wrappers.
+const MAX_PRELUDE_BYTES: u64 = 256 * 1024;
+
+/// The internalizer reports of the pending versions, for the reviewer who is
+/// about to approve one. A version without a report has no entry; a report
+/// that cannot be read has one saying why, since a reviewer should not
+/// approve past it unawares.
+async fn pending_reports(
+    state: &AppState,
+    id: &str,
+    versions: &[crate::database::FeedVersion],
+) -> Vec<ui::VersionReport> {
+    let mut pending: Vec<&crate::database::FeedVersion> =
+        versions.iter().filter(|fv| fv.pending).collect();
+    pending.sort_by(|a, b| b.package.version.cmp(&a.package.version));
+    let lower = id.to_lowercase();
+    let mut out = Vec::new();
+    for fv in pending.into_iter().take(MAX_REPORTS_PER_PAGE) {
+        let version = fv.package.normalized_version();
+        let read = read_report(state, &lower, &version).await;
+        let view = match read {
+            Ok(None) => continue,
+            Ok(Some(v)) => v,
+            Err(e) => {
+                tracing::warn!(package = %lower, %version, error = %e, "unreadable internalizer report");
+                ui::ReportView::Unreadable(e)
+            }
+        };
+        out.push(ui::VersionReport { version, view });
+    }
+    out
+}
+
+async fn read_report(
+    state: &AppState,
+    lower: &str,
+    version: &str,
+) -> std::result::Result<Option<ui::ReportView>, String> {
+    use crate::nupkg::extract_file;
+    use crate::report::{Report, MAX_REPORT_BYTES, REPORT_PATH};
+    let crate::storage::PackageContent::LocalPath(path) = state
+        .storage
+        .get_package(lower, version)
+        .await
+        .map_err(|e| e.to_string())?;
+    let Some(bytes) = extract_file(&path, REPORT_PATH, MAX_REPORT_BYTES)
+        .await
+        .map_err(|e| e.to_string())?
+    else {
+        return Ok(None);
+    };
+    let report = Report::from_slice(&bytes).map_err(|e| e.to_string())?;
+    let prelude = match report.prelude.as_deref() {
+        None => None,
+        Some(entry) => Some(match extract_file(&path, entry, MAX_PRELUDE_BYTES).await {
+            Ok(Some(b)) => Ok(String::from_utf8_lossy(&b).into_owned()),
+            Ok(None) => Err(format!("the package has no entry {entry}")),
+            Err(e) => Err(e.to_string()),
+        }),
+    };
+    Ok(Some(ui::ReportView::Read {
+        report: Box::new(report),
+        prelude,
+    }))
 }
 
 /// Detach a file from the admin page.

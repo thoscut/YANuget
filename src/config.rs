@@ -14,8 +14,8 @@ use crate::error::{Error, Result};
 /// Overwrite policy for re-pushing an existing package id/version.
 ///
 /// Deserializes from either a bool (`true`/`false`, the historical form) or a
-/// string (`"true"`, `"false"`, `"prerelease-only"`), so existing configs keep
-/// working while the new tri-state is available.
+/// string (`"true"`, `"false"`, `"prerelease-only"`, `"pending-only"`), so
+/// existing configs keep working while the newer modes are available.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum OverwriteMode {
     /// Never overwrite — versions are immutable (the default).
@@ -25,16 +25,29 @@ pub enum OverwriteMode {
     Enabled,
     /// Overwrite pre-release versions only; stable releases stay immutable.
     PrereleaseOnly,
+    /// Replace a version only while it is pending (withheld, never served) in
+    /// every feed that holds it, together with its attached files. A version
+    /// approved anywhere stays immutable. For intake feeds a tool pushes into
+    /// and re-runs against.
+    PendingOnly,
 }
 
 impl OverwriteMode {
-    /// Whether a push may overwrite a version with the given pre-release status.
+    /// Whether a push may overwrite a version with the given pre-release
+    /// status, whatever state the version is in. `PendingOnly` depends on
+    /// that state, so it is decided where the state is known, not here.
     pub fn allows(self, is_prerelease: bool) -> bool {
         match self {
-            OverwriteMode::Disabled => false,
+            OverwriteMode::Disabled | OverwriteMode::PendingOnly => false,
             OverwriteMode::Enabled => true,
             OverwriteMode::PrereleaseOnly => is_prerelease,
         }
+    }
+
+    /// Whether a version that has been served can never change under this
+    /// mode, so downloads may be cached as `immutable`.
+    pub fn served_versions_are_immutable(self) -> bool {
+        matches!(self, OverwriteMode::Disabled | OverwriteMode::PendingOnly)
     }
 
     /// A human-readable label for the settings page.
@@ -43,6 +56,7 @@ impl OverwriteMode {
             OverwriteMode::Disabled => "No",
             OverwriteMode::Enabled => "Yes",
             OverwriteMode::PrereleaseOnly => "Pre-release only",
+            OverwriteMode::PendingOnly => "Pending versions only",
         }
     }
 
@@ -60,9 +74,10 @@ impl OverwriteMode {
             "prerelease-only" | "prerelease" | "prereleaseonly" | "pre" => {
                 Ok(OverwriteMode::PrereleaseOnly)
             }
+            "pending-only" | "pending" | "pendingonly" => Ok(OverwriteMode::PendingOnly),
             _ => Err(env_error(
                 name,
-                &format!("must be true, false or prerelease-only, not {v:?}"),
+                &format!("must be true, false, prerelease-only or pending-only, not {v:?}"),
             )),
         }
     }
@@ -74,6 +89,7 @@ impl Serialize for OverwriteMode {
             OverwriteMode::Disabled => "false",
             OverwriteMode::Enabled => "true",
             OverwriteMode::PrereleaseOnly => "prerelease-only",
+            OverwriteMode::PendingOnly => "pending-only",
         })
     }
 }
@@ -84,7 +100,9 @@ impl<'de> Deserialize<'de> for OverwriteMode {
         impl serde::de::Visitor<'_> for ModeVisitor {
             type Value = OverwriteMode;
             fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-                f.write_str(r#"a bool or one of "true", "false", "prerelease-only""#)
+                f.write_str(
+                    r#"a bool or one of "true", "false", "prerelease-only", "pending-only""#,
+                )
             }
             fn visit_bool<E>(self, v: bool) -> std::result::Result<OverwriteMode, E> {
                 Ok(if v {
@@ -108,6 +126,7 @@ impl<'de> Deserialize<'de> for OverwriteMode {
                     "prerelease-only" | "prerelease" | "prereleaseonly" => {
                         Ok(OverwriteMode::PrereleaseOnly)
                     }
+                    "pending-only" | "pending" | "pendingonly" => Ok(OverwriteMode::PendingOnly),
                     other => Err(E::custom(format!("invalid overwrite mode: {other}"))),
                 }
             }
@@ -462,6 +481,12 @@ pub struct FeedConfig {
     /// reads are open. Accepted as either an `X-NuGet-ApiKey` header or the
     /// password of HTTP Basic credentials (what `dotnet`/`nuget` send).
     pub read_api_key: Option<String>,
+    /// Credential that downloads *pending* versions of this feed, and their
+    /// attached files, as well as approved ones, and does nothing else: no
+    /// push, no approve, no search. For testing a version before approving
+    /// it. Sent like the read key. Unset, pending versions are withheld from
+    /// every client.
+    pub preview_api_key: Option<String>,
     /// Admin key gating moderation/promotion (delete) for this feed. Falls back
     /// to the global `admin_api_key`.
     pub admin_api_key: Option<String>,
@@ -487,6 +512,19 @@ pub struct FeedConfig {
     /// version are one namespace across every feed, so without this whoever
     /// stores a version first claims it in all of them.
     pub reserved_id_prefixes: Vec<String>,
+    /// Attached files in this feed; unset fields fall back to `[files]`.
+    pub files: FeedFilesConfig,
+}
+
+/// `[feeds.files]`: what one feed changes about attached files.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FeedFilesConfig {
+    /// The file extensions this feed accepts, replacing
+    /// `files.allowed_extensions` for it (not adding to it). Lets one feed,
+    /// say an internal Chocolatey feed, take `exe` and `msi` while the others
+    /// keep the narrower default.
+    pub allowed_extensions: Option<Vec<String>>,
 }
 
 /// The default feed name used when no `[[feeds]]` are configured.
@@ -503,6 +541,7 @@ pub struct ResolvedFeed {
     /// Accepted push/delete keys (empty means writes are open).
     pub api_keys: Vec<String>,
     pub read_api_key: Option<String>,
+    pub preview_api_key: Option<String>,
     pub admin_api_key: Option<String>,
     pub allow_overwrite: OverwriteMode,
     pub hard_delete_enabled: bool,
@@ -515,6 +554,8 @@ pub struct ResolvedFeed {
     pub reserved_id_prefixes: Vec<String>,
     /// The prefixes every *other* feed reserved, which this one must refuse.
     pub reserved_elsewhere: Vec<ReservedPrefix>,
+    /// The file extensions attached files may have in this feed.
+    pub allowed_extensions: Vec<String>,
 }
 
 /// A package-id prefix reserved by one feed (`reserved_id_prefixes`).
@@ -700,10 +741,16 @@ impl Default for FilesConfig {
 impl FilesConfig {
     /// Whether `ext` (without the dot) is one of the accepted extensions.
     pub fn allows_extension(&self, ext: &str) -> bool {
-        self.allowed_extensions
-            .iter()
-            .any(|allowed| allowed.trim_start_matches('.').eq_ignore_ascii_case(ext))
+        extension_allowed(&self.allowed_extensions, ext)
     }
+}
+
+/// Whether `ext` (without the dot) is in `allowed`, ignoring ASCII case and a
+/// leading dot on the entries.
+pub fn extension_allowed(allowed: &[String], ext: &str) -> bool {
+    allowed
+        .iter()
+        .any(|a| a.trim_start_matches('.').eq_ignore_ascii_case(ext))
 }
 
 impl Default for Config {
@@ -996,6 +1043,9 @@ impl Config {
             if let Some(v) = var("READ_API_KEY")? {
                 f.read_api_key = optional_key(&v);
             }
+            if let Some(v) = var("PREVIEW_API_KEY")? {
+                f.preview_api_key = optional_key(&v);
+            }
             if let Some(v) = var("ADMIN_API_KEY")? {
                 f.admin_api_key = optional_key(&v);
             }
@@ -1119,6 +1169,7 @@ impl Config {
                 prefix: String::new(),
                 api_keys: combine_keys(&self.api_key, &self.api_keys),
                 read_api_key: None,
+                preview_api_key: None,
                 admin_api_key: self.admin_api_key.clone(),
                 allow_overwrite: self.allow_overwrite,
                 hard_delete_enabled: self.hard_delete_enabled,
@@ -1130,6 +1181,7 @@ impl Config {
                 // A single feed has no other feed to reserve anything from.
                 reserved_id_prefixes: Vec::new(),
                 reserved_elsewhere: Vec::new(),
+                allowed_extensions: self.files.allowed_extensions.clone(),
             }]);
         }
 
@@ -1159,6 +1211,7 @@ impl Config {
                 name: f.name.clone(),
                 api_keys,
                 read_api_key: f.read_api_key.clone(),
+                preview_api_key: f.preview_api_key.clone(),
                 admin_api_key: f
                     .admin_api_key
                     .clone()
@@ -1175,6 +1228,11 @@ impl Config {
                     .unwrap_or_else(|| self.retention.clone()),
                 reserved_id_prefixes: reserved_prefixes(f)?,
                 reserved_elsewhere: Vec::new(),
+                allowed_extensions: f
+                    .files
+                    .allowed_extensions
+                    .clone()
+                    .unwrap_or_else(|| self.files.allowed_extensions.clone()),
             });
         }
 
@@ -1294,6 +1352,7 @@ impl std::fmt::Debug for ResolvedFeed {
             .field("prefix", &self.prefix)
             .field("api_keys", &self.api_keys.len())
             .field("read_api_key", &redact_opt(&self.read_api_key))
+            .field("preview_api_key", &redact_opt(&self.preview_api_key))
             .field("admin_api_key", &redact_opt(&self.admin_api_key))
             .field("allow_overwrite", &self.allow_overwrite)
             .field("hard_delete_enabled", &self.hard_delete_enabled)
@@ -1305,6 +1364,7 @@ impl std::fmt::Debug for ResolvedFeed {
             .field("retention", &self.retention)
             .field("reserved_id_prefixes", &self.reserved_id_prefixes)
             .field("reserved_elsewhere", &self.reserved_elsewhere)
+            .field("allowed_extensions", &self.allowed_extensions)
             .finish_non_exhaustive()
     }
 }
@@ -1444,10 +1504,11 @@ fn parse_env_host(name: &str, v: &str) -> Result<IpAddr> {
 
 /// A comma-separated environment list, trimmed, empties dropped.
 /// The per-feed secrets the environment can set, as `YANUGET_FEED_{NAME}_{SUFFIX}`.
-const FEED_ENV_SUFFIXES: [&str; 6] = [
+const FEED_ENV_SUFFIXES: [&str; 7] = [
     "API_KEY",
     "API_KEYS",
     "READ_API_KEY",
+    "PREVIEW_API_KEY",
     "ADMIN_API_KEY",
     "MIRROR_PASSWORD",
     "MIRROR_TOKEN",
@@ -1699,8 +1760,16 @@ mod tests {
             mode(r#"allow_overwrite = "prerelease-only""#),
             OverwriteMode::PrereleaseOnly
         );
+        assert_eq!(
+            mode(r#"allow_overwrite = "pending-only""#),
+            OverwriteMode::PendingOnly
+        );
 
-        // The decision helper.
+        // The decision helper. Pending-only depends on the version's state,
+        // which `allows` does not know, so it says no.
+        assert!(!OverwriteMode::PendingOnly.allows(true));
+        assert!(OverwriteMode::PendingOnly.served_versions_are_immutable());
+        assert!(!OverwriteMode::PrereleaseOnly.served_versions_are_immutable());
         assert!(!OverwriteMode::Disabled.allows(true));
         assert!(OverwriteMode::Enabled.allows(false));
         assert!(OverwriteMode::PrereleaseOnly.allows(true));
@@ -1714,6 +1783,10 @@ mod tests {
         assert_eq!(
             OverwriteMode::parse_env("X", "off").unwrap(),
             OverwriteMode::Disabled
+        );
+        assert_eq!(
+            OverwriteMode::parse_env("X", "pending_only").unwrap(),
+            OverwriteMode::PendingOnly
         );
         assert!(OverwriteMode::parse_env("X", "garbage").is_err());
     }
@@ -2019,6 +2092,7 @@ mod tests {
                     keys.to_str().unwrap(),
                 ),
                 ("YANUGET_FEED_PRE_PROD_READ_API_KEY", "reader"),
+                ("YANUGET_FEED_PRE_PROD_PREVIEW_API_KEY", "previewer"),
                 ("YANUGET_FEED_PRE_PROD_MIRROR_TOKEN", "upstream-token"),
             ],
         )
@@ -2027,6 +2101,7 @@ mod tests {
         assert_eq!(c.feeds[1].admin_api_key.as_deref(), Some("admin-from-file"));
         assert_eq!(c.feeds[1].api_keys, vec!["one", "two"]);
         assert_eq!(c.feeds[1].read_api_key.as_deref(), Some("reader"));
+        assert_eq!(c.feeds[1].preview_api_key.as_deref(), Some("previewer"));
         assert_eq!(
             c.feeds[1].mirror.auth.token.as_deref(),
             Some("upstream-token")

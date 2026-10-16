@@ -60,7 +60,10 @@ min_free_disk_bytes = 2147483648          # YANUGET_MIN_FREE_DISK_BYTES
 #   false  — never overwrite (default)
 #   true   — overwrite any version
 #   "prerelease-only" — overwrite pre-releases only; stable releases stay immutable
-allow_overwrite = false    # YANUGET_ALLOW_OVERWRITE (false|true|prerelease-only)
+#   "pending-only" — replace a version (and drop its attached files) only while
+#                    it is pending in every feed that holds it; for gated
+#                    intake feeds a tool re-pushes into
+allow_overwrite = false    # YANUGET_ALLOW_OVERWRITE (false|true|prerelease-only|pending-only)
 
 # When true, DELETE hard-deletes a package. When false (default), DELETE only
 # unlists it (the NuGet client's "delete" semantics), keeping it restorable.
@@ -237,6 +240,7 @@ inbox_scan_secs = 30                # YANUGET_FILES_INBOX_SCAN_SECS
 # # read_api_key gates download/restore ("get"); unset = open. Accepted as an
 # #   X-NuGet-ApiKey header OR the password of HTTP Basic credentials.
 # # read_api_key = "downloaders"
+# # preview_api_key downloads pending versions and their files, nothing else.
 # # admin_api_key falls back to the global admin_api_key (moderation / "delete").
 # allow_overwrite = false       # falls back to global when unset
 # hard_delete_enabled = false   # falls back to global when unset
@@ -304,3 +308,8 @@ inbox_scan_secs = 30                # YANUGET_FILES_INBOX_SCAN_SECS
 #   [feeds.retention]
 #   enabled = true
 #   keep_latest_stable = 20
+#
+#   # Replaces [files].allowed_extensions for this feed only (not added to
+#   # it), e.g. to take installers in an internal Chocolatey feed.
+#   [feeds.files]
+#   allowed_extensions = ["exe", "msi", "msix", "msu", "zip"]

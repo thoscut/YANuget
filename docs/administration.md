@@ -79,6 +79,31 @@ for all of them.
 
 To remove a whole package, tick all its versions and delete them.
 
+## Internalizer reports
+
+A package that the Chocolatey internalizer rewrote carries a report at
+`internalizer/report.json`. When a pending version has one, its admin page
+shows it under the version list: the status and its reasons, the upstream
+source and hash, the Chocolatey version and image the scripts ran in, each
+original download URL with the attached file that replaces it and whether the
+script's checksum vouched for it (*verified*) or not (*trust on first use*),
+the warnings, and the prelude the install scripts run first.
+
+Before you approve, the page checks the report against the version. A file the
+report lists that is not attached, an attached file whose size or SHA-256
+differs from the report, a prelude the package lacks, or a report the server
+cannot read is listed in a warning, and **Approve** asks for confirmation.
+That is what an interrupted run leaves behind, and approving it publishes an
+install that fails. Run it again, or attach the missing files, first. The
+selection's **Approve** does not check reports.
+
+Everything in a report comes from the package and is shown as text; no URL in
+it is a link. A report is read only for the ten newest pending versions, up to
+1 MiB, with a prelude of up to 256 KiB. Its schema is version 1, defined in
+the `yanuget-pkg` crate (`report` module); fields the server does not know are
+ignored, and a report of another schema version is shown as unreadable. A
+version without a report looks as it always did.
+
 Every admin action can be scripted: with [`yanuget admin`](admin-cli.md), or as
 a `POST` with a CSRF token (see
 [Scripting promotion and approval](feeds.md#scripting-promotion-and-approval)

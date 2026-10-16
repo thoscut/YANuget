@@ -90,10 +90,10 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        run: cargo clippy --all-targets --all-features
+        run: cargo clippy --workspace --all-targets --all-features
 
       - name: Test
-        run: cargo test --all-features
+        run: cargo test --workspace --all-features
 
       - name: Build release
         run: cargo build --release
@@ -129,7 +129,7 @@ jobs:
       # with 1.88, so this is the compiler the image ships, and a behaviour
       # difference between it and stable would otherwise go unnoticed.
       - name: Test against MSRV
-        run: cargo +1.88.0 test --all-targets --all-features
+        run: cargo +1.88.0 test --workspace --all-targets --all-features
 
   audit:
     name: Dependency audit
@@ -200,8 +200,17 @@ jobs:
 
       # Deliberately without a docs site present: this is how crates.io builds
       # it, and it is what caught `build.rs` writing outside `OUT_DIR`.
-      - name: Verify the crate packages and builds from its tarball
-        run: cargo publish --dry-run --locked
+      # `--workspace` packages `yanuget-pkg` too and builds `yanuget` against
+      # that tarball rather than the path, as crates.io would.
+      # The dry run serves `yanuget-pkg` from a local registry under a version
+      # number that does not change between commits, and cargo treats a
+      # registry crate as immutable: a cached extraction or build of an earlier
+      # commit's tarball would stand in for this one's. Both are dropped first.
+      - name: Verify the crates package and build from their tarballs
+        run: |
+          rm -rf ~/.cargo/registry/src/*/yanuget-pkg-*
+          cargo clean -p yanuget-pkg
+          cargo publish --dry-run --locked --workspace
 
       # REQUIRE_DOCS=1 matches how the release workflow builds it, so a docs
       # failure is a build failure here rather than an image that quietly ships

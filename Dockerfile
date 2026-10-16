@@ -47,6 +47,9 @@ RUN set -eu; \
 # build: it is what stages the embeddable documentation site into `OUT_DIR`, and
 # `src/web/docs.rs` does not compile without it.
 COPY Cargo.toml Cargo.lock build.rs ./
+# The workspace's other crates are small; copying them whole lets the
+# dependency build resolve the workspace. Only the server is built.
+COPY crates ./crates
 RUN mkdir src \
     && echo "fn main() {}" > src/main.rs \
     && echo "" > src/lib.rs \

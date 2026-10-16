@@ -25,8 +25,6 @@ pub mod migrate;
 pub mod mirror;
 pub mod models;
 pub mod nuget;
-pub mod nupkg;
-pub mod nuspec;
 pub mod pdb;
 pub mod pe;
 pub mod policy;
@@ -39,8 +37,11 @@ pub mod streaming;
 pub mod symbols;
 pub mod tls;
 pub mod validation;
-pub mod version;
 pub mod web;
 
 pub use error::{Error, Result};
 pub use version::NuGetVersion;
+
+// Package handling lives in the `yanuget-pkg` crate, shared with the tools that
+// build packages for the server; these keep the server's paths unchanged.
+pub use yanuget_pkg::{nupkg, nuspec, range, report, version};

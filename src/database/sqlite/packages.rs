@@ -73,6 +73,82 @@ pub(super) async fn replace_version(
     m: &Membership,
 ) -> Result<()> {
     let mut tx = db.write_tx().await?;
+    replace_rows(&mut tx, p, m).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// [`replace_version`], refused while any feed has approved the version, and
+/// optionally dropping its attached-file rows in the same transaction.
+///
+/// The check runs inside the write transaction (`BEGIN IMMEDIATE`), so an
+/// approval either commits before it and is seen, or waits until the
+/// replacement has committed: an approved version is never replaced.
+pub(super) async fn replace_pending_version(
+    db: &SqliteDatabase,
+    p: &Package,
+    m: &Membership,
+    drop_files: bool,
+) -> Result<Vec<crate::database::PackageFile>> {
+    let mut tx = db.write_tx().await?;
+    let approved: Vec<String> = sqlx::query_scalar(
+        "SELECT feed FROM feed_packages \
+         WHERE lower_id = ?1 AND normalized_version = ?2 AND pending = 0 ORDER BY feed",
+    )
+    .bind(p.lower_id())
+    .bind(p.normalized_version())
+    .fetch_all(&mut *tx)
+    .await?;
+    if !approved.is_empty() {
+        return Err(Error::VersionExists(crate::database::approved_refusal(
+            p, &approved,
+        )));
+    }
+    replace_rows(&mut tx, p, m).await?;
+    let mut dropped = Vec::new();
+    if drop_files {
+        let rows = sqlx::query(
+            "SELECT * FROM package_files WHERE lower_id = ?1 AND normalized_version = ?2",
+        )
+        .bind(p.lower_id())
+        .bind(p.normalized_version())
+        .fetch_all(&mut *tx)
+        .await?;
+        dropped = rows
+            .iter()
+            .map(super::files::row_to_file)
+            .collect::<Result<_>>()?;
+        sqlx::query("DELETE FROM package_files WHERE lower_id = ?1 AND normalized_version = ?2")
+            .bind(p.lower_id())
+            .bind(p.normalized_version())
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(dropped)
+}
+
+pub(super) async fn approved_in(
+    db: &SqliteDatabase,
+    id: &str,
+    version: &NuGetVersion,
+) -> Result<Vec<String>> {
+    Ok(sqlx::query_scalar(
+        "SELECT feed FROM feed_packages \
+         WHERE lower_id = ?1 AND normalized_version = ?2 AND pending = 0 ORDER BY feed",
+    )
+    .bind(canonical_id(id))
+    .bind(version.normalized())
+    .fetch_all(&db.pool)
+    .await?)
+}
+
+/// The rows [`replace_version`] writes, inside the caller's transaction.
+async fn replace_rows(
+    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    p: &Package,
+    m: &Membership,
+) -> Result<()> {
     bind_package(
         sqlx::query(package_insert!(
             "ON CONFLICT(lower_id, normalized_version) DO UPDATE SET \
@@ -95,14 +171,14 @@ pub(super) async fn replace_version(
         )),
         p,
     )?
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
     sqlx::query("DELETE FROM package_tags WHERE lower_id = ?1 AND normalized_version = ?2")
         .bind(p.lower_id())
         .bind(p.normalized_version())
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
-    insert_tags(&mut tx, p).await?;
+    insert_tags(tx, p).await?;
     // The membership's own state is the caller's to decide; its download
     // counter is history and survives the replacement.
     sqlx::query(
@@ -125,9 +201,8 @@ pub(super) async fn replace_version(
     .bind(&m.flag_reason)
     .bind(Utc::now().to_rfc3339())
     .bind(i64::from(m.pinned))
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
-    tx.commit().await?;
     Ok(())
 }
 

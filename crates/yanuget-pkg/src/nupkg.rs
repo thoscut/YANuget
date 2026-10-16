@@ -52,7 +52,7 @@ pub async fn read_archive(path: impl AsRef<Path>) -> Result<ArchiveContents, Err
     let path: PathBuf = path.as_ref().to_path_buf();
     tokio::task::spawn_blocking(move || read_archive_blocking(&path))
         .await
-        .map_err(|e| Error::Other(anyhow::anyhow!("nupkg read task panicked: {e}")))?
+        .map_err(|e| Error::Task(format!("nupkg read task panicked: {e}")))?
 }
 
 fn read_archive_blocking(path: &Path) -> Result<ArchiveContents, Error> {
@@ -106,7 +106,7 @@ fn read_archive_blocking(path: &Path) -> Result<ArchiveContents, Error> {
 
 /// Open an archive for reading, after checking that its central directory
 /// means the same thing to every reader (see [`check_central_directory`]).
-pub(crate) fn open_archive(path: &Path) -> Result<zip::ZipArchive<File>, Error> {
+pub fn open_archive(path: &Path) -> Result<zip::ZipArchive<File>, Error> {
     let mut file = File::open(path)?;
     let directory = check_central_directory(&mut file)?;
     let archive = zip::ZipArchive::new(file)
@@ -129,7 +129,7 @@ pub(crate) fn open_archive(path: &Path) -> Result<zip::ZipArchive<File>, Error> 
 
 /// The index of the entry named `normalized` (see [`normalize_entry`]), from the
 /// central directory alone.
-pub(crate) fn entry_index(archive: &zip::ZipArchive<File>, normalized: &str) -> Option<usize> {
+pub fn entry_index(archive: &zip::ZipArchive<File>, normalized: &str) -> Option<usize> {
     (0..archive.len()).find(|&i| {
         archive
             .name_for_index(i)
@@ -150,7 +150,7 @@ pub async fn extract_file(
     let needle = normalize_entry(entry_name);
     tokio::task::spawn_blocking(move || extract_file_blocking(&path, &needle, max_bytes))
         .await
-        .map_err(|e| Error::Other(anyhow::anyhow!("nupkg extract task panicked: {e}")))?
+        .map_err(|e| Error::Task(format!("nupkg extract task panicked: {e}")))?
 }
 
 /// Extract several named entries in **one** pass over the archive.
@@ -200,7 +200,7 @@ pub async fn extract_entries_to_files(
         result.map(|()| out)
     })
     .await
-    .map_err(|e| Error::Other(anyhow::anyhow!("nupkg extract task panicked: {e}")))?
+    .map_err(|e| Error::Task(format!("nupkg extract task panicked: {e}")))?
 }
 
 /// One archive entry written out by [`extract_entries_to_files`].
@@ -318,7 +318,7 @@ fn extract_file_blocking(
     Ok(Some(buf))
 }
 
-pub(crate) fn normalize_entry(name: &str) -> String {
+pub fn normalize_entry(name: &str) -> String {
     name.replace('\\', "/").to_ascii_lowercase()
 }
 
