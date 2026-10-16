@@ -1,0 +1,53 @@
+# yanuget-internalize configuration. Every setting is optional; shown here are
+# the defaults, or an example where there is none.
+#
+# Each setting can also come from the environment: its TOML path in capitals,
+# joined by `_`, after YANUGET_INTERNALIZE_. `[sandbox.kvm] capture_image` is
+# YANUGET_INTERNALIZE_SANDBOX_KVM_CAPTURE_IMAGE. The environment wins over
+# this file. The push key can come from a file instead:
+# YANUGET_INTERNALIZE_TARGET_API_KEY_FILE=/run/credentials/…/push-key.
+#
+# Check a configuration with `yanuget-internalize -c this.toml config check`.
+
+# Upstream packages and downloaded files, kept between runs.
+cache_dir = "./cache"
+# Scratch space of a run.
+work_dir = "./work"
+
+[target]
+# The intake feed (requires_approval = true) to push to, where its
+# v3/index.json is. `plan` works without one; `run` does not.
+# url = "https://nuget.example.com/intake/"
+# A push key of that feed, and nothing more. Better from the environment or
+# a key file than from here.
+# api_key = ""
+timeout_secs = 300
+
+[upstream]
+# A v2 feed or a v3 service index.
+url = "https://community.chocolatey.org/api/v2/"
+# Requests at a time; the community repository rate-limits heavy users.
+concurrency = 2
+
+[sandbox]
+# "kvm" (a Linux host with /dev/kvm) or "windows-container" (a Windows host).
+backend = "kvm"
+# Wall-clock limit of one capture.
+timeout_secs = 1800
+# Sandboxes at once.
+max_parallel = 1
+# The most a capture may write; more fails the package.
+max_capture_bytes = 4194304
+
+[sandbox.kvm]
+# A path, or a name looked up in PATH.
+qemu = "qemu-system-x86_64"
+# The golden images (contrib/internalizer/, once it exists).
+# capture_image = "/var/lib/yanuget-internalize/images/capture.qcow2"
+# stock_image = "/var/lib/yanuget-internalize/images/stock.qcow2"
+memory_mib = 4096
+cpus = 2
+
+[sandbox.windows_container]
+# Pinned by digest.
+# image = "registry.example.com/yanuget-internalize@sha256:…"

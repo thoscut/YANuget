@@ -133,6 +133,7 @@ Branch off `main` and open the pull request against `main`.
 | Path | What lives there |
 | --- | --- |
 | `crates/yanuget-pkg/` | Package handling with no web or database dependency, shared with tools that build packages for the server: versions (`version.rs`) and version ranges (`range.rs`), manifest parsing (`nuspec.rs`), seek-based archive reading (`nupkg.rs`), and the upstream address policy (`address.rs`). The server re-exports these modules under their old paths (`yanuget::version`, …). |
+| `crates/yanuget-internalize/` | The Chocolatey internalizer (`yanuget-internalize`), unreleased: command line, configuration and its check, and the `Sandbox` trait with a fake for tests (`sandbox/fake.rs`). Reaches the server only over HTTP, with a push key. |
 | `src/streaming.rs` | Bounded-memory copy-to-disk with incremental SHA-512 |
 | `src/storage/` | `PackageStorage` trait and the filesystem backend |
 | `src/database/` | `PackageDatabase` trait and the SQLite backend, one module per table group under `sqlite/` |

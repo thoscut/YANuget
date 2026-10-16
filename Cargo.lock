@@ -3657,6 +3657,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "yanuget-internalize"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "clap",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "yanuget-pkg",
+]
+
+[[package]]
 name = "yanuget-pkg"
 version = "0.1.0"
 dependencies = [

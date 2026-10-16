@@ -762,7 +762,7 @@ Not yet implemented (contributions welcome):
 
 ## Chocolatey internalizer
 
-Planned; nothing here is implemented yet. A tool that takes a package from the
+Partly built: the ticked items have landed. A tool that takes a package from the
 Chocolatey Community Repository (or any v2 or v3 feed), fetches every file its
 scripts download at install time, and publishes a copy into a YANuget feed that
 installs without internet access. Drafted on 2026-10-15 against 0.7.0, whose
@@ -919,7 +919,7 @@ Every server change the tool relies on, in one release (see
 Goal: internalize the dependency closure of a package into a gated feed, for
 packages whose downloads go through Chocolatey's helpers.
 
-- [ ] **`INT-10` Crate, command line, configuration.** `yanuget-internalize`
+- [x] **`INT-10` Crate, command line, configuration.** `yanuget-internalize`
   with `plan` (capture and report, publish nothing) and `run` (capture,
   download, rewrite, publish). Configuration is layered like the server's
   (defaults, TOML, `YANUGET_INTERNALIZE_*`, `_FILE` for secrets) with
@@ -931,6 +931,16 @@ packages whose downloads go through Chocolatey's helpers.
   rewriting and publishing build and are tested on Linux CI against a fake
   sandbox. Exit codes tell "done", "needs attention" and "failed" apart for
   pipelines.
+  *Landed:* `crates/yanuget-internalize`, `publish = false` until its first
+  release. Exit codes: `0` done, `1` failed, `3` needs attention (`2` stays
+  clap's usage error). A package is `id` or `id@version`. Every setting is
+  also `YANUGET_INTERNALIZE_` plus its TOML path in capitals; the push key
+  takes `_FILE`, and `config check` warns about a variable that is not a
+  setting. The check asks the target feed for its service index, which must
+  list `PackagePublish` (`--offline` skips it), and checks `/dev/kvm`, QEMU
+  and the qcow2 images, or a Windows host and a digest-pinned image. Both
+  backends check their host and refuse every capture until their runners
+  land, so `plan` and `run` stop before they fetch anything.
 - [ ] **`INT-11` Upstream client.** The Chocolatey Community Repository over v2
   OData (`FindPackagesById()`, package download), any v3 feed through its
   service index, and the auth modes of `[feeds.mirror]`. Each download is

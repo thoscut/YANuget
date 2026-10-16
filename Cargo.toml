@@ -19,7 +19,7 @@ default-run = "yanuget"
 exclude = [".github/", "scripts/", "site/"]
 
 [workspace]
-members = [".", "crates/yanuget-pkg"]
+members = [".", "crates/yanuget-pkg", "crates/yanuget-internalize"]
 
 [lib]
 name = "yanuget"
