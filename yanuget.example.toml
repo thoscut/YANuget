@@ -60,7 +60,10 @@ min_free_disk_bytes = 2147483648          # YANUGET_MIN_FREE_DISK_BYTES
 #   false  — never overwrite (default)
 #   true   — overwrite any version
 #   "prerelease-only" — overwrite pre-releases only; stable releases stay immutable
-allow_overwrite = false    # YANUGET_ALLOW_OVERWRITE (false|true|prerelease-only)
+#   "pending-only" — replace a version (and drop its attached files) only while
+#                    it is pending in every feed that holds it; for gated
+#                    intake feeds a tool re-pushes into
+allow_overwrite = false    # YANUGET_ALLOW_OVERWRITE (false|true|prerelease-only|pending-only)
 
 # When true, DELETE hard-deletes a package. When false (default), DELETE only
 # unlists it (the NuGet client's "delete" semantics), keeping it restorable.

@@ -21,6 +21,13 @@ expected to change incompatibly at any version.
   feed's settings page shows its list, and `yanuget config check` warns about
   an empty list or an entry no file name can match. A feed without the table
   behaves as before. (`INT-03`)
+- `allow_overwrite = "pending-only"` (also `YANUGET_ALLOW_OVERWRITE=pending-only`
+  and per feed): a push may replace a version while it is pending in every feed
+  that holds it, and the old build's attached files are deleted with it. A
+  version approved in any feed stays immutable; the check runs in the same
+  transaction as the replacement, so an approval racing a push is never lost.
+  Downloads stay `immutable` under it. `yanuget config check` warns when a
+  feed sets it without `requires_approval`. (`INT-04`)
 
 ### Changed
 

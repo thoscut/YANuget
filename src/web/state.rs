@@ -84,7 +84,7 @@ impl FeedContext {
     pub(crate) fn content_cache(&self) -> files::CachePolicy {
         files::CachePolicy {
             private: self.read_auth.is_enabled(),
-            immutable: self.allow_overwrite == OverwriteMode::Disabled,
+            immutable: self.allow_overwrite.served_versions_are_immutable(),
         }
     }
 

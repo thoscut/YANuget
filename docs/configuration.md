@@ -28,7 +28,7 @@ A fully commented template lives in
 | `upload_idle_timeout_secs` | `YANUGET_UPLOAD_IDLE_TIMEOUT_SECS` | int | `300` | Abort an upload after this long without a byte arriving (`408`). Only silence counts; a slow transfer is never cut off. `0` waits forever. |
 | `min_free_disk_bytes` | `YANUGET_MIN_FREE_DISK_BYTES` | int | `2147483648` (2 GiB) | Refuse an upload (`507`) that would leave less than this free on the storage volume. Checked against the declared size when there is one. Mirror fetches and `yanuget migrate` downloads are held to it too, against the upstream's `Content-Length`. `0` turns the check off. |
 | `max_connections` | `YANUGET_MAX_CONNECTIONS` | int | `4096` | Concurrent connections accepted; one over the cap is closed at once. `0` is unlimited. |
-| `allow_overwrite` | `YANUGET_ALLOW_OVERWRITE` | bool \| string | `false` | Re-push an existing version: `false`, `true`, or `"prerelease-only"` (overwrite pre-releases only). |
+| `allow_overwrite` | `YANUGET_ALLOW_OVERWRITE` | bool \| string | `false` | Re-push an existing version: `false`, `true`, `"prerelease-only"` (overwrite pre-releases only), or `"pending-only"` (replace a version only while it is pending in every feed that holds it; see below). |
 | `hard_delete_enabled` | `YANUGET_HARD_DELETE_ENABLED` | bool | `false` | DELETE removes vs. unlists. |
 | `tls_enabled` | `YANUGET_TLS_ENABLED` | bool | `true` | Serve HTTPS (self-signed fallback). |
 | `tls_cert_path` | `YANUGET_TLS_CERT_PATH` | path | *(self-signed)* | PEM certificate (chain). |
@@ -47,8 +47,8 @@ error — it is never skipped or read as "off":
   For a setting that is unset by default (`YANUGET_MAX_PACKAGE_SIZE_BYTES`,
   the retention limits), the empty string means unset.
 - `YANUGET_HOST` is an IP address or `localhost` (the IPv4 loopback).
-- `YANUGET_ALLOW_OVERWRITE` is `true`, `false` or `prerelease-only` (or a
-  boolean spelling).
+- `YANUGET_ALLOW_OVERWRITE` is `true`, `false`, `prerelease-only` or
+  `pending-only` (or a boolean spelling).
 
 A `tls_cert_path` without `tls_key_path`, or the reverse, is also an error
 while TLS is on, rather than a silent fall-back to the self-signed
@@ -423,7 +423,7 @@ affected.
 | `feeds[].api_keys` | string[] | *(global)* | Additional push keys. A feed that sets any push key uses only its own. |
 | `feeds[].read_api_key` | string | *(open)* | Download/restore (get) credential. See below. |
 | `feeds[].admin_api_key` | string | *(global `admin_api_key`)* | Moderation/promotion (delete) credential. |
-| `feeds[].allow_overwrite` | bool \| string | *(global)* | Re-push policy (`false`/`true`/`"prerelease-only"`). |
+| `feeds[].allow_overwrite` | bool \| string | *(global)* | Re-push policy (`false`/`true`/`"prerelease-only"`/`"pending-only"`). |
 | `feeds[].hard_delete_enabled` | bool | *(global)* | DELETE removes vs. unlists. |
 | `feeds[].requires_approval` | bool | `false` | Incoming versions are pending until approved. |
 | `feeds[].promotes_to` | string | *(none)* | Next release ring (must name another feed). |
@@ -541,6 +541,26 @@ approved; its row shows `pending in stable` until then. A promoted (or copied)
 version keeps the state it had: one that is unlisted, disabled or still
 pending in the source arrives unlisted, disabled or pending in the target. Feeds without
 `promotes_to` are simply independent sets a version can be added to.
+
+#### Replacing a pending version
+
+With overwrite off, a second push of a version is `409` even while the first
+is pending and has never been served. A gated feed that a tool pushes into,
+and re-runs against, can set `allow_overwrite = "pending-only"`:
+
+- A push may replace a version that is pending in **every** feed holding it.
+  The new build replaces the old one in all of them, still pending, and the
+  old build's attached files are deleted with it (they belong to the build
+  they were made for). Pushing the same build again changes nothing and keeps
+  the files, so a re-run can finish attaching what an earlier one missed.
+- Once any feed has approved the version, it is immutable: the push is `409`
+  and says where it is approved. The check runs in the same database
+  transaction as the replacement, so an approval that races a push either
+  wins (the push is refused and the approved build stays, files included) or
+  waits until the replacement is recorded.
+
+`yanuget config check` warns when a feed sets it without
+`requires_approval`, since versions pushed there are approved on arrival.
 
 ## Logging
 

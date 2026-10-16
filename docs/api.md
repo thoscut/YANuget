@@ -155,7 +155,7 @@ the payload. `Cache-Control` depends on the feed:
 
 | Feed | `Cache-Control` |
 | --- | --- |
-| Overwrite off (the default) | `public, max-age=31536000, immutable` — an id/version never serves other bytes |
+| Overwrite off (the default) or `"pending-only"` | `public, max-age=31536000, immutable` — an id/version never serves other bytes, since only versions nobody was served can be replaced |
 | Overwrite on (`true` or `"prerelease-only"`) | `public, no-cache` — every use revalidates, since a re-push changes the bytes |
 | Read-gated (`read_api_key`) | `private, …` instead of `public, …`, plus `Vary: Authorization, X-NuGet-ApiKey` |
 

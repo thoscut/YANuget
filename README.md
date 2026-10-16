@@ -166,7 +166,7 @@ The essentials:
 | Data directory | `YANUGET_DATA_DIR` | `./data` | Holds the package store and SQLite DB. |
 | Base URL | `YANUGET_BASE_URL` | *(per-request)* | Derived from `Host`/`X-Forwarded-*` (trusted peers only) if unset. |
 | Max upload size | `YANUGET_MAX_PACKAGE_SIZE_BYTES` | *(unlimited)* | Streams to disk regardless. |
-| Overwrite | `YANUGET_ALLOW_OVERWRITE` | `false` | `false`/`true`/`prerelease-only`. |
+| Overwrite | `YANUGET_ALLOW_OVERWRITE` | `false` | `false`/`true`/`prerelease-only`/`pending-only`. |
 | Hard delete | `YANUGET_HARD_DELETE_ENABLED` | `false` | Otherwise DELETE unlists. |
 | Rate limit | `YANUGET_RATELIMIT_*` | on, 10000/60s | Per-IP throttle; returns `429`. |
 | Trusted proxies | `YANUGET_TRUSTED_PROXIES` | *(none)* | Peers whose `X-Forwarded-*` is honoured. Set behind a proxy. |

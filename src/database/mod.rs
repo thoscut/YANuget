@@ -319,6 +319,23 @@ pub trait PackageDatabase: Send + Sync {
     /// feed's membership, and this membership's download count.
     async fn replace_version(&self, package: &Package, membership: &Membership) -> Result<()>;
 
+    /// [`Self::replace_version`] for `allow_overwrite = "pending-only"`:
+    /// refused with [`Error::VersionExists`](crate::error::Error::VersionExists)
+    /// when any feed has approved the version, checked in the same transaction
+    /// as the replacement, so a concurrent approval is either seen or waits.
+    /// With `drop_files`, the version's attached-file rows are deleted in that
+    /// transaction too and returned, for the caller to delete the blobs nothing
+    /// else references.
+    async fn replace_pending_version(
+        &self,
+        package: &Package,
+        membership: &Membership,
+        drop_files: bool,
+    ) -> Result<Vec<PackageFile>>;
+
+    /// The feeds in which a version is approved (held and not pending).
+    async fn approved_in(&self, id: &str, version: &NuGetVersion) -> Result<Vec<String>>;
+
     /// Up to `limit` versions whose global data no feed holds any more: what a
     /// purge that failed part-way leaves behind.
     async fn orphaned_versions(&self, limit: i64) -> Result<Vec<Package>>;
@@ -613,4 +630,16 @@ pub struct SymbolRef {
 pub struct SymbolKey {
     pub key: String,
     pub filename: String,
+}
+
+/// The refusal for replacing a version that some feed has approved.
+pub fn approved_refusal(p: &Package, feeds: &[String]) -> String {
+    format!(
+        "{} {} is approved in {}, and allow_overwrite = \"pending-only\" replaces \
+         a version only while it is pending in every feed that holds it. Push it as \
+         a new version.",
+        p.id,
+        p.normalized_version(),
+        feeds.join(", ")
+    )
 }

@@ -14,8 +14,8 @@ use crate::error::{Error, Result};
 /// Overwrite policy for re-pushing an existing package id/version.
 ///
 /// Deserializes from either a bool (`true`/`false`, the historical form) or a
-/// string (`"true"`, `"false"`, `"prerelease-only"`), so existing configs keep
-/// working while the new tri-state is available.
+/// string (`"true"`, `"false"`, `"prerelease-only"`, `"pending-only"`), so
+/// existing configs keep working while the newer modes are available.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum OverwriteMode {
     /// Never overwrite — versions are immutable (the default).
@@ -25,16 +25,29 @@ pub enum OverwriteMode {
     Enabled,
     /// Overwrite pre-release versions only; stable releases stay immutable.
     PrereleaseOnly,
+    /// Replace a version only while it is pending (withheld, never served) in
+    /// every feed that holds it, together with its attached files. A version
+    /// approved anywhere stays immutable. For intake feeds a tool pushes into
+    /// and re-runs against.
+    PendingOnly,
 }
 
 impl OverwriteMode {
-    /// Whether a push may overwrite a version with the given pre-release status.
+    /// Whether a push may overwrite a version with the given pre-release
+    /// status, whatever state the version is in. `PendingOnly` depends on
+    /// that state, so it is decided where the state is known, not here.
     pub fn allows(self, is_prerelease: bool) -> bool {
         match self {
-            OverwriteMode::Disabled => false,
+            OverwriteMode::Disabled | OverwriteMode::PendingOnly => false,
             OverwriteMode::Enabled => true,
             OverwriteMode::PrereleaseOnly => is_prerelease,
         }
+    }
+
+    /// Whether a version that has been served can never change under this
+    /// mode, so downloads may be cached as `immutable`.
+    pub fn served_versions_are_immutable(self) -> bool {
+        matches!(self, OverwriteMode::Disabled | OverwriteMode::PendingOnly)
     }
 
     /// A human-readable label for the settings page.
@@ -43,6 +56,7 @@ impl OverwriteMode {
             OverwriteMode::Disabled => "No",
             OverwriteMode::Enabled => "Yes",
             OverwriteMode::PrereleaseOnly => "Pre-release only",
+            OverwriteMode::PendingOnly => "Pending versions only",
         }
     }
 
@@ -60,9 +74,10 @@ impl OverwriteMode {
             "prerelease-only" | "prerelease" | "prereleaseonly" | "pre" => {
                 Ok(OverwriteMode::PrereleaseOnly)
             }
+            "pending-only" | "pending" | "pendingonly" => Ok(OverwriteMode::PendingOnly),
             _ => Err(env_error(
                 name,
-                &format!("must be true, false or prerelease-only, not {v:?}"),
+                &format!("must be true, false, prerelease-only or pending-only, not {v:?}"),
             )),
         }
     }
@@ -74,6 +89,7 @@ impl Serialize for OverwriteMode {
             OverwriteMode::Disabled => "false",
             OverwriteMode::Enabled => "true",
             OverwriteMode::PrereleaseOnly => "prerelease-only",
+            OverwriteMode::PendingOnly => "pending-only",
         })
     }
 }
@@ -84,7 +100,9 @@ impl<'de> Deserialize<'de> for OverwriteMode {
         impl serde::de::Visitor<'_> for ModeVisitor {
             type Value = OverwriteMode;
             fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-                f.write_str(r#"a bool or one of "true", "false", "prerelease-only""#)
+                f.write_str(
+                    r#"a bool or one of "true", "false", "prerelease-only", "pending-only""#,
+                )
             }
             fn visit_bool<E>(self, v: bool) -> std::result::Result<OverwriteMode, E> {
                 Ok(if v {
@@ -108,6 +126,7 @@ impl<'de> Deserialize<'de> for OverwriteMode {
                     "prerelease-only" | "prerelease" | "prereleaseonly" => {
                         Ok(OverwriteMode::PrereleaseOnly)
                     }
+                    "pending-only" | "pending" | "pendingonly" => Ok(OverwriteMode::PendingOnly),
                     other => Err(E::custom(format!("invalid overwrite mode: {other}"))),
                 }
             }
@@ -1727,8 +1746,16 @@ mod tests {
             mode(r#"allow_overwrite = "prerelease-only""#),
             OverwriteMode::PrereleaseOnly
         );
+        assert_eq!(
+            mode(r#"allow_overwrite = "pending-only""#),
+            OverwriteMode::PendingOnly
+        );
 
-        // The decision helper.
+        // The decision helper. Pending-only depends on the version's state,
+        // which `allows` does not know, so it says no.
+        assert!(!OverwriteMode::PendingOnly.allows(true));
+        assert!(OverwriteMode::PendingOnly.served_versions_are_immutable());
+        assert!(!OverwriteMode::PrereleaseOnly.served_versions_are_immutable());
         assert!(!OverwriteMode::Disabled.allows(true));
         assert!(OverwriteMode::Enabled.allows(false));
         assert!(OverwriteMode::PrereleaseOnly.allows(true));
@@ -1742,6 +1769,10 @@ mod tests {
         assert_eq!(
             OverwriteMode::parse_env("X", "off").unwrap(),
             OverwriteMode::Disabled
+        );
+        assert_eq!(
+            OverwriteMode::parse_env("X", "pending_only").unwrap(),
+            OverwriteMode::PendingOnly
         );
         assert!(OverwriteMode::parse_env("X", "garbage").is_err());
     }

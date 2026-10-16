@@ -124,7 +124,7 @@ pub(super) async fn increment_file_downloads(
     Ok(())
 }
 
-fn row_to_file(row: &SqliteRow) -> Result<PackageFile> {
+pub(super) fn row_to_file(row: &SqliteRow) -> Result<PackageFile> {
     Ok(PackageFile {
         lower_id: row.try_get("lower_id")?,
         normalized_version: row.try_get("normalized_version")?,

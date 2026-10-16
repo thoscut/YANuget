@@ -102,6 +102,13 @@ fn check_file_types(feed: &ResolvedFeed, report: &mut Report) {
 
 fn check_feed(feed: &ResolvedFeed, report: &mut Report) {
     let name = &feed.name;
+    if feed.allow_overwrite == crate::config::OverwriteMode::PendingOnly && !feed.requires_approval
+    {
+        report.warnings.push(format!(
+            "feed {name}: allow_overwrite = \"pending-only\" without requires_approval; \
+             only versions promoted in while pending elsewhere can be replaced"
+        ));
+    }
     if feed.api_keys.is_empty() {
         report.warnings.push(format!(
             "feed {name}: no push key, so push and delete are open to anyone who can reach it"
@@ -207,6 +214,32 @@ mod tests {
         let mut report = Report::default();
         check_loaded(&config, &mut report);
         report
+    }
+
+    #[test]
+    fn pending_only_without_a_gate_is_warned_about() {
+        use crate::config::OverwriteMode;
+        let feed = |name: &str, gated: bool| FeedConfig {
+            name: name.into(),
+            allow_overwrite: Some(OverwriteMode::PendingOnly),
+            requires_approval: gated,
+            ..Default::default()
+        };
+        let config = Config {
+            tls_enabled: false,
+            feeds: vec![feed("intake", true), feed("open", false)],
+            ..Config::default()
+        };
+        let report = checked(config);
+        assert!(report.is_ok(), "{report:?}");
+        let pending = |f: &str| {
+            report
+                .warnings
+                .iter()
+                .any(|w| w.starts_with(&format!("feed {f}: ")) && w.contains("pending-only"))
+        };
+        assert!(!pending("intake"), "{report:?}");
+        assert!(pending("open"), "{report:?}");
     }
 
     #[test]

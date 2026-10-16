@@ -859,7 +859,7 @@ Every server change the tool relies on, in one release (see
   *Done when:* `yanuget config check`, `yanuget.example.toml` and
   `docs/configuration.md` cover it, and a feed without the override behaves as
   today.
-- [ ] **`INT-04` Replace a pending version.** With overwrite off, a second push
+- [x] **`INT-04` Replace a pending version.** With overwrite off, a second push
   of the same version is `409` even while the first is pending and has never
   been served. Add `allow_overwrite = "pending-only"`: a push may replace a
   version that is pending in every feed holding it, together with its attached
