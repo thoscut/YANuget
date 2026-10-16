@@ -240,6 +240,7 @@ inbox_scan_secs = 30                # YANUGET_FILES_INBOX_SCAN_SECS
 # # read_api_key gates download/restore ("get"); unset = open. Accepted as an
 # #   X-NuGet-ApiKey header OR the password of HTTP Basic credentials.
 # # read_api_key = "downloaders"
+# # preview_api_key downloads pending versions and their files, nothing else.
 # # admin_api_key falls back to the global admin_api_key (moderation / "delete").
 # allow_overwrite = false       # falls back to global when unset
 # hard_delete_enabled = false   # falls back to global when unset

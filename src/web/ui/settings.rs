@@ -40,6 +40,14 @@ pub fn settings_page(urls: &UrlBuilder, config: &Config, feed: &crate::web::Feed
     server.push_str(&kv("Feed", &feed.name));
     server.push_str(&kv("Push / delete auth", auth));
     server.push_str(&kv("Download auth", read_auth));
+    server.push_str(&kv(
+        "Pending versions",
+        if feed.preview_auth.is_enabled() {
+            "Downloadable with the preview key"
+        } else {
+            "Withheld until approved"
+        },
+    ));
     server.push_str(&kv("Max package size", &max_size));
     server.push_str(&kv(
         "Overwrite existing version",

@@ -481,6 +481,12 @@ pub struct FeedConfig {
     /// reads are open. Accepted as either an `X-NuGet-ApiKey` header or the
     /// password of HTTP Basic credentials (what `dotnet`/`nuget` send).
     pub read_api_key: Option<String>,
+    /// Credential that downloads *pending* versions of this feed, and their
+    /// attached files, as well as approved ones, and does nothing else: no
+    /// push, no approve, no search. For testing a version before approving
+    /// it. Sent like the read key. Unset, pending versions are withheld from
+    /// every client.
+    pub preview_api_key: Option<String>,
     /// Admin key gating moderation/promotion (delete) for this feed. Falls back
     /// to the global `admin_api_key`.
     pub admin_api_key: Option<String>,
@@ -535,6 +541,7 @@ pub struct ResolvedFeed {
     /// Accepted push/delete keys (empty means writes are open).
     pub api_keys: Vec<String>,
     pub read_api_key: Option<String>,
+    pub preview_api_key: Option<String>,
     pub admin_api_key: Option<String>,
     pub allow_overwrite: OverwriteMode,
     pub hard_delete_enabled: bool,
@@ -1036,6 +1043,9 @@ impl Config {
             if let Some(v) = var("READ_API_KEY")? {
                 f.read_api_key = optional_key(&v);
             }
+            if let Some(v) = var("PREVIEW_API_KEY")? {
+                f.preview_api_key = optional_key(&v);
+            }
             if let Some(v) = var("ADMIN_API_KEY")? {
                 f.admin_api_key = optional_key(&v);
             }
@@ -1159,6 +1169,7 @@ impl Config {
                 prefix: String::new(),
                 api_keys: combine_keys(&self.api_key, &self.api_keys),
                 read_api_key: None,
+                preview_api_key: None,
                 admin_api_key: self.admin_api_key.clone(),
                 allow_overwrite: self.allow_overwrite,
                 hard_delete_enabled: self.hard_delete_enabled,
@@ -1200,6 +1211,7 @@ impl Config {
                 name: f.name.clone(),
                 api_keys,
                 read_api_key: f.read_api_key.clone(),
+                preview_api_key: f.preview_api_key.clone(),
                 admin_api_key: f
                     .admin_api_key
                     .clone()
@@ -1340,6 +1352,7 @@ impl std::fmt::Debug for ResolvedFeed {
             .field("prefix", &self.prefix)
             .field("api_keys", &self.api_keys.len())
             .field("read_api_key", &redact_opt(&self.read_api_key))
+            .field("preview_api_key", &redact_opt(&self.preview_api_key))
             .field("admin_api_key", &redact_opt(&self.admin_api_key))
             .field("allow_overwrite", &self.allow_overwrite)
             .field("hard_delete_enabled", &self.hard_delete_enabled)
@@ -1491,10 +1504,11 @@ fn parse_env_host(name: &str, v: &str) -> Result<IpAddr> {
 
 /// A comma-separated environment list, trimmed, empties dropped.
 /// The per-feed secrets the environment can set, as `YANUGET_FEED_{NAME}_{SUFFIX}`.
-const FEED_ENV_SUFFIXES: [&str; 6] = [
+const FEED_ENV_SUFFIXES: [&str; 7] = [
     "API_KEY",
     "API_KEYS",
     "READ_API_KEY",
+    "PREVIEW_API_KEY",
     "ADMIN_API_KEY",
     "MIRROR_PASSWORD",
     "MIRROR_TOKEN",
@@ -2078,6 +2092,7 @@ mod tests {
                     keys.to_str().unwrap(),
                 ),
                 ("YANUGET_FEED_PRE_PROD_READ_API_KEY", "reader"),
+                ("YANUGET_FEED_PRE_PROD_PREVIEW_API_KEY", "previewer"),
                 ("YANUGET_FEED_PRE_PROD_MIRROR_TOKEN", "upstream-token"),
             ],
         )
@@ -2086,6 +2101,7 @@ mod tests {
         assert_eq!(c.feeds[1].admin_api_key.as_deref(), Some("admin-from-file"));
         assert_eq!(c.feeds[1].api_keys, vec!["one", "two"]);
         assert_eq!(c.feeds[1].read_api_key.as_deref(), Some("reader"));
+        assert_eq!(c.feeds[1].preview_api_key.as_deref(), Some("previewer"));
         assert_eq!(
             c.feeds[1].mirror.auth.token.as_deref(),
             Some("upstream-token")

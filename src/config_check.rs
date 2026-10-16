@@ -102,6 +102,23 @@ fn check_file_types(feed: &ResolvedFeed, report: &mut Report) {
 
 fn check_feed(feed: &ResolvedFeed, report: &mut Report) {
     let name = &feed.name;
+    if let Some(preview) = &feed.preview_api_key {
+        let reused = feed.read_api_key.as_deref() == Some(preview.as_str())
+            || feed.api_keys.contains(preview)
+            || feed.admin_api_key.as_deref() == Some(preview.as_str());
+        if reused {
+            report.warnings.push(format!(
+                "feed {name}: the preview key is also another key of the feed; give it \
+                 its own, or everyone holding that one can download pending versions"
+            ));
+        }
+        if !feed.requires_approval {
+            report.notes.push(format!(
+                "feed {name}: a preview key without requires_approval only matters for \
+                 versions promoted in while pending"
+            ));
+        }
+    }
     if feed.allow_overwrite == crate::config::OverwriteMode::PendingOnly && !feed.requires_approval
     {
         report.warnings.push(format!(
@@ -123,6 +140,10 @@ fn check_feed(feed: &ResolvedFeed, report: &mut Report) {
     for (role, is_short) in [
         ("push", feed.api_keys.iter().any(|k| short(k))),
         ("read", feed.read_api_key.as_deref().is_some_and(short)),
+        (
+            "preview",
+            feed.preview_api_key.as_deref().is_some_and(short),
+        ),
         ("admin", feed.admin_api_key.as_deref().is_some_and(short)),
     ] {
         if is_short {

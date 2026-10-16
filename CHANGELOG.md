@@ -28,6 +28,11 @@ expected to change incompatibly at any version.
   transaction as the replacement, so an approval racing a push is never lost.
   Downloads stay `immutable` under it. `yanuget config check` warns when a
   feed sets it without `requires_approval`. (`INT-04`)
+- A per-feed `preview_api_key` (also `YANUGET_FEED_{NAME}_PREVIEW_API_KEY`,
+  with `_FILE`) downloads pending versions and their attached files from the
+  flat container and the file URLs, and does nothing else: no search, push,
+  approve or admin. Its responses are private, never `immutable`, and not
+  counted as downloads. (`INT-32`)
 
 ### Changed
 

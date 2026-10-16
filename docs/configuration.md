@@ -68,7 +68,7 @@ secret store:
 - **Global keys** are `YANUGET_API_KEY`, `YANUGET_API_KEYS` and
   `YANUGET_ADMIN_API_KEY` (above).
 - **A feed's keys** are `YANUGET_FEED_{NAME}_API_KEY`, `..._API_KEYS`,
-  `..._READ_API_KEY`, `..._ADMIN_API_KEY`, and for its mirror
+  `..._READ_API_KEY`, `..._PREVIEW_API_KEY`, `..._ADMIN_API_KEY`, and for its mirror
   `..._MIRROR_PASSWORD` and `..._MIRROR_TOKEN`. `{NAME}` is the feed's name
   upper-cased, with `-` and `.` written as `_`: feed `stage` is
   `YANUGET_FEED_STAGE_API_KEY`, feed `pre-prod` is
@@ -422,6 +422,7 @@ affected.
 | `feeds[].api_key` | string | *(global `api_key`)* | Push (put) credential. |
 | `feeds[].api_keys` | string[] | *(global)* | Additional push keys. A feed that sets any push key uses only its own. |
 | `feeds[].read_api_key` | string | *(open)* | Download/restore (get) credential. See below. |
+| `feeds[].preview_api_key` | string | *(none)* | Downloads pending versions and their files too, and nothing else. See [Previewing pending versions](#previewing-pending-versions). |
 | `feeds[].admin_api_key` | string | *(global `admin_api_key`)* | Moderation/promotion (delete) credential. |
 | `feeds[].allow_overwrite` | bool \| string | *(global)* | Re-push policy (`false`/`true`/`"prerelease-only"`/`"pending-only"`). |
 | `feeds[].hard_delete_enabled` | bool | *(global)* | DELETE removes vs. unlists. |
@@ -541,6 +542,27 @@ approved; its row shows `pending in stable` until then. A promoted (or copied)
 version keeps the state it had: one that is unlisted, disabled or still
 pending in the source arrives unlisted, disabled or pending in the target. Feeds without
 `promotes_to` are simply independent sets a version can be added to.
+
+#### Previewing pending versions
+
+A pending version is withheld from every client. To test one before
+approving it (by hand, or from a validation run that installs it), give the
+feed a `preview_api_key` (or `YANUGET_FEED_{NAME}_PREVIEW_API_KEY`, also with
+`_FILE`). Sent like the read key, as `X-NuGet-ApiKey` or the password of HTTP
+Basic credentials, it downloads:
+
+- the `.nupkg` and `.nuspec` of a pending or approved version from the flat
+  container (`/{feed}/v3/package/{id}/{version}/…`), and
+- its attached files and their `index.json` (`/{feed}/files/{id}/{version}/…`).
+
+That is all it does. It does not list or search pending versions, push,
+approve or reach `/admin`, and on a read-gated feed it stands in for the read
+key on those download URLs only. A disabled version stays withheld. Responses
+to it are `Cache-Control: private` and never `immutable`, with `Vary` on the
+credential headers, and they are not counted as downloads.
+
+`yanuget config check` warns when the preview key is also another key of the
+feed.
 
 #### Replacing a pending version
 

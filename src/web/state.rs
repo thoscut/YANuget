@@ -31,6 +31,8 @@ pub struct FeedContext {
     pub auth: ApiKeyAuth,
     /// Download/restore (get) authenticator.
     pub read_auth: ReadAuth,
+    /// The preview key: downloads pending versions too, and nothing else.
+    pub preview_auth: ReadAuth,
     /// Moderation/promotion (delete) authenticator.
     pub admin: AdminAuth,
     pub allow_overwrite: OverwriteMode,
@@ -105,6 +107,7 @@ impl FeedContext {
             prefix: feed.prefix.clone(),
             auth: ApiKeyAuth::new(feed.api_keys.clone()),
             read_auth: ReadAuth::new(feed.read_api_key.clone()),
+            preview_auth: ReadAuth::new(feed.preview_api_key.clone()),
             admin: AdminAuth::new(feed.admin_api_key.clone()),
             allow_overwrite: feed.allow_overwrite,
             hard_delete_enabled: feed.hard_delete_enabled,
@@ -118,6 +121,41 @@ impl FeedContext {
             cleanup: Arc::default(),
             counters: FeedCounters::default(),
         })
+    }
+}
+
+/// How a download is served.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Access {
+    /// A version clients may fetch, under the feed's usual cache policy.
+    Public,
+    /// A pending version, fetched with the preview key: kept out of shared
+    /// caches and never `immutable`, since a pending build can still be
+    /// replaced (`allow_overwrite = "pending-only"`).
+    Preview,
+}
+
+impl Access {
+    /// A preview response depends on the credential sent, so caches must
+    /// key on it.
+    pub(crate) fn mark(self, response: &mut axum::response::Response) {
+        if self == Access::Preview {
+            response.headers_mut().append(
+                axum::http::header::VARY,
+                axum::http::HeaderValue::from_static("Authorization, X-NuGet-ApiKey"),
+            );
+        }
+    }
+
+    /// The cache policy for content served this way.
+    pub(crate) fn cache(self, feed: &FeedContext) -> files::CachePolicy {
+        match self {
+            Access::Public => feed.content_cache(),
+            Access::Preview => files::CachePolicy {
+                private: true,
+                immutable: false,
+            },
+        }
     }
 }
 
@@ -272,6 +310,35 @@ impl AppState {
         let path = self.temp_dir.join(format!("{}.tmp", uuid::Uuid::new_v4()));
         let file = tokio::fs::File::create(&path).await?;
         Ok((TempPath::new(path), file))
+    }
+
+    /// Whether a download of `id`/`version` may be served, and how. The
+    /// feed's preview key may fetch a pending version as well as an approved
+    /// one (never a disabled one), and stands in for the read key on the
+    /// download endpoints only. Anyone else needs read access and a servable
+    /// version. A miss is `None`; the caller decides whether to mirror.
+    pub(super) async fn download_access(
+        &self,
+        headers: &HeaderMap,
+        id: &str,
+        version: &crate::version::NuGetVersion,
+    ) -> Result<Option<Access>> {
+        if self.feed.preview_auth.presented(headers) {
+            let held = self.db.get_membership(self.feed(), id, version).await?;
+            return Ok(held.filter(|m| m.enabled).map(|m| {
+                if m.pending {
+                    Access::Preview
+                } else {
+                    Access::Public
+                }
+            }));
+        }
+        self.require_read(headers)?;
+        Ok(self
+            .db
+            .is_servable(self.feed(), id, version)
+            .await?
+            .then_some(Access::Public))
     }
 
     /// Reject the request unless valid read credentials are presented (a no-op

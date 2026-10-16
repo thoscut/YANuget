@@ -896,7 +896,7 @@ Every server change the tool relies on, in one release (see
   never computes one. Verify the premise first: if the helpers do send source
   credentials, the item shrinks to a test. Either way, a security review
   before it is built.
-- [ ] **`INT-32` Read access to pending versions.** A per-feed
+- [x] **`INT-32` Read access to pending versions.** A per-feed
   `preview_api_key` that can download pending packages and their files and do
   nothing else: no approve, no push. For `INT-26`, and for anyone who wants to
   test a version before approving it. Set like every other key:

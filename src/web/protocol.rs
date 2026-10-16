@@ -9,6 +9,7 @@ use axum::response::{Html, IntoResponse, Json, Response};
 use serde::Deserialize;
 
 use super::helpers::{check_id, is_semver2_level, parse_stored_version, parse_version};
+use super::state::Access;
 use super::{files, ui, AppState, FeedCounters};
 use crate::database::SearchRequest;
 use crate::error::{Error, Result};
@@ -119,18 +120,25 @@ pub(super) async fn download_package(
     Path((id, version, filename)): Path<(String, String, String)>,
 ) -> Result<Response> {
     check_id(&id)?;
-    state.require_read(&headers)?;
+    if !state.feed.preview_auth.presented(&headers) {
+        state.require_read(&headers)?;
+    }
     let version = parse_version(&version)?;
     let normalized = version.normalized();
 
-    // Admin-disabled / pending versions are withheld from clients entirely.
-    // On a miss, attempt a read-through mirror before giving up.
-    if !state.db.is_servable(state.feed(), &id, &version).await? {
-        state.mirror_version(&id, &version).await;
-        if !state.db.is_servable(state.feed(), &id, &version).await? {
-            return Err(Error::PackageNotFound);
+    // Admin-disabled / pending versions are withheld from clients entirely
+    // (pending ones are served to the feed's preview key). On a miss, attempt
+    // a read-through mirror before giving up.
+    let access = match state.download_access(&headers, &id, &version).await? {
+        Some(access) => access,
+        None => {
+            state.mirror_version(&id, &version).await;
+            state
+                .download_access(&headers, &id, &version)
+                .await?
+                .ok_or(Error::PackageNotFound)?
         }
-    }
+    };
 
     // The flat container exposes both the `.nupkg` and the bare `.nuspec` under
     // the same path prefix; dispatch on the requested file's extension.
@@ -190,7 +198,7 @@ pub(super) async fn download_package(
     let meta = files::FileMeta {
         etag: etag.as_deref(),
         last_modified: package.as_ref().map(|p| p.published),
-        cache: state.feed.content_cache(),
+        cache: access.cache(&state.feed),
         ..Default::default()
     };
 
@@ -223,11 +231,12 @@ pub(super) async fn download_package(
             header::CONTENT_SECURITY_POLICY,
             HeaderValue::from_static("default-src 'none'"),
         );
+        access.mark(&mut response);
         return Ok(response);
     }
 
     let name = format!("{}.{}.nupkg", id.to_lowercase(), normalized.to_lowercase());
-    let response = files::serve_open_file(
+    let mut response = files::serve_open_file(
         file,
         &headers,
         NUPKG_CONTENT_TYPE,
@@ -241,8 +250,13 @@ pub(super) async fn download_package(
     // Count the download once per transfer rather than once per ranged request
     // of it, and only when bytes actually go out: a 304 is a client confirming
     // it already has them. The write runs off the request path, so a busy
-    // database never holds up the file.
-    if files::counts_as_download(&method, &headers) && files::sends_content(&response) {
+    // database never holds up the file. A preview of a pending version is a
+    // test, not a download.
+    access.mark(&mut response);
+    if access == Access::Public
+        && files::counts_as_download(&method, &headers)
+        && files::sends_content(&response)
+    {
         FeedCounters::count(&state.feed.counters.downloads);
         let (db, feed) = (state.db.clone(), state.feed.name.clone());
         tokio::spawn(async move {

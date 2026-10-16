@@ -5227,3 +5227,136 @@ async fn files_of_a_pending_version_are_withheld_until_approval() {
         installer.as_slice()
     );
 }
+
+const PREVIEW_KEY: &str = "preview-key-of-the-intake-feed";
+
+/// `INT-32`: the preview key downloads a pending version and its files, and
+/// nothing else.
+#[tokio::test]
+async fn the_preview_key_downloads_pending_versions_and_nothing_else() {
+    let server = spawn_feeds(|c| {
+        c.api_key = Some(API_KEY.into());
+        c.admin_api_key = Some(ADMIN_KEY.into());
+        let mut intake = feed("intake");
+        intake.requires_approval = true;
+        intake.read_api_key = Some("reader-key".into());
+        intake.preview_api_key = Some(PREVIEW_KEY.into());
+        c.feeds = vec![intake];
+    })
+    .await;
+    let pushed = push_to(
+        &server,
+        "/intake/api/v2/package",
+        API_KEY,
+        build_nupkg("Preview.Pkg", "1.0.0", b"x"),
+    )
+    .await;
+    assert_eq!(pushed.status(), reqwest::StatusCode::CREATED);
+    let image = image_bytes(9);
+    assert_eq!(
+        put_feed_file(
+            &server,
+            "/intake",
+            "Preview.Pkg",
+            "1.0.0",
+            "base.wim",
+            image.clone()
+        )
+        .await
+        .status(),
+        reqwest::StatusCode::CREATED
+    );
+
+    let get = |path: &str, key: &str| {
+        server
+            .client
+            .get(server.url(path))
+            .header("X-NuGet-ApiKey", key)
+            .send()
+    };
+    let nupkg = "/intake/v3/package/preview.pkg/1.0.0/preview.pkg.1.0.0.nupkg";
+    let nuspec = "/intake/v3/package/preview.pkg/1.0.0/preview.pkg.nuspec";
+    let file = "/intake/files/preview.pkg/1.0.0/base.wim";
+    let index = "/intake/files/preview.pkg/1.0.0/index.json";
+
+    // Readers do not see it while it is pending.
+    for path in [nupkg, nuspec, file, index] {
+        assert_eq!(
+            get(path, "reader-key").await.unwrap().status(),
+            reqwest::StatusCode::NOT_FOUND,
+            "{path}"
+        );
+    }
+    // The preview key does, kept out of shared caches.
+    for path in [nupkg, nuspec, file, index] {
+        let r = get(path, PREVIEW_KEY).await.unwrap();
+        assert!(r.status().is_success(), "{path}: {}", r.status());
+        let cache = r.headers()["cache-control"].to_str().unwrap().to_string();
+        assert!(cache.starts_with("private"), "{path}: {cache}");
+        assert!(!cache.contains("immutable"), "{path}: {cache}");
+        let vary: Vec<_> = r
+            .headers()
+            .get_all("vary")
+            .iter()
+            .map(|v| v.to_str().unwrap().to_string())
+            .collect();
+        assert!(
+            vary.iter().any(|v| v.contains("X-NuGet-ApiKey")),
+            "{path}: {vary:?}"
+        );
+    }
+    let bytes = get(file, PREVIEW_KEY).await.unwrap().bytes().await.unwrap();
+    assert_eq!(bytes.as_ref(), image.as_slice());
+    // Basic credentials work as for the read key.
+    let basic = server
+        .client
+        .get(server.url(nupkg))
+        .basic_auth("anyone", Some(PREVIEW_KEY))
+        .send()
+        .await
+        .unwrap();
+    assert!(basic.status().is_success());
+
+    // And nothing else: no listing, search, push or admin.
+    for path in [
+        "/intake/v3/package/preview.pkg/index.json",
+        "/intake/v3/search?q=preview",
+        "/intake/v3/registration/preview.pkg/index.json",
+    ] {
+        assert_eq!(
+            get(path, PREVIEW_KEY).await.unwrap().status(),
+            reqwest::StatusCode::UNAUTHORIZED,
+            "{path}"
+        );
+    }
+    let push = push_to(
+        &server,
+        "/intake/api/v2/package",
+        PREVIEW_KEY,
+        build_nupkg("Preview.Other", "1.0.0", b"y"),
+    )
+    .await;
+    assert_eq!(push.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let approve = no_redirect()
+        .post(server.url("/intake/admin/packages/preview.pkg/1.0.0/approve"))
+        .basic_auth("admin", Some(PREVIEW_KEY))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(admin_body(PREVIEW_KEY))
+        .send()
+        .await
+        .unwrap();
+    assert!(approve.status().is_client_error(), "{}", approve.status());
+    assert_eq!(
+        get(nupkg, "reader-key").await.unwrap().status(),
+        reqwest::StatusCode::NOT_FOUND,
+        "still pending"
+    );
+
+    // A disabled version stays withheld from the preview key too.
+    let disable = admin_action(&server, "/intake/admin/packages/preview.pkg/1.0.0/disable").await;
+    assert_eq!(disable.status(), reqwest::StatusCode::SEE_OTHER);
+    assert_eq!(
+        get(nupkg, PREVIEW_KEY).await.unwrap().status(),
+        reqwest::StatusCode::NOT_FOUND
+    );
+}
