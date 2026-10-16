@@ -202,8 +202,15 @@ jobs:
       # it, and it is what caught `build.rs` writing outside `OUT_DIR`.
       # `--workspace` packages `yanuget-pkg` too and builds `yanuget` against
       # that tarball rather than the path, as crates.io would.
+      # The dry run serves `yanuget-pkg` from a local registry under a version
+      # number that does not change between commits, and cargo treats a
+      # registry crate as immutable: a cached extraction or build of an earlier
+      # commit's tarball would stand in for this one's. Both are dropped first.
       - name: Verify the crates package and build from their tarballs
-        run: cargo publish --dry-run --locked --workspace
+        run: |
+          rm -rf ~/.cargo/registry/src/*/yanuget-pkg-*
+          cargo clean -p yanuget-pkg
+          cargo publish --dry-run --locked --workspace
 
       # REQUIRE_DOCS=1 matches how the release workflow builds it, so a docs
       # failure is a build failure here rather than an image that quietly ships
