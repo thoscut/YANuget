@@ -44,4 +44,4 @@ pub use version::NuGetVersion;
 
 // Package handling lives in the `yanuget-pkg` crate, shared with the tools that
 // build packages for the server; these keep the server's paths unchanged.
-pub use yanuget_pkg::{nupkg, nuspec, range, version};
+pub use yanuget_pkg::{nupkg, nuspec, range, report, version};

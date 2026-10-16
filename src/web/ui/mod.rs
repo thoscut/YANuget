@@ -32,8 +32,8 @@ mod settings;
 mod stats;
 
 pub use admin::{
-    admin_dashboard_page, admin_package_page, admin_retention_page, AdminPackageExtras,
-    RetentionNotice, RetentionView, TransferNotice, TransferOp, CSRF_FIELD,
+    admin_dashboard_page, admin_package_page, admin_retention_page, AdminPackageExtras, ReportView,
+    RetentionNotice, RetentionView, TransferNotice, TransferOp, VersionReport, CSRF_FIELD,
 };
 pub use escape::escape_html;
 pub use gallery::{feeds_index_page, gallery_page, tags_page, GalleryView, MAX_CLOUD_TAGS};

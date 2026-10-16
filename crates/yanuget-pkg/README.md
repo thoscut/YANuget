@@ -10,6 +10,8 @@ server and its tools, with no web framework or database underneath:
   duplicate or traversing names) and extracting single entries by seeking.
 - `address` (and, with the `net` feature, a guarded reqwest resolver): which
   hosts and addresses an upstream fetch must not reach.
+- `report`: the internalizer report (`internalizer/report.json`), schema
+  version 1, shared by the tool that writes it and the server that shows it.
 
 Errors are this crate's own `yanuget_pkg::Error`; the server converts them into
 its HTTP errors.

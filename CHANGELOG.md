@@ -33,6 +33,13 @@ expected to change incompatibly at any version.
   flat container and the file URLs, and does nothing else: no search, push,
   approve or admin. Its responses are private, never `immutable`, and not
   counted as downloads. (`INT-32`)
+- The admin page of a package shows the internalizer report
+  (`internalizer/report.json`, schema version 1) of each pending version that
+  carries one: upstream, downloads with their files and checksum status,
+  warnings and prelude, all escaped. A report listing files that are not
+  attached, or that differ, is flagged and its **Approve** asks for
+  confirmation. The schema lives in `yanuget-pkg` as `report::Report`.
+  (`INT-30`)
 
 ### Changed
 

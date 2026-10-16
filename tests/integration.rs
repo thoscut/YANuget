@@ -5360,3 +5360,148 @@ async fn the_preview_key_downloads_pending_versions_and_nothing_else() {
         reqwest::StatusCode::NOT_FOUND
     );
 }
+
+/// A package carrying extra entries next to its manifest, such as an
+/// internalizer report and its prelude.
+fn build_nupkg_with_entries(id: &str, version: &str, entries: &[(&str, &[u8])]) -> Vec<u8> {
+    let base = build_nupkg(id, version, b"x");
+    let mut archive = zip::ZipArchive::new(Cursor::new(base)).unwrap();
+    let mut cursor = Cursor::new(Vec::new());
+    {
+        let mut zip = zip::ZipWriter::new(&mut cursor);
+        for i in 0..archive.len() {
+            zip.raw_copy_file(archive.by_index(i).unwrap()).unwrap();
+        }
+        let opts =
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        for (name, bytes) in entries {
+            zip.start_file(*name, opts).unwrap();
+            zip.write_all(bytes).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+    cursor.into_inner()
+}
+
+/// `INT-30`: a pending version's internalizer report is on its admin page,
+/// escaped, and a file it lists but the version lacks holds up the approval.
+#[tokio::test]
+async fn the_admin_page_shows_a_pending_versions_report() {
+    let server = spawn_intake().await;
+    let setup = image_bytes(7);
+    let report = format!(
+        r#"{{"schema": 1, "package": {{"id": "Report.Pkg", "version": "1.0"}},
+            "status": "internalized",
+            "upstream": {{"source": "https://community.chocolatey.org/api/v2/"}},
+            "environment": {{"chocolatey_version": "2.4.3"}},
+            "downloads": [
+              {{"url": "https://vendor.example/setup.exe?a=1&b=<2>", "helper": "Install-ChocolateyPackage",
+                "file": "setup.exe", "size": {size}, "sha256": "{sha}",
+                "checksum": {{"status": "verified", "algorithm": "sha256"}}}},
+              {{"url": "https://vendor.example/extra.msi", "file": "extra.msi",
+                "checksum": {{"status": "trust-on-first-use"}}}}
+            ],
+            "warnings": ["<script>alert(1)</script>"],
+            "prelude": "tools/prelude.ps1",
+            "a_later_field": true}}"#,
+        size = setup.len(),
+        sha = sha256_hex(&setup),
+    );
+    let nupkg = build_nupkg_with_entries(
+        "Report.Pkg",
+        "1.0.0",
+        &[
+            ("internalizer/report.json", report.as_bytes()),
+            ("tools/prelude.ps1", b"$base = 'https://feed' # <b>"),
+        ],
+    );
+    let pushed = push_to(&server, "/intake/api/v2/package", API_KEY, nupkg).await;
+    assert_eq!(pushed.status(), reqwest::StatusCode::CREATED);
+    // A version without a report renders as before.
+    let plain = push_to(
+        &server,
+        "/intake/api/v2/package",
+        API_KEY,
+        build_nupkg("Report.Pkg", "0.9.0", b"y"),
+    )
+    .await;
+    assert_eq!(plain.status(), reqwest::StatusCode::CREATED);
+    let put = put_feed_file(
+        &server,
+        "/intake",
+        "Report.Pkg",
+        "1.0.0",
+        "setup.exe",
+        setup,
+    )
+    .await;
+    assert_eq!(put.status(), reqwest::StatusCode::CREATED);
+
+    let page = || async {
+        let resp = server
+            .client
+            .get(server.url("/intake/admin/packages/report.pkg"))
+            .basic_auth("admin", Some(ADMIN_KEY))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        resp.text().await.unwrap()
+    };
+    let html = page().await;
+    assert!(html.contains("Internalizer report: 1.0.0"), "{html}");
+    assert!(!html.contains("Internalizer report: 0.9.0"));
+    assert!(html.contains("setup.exe?a=1&amp;b=&lt;2&gt;"));
+    assert!(html.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
+    assert!(!html.contains("<script>alert(1)"));
+    assert!(html.contains("tools/prelude.ps1"));
+    assert!(html.contains("https://feed") && html.contains("# &lt;b&gt;"));
+    assert!(html.contains("2.4.3"));
+    assert!(html.contains("trust on first use"));
+    assert!(html.contains("extra.msi is not attached"), "{html}");
+    assert!(html.contains("Approve it anyway?"));
+
+    // Attached, nothing stands in the way any more.
+    let put = put_feed_file(
+        &server,
+        "/intake",
+        "Report.Pkg",
+        "1.0.0",
+        "extra.msi",
+        image_bytes(8),
+    )
+    .await;
+    assert_eq!(put.status(), reqwest::StatusCode::CREATED);
+    let html = page().await;
+    assert!(!html.contains("is not attached"), "{html}");
+    assert!(!html.contains("Approve it anyway?"));
+    assert!(html.contains("Internalized; the report is below."));
+}
+
+/// `INT-30`: a report the server cannot read says so instead of hiding.
+#[tokio::test]
+async fn an_unreadable_report_is_shown_as_such() {
+    let server = spawn_intake().await;
+    let nupkg = build_nupkg_with_entries(
+        "Broken.Report",
+        "1.0.0",
+        &[(
+            "internalizer/report.json",
+            br#"{"schema": 2, "anything": "new"}"#,
+        )],
+    );
+    let pushed = push_to(&server, "/intake/api/v2/package", API_KEY, nupkg).await;
+    assert_eq!(pushed.status(), reqwest::StatusCode::CREATED);
+    let html = server
+        .client
+        .get(server.url("/intake/admin/packages/broken.report"))
+        .basic_auth("admin", Some(ADMIN_KEY))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(html.contains("schema version 2"), "{html}");
+    assert!(html.contains("Approve it anyway?"));
+}

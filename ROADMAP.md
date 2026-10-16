@@ -841,8 +841,8 @@ Every server change the tool relies on, in one release (see
   behaviour, `cargo deny` and `cargo audit` cover the workspace, and
   `VersionRange` has property tests over NuGet's interval notation.
   *Landed:* the crate is `crates/yanuget-pkg` (address policy in `address.rs`,
-  the resolver behind the `net` feature). The report schema is added there
-  with `INT-21`/`INT-30`, once its fields are settled.
+  the resolver behind the `net` feature). The report schema (version 1) landed
+  there with `INT-30`, as `report.rs`.
 - [ ] **`INT-02` A streaming `.nupkg` rewriter** in `yanuget-pkg`. Copy
   unchanged entries raw, without recompressing; replace or add named entries;
   rewrite the `.nuspec`; keep the OPC parts (`[Content_Types].xml`,
@@ -873,7 +873,7 @@ Every server change the tool relies on, in one release (see
   (`version_in_feed` checks membership only) and is withheld until approval
   (`download`). Cover it end to end: push to a gated feed, attach, download is
   refused, approve, download succeeds; then the same after `promote`.
-- [ ] **`INT-30` Show the report in the admin area.** The package page of a
+- [x] **`INT-30` Show the report in the admin area.** The package page of a
   pending version, which since 0.7.0 says where the version is approved, reads
   `internalizer/report.json` with the seek-based `nupkg::extract_file` and
   shows the upstream source, each original URL with
@@ -883,6 +883,11 @@ Every server change the tool relies on, in one release (see
   other sink (`SEC-24`); a package without it renders as today. Tested
   against fixture reports, because the tool that writes real ones ships after
   0.8.0.
+  *Landed:* schema version 1 is `yanuget_pkg::report` (`Report::from_slice`,
+  1 MiB cap, unknown fields and enum values tolerated, another schema version
+  refused by name). The page reads the ten newest pending versions, checks
+  each listed file's presence, size and SHA-256, and asks before approving one
+  that does not match; the selection's Approve does not check.
 - [ ] **`INT-31` Attached files on read-gated feeds.** Chocolatey's helpers do
   not send source credentials to download URLs *(to verify)*, so a feed with a
   `read_api_key` cannot serve its files to `choco install`. Proposal: a token in
