@@ -24,10 +24,28 @@ work_dir = "./work"
 timeout_secs = 300
 
 [upstream]
-# A v2 feed or a v3 service index.
+# A v2 feed, or a v3 service index (a URL ending in .json).
 url = "https://community.chocolatey.org/api/v2/"
-# Requests at a time; the community repository rate-limits heavy users.
+# Requests at a time; the community repository rate-limits heavy users. A 429
+# or 503 is waited out (Retry-After, else a doubling backoff) and tried again.
 concurrency = 2
+# Connecting, any silence while the upstream answers, one metadata request.
+timeout_secs = 60
+# The largest package taken from the upstream.
+max_package_bytes = 2147483648
+# Allow URLs and redirects that lead to loopback, private or link-local
+# addresses: for an upstream on the internal network.
+allow_private = false
+# An outbound proxy; without one, HTTP(S)_PROXY is ignored.
+# proxy = "http://proxy.example.com:3128"
+# Credentials, sent to the upstream's own scheme, host and port only, never
+# to a CDN it redirects to. Basic (username and password) or a token.
+# username = ""
+# password = ""       # or YANUGET_INTERNALIZE_UPSTREAM_PASSWORD(_FILE)
+# token = ""          # or YANUGET_INTERNALIZE_UPSTREAM_TOKEN(_FILE)
+
+# [upstream.headers]
+# X-Api-Key = ""
 
 [sandbox]
 # "kvm" (a Linux host with /dev/kvm) or "windows-container" (a Windows host).

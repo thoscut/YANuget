@@ -8,9 +8,9 @@ at them. The plan is the "Chocolatey internalizer" section of
 [ROADMAP.md](../../ROADMAP.md).
 
 **Not released, and not usable yet.** The command line, the configuration and
-its check exist (`INT-10`); fetching packages, the sandbox runners and
-publishing follow. `plan` and `run` stop with an error before they fetch
-anything.
+its check (`INT-10`) and the upstream client (`INT-11`) exist; the sandbox
+runners and publishing follow. `plan` resolves the packages it is given and
+then stops with an error, as does `run`.
 
 ## Command line
 
@@ -44,8 +44,30 @@ points at. With the KVM backend: a Linux host, `/dev/kvm` openable for
 reading and writing, QEMU found, the golden images present and in qcow2
 format. With the Windows container backend: a Windows host and an image
 pinned by digest. It asks the target feed for its service index, which must
-list a push resource (`--offline` skips that), and warns about a
+list a push resource, and the upstream for its service document or index
+(`--offline` skips both), and warns about a
 `YANUGET_INTERNALIZE_*` variable that is not a setting. Errors exit `1`.
+
+## Upstream
+
+`upstream.url` is a NuGet v2 feed, the Chocolatey Community Repository by
+default, or a v3 service index (a URL ending in `.json`). Versions come from
+`FindPackagesById()` on v2, and from the registration (or, without one, the
+flat container) on v3; without a version, a package resolves to its newest
+listed stable version, as `choco install` picks it.
+
+Every download is checked against the hash the feed states (`PackageHash`)
+and its manifest against the id and version asked for, then kept in
+`cache_dir/packages` under that hash; a cached package is hashed again before
+it is used. A feed that states no hash, as most v3 feeds do, gets its
+packages cached under their identity and marked as unverified.
+
+URLs, redirects included, that lead to private, loopback or link-local
+addresses are refused unless `upstream.allow_private` is set; names are
+checked as they resolve. Redirects are followed one hop at a time, never from
+https to http, and credentials go only to the upstream's own origin. A `429`
+or `503` is waited out and tried again; when the upstream stops answering,
+and when it answers again, the tool logs it once.
 
 ## Sandboxes
 

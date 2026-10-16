@@ -3662,10 +3662,17 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "axum",
+ "base64 0.23.1",
  "clap",
+ "flate2",
+ "futures-util",
+ "hex",
+ "quick-xml",
  "reqwest",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror",
  "tokio",
@@ -3673,6 +3680,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "yanuget-pkg",
+ "zip",
 ]
 
 [[package]]

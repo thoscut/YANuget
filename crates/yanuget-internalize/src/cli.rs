@@ -9,6 +9,7 @@ use yanuget_pkg::NuGetVersion;
 
 use crate::config::{Config, CONFIG_ENV};
 use crate::outcome::Outcome;
+use crate::upstream::Upstream;
 
 /// Internalize Chocolatey packages into a YANuget feed: capture what their
 /// scripts download in an offline sandbox, attach the files, and push a copy
@@ -159,6 +160,15 @@ pub async fn run(cli: Cli) -> anyhow::Result<Outcome> {
         Command::Plan(args) => {
             let config = Config::load(config_path).context("cannot load the configuration")?;
             prepare(&config, &args.packages)?;
+            let upstream = Upstream::new(&config.upstream, &config.cache_dir)?;
+            // Metadata only: what each root resolves to.
+            for spec in &args.packages {
+                let info = upstream
+                    .resolve(&spec.id, spec.version.as_ref())
+                    .await
+                    .with_context(|| format!("cannot resolve {spec}"))?;
+                println!("{} {}", info.id, info.version.normalized());
+            }
             not_built_yet()
         }
         Command::Run(args) => {
@@ -188,7 +198,7 @@ fn prepare(config: &Config, packages: &[PackageSpec]) -> anyhow::Result<()> {
 }
 
 fn not_built_yet() -> anyhow::Result<Outcome> {
-    bail!("nothing was done: fetching packages from the upstream is not built yet")
+    bail!("nothing was done: capturing in the sandbox is not built yet")
 }
 
 #[cfg(test)]
