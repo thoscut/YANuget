@@ -22,6 +22,17 @@ expected to change incompatibly at any version.
   an empty list or an entry no file name can match. A feed without the table
   behaves as before. (`INT-03`)
 
+### Changed
+
+- Package handling moved into a workspace crate, `yanuget-pkg`
+  (`crates/yanuget-pkg/`): NuGet versions, the `.nuspec` parser, `.nupkg`
+  reading and the upstream address policy, with no axum or sqlx dependency and
+  an error type of its own. The server re-exports the modules under their old
+  paths and behaves as before. The crate adds `VersionRange`, NuGet's interval
+  notation (parse, normalize, `contains`, best match), for tools that resolve
+  dependencies. A release that publishes to crates.io publishes `yanuget-pkg`
+  first; see RELEASING.md. (`INT-01`)
+
 ## [0.7.0] — 2026-10-15
 
 Upgrading from 0.6.x needs no change to the configuration or the database.

@@ -240,9 +240,9 @@ HTTP (axum)  ──▶  indexing pipeline  ──▶  PackageStorage (trait)  �
 ## Development
 
 ```bash
-cargo test            # unit + integration tests
-cargo clippy --all-targets   # lints (CI requires zero warnings)
-cargo fmt --check     # formatting
+cargo test --workspace                   # unit + integration tests
+cargo clippy --workspace --all-targets   # lints (CI requires zero warnings)
+cargo fmt --all --check                  # formatting
 
 # End-to-end against the real .NET SDK (downloads it on first run).
 cargo build --release && scripts/verify-with-dotnet.sh

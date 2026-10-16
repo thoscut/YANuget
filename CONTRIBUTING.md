@@ -41,8 +41,8 @@ Everything CI enforces, in the order it fails fastest:
 
 ```bash
 cargo fmt --all
-cargo clippy --all-targets --all-features   # must be warning-free
-cargo test --all-features
+cargo clippy --workspace --all-targets --all-features   # must be warning-free
+cargo test --workspace --all-features
 mkdocs build --strict                       # if you touched docs/
 ```
 
@@ -132,8 +132,7 @@ Branch off `main` and open the pull request against `main`.
 
 | Path | What lives there |
 | --- | --- |
-| `src/version.rs` | NuGet version parsing, normalization, ordering |
-| `src/nuspec.rs`, `src/nupkg.rs` | Manifest parsing; seek-based archive reading |
+| `crates/yanuget-pkg/` | Package handling with no web or database dependency, shared with tools that build packages for the server: versions (`version.rs`) and version ranges (`range.rs`), manifest parsing (`nuspec.rs`), seek-based archive reading (`nupkg.rs`), and the upstream address policy (`address.rs`). The server re-exports these modules under their old paths (`yanuget::version`, …). |
 | `src/streaming.rs` | Bounded-memory copy-to-disk with incremental SHA-512 |
 | `src/storage/` | `PackageStorage` trait and the filesystem backend |
 | `src/database/` | `PackageDatabase` trait and the SQLite backend, one module per table group under `sqlite/` |

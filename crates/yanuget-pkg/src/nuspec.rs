@@ -253,7 +253,7 @@ impl Counts {
 pub async fn parse_nuspec_blocking(xml: String) -> Result<Nuspec, Error> {
     tokio::task::spawn_blocking(move || parse_nuspec(&xml))
         .await
-        .map_err(|e| Error::Other(anyhow::anyhow!("nuspec parse task panicked: {e}")))?
+        .map_err(|e| Error::Task(format!("nuspec parse task panicked: {e}")))?
 }
 
 /// Parse a `.nuspec` document. Returns [`Error::InvalidPackage`] when the XML is

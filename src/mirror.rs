@@ -150,68 +150,7 @@ const MIRROR_BUDGET: Duration = Duration::from_secs(60);
 /// server configured one.
 const DEFAULT_MIRROR_MAX_PACKAGE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
-/// Resolves upstream host names, dropping every private, loopback or
-/// link-local address unless the operator allowed a private upstream.
-///
-/// Checking a URL before requesting it cannot stop a *name* that resolves to
-/// such an address (`metadata.evil.example` with an `A` record of
-/// `169.254.169.254`, or `localhost.` with its trailing dot), and a check that
-/// resolves separately from the connection is undone by a DNS answer that
-/// changes in between. The resolver is where the connection's own addresses
-/// come from, so filtering here covers every URL the mirror fetches, every
-/// redirect hop and every later reconnect at once.
-///
-/// Literal IP hosts never reach a resolver; [`MirrorClient::check_url`] and
-/// the redirect handling classify those.
-#[derive(Default)]
-struct GuardedResolver {
-    /// A configured outbound proxy's host, resolved without the filter: the
-    /// operator named it, and it is routinely on the private network.
-    proxy_host: Option<String>,
-    /// Names answered without a DNS lookup, and filtered like any other.
-    /// Empty outside tests, which need a name that resolves to loopback.
-    fixed: Vec<(String, std::net::IpAddr)>,
-}
-
-impl reqwest::dns::Resolve for GuardedResolver {
-    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
-        let host = name.as_str().to_string();
-        let exempt = self
-            .proxy_host
-            .as_deref()
-            .is_some_and(|p| p.eq_ignore_ascii_case(&host));
-        let fixed = self
-            .fixed
-            .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case(&host))
-            .map(|(_, ip)| std::net::SocketAddr::new(*ip, 0));
-        Box::pin(async move {
-            let addrs: Vec<std::net::SocketAddr> = match fixed {
-                Some(addr) => vec![addr],
-                None => tokio::net::lookup_host((host.as_str(), 0)).await?.collect(),
-            };
-            if exempt {
-                return Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs);
-            }
-            let public: Vec<std::net::SocketAddr> = addrs
-                .iter()
-                .copied()
-                .filter(|a| !crate::proxy::is_private_ip_addr(a.ip()))
-                .collect();
-            if public.is_empty() {
-                if let Some(first) = addrs.first() {
-                    return Err(format!(
-                        "upstream host {host} resolves to the private address {}; \
-                         set allow_private_upstream = true to permit it",
-                        first.ip()
-                    )
-                    .into());
-                }
-            }
-            Ok(Box::new(public.into_iter()) as reqwest::dns::Addrs)
-        })
-    }
-}
+use yanuget_pkg::address::GuardedResolver;
 
 impl MirrorClient {
     /// Build a client from a feed's [`MirrorConfig`]. Returns `None` when
@@ -304,6 +243,7 @@ impl MirrorClient {
             builder = builder.dns_resolver(std::sync::Arc::new(GuardedResolver {
                 proxy_host,
                 fixed: dns.guarded.clone(),
+                hint: Some("set allow_private_upstream = true to permit it".into()),
             }));
         }
         for (name, addr) in &dns.unguarded {

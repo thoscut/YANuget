@@ -403,7 +403,20 @@ jobs:
       # The published crate embeds the placeholder docs page rather than the
       # rendered site: `site/` is generated, so it is not part of the package,
       # and `/docs` on a `cargo install`ed binary links to the online copy.
+      # `yanuget` depends on `yanuget-pkg`, which is versioned on its own and
+      # published first, unless crates.io already has its current version.
       - name: Publish
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-        run: cargo publish --locked
+        run: |
+          set -eu
+          pkg=$(sed -n 's/^version = "\(.*\)"$/\1/p' crates/yanuget-pkg/Cargo.toml | head -1)
+          status=$(curl -s -o /dev/null -w '%{http_code}' \
+            -A "yanuget release workflow (github.com/thoscut/yanuget)" \
+            "https://crates.io/api/v1/crates/yanuget-pkg/$pkg")
+          if [ "$status" = "404" ]; then
+            cargo publish --locked -p yanuget-pkg
+          else
+            echo "yanuget-pkg $pkg is on crates.io already (HTTP $status)"
+          fi
+          cargo publish --locked -p yanuget

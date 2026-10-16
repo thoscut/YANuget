@@ -92,6 +92,16 @@ pub enum Error {
     Other(#[from] anyhow::Error),
 }
 
+impl From<yanuget_pkg::Error> for Error {
+    fn from(e: yanuget_pkg::Error) -> Self {
+        match e {
+            yanuget_pkg::Error::InvalidPackage(why) => Error::InvalidPackage(why),
+            yanuget_pkg::Error::Io(e) => Error::Io(e),
+            yanuget_pkg::Error::Task(why) => Error::Other(anyhow::anyhow!(why)),
+        }
+    }
+}
+
 impl Error {
     /// The HTTP status code that best represents this error.
     pub fn status(&self) -> StatusCode {

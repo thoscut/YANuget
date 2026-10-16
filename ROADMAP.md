@@ -825,7 +825,7 @@ the operator, and the docs say so.
 Every server change the tool relies on, in one release (see
 [Target releases](#target-releases)), each useful on its own.
 
-- [ ] **`INT-01` Extract a `yanuget-pkg` crate.** Move `version.rs`,
+- [x] **`INT-01` Extract a `yanuget-pkg` crate.** Move `version.rs`,
   `nuspec.rs`, `nupkg.rs` and the models they use into a workspace crate with
   no axum or sqlx dependency and its own `thiserror` error type, converted into
   `crate::error::Error` by the server. Today `nupkg.rs` and `nuspec.rs` return
@@ -840,6 +840,9 @@ Every server change the tool relies on, in one release (see
   *Done when:* the server builds against the crate with no change in
   behaviour, `cargo deny` and `cargo audit` cover the workspace, and
   `VersionRange` has property tests over NuGet's interval notation.
+  *Landed:* the crate is `crates/yanuget-pkg` (address policy in `address.rs`,
+  the resolver behind the `net` feature). The report schema is added there
+  with `INT-21`/`INT-30`, once its fields are settled.
 - [ ] **`INT-02` A streaming `.nupkg` rewriter** in `yanuget-pkg`. Copy
   unchanged entries raw, without recompressing; replace or add named entries;
   rewrite the `.nuspec`; keep the OPC parts (`[Content_Types].xml`,
