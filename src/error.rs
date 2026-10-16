@@ -97,7 +97,9 @@ impl From<yanuget_pkg::Error> for Error {
         match e {
             yanuget_pkg::Error::InvalidPackage(why) => Error::InvalidPackage(why),
             yanuget_pkg::Error::Io(e) => Error::Io(e),
-            yanuget_pkg::Error::Task(why) => Error::Other(anyhow::anyhow!(why)),
+            yanuget_pkg::Error::Task(why) | yanuget_pkg::Error::InvalidRewrite(why) => {
+                Error::Other(anyhow::anyhow!(why))
+            }
         }
     }
 }

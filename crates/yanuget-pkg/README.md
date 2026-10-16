@@ -8,6 +8,9 @@ server and its tools, with no web framework or database underneath:
 - `nuspec`: a bounded, namespace-aware `.nuspec` parser.
 - `nupkg`: reading `.nupkg` archives defensively (bounded entries, no
   duplicate or traversing names) and extracting single entries by seeking.
+- `rewrite`: rewriting a `.nupkg` in constant memory. Unchanged entries are
+  copied raw; entries and the manifest can be replaced, added or removed; the
+  content types and core properties follow, and the signature is dropped.
 - `address` (and, with the `net` feature, a guarded reqwest resolver): which
   hosts and addresses an upstream fetch must not reach.
 - `report`: the internalizer report (`internalizer/report.json`), schema

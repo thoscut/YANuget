@@ -40,6 +40,13 @@ expected to change incompatibly at any version.
   attached, or that differ, is flagged and its **Approve** asks for
   confirmation. The schema lives in `yanuget-pkg` as `report::Report`.
   (`INT-30`)
+- `yanuget-pkg` can rewrite a `.nupkg` (`rewrite::Rewrite`): replace, add or
+  remove entries and the manifest while every other entry is copied raw,
+  without recompressing, in memory that does not grow with the package. It
+  completes `[Content_Types].xml` for new extensions, writes the core
+  properties anew from a replaced manifest, and drops `.signature.p7s`.
+  Copies are checked against the source after writing, and entries of 4 GiB
+  and more keep their sizes. (`INT-02`)
 
 ### Changed
 

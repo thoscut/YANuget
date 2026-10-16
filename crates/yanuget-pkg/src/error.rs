@@ -7,6 +7,12 @@ pub enum Error {
     #[error("invalid package: {0}")]
     InvalidPackage(String),
 
+    /// A rewrite asked for something the package cannot take: a name that is
+    /// not allowed, an entry it does not have, a manifest that does not parse.
+    /// A fault of the caller, not of the package.
+    #[error("invalid rewrite: {0}")]
+    InvalidRewrite(String),
+
     /// Reading the package from disk failed.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),

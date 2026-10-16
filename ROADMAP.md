@@ -843,7 +843,7 @@ Every server change the tool relies on, in one release (see
   *Landed:* the crate is `crates/yanuget-pkg` (address policy in `address.rs`,
   the resolver behind the `net` feature). The report schema (version 1) landed
   there with `INT-30`, as `report.rs`.
-- [ ] **`INT-02` A streaming `.nupkg` rewriter** in `yanuget-pkg`. Copy
+- [x] **`INT-02` A streaming `.nupkg` rewriter** in `yanuget-pkg`. Copy
   unchanged entries raw, without recompressing; replace or add named entries;
   rewrite the `.nuspec`; keep the OPC parts (`[Content_Types].xml`,
   `_rels/.rels`, the `.psmdcp` core properties) consistent, with a content type
@@ -851,6 +851,13 @@ Every server change the tool relies on, in one release (see
   Peak memory must not depend on package size.
   *Done when:* an unchanged rewrite keeps every entry byte-identical, Chocolatey
   CLI installs a rewritten package, and a 5 GB entry passes in constant memory.
+  *Landed:* `yanuget_pkg::rewrite`. An empty rewrite keeps every entry's
+  compressed bytes and CRC; a 5 GiB entry passes with under 64 MiB of growth
+  (an ignored test, `cargo test -p yanuget-pkg -- --ignored`), and Python's
+  `zipfile` reads it back. The `zip` crate leaves the ZIP64 sizes of a raw
+  copy at zero, so the rewriter writes them itself and checks every copy
+  against the source. Not yet checked: an install with Chocolatey CLI, which
+  needs a Windows host; that belongs with the regression corpus (`INT-22`).
 - [x] **`INT-03` Per-feed `allowed_extensions` for attached files.** `[files]`
   is global, and its defaults rightly exclude `exe` and `msi`. Let a feed
   override the list (`[feeds.files]`), so executables are accepted by the
