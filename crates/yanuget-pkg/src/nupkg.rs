@@ -66,10 +66,10 @@ fn read_archive_blocking(path: &Path) -> Result<ArchiveContents, Error> {
     let mut entry_names = HashSet::with_capacity(archive.len());
     let mut nuspec_index: Option<usize> = None;
     for i in 0..archive.len() {
-        let Some(name) = archive.name_for_index(i) else {
+        let Some(name) = entry_name(&archive, i)? else {
             continue;
         };
-        let normalized = normalize_entry(name);
+        let normalized = normalize_entry(&name);
         // The nuspec is a root-level `*.nuspec` (no directory separators).
         if normalized.ends_with(".nuspec") && !normalized.contains('/') {
             // NuGet refuses a package with more than one; picking one of them
@@ -124,7 +124,26 @@ pub fn open_archive(path: &Path) -> Result<zip::ZipArchive<File>, Error> {
     }
     // The crate keys entries by name and keeps the last of a duplicated name.
     reject_duplicate_entries(directory.records, archive.len())?;
+    // The crate decodes a name when it is asked for, not when it reads the
+    // directory. Decoding them all here keeps a name that is neither UTF-8
+    // nor CP437 a reason to refuse the package as a whole, rather than an
+    // error in whichever reader happens to ask for that entry.
+    for i in 0..archive.len() {
+        entry_name(&archive, i)?;
+    }
     Ok(archive)
+}
+
+/// The decoded name of entry `i`, or `None` past the end.
+pub fn entry_name<R: std::io::Read + std::io::Seek>(
+    archive: &zip::ZipArchive<R>,
+    i: usize,
+) -> Result<Option<String>, Error> {
+    archive
+        .name_for_index(i)
+        .transpose()
+        .map(|name| name.map(|n| n.into_owned()))
+        .map_err(|e| Error::InvalidPackage(format!("an entry name cannot be decoded: {e}")))
 }
 
 /// The index of the entry named `normalized` (see [`normalize_entry`]), from the
@@ -133,7 +152,7 @@ pub fn entry_index(archive: &zip::ZipArchive<File>, normalized: &str) -> Option<
     (0..archive.len()).find(|&i| {
         archive
             .name_for_index(i)
-            .is_some_and(|name| normalize_entry(name) == normalized)
+            .is_some_and(|name| name.is_ok_and(|name| normalize_entry(&name) == normalized))
     })
 }
 
@@ -226,13 +245,12 @@ fn extract_entries_blocking(
 
     let mut total: u64 = 0;
     for i in 0..archive.len() {
-        let Some(name) = archive.name_for_index(i) else {
+        let Some(name) = entry_name(&archive, i)? else {
             continue;
         };
-        if !wanted.contains(&normalize_entry(name)) {
+        if !wanted.contains(&normalize_entry(&name)) {
             continue;
         }
-        let name = name.to_string();
         let too_large = |what: &str, limit: u64| {
             Error::InvalidPackage(format!(
                 "{name} takes the {what} past the {} MiB limit",
@@ -292,7 +310,10 @@ fn extract_file_blocking(
     let entry = archive
         .by_index(idx)
         .map_err(|e| Error::InvalidPackage(format!("could not open entry: {e}")))?;
-    let name = entry.name().to_string();
+    let name = entry
+        .name()
+        .map_err(|e| Error::InvalidPackage(format!("an entry name cannot be decoded: {e}")))?
+        .into_owned();
     let too_large = || {
         Error::InvalidPackage(format!(
             "package entry {name} is larger than the {} KiB allowed for it",
