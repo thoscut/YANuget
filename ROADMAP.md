@@ -854,9 +854,10 @@ Every server change the tool relies on, in one release (see
   *Landed:* `yanuget_pkg::rewrite`. An empty rewrite keeps every entry's
   compressed bytes and CRC; a 5 GiB entry passes with under 64 MiB of growth
   (an ignored test, `cargo test -p yanuget-pkg -- --ignored`), and Python's
-  `zipfile` reads it back. The `zip` crate leaves the ZIP64 sizes of a raw
-  copy at zero, so the rewriter writes them itself and checks every copy
-  against the source. Not yet checked: an install with Chocolatey CLI, which
+  `zipfile` reads it back. Every copy is checked against the source after
+  writing: `zip` 2.x left the ZIP64 sizes of a raw copy at zero, which the
+  rewriter patched until `zip` 9 (taken for RUSTSEC-2026-0367/0368/0369)
+  wrote them itself. Not yet checked: an install with Chocolatey CLI, which
   needs a Windows host; that belongs with the regression corpus (`INT-22`).
 - [x] **`INT-03` Per-feed `allowed_extensions` for attached files.** `[files]`
   is global, and its defaults rightly exclude `exe` and `msi`. Let a feed

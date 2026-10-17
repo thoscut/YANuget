@@ -58,6 +58,11 @@ expected to change incompatibly at any version.
   notation (parse, normalize, `contains`, best match), for tools that resolve
   dependencies. A release that publishes to crates.io publishes `yanuget-pkg`
   first; see RELEASING.md. (`INT-01`)
+- `zip` 9 replaces `zip` 2.4.2, against RUSTSEC-2026-0367, -0368 and -0369.
+  Those concern extracting an archive to disk, which YANuget never does (it
+  reads packages entry by entry), so no released version was exposed. A
+  package with an entry name that is neither UTF-8 nor CP437 is still
+  refused when it is opened.
 
 ## [0.7.0] — 2026-10-15
 
