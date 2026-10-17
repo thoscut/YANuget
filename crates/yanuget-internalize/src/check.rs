@@ -4,7 +4,7 @@
 //! It loads the configuration as a run does (TOML, environment, key files),
 //! then looks at what it points at: the sandbox backend's host (`/dev/kvm`,
 //! QEMU, the golden images), the directories, and, unless `--offline`, the
-//! target feed.
+//! target feed and the upstream.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -57,7 +57,7 @@ impl Host {
 pub const MIN_KEY_CHARS: usize = 32;
 
 /// Load the configuration at `path` as a run would, and check it against this
-/// host; with `online`, also ask the target feed.
+/// host; with `online`, also ask the target feed and the upstream.
 pub async fn check(path: Option<&str>, online: bool) -> Report {
     let mut report = Report::default();
     let host = Host::current();
@@ -72,10 +72,11 @@ pub async fn check(path: Option<&str>, online: bool) -> Report {
     check_loaded(&config, &host, &mut report);
     if online {
         check_target_online(&config, &mut report).await;
-    } else if config.target.url.is_some() {
+        check_upstream_online(&config, &mut report).await;
+    } else {
         report
             .notes
-            .push("--offline: the target feed was not asked".into());
+            .push("--offline: the target feed and the upstream were not asked".into());
     }
     report
 }
@@ -300,6 +301,28 @@ fn is_loopback_url(url: &str) -> bool {
                 || h.parse::<std::net::IpAddr>()
                     .is_ok_and(|ip| ip.is_loopback())
         })
+}
+
+/// Ask the upstream whether it answers, the way a run first asks it.
+pub async fn check_upstream_online(config: &Config, report: &mut Report) {
+    let probe = match crate::upstream::Upstream::new(&config.upstream, &config.cache_dir) {
+        Ok(mut upstream) => {
+            // One try: a check should say at once that the upstream is gone.
+            upstream
+                .http_mut()
+                .set_retry(crate::upstream::http::RetryPolicy {
+                    attempts: 1,
+                    ..Default::default()
+                });
+            upstream.probe().await
+        }
+        Err(e) => Err(e),
+    };
+    if let Err(e) = probe {
+        report
+            .errors
+            .push(format!("upstream {}: {e}", config.upstream.url));
+    }
 }
 
 /// Ask the target feed for its service index: it has to answer, and it has

@@ -22,7 +22,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["rt"] }
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
+# zip's `deflate-flate2` leaves flate2's backend to the application; this
+# picks flate2's default pure-Rust one, as the server's own flate2 does.
+flate2 = "1"
 uuid = { version = "1", features = ["v4"] }
 quick-xml = { version = "0.42", features = ["serialize"] }
 reqwest = { version = "0.12", default-features = false, optional = true }
@@ -30,5 +33,5 @@ reqwest = { version = "0.12", default-features = false, optional = true }
 [dev-dependencies]
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
 proptest = "1"
