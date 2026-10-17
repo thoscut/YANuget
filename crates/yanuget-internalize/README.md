@@ -8,9 +8,10 @@ at them. The plan is the "Chocolatey internalizer" section of
 [ROADMAP.md](../../ROADMAP.md).
 
 **Not released, and not usable yet.** The command line, the configuration and
-its check (`INT-10`) and the upstream client (`INT-11`) exist; the sandbox
-runners and publishing follow. `plan` resolves the packages it is given and
-then stops with an error, as does `run`.
+its check (`INT-10`), the upstream client (`INT-11`) and the dependency
+closure (`INT-12`) exist; the sandbox runners and publishing follow. `plan`
+shows the closure of the packages it is given and then stops with an error;
+`run` stops before it fetches anything.
 
 ## Command line
 
@@ -68,6 +69,32 @@ checked as they resolve. Redirects are followed one hop at a time, never from
 https to http, and credentials go only to the upstream's own origin. A `429`
 or `503` is waited out and tried again; when the upstream stops answering,
 and when it answers again, the tool logs it once.
+
+## Dependency closure
+
+`plan` resolves each package's dependencies before anything is downloaded
+and prints the closure, one package a line, root first:
+
+```text
+git 2.51.0
+  git.install 2.51.0
+  chocolatey-core.extension 1.4.0 (the target holds it)
+  chocolatey-compatibility.extension 1.0.0
+4 packages, 3 to internalize
+```
+
+The versions are the ones Chocolatey CLI v2 installs for the same command:
+NuGet's resolver as Chocolatey runs it, with `DependencyBehavior.Highest`, so
+each dependency takes the highest version every range on it allows, not the
+lowest as `dotnet restore` does. Pre-release versions are candidates only when
+the root is one or a range pins exactly that version, and an unlisted version
+is taken only when no listed one fits. Extension packages are ordinary dependencies and part of the closure,
+since scripts call their helpers. A dependency on `chocolatey` itself is left
+to the Chocolatey CLI the image has, and listed as such.
+
+With `target.url` set, each package the target feed serves already is marked.
+A read-gated feed cannot say, since the tool holds a push key only; pending
+versions are not listed either. Pushing such a version again answers `409`.
 
 ## Sandboxes
 

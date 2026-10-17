@@ -76,6 +76,12 @@ pub fn flat_package_url(base: &Url, id: &str, version: &str) -> Result<Url, Upst
     join(base, &format!("{id}/{version}/{id}.{version}.nupkg"))
 }
 
+pub fn flat_nuspec_url(base: &Url, id: &str, version: &str) -> Result<Url, UpstreamError> {
+    let id = id.to_ascii_lowercase();
+    let version = version.to_ascii_lowercase();
+    join(base, &format!("{id}/{version}/{id}.nuspec"))
+}
+
 fn join(base: &Url, path: &str) -> Result<Url, UpstreamError> {
     base.join(path)
         .map_err(|e| UpstreamError::Invalid(format!("upstream URL: {e}")))

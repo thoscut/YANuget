@@ -314,6 +314,50 @@ impl Upstream {
         Ok(out)
     }
 
+    /// What `info` depends on. A v2 feed and a v3 registration list it with
+    /// the version; a v3 feed with only a flat container does not, so its
+    /// manifest is read from there.
+    pub async fn dependencies(
+        &self,
+        info: &PackageInfo,
+    ) -> Result<Vec<DependencyRef>, UpstreamError> {
+        let flat = match &self.protocol {
+            Protocol::V2 { .. } => return Ok(info.dependencies.clone()),
+            Protocol::V3 { .. } => match self.v3_resources().await? {
+                v3::Resources {
+                    registration: None,
+                    flat_container: Some(flat),
+                } => flat,
+                _ => return Ok(info.dependencies.clone()),
+            },
+        };
+        let url = v3::flat_nuspec_url(flat, &info.id, &info.version.normalized())?;
+        let what = format!("manifest of {} {}", info.id, info.version.normalized());
+        let body = self
+            .document(&url, &what)
+            .await?
+            .ok_or_else(|| UpstreamError::NotFound(format!("upstream {what}: not found")))?;
+        let xml = String::from_utf8(body)
+            .map_err(|_| UpstreamError::Invalid(format!("upstream {what} is not UTF-8")))?;
+        let nuspec = yanuget_pkg::nuspec::parse_nuspec(&xml)
+            .map_err(|e| UpstreamError::Invalid(format!("upstream {what}: {e}")))?;
+        let mut out: Vec<DependencyRef> = Vec::new();
+        for dep in nuspec
+            .dependency_groups
+            .into_iter()
+            .flat_map(|g| g.dependencies)
+        {
+            let dep = DependencyRef {
+                id: dep.id,
+                range: dep.version_range.filter(|r| !r.trim().is_empty()),
+            };
+            if !out.contains(&dep) {
+                out.push(dep);
+            }
+        }
+        Ok(out)
+    }
+
     /// The version to take of `id`: `version` when given, else the newest
     /// listed stable version, as `choco install` picks it.
     pub async fn resolve(
