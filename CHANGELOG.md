@@ -113,6 +113,11 @@ expected to change incompatibly at any version.
   2.0.0 range (`[2.0.0-beta.1, )`, build metadata) is now SemVer 2.0.0, as on
   nuget.org: it is withheld from SemVer 1.0.0 clients, which cannot resolve the
   dependency. Schema step 8 marks the versions already stored.
+- A hard delete (`nuget delete` with `hard_delete_enabled`) and an admin delete,
+  bulk delete or move now run to completion when the client disconnects, as a
+  push does. Stopped between removing the version from the feed and recording
+  the deletion, they left no tombstone, so a read-through mirror fetched the
+  version back.
 
 ## [0.7.0] — 2026-10-15
 

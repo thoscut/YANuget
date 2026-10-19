@@ -165,14 +165,20 @@ pub(super) async fn delete_package(
 
     if state.feed.hard_delete_enabled {
         // Hard delete removes this feed's membership (and, when it was the last
-        // feed, the payload, sidecars and indexed symbols).
-        let removed = retention::purge_version(
-            state.storage.as_ref(),
-            state.db.as_ref(),
-            state.feed(),
-            &id,
-            &version,
-        )
+        // feed, the payload, sidecars and indexed symbols). Detached, so a
+        // client that disconnects cannot stop it between the membership and
+        // the tombstone that keeps a mirror from fetching the version back.
+        let purging = state.clone();
+        let removed = detached(async move {
+            retention::purge_version(
+                purging.storage.as_ref(),
+                purging.db.as_ref(),
+                purging.feed(),
+                &id,
+                &version,
+            )
+            .await
+        })
         .await?;
         if removed {
             Ok(StatusCode::NO_CONTENT.into_response())
