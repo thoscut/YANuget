@@ -170,6 +170,7 @@ async fn checksums_decide_what_a_file_is_worth() {
     assert_eq!(got.checksum.algorithm.as_deref(), Some("sha256"));
     assert_eq!(std::fs::read(&got.path).unwrap(), body);
     assert_eq!(got.size, body.len() as u64);
+    assert_eq!(got.head, body[..16]);
     assert!(got.final_url.unwrap().path().ends_with("/plain/setup.exe"));
     assert_eq!(
         got.content_disposition.as_deref(),
@@ -178,6 +179,7 @@ async fn checksums_decide_what_a_file_is_worth() {
     // The second time it comes from the cache.
     let again = d.fetch(&url, Some(&declared)).await.unwrap();
     assert!(again.final_url.is_none());
+    assert_eq!(again.head, body[..16]);
 
     // MD5 and nothing are trust-on-first-use, a matching MD5 included.
     let md5 = hex::encode(<md5::Md5 as Digest>::digest(&body));
@@ -238,6 +240,7 @@ async fn a_broken_transfer_resumes_or_restarts() {
         .await
         .unwrap();
     assert_eq!(std::fs::read(&got.path).unwrap(), body);
+    assert_eq!(got.head, body[..16], "the restart starts the head over");
     let ranges = std::mem::take(&mut seen.lock().unwrap().ranges);
     assert_eq!(ranges, [None, None]);
 

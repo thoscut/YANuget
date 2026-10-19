@@ -745,13 +745,7 @@ impl FilesConfig {
     }
 }
 
-/// Whether `ext` (without the dot) is in `allowed`, ignoring ASCII case and a
-/// leading dot on the entries.
-pub fn extension_allowed(allowed: &[String], ext: &str) -> bool {
-    allowed
-        .iter()
-        .any(|a| a.trim_start_matches('.').eq_ignore_ascii_case(ext))
-}
+pub use yanuget_pkg::files::extension_allowed;
 
 impl Default for Config {
     fn default() -> Self {

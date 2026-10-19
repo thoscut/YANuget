@@ -385,16 +385,7 @@ fn safe_segment(segment: &str) -> Result<String> {
     Ok(segment.to_string())
 }
 
-/// Whether `segment` names a Windows device, with or without an extension
-/// (`nul`, `COM1.pdb`, `lpt9.txt`).
-pub(crate) fn is_windows_device_name(segment: &str) -> bool {
-    let stem = segment.split('.').next().unwrap_or("").trim_end();
-    let stem = stem.to_ascii_uppercase();
-    matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
-        || ((stem.starts_with("COM") || stem.starts_with("LPT"))
-            && stem.len() == 4
-            && matches!(stem.as_bytes()[3], b'1'..=b'9'))
-}
+pub(crate) use yanuget_pkg::files::is_windows_device_name;
 
 #[cfg(test)]
 mod tests {

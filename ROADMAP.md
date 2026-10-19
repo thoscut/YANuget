@@ -1246,7 +1246,7 @@ packages whose downloads go through Chocolatey's helpers.
   `Range` and `If-Range` (a strong `ETag`, else `Last-Modified`) where the
   host offers byte ranges, and restarted otherwise. A failed download leaves
   nothing in the cache.
-- [ ] **`INT-18` File names.** Attached file names are 1–128 characters of
+- [x] **`INT-18` File names.** Attached file names are 1–128 characters of
   `A-Z a-z 0-9 . _ -` with an allowed extension; upstream names carry spaces
   and `+`, or there is no name at all (`?product=…&os=win64`). Keep the
   original name where it is valid; otherwise derive it from
@@ -1254,6 +1254,17 @@ packages whose downloads go through Chocolatey's helpers.
   extension against the content (`MZ`, the OLE header of `.msi`, `PK`), and
   break collisions with a hash prefix. A file the feed's `allowed_extensions`
   refuses is reported, not renamed to pass.
+  *Landed:* `yanuget_internalize::naming`. The server's rule moved to
+  `yanuget_pkg::files`, so the server's attach check and the tool's names are
+  one definition. The URL's own name is kept when it is valid and its
+  extension fits the content. Otherwise the name comes from
+  `Content-Disposition` (`filename*` first), the URL after redirects, the URL
+  as captured, and last the package (`git.install-2.51.0`). Disallowed runs
+  become `_` and long stems are cut. The extension is the name's own if it
+  fits the content, else the captured `fileType` if that fits, else the
+  content's (`MZ`, OLE, `PK`, 7z, `MSCF`, gzip). The same file keeps the
+  name it was given, and a different file on a taken name gets the first
+  eight hex digits of its SHA-256 in front.
 - [ ] **`INT-19` Prelude.** The wrappers are proxy commands
   (`[System.Management.Automation.ProxyCommand]::Create`) generated from the
   pinned Chocolatey version's helper metadata, so positional calls and

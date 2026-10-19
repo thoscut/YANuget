@@ -68,7 +68,12 @@ pub struct Downloaded {
     /// file.
     pub content_disposition: Option<String>,
     pub content_type: Option<String>,
+    /// The file's first bytes, to tell what it is ([`crate::naming::Kind`]).
+    pub head: Vec<u8>,
 }
+
+/// How many of a file's first bytes [`Downloaded::head`] keeps.
+pub const HEAD_BYTES: usize = 16;
 
 /// Fetches files under the download policy.
 #[derive(Debug)]
@@ -149,11 +154,13 @@ impl Downloader {
         let mut file = tokio::fs::File::open(&path).await?;
         let mut hasher = Sha256::new();
         let mut buf = vec![0u8; 64 * 1024];
+        let mut head = Vec::new();
         loop {
             let n = tokio::io::AsyncReadExt::read(&mut file, &mut buf).await?;
             if n == 0 {
                 break;
             }
+            keep_head(&mut head, &buf[..n]);
             hasher.update(&buf[..n]);
         }
         if hex::encode(hasher.finalize()) != sum.hex {
@@ -169,6 +176,7 @@ impl Downloader {
             final_url: None,
             content_disposition: None,
             content_type: None,
+            head,
         }))
     }
 
@@ -188,6 +196,7 @@ impl Downloader {
         let mut file = tokio::fs::File::create(partial).await?;
         let mut hashes = Hashes::new(declared.map(|c| c.kind));
         let mut written: u64 = 0;
+        let mut head = Vec::new();
         // What a resume needs: the host takes ranges, and a validator proves
         // the rest belongs to the same file.
         let mut validator: Option<HeaderValue> = None;
@@ -229,6 +238,7 @@ impl Downloader {
                         .await?;
                     hashes = Hashes::new(declared.map(|c| c.kind));
                     written = 0;
+                    head.clear();
                 }
                 if resp.content_length().is_some_and(|n| n > self.max_bytes) {
                     return Err(too_large());
@@ -259,6 +269,7 @@ impl Downloader {
                             return Err(too_large());
                         }
                         hashes.update(&chunk);
+                        keep_head(&mut head, &chunk);
                         file.write_all(&chunk).await?;
                         written += chunk.len() as u64;
                     }
@@ -302,8 +313,14 @@ impl Downloader {
             final_url: Some(final_url),
             content_disposition,
             content_type,
+            head,
         })
     }
+}
+
+fn keep_head(head: &mut Vec<u8>, bytes: &[u8]) {
+    let want = HEAD_BYTES.saturating_sub(head.len());
+    head.extend_from_slice(&bytes[..want.min(bytes.len())]);
 }
 
 fn header(h: &HeaderMap, name: reqwest::header::HeaderName) -> Option<String> {
