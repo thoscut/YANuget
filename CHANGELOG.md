@@ -90,6 +90,7 @@ expected to change incompatibly at any version.
   seconds, counted from accept and covering the TLS handshake) to send them,
   and idle HTTP/2 connections are pinged every 60 seconds and closed when a
   ping goes unanswered for 20.
+- The statistics page listed unlisted versions among the recent packages.
 
 ### Fixed
 
