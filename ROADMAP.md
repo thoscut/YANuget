@@ -985,6 +985,17 @@ Every server change the tool relies on, in one release (see
   never computes one. Verify the premise first: if the helpers do send source
   credentials, the item shrinks to a test. Either way, a security review
   before it is built.
+  *Premise checked* on 2026-10-19 against Chocolatey CLI's helpers
+  (`chocolatey/choco` at `c8659d4`): `Get-WebFile` and `Get-WebHeaders` set
+  only `CredentialCache::DefaultCredentials` (the Windows logon, for
+  integrated authentication) and proxy credentials; the source's user name
+  and password never reach PowerShell, and none of the variables the CLI sets
+  for a script carries them. So a read-gated feed cannot serve its files to
+  `choco install` today, and the item stands. The one alternative the helpers
+  allow: `-Options @{Headers = @{…}}` adds any request header, so a prelude
+  could send `Authorization` from a variable set on each client. That puts a
+  read key on every client and needs per-client setup, where the token needs
+  none; it stays a fallback.
 - [x] **`INT-32` Read access to pending versions.** A per-feed
   `preview_api_key` that can download pending packages and their files and do
   nothing else: no approve, no push. For `INT-26`, and for anyone who wants to
