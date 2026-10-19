@@ -2108,6 +2108,11 @@ async fn gallery_pager_goes_to_a_page_and_snaps_to_page_starts() {
     assert!(body.contains("<select id=\"pg-take\""), "{body}");
     assert!(!body.contains("pg-page"), "{body}");
 
+    // No page is larger than the largest size the pager offers.
+    let body = get_text(&server, "/packages?take=1000").await;
+    assert!(body.contains("value=\"100\""), "{body}");
+    assert!(!body.contains("value=\"1000\""), "{body}");
+
     // The search text survives the round trip through the forms.
     let body = get_text(&server, "/packages?q=pp&page=3").await;
     assert!(body.contains("5\u{2013}5 of 5"), "{body}");

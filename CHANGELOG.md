@@ -127,6 +127,10 @@ expected to change incompatibly at any version.
   text: an expired form says to reload the page, and a copy or move the target
   feed's license policy refuses says why. Server errors stay generic, and
   `401`, `404` and `429` keep their own text.
+- The gallery's `?take=` is capped at 100, the largest page size its pager
+  offers (or `gallery_page_size` when that is larger), instead of 1000: every
+  package on a page loads all of its versions, so one anonymous request could
+  load a thousand packages' worth.
 
 ## [0.7.0] — 2026-10-15
 
