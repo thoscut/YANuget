@@ -50,6 +50,11 @@ expected to change incompatibly at any version.
 
 ### Changed
 
+- The minimum supported Rust is 1.89 (from 1.88), for `uuid` 1.27 and later;
+  the container image is built with 1.89. (`DEP-07`)
+- `axum-server` 0.8 replaces 0.7, which drops the unmaintained
+  `rustls-pemfile` (RUSTSEC-2025-0134) from the dependencies: certificates
+  are read through `rustls-pki-types`. (`DEP-06`)
 - Package handling moved into a workspace crate, `yanuget-pkg`
   (`crates/yanuget-pkg/`): NuGet versions, the `.nuspec` parser, `.nupkg`
   reading and the upstream address policy, with no axum or sqlx dependency and
@@ -58,6 +63,11 @@ expected to change incompatibly at any version.
   notation (parse, normalize, `contains`, best match), for tools that resolve
   dependencies. A release that publishes to crates.io publishes `yanuget-pkg`
   first; see RELEASING.md. (`INT-01`)
+- `zip` 9 replaces `zip` 2.4.2, against RUSTSEC-2026-0367, -0368 and -0369.
+  Those concern extracting an archive to disk, which YANuget never does (it
+  reads packages entry by entry), so no released version was exposed. A
+  package with an entry name that is neither UTF-8 nor CP437 is still
+  refused when it is opened.
 
 ## [0.7.0] — 2026-10-15
 

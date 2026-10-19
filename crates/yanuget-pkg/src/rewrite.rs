@@ -151,10 +151,8 @@ fn rewrite_into(input: &Path, output: &Path, plan: &Rewrite) -> Result<Rewritten
     let mut has_content_types = false;
     let mut has_nuspec = false;
     for i in 0..archive.len() {
-        let name = archive
-            .name_for_index(i)
-            .ok_or_else(|| Error::InvalidPackage("an entry has no name".into()))?
-            .to_string();
+        let name = crate::nupkg::entry_name(&archive, i)?
+            .ok_or_else(|| Error::InvalidPackage("an entry has no name".into()))?;
         let normalized = normalize_entry(&name);
         seen.insert(normalized.clone());
         let is_nuspec = normalized.ends_with(".nuspec") && !normalized.contains('/');
@@ -296,7 +294,6 @@ fn rewrite_into(input: &Path, output: &Path, plan: &Rewrite) -> Result<Rewritten
     out.flush()?;
     let file = out.into_inner().map_err(|e| Error::Io(e.into_error()))?;
     drop(file);
-    fix_zip64_sizes(output, &copied)?;
     verify_copies(output, &copied)?;
     File::open(output)?.sync_all()?;
     done.added = added;
@@ -309,98 +306,6 @@ struct Copied {
     size: u64,
     compressed: u64,
     crc32: u32,
-}
-
-/// Sizes at or above this live in the ZIP64 extra field.
-const ZIP64_THRESHOLD: u64 = 0xFFFF_FFFF;
-const ZIP64_TAG: u16 = 0x0001;
-
-/// Write the true sizes into the ZIP64 fields of entries copied raw.
-///
-/// The `zip` crate (2.x) writes the ZIP64 extra field of a raw copy before it
-/// knows the sizes and never comes back to it, so a copied entry of 4 GiB or
-/// more would read as empty. The field has the right shape and place, in the
-/// local header and in the central directory, and only its values are
-/// written here.
-fn fix_zip64_sizes(path: &Path, copied: &[Copied]) -> Result<(), Error> {
-    use std::io::{Seek, SeekFrom};
-    let large: Vec<&Copied> = copied
-        .iter()
-        .filter(|c| c.size >= ZIP64_THRESHOLD || c.compressed >= ZIP64_THRESHOLD)
-        .collect();
-    if large.is_empty() {
-        return Ok(());
-    }
-    let mut places = Vec::new();
-    {
-        let mut archive = zip::ZipArchive::new(File::open(path)?)
-            .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))?;
-        for c in &large {
-            let entry = archive
-                .by_name(&c.name)
-                .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))?;
-            places.push((c, entry.header_start(), entry.central_header_start()));
-        }
-    }
-    let mut file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)?;
-    let broken =
-        |what: &str| Error::Io(std::io::Error::other(format!("rewritten archive: {what}")));
-    for (c, local, central) in places {
-        for (start, signature, fixed, name_at, sizes_at) in [
-            (central, 0x0201_4b50u32, 46u64, 28usize, 20usize),
-            (local, 0x0403_4b50u32, 30u64, 26usize, 18usize),
-        ] {
-            let mut header = vec![0u8; fixed as usize];
-            file.seek(SeekFrom::Start(start))?;
-            file.read_exact(&mut header)?;
-            let at = |i: usize| {
-                u32::from_le_bytes([header[i], header[i + 1], header[i + 2], header[i + 3]])
-            };
-            let short = |i: usize| u16::from_le_bytes([header[i], header[i + 1]]) as u64;
-            if at(0) != signature {
-                return Err(broken("a header is not where the directory says"));
-            }
-            let (compressed32, size32) = (at(sizes_at), at(sizes_at + 4));
-            let (name_len, extra_len) = (short(name_at), short(name_at + 2));
-            let extra_start = start + fixed + name_len;
-            let mut extra = vec![0u8; extra_len as usize];
-            file.seek(SeekFrom::Start(extra_start))?;
-            file.read_exact(&mut extra)?;
-            let mut i = 0;
-            let mut field = None;
-            while i + 4 <= extra.len() {
-                let tag = u16::from_le_bytes([extra[i], extra[i + 1]]);
-                let len = u16::from_le_bytes([extra[i + 2], extra[i + 3]]) as usize;
-                if tag == ZIP64_TAG {
-                    field = Some((i + 4, len));
-                    break;
-                }
-                i += 4 + len;
-            }
-            let (data, len) = field.ok_or_else(|| broken("a large entry has no ZIP64 field"))?;
-            // The field holds, in this order, each size whose 32-bit slot
-            // says 0xFFFFFFFF.
-            let mut values = Vec::new();
-            if u64::from(size32) == ZIP64_THRESHOLD {
-                values.push(c.size);
-            }
-            if u64::from(compressed32) == ZIP64_THRESHOLD {
-                values.push(c.compressed);
-            }
-            if values.len() * 8 > len {
-                return Err(broken("a ZIP64 field is too short for its sizes"));
-            }
-            file.seek(SeekFrom::Start(extra_start + data as u64))?;
-            for v in values {
-                file.write_all(&v.to_le_bytes())?;
-            }
-        }
-    }
-    file.flush()?;
-    Ok(())
 }
 
 /// Check that every entry copied raw reads back with the size, compressed size
@@ -651,7 +556,12 @@ mod tests {
                 let mut e = archive.by_index_raw(i).unwrap();
                 let mut raw = Vec::new();
                 e.read_to_end(&mut raw).unwrap();
-                (e.name().to_string(), e.compression(), e.crc32(), raw)
+                (
+                    e.name().unwrap().into_owned(),
+                    e.compression(),
+                    e.crc32(),
+                    raw,
+                )
             })
             .collect()
     }

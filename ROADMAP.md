@@ -7,6 +7,73 @@ is the work list.
 Items are tagged with a stable id (`SEC-…`, `COR-…`, …) so commits and pull
 requests can reference them, and ticked off rather than deleted when they land.
 
+## Open items
+
+Everything still open across this file and the project's working threads, as
+of 2026-10-19 (`main` at `d1989fc`, 0.7.0 released). The entries further down
+hold the detail; this list is the index.
+
+**In review**
+
+- PR #58: `INT-11` (upstream client), `INT-12` (dependency closure) and `zip`
+  9. Green. Merging it also turns `main` green again: since #57 its dependency
+  audit fails on RUSTSEC-2026-0368 (with -0367 and -0369) against `zip` 2.4.2,
+  which #58 replaces.
+
+**Server 0.8.0** ([Target releases](#target-releases))
+
+- `INT-31` Attached files on read-gated feeds: the premise holds (Chocolatey's
+  helpers never send source credentials); a security review of the token
+  design comes next, before it is built. Blocks 0.8.0.
+- `INT-21` Report: fix schema version 1 for the tool. Blocks 0.8.0.
+
+**Internalizer 0.1.0**
+
+- `INT-13` to `INT-20` and `INT-22`: golden images, capture helpers, the KVM
+  runner, capture validation, downloader, file names, prelude, publish, and the
+  regression corpus. `INT-13` waits on the licensing question below.
+
+**Dependencies and toolchain**
+
+- [x] **`DEP-06` `axum-server` 0.8.** It no longer depends on `rustls-pemfile`
+  (`RUSTSEC-2025-0134`, see `DEP-01`): 0.8.0 reads PEM through
+  `rustls-pki-types` and needs Rust 1.82. Upgrade, then drop the comment on
+  that advisory in `ci.yml`.
+  *Done:* `rustls-pemfile` is gone from `Cargo.lock`.
+- [x] **`DEP-07` MSRV policy.** The floor was 1.88 (`Cargo.toml`, the MSRV
+  job, the Dockerfile builder stage, README, CONTRIBUTING). `uuid` 1.27 needs
+  1.89, which is why Dependabot's #47 was closed unmerged; the next `uuid`
+  bump fails the same way, because Dependabot does not ignore it. `sqlx` 0.9
+  needs 1.94 and is ignored in `dependabot.yml` on purpose. Decide: raise the
+  floor to 1.89 now (cheap; 1.89 is over a year old), or hold `uuid` in
+  Dependabot too. `sqlx` 0.9 waits for a release that raises the floor to
+  1.94.
+  *Done:* raised to 1.89 everywhere the floor is stated, `uuid` is at 1.28.
+
+**Documentation**
+
+- [ ] **`DOC-09` cosign 3.** The 0.7.0 image signature is stored as a
+  Sigstore bundle, which `cosign verify` finds from cosign 3 on; cosign 2.5
+  reports "no signatures found". SECURITY.md and RELEASING.md should say which
+  cosign version the command needs.
+
+**Features under discussion**
+
+- Markdown readmes on the package page; see [Features](#features).
+
+**For the repository owner**
+
+- The release settings under [For the repository owner](#for-the-repository-owner):
+  0.7.0 ran attestation and cosign signing for real, but whether the `release`
+  environment, the tag ruleset and crates.io trusted publishing exist has not
+  been checked from here.
+- An open question from the review: move the `SEC-…` findings from this public
+  file into a private security advisory? Every one of them is fixed and
+  released since 0.6.0.
+- The internalizer's [open questions](#open-questions), above all the Windows
+  license for the golden images (needed before `INT-13` ships) and the
+  release scheme for the tool.
+
 ## Review of 2026-09-30
 
 A full review of `main` at `4e086c5` (0.5.1 plus everything under
@@ -93,8 +160,10 @@ These need settings no commit can change; the release workflow expects them
 5. Give this repository *Write* access to the `thoscut/yanuget` package on
    ghcr (package settings → Manage Actions access).
 
-Not yet exercised: the attestation, cosign, trusted-publishing and
-environment steps (they run only on a release), and
+Exercised by the 0.7.0 release: build provenance for the archives and the
+image, and the image's cosign signature (`cosign verify` from SECURITY.md
+passes with cosign 3; see `DOC-09`). Not yet exercised: crates.io trusted
+publishing (`PUBLISH_TO_CRATES_IO` is unset), and
 `scripts/Send-YanugetFile.ps1`, which was reviewed but not run.
 
 ---
@@ -757,6 +826,16 @@ Not yet implemented (contributions welcome):
   timestamps).
 - A Chocolatey internalizer, planned in detail under
   [Chocolatey internalizer](#chocolatey-internalizer) (`INT-…`).
+- Markdown readmes on the package page. NuGet readmes are Markdown, and
+  nuget.org renders them; descriptions are plain text and stay so, in the list
+  and on the package page. Sketch: `pulldown-cmark` with a filter over its
+  events that emits raw HTML as text and sends every link and image URL
+  through `safe_href`; external images as links with their alt text (the CSP
+  blocks them anyway); a cap on the HTML produced. This would be the first
+  place package data becomes markup, so it needs a documented exception to the
+  escaping rule of `MNT-01`, a `SEC-…` entry of its own and an XSS corpus in
+  `tests/http_security.rs`. Assessed on 2026-10-02 at one to two days; not
+  started.
 
 ---
 
@@ -854,9 +933,10 @@ Every server change the tool relies on, in one release (see
   *Landed:* `yanuget_pkg::rewrite`. An empty rewrite keeps every entry's
   compressed bytes and CRC; a 5 GiB entry passes with under 64 MiB of growth
   (an ignored test, `cargo test -p yanuget-pkg -- --ignored`), and Python's
-  `zipfile` reads it back. The `zip` crate leaves the ZIP64 sizes of a raw
-  copy at zero, so the rewriter writes them itself and checks every copy
-  against the source. Not yet checked: an install with Chocolatey CLI, which
+  `zipfile` reads it back. Every copy is checked against the source after
+  writing: `zip` 2.x left the ZIP64 sizes of a raw copy at zero, which the
+  rewriter patched until `zip` 9 (taken for RUSTSEC-2026-0367/0368/0369)
+  wrote them itself. Not yet checked: an install with Chocolatey CLI, which
   needs a Windows host; that belongs with the regression corpus (`INT-22`).
 - [x] **`INT-03` Per-feed `allowed_extensions` for attached files.** `[files]`
   is global, and its defaults rightly exclude `exe` and `msi`. Let a feed
@@ -908,6 +988,17 @@ Every server change the tool relies on, in one release (see
   never computes one. Verify the premise first: if the helpers do send source
   credentials, the item shrinks to a test. Either way, a security review
   before it is built.
+  *Premise checked* on 2026-10-19 against Chocolatey CLI's helpers
+  (`chocolatey/choco` at `c8659d4`): `Get-WebFile` and `Get-WebHeaders` set
+  only `CredentialCache::DefaultCredentials` (the Windows logon, for
+  integrated authentication) and proxy credentials; the source's user name
+  and password never reach PowerShell, and none of the variables the CLI sets
+  for a script carries them. So a read-gated feed cannot serve its files to
+  `choco install` today, and the item stands. The one alternative the helpers
+  allow: `-Options @{Headers = @{…}}` adds any request header, so a prelude
+  could send `Authorization` from a variable set on each client. That puts a
+  read key on every client and needs per-client setup, where the token needs
+  none; it stays a fallback.
 - [x] **`INT-32` Read access to pending versions.** A per-feed
   `preview_api_key` that can download pending packages and their files and do
   nothing else: no approve, no push. For `INT-26`, and for anyone who wants to

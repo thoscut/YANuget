@@ -17,7 +17,7 @@
 # The builder runs on the build machine's own architecture and cross-compiles
 # for the image's (`TARGETARCH`), because compiling the arm64 image under QEMU
 # emulation works but takes an order of magnitude longer.
-FROM --platform=$BUILDPLATFORM rust:1.88-slim-trixie@sha256:9a7159329166b45f453351a077367f501aa3e98378f7e327530e7966a139d05f AS builder
+FROM --platform=$BUILDPLATFORM rust:1.89-slim-trixie@sha256:8cffb8fe4e8a95cf0d6a2060375e5a28aff4c752155aa9f1f9193530769bdf66 AS builder
 ARG TARGETARCH
 WORKDIR /app
 

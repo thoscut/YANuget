@@ -14,8 +14,8 @@ updates:
       minor-and-patch:
         update-types: [minor, patch]
     ignore:
-      # sqlx 0.9 requires rustc 1.94 — six minor versions past this crate's
-      # declared MSRV of 1.88. Taking it is not a dependency decision, it is a
+      # sqlx 0.9 requires rustc 1.94 — five minor versions past this crate's
+      # declared MSRV of 1.89. Taking it is not a dependency decision, it is a
       # decision to drop every toolchain between the two, and that belongs in a
       # release rather than in a routine bump. The 0.9 API change it brings (SQL
       # strings must be `&'static str` or explicitly asserted) has already been
@@ -76,7 +76,7 @@ updates:
     schedule:
       interval: monthly
     ignore:
-      # Same trap as `dtolnay/rust-toolchain` above: `rust:1.88-slim-trixie`
+      # Same trap as `dtolnay/rust-toolchain` above: `rust:1.89-slim-trixie`
       # does not name a version of a dependency, it declares the crate's MSRV.
       # The builder stage is pinned there on purpose so the image build
       # re-checks that the crate still compiles at its floor, and it is raised

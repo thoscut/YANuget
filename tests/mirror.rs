@@ -163,6 +163,7 @@ impl Upstream {
             .with_state(state.clone());
         tokio::spawn(async move {
             axum_server::from_tcp_rustls(listener, tls)
+                .unwrap()
                 .serve(app.into_make_service())
                 .await
                 .unwrap();

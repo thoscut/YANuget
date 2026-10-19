@@ -65,7 +65,7 @@ impl ServeLimits {
 pub async fn serve(
     app: axum::Router,
     config: &Config,
-    handle: Handle,
+    handle: Handle<SocketAddr>,
     limits: ServeLimits,
 ) -> Result<()> {
     let addr = config.socket_addr();

@@ -46,7 +46,7 @@ on an air-gapped network.
 ## Quick start
 
 ```bash
-# Build (Rust 1.88+) and run with an API key
+# Build (Rust 1.89+) and run with an API key
 cargo build --release
 YANUGET_API_KEY=change-me ./target/release/yanuget
 ```
