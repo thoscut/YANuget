@@ -131,6 +131,11 @@ expected to change incompatibly at any version.
   offers (or `gallery_page_size` when that is larger), instead of 1000: every
   package on a page loads all of its versions, so one anonymous request could
   load a thousand packages' worth.
+- Shutdown takes at most the documented ten seconds. Requests and background
+  work now drain against one deadline set when the signal arrives; the
+  background tasks used to get a second ten seconds after the server stopped.
+  The Compose example in the deployment guide sets `stop_grace_period: 15s`, so
+  `docker stop` does not kill the server at the moment its grace runs out.
 
 ## [0.7.0] — 2026-10-15
 

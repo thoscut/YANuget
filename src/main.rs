@@ -375,11 +375,16 @@ async fn run_server(config_path: Option<&str>) -> anyhow::Result<()> {
     // requests the grace period, then close what is left. The plain-HTTP path
     // used to wait for its last connection indefinitely.
     let handle = axum_server::Handle::new();
+    // One deadline for everything shutdown waits on, set when the signal
+    // arrives: requests and background work drain at the same time, so the
+    // whole stop takes the grace period, not one period after another.
+    let deadline = Arc::new(std::sync::OnceLock::<tokio::time::Instant>::new());
     {
-        let handle = handle.clone();
+        let (handle, deadline) = (handle.clone(), deadline.clone());
         let shutdown_rx = shutdown_rx.clone();
         tokio::spawn(async move {
             wait_for_shutdown(shutdown_rx).await;
+            let _ = deadline.set(tokio::time::Instant::now() + yanuget::server::SHUTDOWN_GRACE);
             handle.graceful_shutdown(Some(yanuget::server::SHUTDOWN_GRACE));
         });
     }
@@ -416,13 +421,15 @@ async fn run_server(config_path: Option<&str>) -> anyhow::Result<()> {
     server.await??;
 
     // The server has stopped; let background work that was mid-way finish,
-    // within the same grace period.
-    if tokio::time::timeout(
-        yanuget::server::SHUTDOWN_GRACE,
-        futures::future::join_all(background),
-    )
-    .await
-    .is_err()
+    // by the deadline the requests had. It has been winding down since the
+    // signal, alongside them.
+    let deadline = deadline
+        .get()
+        .copied()
+        .unwrap_or_else(|| tokio::time::Instant::now() + yanuget::server::SHUTDOWN_GRACE);
+    if tokio::time::timeout_at(deadline, futures::future::join_all(background))
+        .await
+        .is_err()
     {
         tracing::warn!("background tasks still running at shutdown; abandoning them");
     }
