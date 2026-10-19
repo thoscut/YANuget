@@ -91,9 +91,6 @@ expected to change incompatibly at any version.
   and idle HTTP/2 connections are pinged every 60 seconds and closed when a
   ping goes unanswered for 20.
 - The statistics page listed unlisted versions among the recent packages.
-
-### Fixed
-
 - An archive whose entry names differ only in case or in `\` against `/`
   (`lib/a.pdb`, `LIB/A.pdb`, `lib\a.pdb`) is refused. They counted as one name
   but were all extracted, so a symbol package could pass the 512-PDB cap many
