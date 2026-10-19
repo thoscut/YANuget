@@ -51,6 +51,10 @@ pub struct IndexOptions {
     pub expect: Option<ExpectedIdentity>,
     /// Id prefixes other feeds reserved: an id under one is refused here.
     pub reserved_elsewhere: Vec<ReservedPrefix>,
+    /// The license policies of the other feeds, by name. A `pending-only`
+    /// overwrite replaces the build in every feed that holds the version, so
+    /// the new build is held to each of their policies too.
+    pub other_license_policies: Vec<(String, LicensePolicyConfig)>,
 }
 
 /// The id/version a caller requires the indexed manifest to declare.
@@ -306,9 +310,24 @@ async fn index_inner(
     // Under "pending-only" a new build takes the old one's attached files
     // with it: they belong to the build they were fetched for. The same
     // build keeps them, so a re-run can complete what an earlier one left.
+    //
+    // The other feeds that hold it get the new build too, so each of their
+    // license policies judges it: a blocking one refuses the push, a warning
+    // one re-flags the version there. The same bytes change nothing there.
+    let others: Vec<(String, policy::PolicyOutcome)> = if same_content {
+        Vec::new()
+    } else {
+        options
+            .other_license_policies
+            .iter()
+            .filter(|(name, _)| name != feed)
+            .map(|(name, p)| (name.clone(), policy::evaluate_license(p, &package)))
+            .collect()
+    };
     let swap = if pending_only {
         Swap::PendingOnly {
             drop_files: !same_content,
+            others: &others,
         }
     } else {
         Swap::Any
@@ -346,14 +365,18 @@ async fn index_inner(
 
 /// How an overwrite swaps the rows.
 #[derive(Clone, Copy)]
-enum Swap {
+enum Swap<'a> {
     /// Whatever state the version is in.
     Any,
-    /// Only while no feed has approved it, checked in the swap's transaction.
-    PendingOnly { drop_files: bool },
+    /// Only while no feed has approved it, checked in the swap's transaction,
+    /// with the other feeds' license verdicts on the new build.
+    PendingOnly {
+        drop_files: bool,
+        others: &'a [(String, policy::PolicyOutcome)],
+    },
 }
 
-impl Swap {
+impl Swap<'_> {
     /// Swap the rows, returning the attached files dropped with them.
     async fn replace(
         self,
@@ -366,8 +389,8 @@ impl Swap {
                 .replace_version(package, membership)
                 .await
                 .map(|()| Vec::new()),
-            Swap::PendingOnly { drop_files } => {
-                db.replace_pending_version(package, membership, drop_files)
+            Swap::PendingOnly { drop_files, others } => {
+                db.replace_pending_version(package, membership, drop_files, others)
                     .await
             }
         }
@@ -460,7 +483,7 @@ async fn overwrite(
     existing: &Package,
     membership: &Membership,
     sidecars: &Sidecars<'_>,
-    swap: Swap,
+    swap: Swap<'_>,
 ) -> Result<Vec<PackageFile>> {
     let id = &package.id;
     let normalized = package.normalized_version();
@@ -1293,6 +1316,81 @@ mod tests {
         .await
         .unwrap();
         sha
+    }
+
+    /// [`NUSPEC`] under GPL-3.0, packaged differently from its plain build.
+    async fn push_gpl(
+        storage: &dyn PackageStorage,
+        db: &dyn PackageDatabase,
+        feed: &str,
+        opts: &IndexOptions,
+    ) -> Result<IndexResult> {
+        let nuspec = NUSPEC.replace(
+            "<authors>",
+            "<license type=\"expression\">GPL-3.0-only</license><authors>",
+        );
+        let (_d, temp) = make_package(&nuspec, true).await;
+        let s = summary_for(&temp).await;
+        index_package(storage, db, feed, temp, s, opts).await
+    }
+
+    fn no_gpl(action: crate::config::PolicyAction) -> LicensePolicyConfig {
+        LicensePolicyConfig {
+            enabled: true,
+            allow_unlicensed: true,
+            blocked: vec!["GPL-3.0-only".into()],
+            action,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_pending_only_replace_is_held_to_every_holding_feeds_policy() {
+        use crate::config::PolicyAction;
+        let store_dir = tempfile::tempdir().unwrap();
+        let storage = FilesystemStorage::new(store_dir.path()).await.unwrap();
+        let db = SqliteDatabase::in_memory().await.unwrap();
+        // The same pending build in "intake" and in "prod", where GPL is
+        // blocked.
+        let opts = IndexOptions {
+            other_license_policies: vec![("prod".into(), no_gpl(PolicyAction::Block))],
+            ..pending_only(true)
+        };
+        push(&storage, &db, "intake", false, &opts).await.unwrap();
+        push(&storage, &db, "prod", false, &pending_only(true))
+            .await
+            .unwrap();
+
+        let err = push_gpl(&storage, &db, "intake", &opts).await.unwrap_err();
+        assert!(matches!(err, Error::PolicyViolation(_)), "{err:?}");
+        assert!(err.to_string().contains("prod"), "{err}");
+        let kept = db
+            .get_package_data("contoso.utils", &v123())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!kept.has_readme, "the previous build stays");
+        assert!(kept.license_expression.is_none());
+
+        // Under "warn" the new build goes in, flagged where the policy says.
+        let opts = IndexOptions {
+            other_license_policies: vec![("prod".into(), no_gpl(PolicyAction::Warn))],
+            ..pending_only(true)
+        };
+        let res = push_gpl(&storage, &db, "intake", &opts).await.unwrap();
+        assert!(res.flag_reason.is_none(), "intake has no policy");
+        let prod = db.find_all_versions("prod", "contoso.utils").await.unwrap();
+        assert!(prod[0].flagged, "prod flags the new build");
+        let intake = db
+            .find_all_versions("intake", "contoso.utils")
+            .await
+            .unwrap();
+        assert!(!intake[0].flagged);
+
+        // A build prod accepts clears its flag again.
+        push(&storage, &db, "intake", false, &opts).await.unwrap();
+        let prod = db.find_all_versions("prod", "contoso.utils").await.unwrap();
+        assert!(!prod[0].flagged);
     }
 
     #[tokio::test]

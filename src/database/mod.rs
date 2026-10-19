@@ -326,11 +326,17 @@ pub trait PackageDatabase: Send + Sync {
     /// With `drop_files`, the version's attached-file rows are deleted in that
     /// transaction too and returned, for the caller to delete the blobs nothing
     /// else references.
+    ///
+    /// `others` are the other feeds' license verdicts on the new build: a feed
+    /// holding the version whose verdict blocks it refuses the replacement
+    /// with [`Error::PolicyViolation`](crate::error::Error::PolicyViolation),
+    /// and every other feed listed there has its flag set from its verdict.
     async fn replace_pending_version(
         &self,
         package: &Package,
         membership: &Membership,
         drop_files: bool,
+        others: &[(String, crate::policy::PolicyOutcome)],
     ) -> Result<Vec<PackageFile>>;
 
     /// The feeds in which a version is approved (held and not pending).
