@@ -129,9 +129,9 @@ impl FeedContext {
 pub(crate) enum Access {
     /// A version clients may fetch, under the feed's usual cache policy.
     Public,
-    /// A pending version, fetched with the preview key: kept out of shared
-    /// caches and never `immutable`, since a pending build can still be
-    /// replaced (`allow_overwrite = "pending-only"`).
+    /// Any version fetched with the preview key: kept out of shared caches,
+    /// never `immutable` (a pending build can still be replaced under
+    /// `allow_overwrite = "pending-only"`) and not counted as a download.
     Preview,
 }
 
@@ -337,14 +337,11 @@ impl AppState {
         version: &crate::version::NuGetVersion,
     ) -> Result<Option<Access>> {
         if self.feed.preview_auth.presented(headers) {
+            // Preview treatment whether or not the version is still pending:
+            // what the key fetches is a test, not a download, and its answer
+            // must not be cached as the version's public, immutable one.
             let held = self.db.get_membership(self.feed(), id, version).await?;
-            return Ok(held.filter(|m| m.enabled).map(|m| {
-                if m.pending {
-                    Access::Preview
-                } else {
-                    Access::Public
-                }
-            }));
+            return Ok(held.filter(|m| m.enabled).map(|_| Access::Preview));
         }
         self.require_read(headers)?;
         Ok(self

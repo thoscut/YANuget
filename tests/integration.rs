@@ -5388,6 +5388,20 @@ async fn the_preview_key_downloads_pending_versions_and_nothing_else() {
         "still pending"
     );
 
+    // Once approved, the preview key still gets a preview: private, never
+    // immutable, the same as for a pending version.
+    let approve = admin_action(&server, "/intake/admin/packages/preview.pkg/1.0.0/approve").await;
+    assert_eq!(approve.status(), reqwest::StatusCode::SEE_OTHER);
+    let read = get(nupkg, "reader-key").await.unwrap();
+    assert!(read.status().is_success());
+    for path in [nupkg, file] {
+        let r = get(path, PREVIEW_KEY).await.unwrap();
+        assert!(r.status().is_success(), "{path}: {}", r.status());
+        let cache = r.headers()["cache-control"].to_str().unwrap().to_string();
+        assert!(cache.starts_with("private"), "{path}: {cache}");
+        assert!(!cache.contains("immutable"), "{path}: {cache}");
+    }
+
     // A disabled version stays withheld from the preview key too.
     let disable = admin_action(&server, "/intake/admin/packages/preview.pkg/1.0.0/disable").await;
     assert_eq!(disable.status(), reqwest::StatusCode::SEE_OTHER);
