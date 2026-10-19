@@ -1330,11 +1330,18 @@ packages whose downloads go through Chocolatey's helpers.
 
 ### Internalizer: production
 
-- [ ] **`INT-23` Static cross-check.** Scan every package script for URL-like
+- [x] **`INT-23` Static cross-check.** Scan every package script for URL-like
   literals, including `chocolateyUninstall.ps1` and
   `chocolateyBeforeModify.ps1`, which capture does not run, and warn about each
   one capture did not see. A regex is enough, since it only ever raises a
   warning.
+  *Landed:* `yanuget_internalize::crosscheck`. Every `.ps1`, `.psm1` and
+  `.psd1` entry up to 4 MiB (UTF-8, or UTF-16 by its byte-order mark) is
+  scanned for `http`/`https` URLs outside `#` and `<# #>` comments; a larger
+  one is named in a warning instead. A URL built from variables is seen when
+  a captured URL starts with its literal part, and one whose host is a
+  variable cannot be compared. At most twenty warnings a package, then a
+  count. `run` calls it once a sandbox backend captures.
 - [ ] **`INT-24` Environment variants.** Capture once per architecture
   (`$env:ChocolateyForceX86`), configured locale and set of package
   parameters, and map the union of URLs. A package that picks its installer by
@@ -1343,11 +1350,21 @@ packages whose downloads go through Chocolatey's helpers.
   the system locale needs a reboot, which would throw away the saved state;
   whether `Set-Culture` before the run is enough for most scripts is
   *(to verify)*.
-- [ ] **`INT-25` Overrides.** One TOML file per package id
+- [x] **`INT-25` Overrides.** One TOML file per package id
   (`deny_unknown_fields`): extra URLs, URL rewrites, package parameters for
   capture, a replacement script, or `skip` with a reason. Every override used
   is in the report; one that no longer matches a capture is a warning, so stale
   overrides surface.
+  *Landed:* `yanuget_internalize::overrides`, in `overrides_dir`, the file
+  named for the id. `versions` narrows it to a range; `skip` stands alone and
+  `plan` marks the package. `package_parameters` go to the capture job as
+  `--params` for the root. The script (a path inside the directory, 1 MiB at
+  most) replaces the package's `chocolateyInstall.ps1` under its own name
+  before the capture, so capture and feed see the same script. Downloads may
+  carry a SHA-256; a rewrite fetches a captured URL from elsewhere while the
+  package keeps asking for the original. The report gained `overrides`, a
+  list of lines (a field added to schema version 1, which 0.8.0 ignores).
+  One bad file fails the set; `config check` loads it.
 - [ ] **`INT-26` Validation install.** After publishing, restore a guest from
   the *stock* image, without the capture helpers, and install each new pending
   version with its real installers. The guest's only network device sits on an

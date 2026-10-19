@@ -13,6 +13,9 @@
 cache_dir = "./cache"
 # Scratch space of a run.
 work_dir = "./work"
+# One TOML file per package id with what the capture cannot find out: skip,
+# package parameters, a replacement script, extra downloads, URL rewrites.
+# overrides_dir = "./overrides"
 
 [target]
 # The intake feed (requires_approval = true) to push to, where its

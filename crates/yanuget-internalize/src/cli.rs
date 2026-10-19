@@ -10,6 +10,7 @@ use yanuget_pkg::NuGetVersion;
 use crate::closure::{self, Closure};
 use crate::config::{Config, CONFIG_ENV};
 use crate::outcome::Outcome;
+use crate::overrides::Overrides;
 use crate::target::Target;
 use crate::upstream::Upstream;
 
@@ -164,6 +165,10 @@ pub async fn run(cli: Cli) -> anyhow::Result<Outcome> {
             prepare(&config, &args.packages)?;
             let upstream = Upstream::new(&config.upstream, &config.cache_dir)?;
             let target = Target::new(&config.target)?;
+            let overrides = match &config.overrides_dir {
+                Some(dir) => Overrides::load(dir)?,
+                None => Overrides::none(),
+            };
             // Metadata only: nothing is downloaded before the plan is shown.
             for spec in &args.packages {
                 let root = upstream
@@ -173,7 +178,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<Outcome> {
                 let closure = closure::resolve(&upstream, &root)
                     .await
                     .with_context(|| format!("cannot resolve the dependencies of {spec}"))?;
-                print_closure(&closure, target.as_ref()).await?;
+                print_closure(&closure, target.as_ref(), &overrides).await?;
             }
             not_built_yet()
         }
@@ -204,8 +209,12 @@ fn prepare(config: &Config, packages: &[PackageSpec]) -> anyhow::Result<()> {
 }
 
 /// One root and its dependencies, one package a line, each marked when the
-/// target feed serves it already.
-async fn print_closure(closure: &Closure, target: Option<&Target>) -> anyhow::Result<()> {
+/// target feed serves it already or an override skips it.
+async fn print_closure(
+    closure: &Closure,
+    target: Option<&Target>,
+    overrides: &Overrides,
+) -> anyhow::Result<()> {
     let mut held = 0;
     let mut unknown = false;
     for (i, p) in closure.packages.iter().enumerate() {
@@ -219,13 +228,20 @@ async fn print_closure(closure: &Closure, target: Option<&Target>) -> anyhow::Re
             },
             None => false,
         };
-        held += usize::from(holds);
+        let skip = overrides
+            .get(&p.info.id, &p.info.version)
+            .and_then(|o| o.skip.as_deref());
+        held += usize::from(holds || skip.is_some());
+        let mark = match (holds, skip) {
+            (true, _) => " (the target holds it)".to_string(),
+            (false, Some(why)) => format!(" (skipped by its override: {why})"),
+            (false, None) => String::new(),
+        };
         println!(
-            "{}{} {}{}",
+            "{}{} {}{mark}",
             if i == 0 { "" } else { "  " },
             p.info.id,
             p.info.version.normalized(),
-            if holds { " (the target holds it)" } else { "" }
         );
     }
     for (dependent, range) in &closure.provided {

@@ -42,6 +42,9 @@ pub struct Config {
     /// Scratch space of a run: closures handed to the sandbox, rewritten
     /// packages before they are pushed.
     pub work_dir: PathBuf,
+    /// One TOML file per package id with what the capture cannot find out
+    /// (`INT-25`); none without.
+    pub overrides_dir: Option<PathBuf>,
     pub target: TargetConfig,
     pub upstream: UpstreamConfig,
     pub downloads: DownloadsConfig,
@@ -53,6 +56,7 @@ impl Default for Config {
         Config {
             cache_dir: PathBuf::from("./cache"),
             work_dir: PathBuf::from("./work"),
+            overrides_dir: None,
             target: TargetConfig::default(),
             upstream: UpstreamConfig::default(),
             downloads: DownloadsConfig::default(),
@@ -296,6 +300,7 @@ pub const KNOWN_ENV: &[&str] = &[
     CONFIG_ENV,
     "YANUGET_INTERNALIZE_CACHE_DIR",
     "YANUGET_INTERNALIZE_WORK_DIR",
+    "YANUGET_INTERNALIZE_OVERRIDES_DIR",
     "YANUGET_INTERNALIZE_TARGET_URL",
     "YANUGET_INTERNALIZE_TARGET_API_KEY",
     "YANUGET_INTERNALIZE_TARGET_API_KEY_FILE",
@@ -383,6 +388,9 @@ impl Config {
         }
         if let Some(v) = get("YANUGET_INTERNALIZE_WORK_DIR")? {
             self.work_dir = path(v);
+        }
+        if let Some(v) = get("YANUGET_INTERNALIZE_OVERRIDES_DIR")? {
+            self.overrides_dir = opt_path(v);
         }
 
         if let Some(v) = get("YANUGET_INTERNALIZE_TARGET_URL")? {

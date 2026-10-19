@@ -40,6 +40,10 @@ pub struct Report {
     pub downloads: Vec<Download>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
+    /// The overrides a person set for the package that were used, one line
+    /// each. Added to schema version 1 after YANuget 0.8.0, which ignores it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub overrides: Vec<String>,
     /// The package entry holding the prelude that points the install scripts
     /// at the internal URLs, when there is one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -223,6 +227,7 @@ mod tests {
             {"url": "https://example.com/tool.zip", "checksum": {"status": "trust-on-first-use"}}
         ],
         "warnings": ["tool.zip: the feed does not allow .zip files"],
+        "overrides": ["download https://example.com/tool.zip added"],
         "prelude": "tools/internalizer-prelude.ps1",
         "generated_at": "2026-10-01T12:00:00Z"
     }"#;
