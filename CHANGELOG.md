@@ -76,6 +76,12 @@ expected to change incompatibly at any version.
   but were all extracted, so a symbol package could pass the 512-PDB cap many
   times over and have each copy verified; a readme or icon lookup could also
   take a different one than the client. Directory entries are not compared.
+- `yanuget backup` refuses a destination inside a `storage_path` that lies
+  outside the data directory, or one containing it; the copy used to recurse
+  into itself. `yanuget restore` refuses a backup in such a place too.
+- `yanuget restore --force` copies every file from the backup. It skipped live
+  files with the same size and modification time, so one damaged in place was
+  kept, although the store is meant to match the backup exactly.
 
 ## [0.7.0] — 2026-10-15
 
