@@ -10,15 +10,21 @@ requests can reference them, and ticked off rather than deleted when they land.
 ## Open items
 
 Everything still open across this file and the project's working threads, as
-of 2026-10-19 (`main` at `d1989fc`, 0.7.0 released). The entries further down
-hold the detail; this list is the index.
+of 2026-10-19 (0.7.0 released). The entries further down hold the detail; this
+list is the index.
 
 **In review**
 
-- PR #58: `INT-11` (upstream client), `INT-12` (dependency closure) and `zip`
-  9. Green. Merging it also turns `main` green again: since #57 its dependency
-  audit fails on RUSTSEC-2026-0368 (with -0367 and -0369) against `zip` 2.4.2,
-  which #58 replaces.
+- PR #58: `INT-11` (upstream client) and `INT-12` (dependency closure). Its
+  `zip` 9 commit is in `main` already (#59).
+- PR #63: the fixes from the [review of 2026-10-19](#review-of-2026-10-19);
+  what it leaves open is listed there.
+
+**From the review of 2026-10-19**
+
+- Correctness: `COR-26` to `COR-30`. Operations: `DEP-08`, `DEP-09`.
+  Hardening: `SEC-28` to `SEC-30`. Performance and UI: `PERF-04` to
+  `PERF-08`, `UI-01`.
 
 **Server 0.8.0** ([Target releases](#target-releases))
 
@@ -67,12 +73,93 @@ hold the detail; this list is the index.
   0.7.0 ran attestation and cosign signing for real, but whether the `release`
   environment, the tag ruleset and crates.io trusted publishing exist has not
   been checked from here.
-- An open question from the review: move the `SEC-…` findings from this public
-  file into a private security advisory? Every one of them is fixed and
-  released since 0.6.0.
+- An open question from the review of 2026-09-30: move its `SEC-…` findings
+  from this public file into a private security advisory? Every one of them
+  is fixed and released since 0.6.0.
 - The internalizer's [open questions](#open-questions), above all the Windows
   license for the golden images (needed before `INT-13` ships) and the
   release scheme for the tool.
+
+## Review of 2026-10-19
+
+A multi-expert review of `main` after 0.7.0 (auth and web, package parsing,
+database and protocol, operations, UI and performance). PR #63 fixes what
+it found that fits one pull request; the entries below are what it leaves
+open. File and line references are from `main` at `a193027`.
+
+### Correctness and data integrity
+
+- [ ] **`COR-26` `pending-only` overwrite skips other feeds' license policy.**
+  `src/database/sqlite/packages.rs:147-192`, `src/indexing.rs:286-330`. With
+  `allow_overwrite = "pending-only"`, a push to feed A replaces the global
+  build for feed B too, where the same version is pending; only A's policy is
+  checked and only A's `flagged` is recomputed. *Fix:* in the same
+  transaction, check the policy of every feed that holds the version, or
+  re-flag it there.
+- [ ] **`COR-27` Memberships of removed or renamed feeds stay behind.** Then
+  `purge_global_data` never runs for those versions, an overwrite answers
+  `409`, and the renamed feed looks empty. *Fix:* warn at startup and in
+  `yanuget config check`, and add a command that migrates or removes them.
+- [ ] **`COR-28` `max_age_days` counts from the global `published`**
+  (`src/retention.rs:178`), not from `feed_packages.added`, so an old version
+  promoted into prod is deleted there by the next sweep. Count from `added`,
+  or document the behaviour.
+- [ ] **`COR-29` A mirror takes the upstream's listing state only once**
+  (`src/mirror.rs:1581, 1649, 1675`), on the first mirror. A version unlisted
+  upstream later stays listed here. *Fix:* reconcile on refresh while no
+  admin has set the state.
+- [ ] **`COR-30` Backup verification compares sizes only** (`verify` in
+  `src/backup.rs`). Under `allow_overwrite`, new bytes of the same size leave
+  a copy whose hash no longer matches its row. *Fix:* compare `package_hash`
+  for the files copied in the last pass.
+
+### Operations and documentation
+
+- [ ] **`DEP-08` `sudo -u yanuget yanuget …` does not see the unit's
+  environment** (`contrib/systemd/yanuget.service`, `docs/backup.md`,
+  `docs/deployment.md:153`). `data_dir` then falls back to `./data` in the
+  current directory, and `restore` writes there and reports success. *Fix:*
+  the install steps put an absolute `data_dir` into the TOML file, and
+  `restore` prints its target and refuses a relative `data_dir`.
+- [ ] **`DEP-09` No warning for unknown `YANUGET_*` variables** in the
+  server, as the internalizer has (`check_env_names`). `YANUGET_ADMIN_KEY`
+  instead of `YANUGET_ADMIN_API_KEY` silently turns `/admin` off.
+- [ ] **`PERF-04` `/metrics` and `/health/status` without a token** run three
+  aggregate scans per feed on every request. *Fix:* cache `gather()` for a
+  few seconds.
+
+### Hardening
+
+- [ ] **`SEC-28` A wrong preview key answers `404`, not `401`**
+  (`src/web/protocol.rs:122-138`), so it does not count toward
+  `max_failed_auth`.
+- [ ] **`SEC-29` Free-space checks do not reserve.** Without a running
+  reservation, N concurrent uploads each pass the check alone, and the number
+  of open tus sessions per feed is not capped. PR #63 re-checks
+  `min_free_disk_bytes` while an upload streams; the reservation and the cap
+  remain.
+- [ ] **`SEC-30` `rewrite` and `[Content_Types].xml`.** New types are inserted
+  at `rfind("</Types>")` (`crates/yanuget-pkg/src/rewrite.rs:421`), which a
+  comment can contain, and control characters in part names are not refused.
+  Matters once the internalizer rewrites packages (`INT-20`).
+
+### Performance and UI
+
+- [ ] **`PERF-05` No response compression** (tower-http's `compression-*`
+  features are off): large registration and search JSON goes out
+  uncompressed when no proxy compresses it.
+- [ ] **`PERF-06` Mirror JSON is decompressed on the async thread and parsed
+  into `serde_json::Value`** (`src/mirror.rs:510-570`; `:745` clones the
+  items). *Fix:* `spawn_blocking` and typed structs.
+- [ ] **`PERF-07` The bundled docs have no `Cache-Control` or `ETag`**, and
+  each request copies the file (`into_owned()`, `src/web/docs.rs:57-75`).
+- [ ] **`PERF-08` Gallery header queries.** The header needs the headline
+  and a `COUNT(*)` per id, not more. (The cap on `take` is in PR #63.)
+- [ ] **`UI-01` The admin dashboard is a flat list** without paging and
+  without marking pending or flagged versions (`src/web/admin.rs:103-110`).
+  *Fix:* badges with counts, pending first, filters.
+
+---
 
 ## Review of 2026-09-30
 
