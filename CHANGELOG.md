@@ -69,6 +69,14 @@ expected to change incompatibly at any version.
   package with an entry name that is neither UTF-8 nor CP437 is still
   refused when it is opened.
 
+### Fixed
+
+- An archive whose entry names differ only in case or in `\` against `/`
+  (`lib/a.pdb`, `LIB/A.pdb`, `lib\a.pdb`) is refused. They counted as one name
+  but were all extracted, so a symbol package could pass the 512-PDB cap many
+  times over and have each copy verified; a readme or icon lookup could also
+  take a different one than the client. Directory entries are not compared.
+
 ## [0.7.0] — 2026-10-15
 
 Upgrading from 0.6.x needs no change to the configuration or the database.

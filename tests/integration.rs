@@ -4392,6 +4392,40 @@ async fn a_symbol_package_with_absurdly_many_pdbs_is_refused_quickly() {
     );
 }
 
+/// Entry names that differ only in case or separator used to count once
+/// against the PDB cap — the listing is normalized — yet each was extracted
+/// and verified, so a few hundred spellings of one PDB multiplied the work.
+/// Such an archive is now refused before anything is extracted.
+#[tokio::test]
+async fn a_symbol_package_spelling_one_pdb_many_ways_is_refused() {
+    let server = spawn().await;
+    push_multipart(&server, API_KEY, build_nupkg("Same.Pdb", "1.0.0", b"dll")).await;
+
+    let mut cursor = Cursor::new(Vec::new());
+    {
+        let mut zip = zip::ZipWriter::new(&mut cursor);
+        let opts =
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        zip.start_file("Same.Pdb.nuspec", opts).unwrap();
+        zip.write_all(
+            br#"<?xml version="1.0"?><package><metadata><id>Same.Pdb</id>
+                <version>1.0.0</version><authors>a</authors>
+                <description>d</description></metadata></package>"#,
+        )
+        .unwrap();
+        for name in ["lib/net8.0/a.pdb", "LIB/net8.0/A.pdb", "lib\\net8.0\\a.PDB"] {
+            zip.start_file(name, opts).unwrap();
+            zip.write_all(&[0u8; 64]).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+
+    let response = push_symbol(&server, API_KEY, cursor.into_inner()).await;
+    assert_eq!(response.status(), 400);
+    let body = response.text().await.unwrap();
+    assert!(body.contains("differing only in case"), "{body}");
+}
+
 /// Overwriting a version must not leave the previous build's symbols behind.
 ///
 /// The replacement build's PDBs carry different SSQP keys, so the old mappings
