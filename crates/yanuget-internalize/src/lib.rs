@@ -11,6 +11,7 @@ pub mod check;
 pub mod cli;
 pub mod closure;
 pub mod config;
+pub mod download;
 pub mod outcome;
 pub mod sandbox;
 pub mod target;

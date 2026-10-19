@@ -1225,7 +1225,7 @@ packages whose downloads go through Chocolatey's helpers.
   reason, up to twenty. The caller's path tells the package's own scripts
   (`lib\{id}\`) from an extension's module (`extensions\{name}\`) for
   `INT-21`.
-- [ ] **`INT-17` Downloader.** Stream each captured URL to disk while hashing
+- [x] **`INT-17` Downloader.** Stream each captured URL to disk while hashing
   with SHA-256 and with the algorithm the script declares (MD5, SHA-1, SHA-256,
   SHA-512); a declared checksum that does not match fails the package. A call
   with no checksum, or only MD5 or SHA-1, is marked trust-on-first-use in the
@@ -1235,6 +1235,17 @@ packages whose downloads go through Chocolatey's helpers.
   untrusted scripts, and a package pointing at an internal host would
   otherwise get that host's answer published into the feed. Size cap, retries,
   resume.
+  *Landed:* `yanuget_internalize::download`, configured in `[downloads]`
+  (`concurrency`, `timeout_secs`, `max_file_bytes`, default 8 GiB,
+  `resume_attempts`, `allow_private_hosts`, `proxy`). Files land in
+  `cache_dir/files` under their SHA-256; a declared SHA-256 finds a file
+  there without a download, after hashing it again. The upstream's HTTP client
+  is shared, without credentials: the address policy on every hop, no
+  https-to-http redirect, `429`/`503` waited out. An allow-listed host is
+  resolved without the filter. A transfer that breaks off is resumed with
+  `Range` and `If-Range` (a strong `ETag`, else `Last-Modified`) where the
+  host offers byte ranges, and restarted otherwise. A failed download leaves
+  nothing in the cache.
 - [ ] **`INT-18` File names.** Attached file names are 1–128 characters of
   `A-Z a-z 0-9 . _ -` with an allowed extension; upstream names carry spaces
   and `+`, or there is no name at all (`?product=…&os=win64`). Keep the

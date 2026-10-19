@@ -96,6 +96,26 @@ With `target.url` set, each package the target feed serves already is marked.
 A read-gated feed cannot say, since the tool holds a push key only; pending
 versions are not listed either. Pushing such a version again answers `409`.
 
+## Capture and downloads
+
+What the recording helpers in the sandbox write is parsed as hostile input,
+since the package's own code runs next to them: schema version 1, one JSON
+object a line, unknown fields refused, caps on lines, calls and size, no
+control or bidirectional characters, `http` and `https` URLs only, a hex
+checksum of its type's length, and every call attributed to a package of the
+closure. A capture that breaks a rule is rejected whole, with every reason,
+and nothing in it is repaired.
+
+Each captured URL is then downloaded into `cache_dir/files`, under the file's
+SHA-256, while it is hashed with SHA-256 and with the algorithm the script
+declares. A declared checksum that does not match fails the package. A match
+on SHA-256 or SHA-512 verifies the file; MD5, SHA-1 or no checksum leaves it
+trust-on-first-use, which the report says. URLs and redirects that lead to
+loopback, private or link-local addresses are refused unless
+`downloads.allow_private_hosts` names the host, and no credentials are sent.
+A transfer that breaks off is resumed with a `Range` where the host offers
+ranges and a validator, and restarted where it does not.
+
 ## Sandboxes
 
 Everything around the sandbox only sees the `Sandbox` trait, so it builds and

@@ -44,6 +44,7 @@ pub struct Config {
     pub work_dir: PathBuf,
     pub target: TargetConfig,
     pub upstream: UpstreamConfig,
+    pub downloads: DownloadsConfig,
     pub sandbox: SandboxConfig,
 }
 
@@ -54,6 +55,7 @@ impl Default for Config {
             work_dir: PathBuf::from("./work"),
             target: TargetConfig::default(),
             upstream: UpstreamConfig::default(),
+            downloads: DownloadsConfig::default(),
             sandbox: SandboxConfig::default(),
         }
     }
@@ -127,6 +129,43 @@ impl Default for UpstreamConfig {
             password: None,
             token: None,
             headers: BTreeMap::new(),
+        }
+    }
+}
+
+/// The files captured scripts download: installers and archives from vendor
+/// hosts.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct DownloadsConfig {
+    /// Downloads at a time.
+    pub concurrency: usize,
+    /// For connecting and for any silence while a host sends.
+    pub timeout_secs: u64,
+    /// The largest file taken.
+    pub max_file_bytes: u64,
+    /// How often a download cut off midway is resumed (or restarted, where
+    /// the host cannot resume) before it fails.
+    pub resume_attempts: u32,
+    /// Hosts a download may reach although they are, or resolve to,
+    /// loopback, private or link-local addresses. Package scripts are
+    /// untrusted: without this, a script cannot make the tool fetch from an
+    /// internal host and publish the answer into the feed.
+    pub allow_private_hosts: Vec<String>,
+    /// An outbound proxy (`http://proxy:3128`). Without one the tool connects
+    /// directly and ignores `HTTP(S)_PROXY`.
+    pub proxy: Option<String>,
+}
+
+impl Default for DownloadsConfig {
+    fn default() -> Self {
+        DownloadsConfig {
+            concurrency: 4,
+            timeout_secs: 60,
+            max_file_bytes: 8 * 1024 * 1024 * 1024,
+            resume_attempts: 5,
+            allow_private_hosts: Vec::new(),
+            proxy: None,
         }
     }
 }
@@ -265,6 +304,12 @@ pub const KNOWN_ENV: &[&str] = &[
     "YANUGET_INTERNALIZE_UPSTREAM_PASSWORD_FILE",
     "YANUGET_INTERNALIZE_UPSTREAM_TOKEN",
     "YANUGET_INTERNALIZE_UPSTREAM_TOKEN_FILE",
+    "YANUGET_INTERNALIZE_DOWNLOADS_CONCURRENCY",
+    "YANUGET_INTERNALIZE_DOWNLOADS_TIMEOUT_SECS",
+    "YANUGET_INTERNALIZE_DOWNLOADS_MAX_FILE_BYTES",
+    "YANUGET_INTERNALIZE_DOWNLOADS_RESUME_ATTEMPTS",
+    "YANUGET_INTERNALIZE_DOWNLOADS_ALLOW_PRIVATE_HOSTS",
+    "YANUGET_INTERNALIZE_DOWNLOADS_PROXY",
     "YANUGET_INTERNALIZE_SANDBOX_BACKEND",
     "YANUGET_INTERNALIZE_SANDBOX_TIMEOUT_SECS",
     "YANUGET_INTERNALIZE_SANDBOX_MAX_PARALLEL",
@@ -373,6 +418,32 @@ impl Config {
             self.upstream.token = opt_str(v).map(Secret);
         }
 
+        let d = &mut self.downloads;
+        if let Some(v) = get("YANUGET_INTERNALIZE_DOWNLOADS_CONCURRENCY")? {
+            d.concurrency = parse_int("YANUGET_INTERNALIZE_DOWNLOADS_CONCURRENCY", &v)?;
+        }
+        if let Some(v) = get("YANUGET_INTERNALIZE_DOWNLOADS_TIMEOUT_SECS")? {
+            d.timeout_secs = parse_int("YANUGET_INTERNALIZE_DOWNLOADS_TIMEOUT_SECS", &v)?;
+        }
+        if let Some(v) = get("YANUGET_INTERNALIZE_DOWNLOADS_MAX_FILE_BYTES")? {
+            d.max_file_bytes = parse_int("YANUGET_INTERNALIZE_DOWNLOADS_MAX_FILE_BYTES", &v)?;
+        }
+        if let Some(v) = get("YANUGET_INTERNALIZE_DOWNLOADS_RESUME_ATTEMPTS")? {
+            d.resume_attempts = parse_int("YANUGET_INTERNALIZE_DOWNLOADS_RESUME_ATTEMPTS", &v)?;
+        }
+        if let Some(v) = get("YANUGET_INTERNALIZE_DOWNLOADS_ALLOW_PRIVATE_HOSTS")? {
+            // Comma-separated, as the server's list settings are.
+            d.allow_private_hosts = v
+                .split(',')
+                .map(str::trim)
+                .filter(|h| !h.is_empty())
+                .map(str::to_string)
+                .collect();
+        }
+        if let Some(v) = get("YANUGET_INTERNALIZE_DOWNLOADS_PROXY")? {
+            d.proxy = opt_str(v);
+        }
+
         let s = &mut self.sandbox;
         if let Some(v) = get("YANUGET_INTERNALIZE_SANDBOX_BACKEND")? {
             s.backend = Backend::parse("YANUGET_INTERNALIZE_SANDBOX_BACKEND", &v)?;
@@ -415,11 +486,27 @@ impl Config {
             self.target.url = Some(normalize_url("target.url", url)?);
         }
         self.upstream.url = normalize_url("upstream.url", &self.upstream.url)?;
-        if let Some(proxy) = &self.upstream.proxy {
-            reqwest::Url::parse(proxy)
-                .ok()
-                .filter(|u| matches!(u.scheme(), "http" | "https"))
-                .ok_or_else(|| ConfigError("upstream.proxy is not a proxy URL".into()))?;
+        for (name, proxy) in [
+            ("upstream.proxy", &self.upstream.proxy),
+            ("downloads.proxy", &self.downloads.proxy),
+        ] {
+            if let Some(proxy) = proxy {
+                reqwest::Url::parse(proxy)
+                    .ok()
+                    .filter(|u| matches!(u.scheme(), "http" | "https"))
+                    .ok_or_else(|| ConfigError(format!("{name} is not a proxy URL")))?;
+            }
+        }
+        for host in &self.downloads.allow_private_hosts {
+            let valid = !host.is_empty()
+                && !host.contains(['/', '@', ' '])
+                && reqwest::Url::parse(&format!("http://{host}/"))
+                    .is_ok_and(|u| u.host_str().is_some_and(|h| h.eq_ignore_ascii_case(host)));
+            if !valid {
+                return Err(ConfigError(format!(
+                    "downloads.allow_private_hosts: {host:?} is not a host name or address"
+                )));
+            }
         }
         let u = &self.upstream;
         match (&u.username, &u.password, &u.token) {
@@ -471,6 +558,9 @@ impl Config {
                 "upstream.max_package_bytes",
                 self.upstream.max_package_bytes,
             ),
+            ("downloads.concurrency", self.downloads.concurrency as u64),
+            ("downloads.timeout_secs", self.downloads.timeout_secs),
+            ("downloads.max_file_bytes", self.downloads.max_file_bytes),
             ("sandbox.timeout_secs", self.sandbox.timeout_secs),
             ("sandbox.max_parallel", self.sandbox.max_parallel as u64),
             ("sandbox.max_capture_bytes", self.sandbox.max_capture_bytes),
@@ -775,6 +865,33 @@ mod tests {
         ] {
             assert!(load(Some(toml), vars).is_err(), "{toml} {vars:?}");
         }
+    }
+
+    #[test]
+    fn download_hosts_are_host_names() {
+        let c = load(
+            Some("[downloads]\nallow_private_hosts = [\"files.intranet\"]\n"),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(c.downloads.allow_private_hosts, ["files.intranet"]);
+        let c = load(
+            None,
+            &[(
+                "YANUGET_INTERNALIZE_DOWNLOADS_ALLOW_PRIVATE_HOSTS",
+                " files.intranet , 10.0.0.5,[::1] ",
+            )],
+        )
+        .unwrap();
+        assert_eq!(
+            c.downloads.allow_private_hosts,
+            ["files.intranet", "10.0.0.5", "[::1]"]
+        );
+        for host in ["http://x", "x:80", "a b", "user@x", ""] {
+            let toml = format!("[downloads]\nallow_private_hosts = [{host:?}]\n");
+            assert!(load(Some(&toml), &[]).is_err(), "{host:?}");
+        }
+        assert!(load(Some("[downloads]\nmax_file_bytes = 0\n"), &[]).is_err());
     }
 
     #[test]

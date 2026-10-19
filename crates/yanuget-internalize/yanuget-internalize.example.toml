@@ -47,6 +47,26 @@ allow_private = false
 # [upstream.headers]
 # X-Api-Key = ""
 
+[downloads]
+# The files captured scripts download: installers and archives from vendor
+# hosts. Each is hashed with SHA-256 and with the algorithm the script
+# declares; a declared checksum that does not match fails the package.
+concurrency = 4
+# Connecting, and any silence while a host sends.
+timeout_secs = 60
+# The largest file taken.
+max_file_bytes = 8589934592
+# How often a download cut off midway is resumed (or restarted, where the
+# host cannot resume) before it fails.
+resume_attempts = 5
+# Hosts a download may reach although they are, or resolve to, loopback,
+# private or link-local addresses. Package scripts are untrusted: without
+# this, one could make the tool fetch from an internal host and publish the
+# answer. As a variable: comma-separated.
+allow_private_hosts = []
+# An outbound proxy; without one, HTTP(S)_PROXY is ignored.
+# proxy = "http://proxy.example.com:3128"
+
 [sandbox]
 # "kvm" (a Linux host with /dev/kvm) or "windows-container" (a Windows host).
 backend = "kvm"
