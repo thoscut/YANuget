@@ -7,6 +7,160 @@ is the work list.
 Items are tagged with a stable id (`SEC-…`, `COR-…`, …) so commits and pull
 requests can reference them, and ticked off rather than deleted when they land.
 
+## Open items
+
+Everything still open across this file and the project's working threads, as
+of 2026-10-19 (0.7.0 released). The entries further down hold the detail; this
+list is the index.
+
+**In review**
+
+- PR #58: `INT-11` (upstream client) and `INT-12` (dependency closure). Its
+  `zip` 9 commit is in `main` already (#59).
+- PR #63: the fixes from the [review of 2026-10-19](#review-of-2026-10-19);
+  what it leaves open is listed there.
+
+**From the review of 2026-10-19**
+
+- Correctness: `COR-26` to `COR-30`. Operations: `DEP-08`, `DEP-09`.
+  Hardening: `SEC-28` to `SEC-30`. Performance and UI: `PERF-04` to
+  `PERF-08`, `UI-01`.
+
+**Server 0.8.0** ([Target releases](#target-releases))
+
+- `INT-31` Attached files on read-gated feeds: the premise holds (Chocolatey's
+  helpers never send source credentials); a security review of the token
+  design comes next, before it is built. Blocks 0.8.0.
+- `INT-21` Report: fix schema version 1 for the tool. Blocks 0.8.0.
+
+**Internalizer 0.1.0**
+
+- `INT-13` to `INT-20` and `INT-22`: golden images, capture helpers, the KVM
+  runner, capture validation, downloader, file names, prelude, publish, and the
+  regression corpus. `INT-13` waits on the licensing question below.
+
+**Dependencies and toolchain**
+
+- [x] **`DEP-06` `axum-server` 0.8.** It no longer depends on `rustls-pemfile`
+  (`RUSTSEC-2025-0134`, see `DEP-01`): 0.8.0 reads PEM through
+  `rustls-pki-types` and needs Rust 1.82. Upgrade, then drop the comment on
+  that advisory in `ci.yml`.
+  *Done:* `rustls-pemfile` is gone from `Cargo.lock`.
+- [x] **`DEP-07` MSRV policy.** The floor was 1.88 (`Cargo.toml`, the MSRV
+  job, the Dockerfile builder stage, README, CONTRIBUTING). `uuid` 1.27 needs
+  1.89, which is why Dependabot's #47 was closed unmerged; the next `uuid`
+  bump fails the same way, because Dependabot does not ignore it. `sqlx` 0.9
+  needs 1.94 and is ignored in `dependabot.yml` on purpose. Decide: raise the
+  floor to 1.89 now (cheap; 1.89 is over a year old), or hold `uuid` in
+  Dependabot too. `sqlx` 0.9 waits for a release that raises the floor to
+  1.94.
+  *Done:* raised to 1.89 everywhere the floor is stated, `uuid` is at 1.28.
+
+**Documentation**
+
+- [ ] **`DOC-09` cosign 3.** The 0.7.0 image signature is stored as a
+  Sigstore bundle, which `cosign verify` finds from cosign 3 on; cosign 2.5
+  reports "no signatures found". SECURITY.md and RELEASING.md should say which
+  cosign version the command needs.
+
+**Features under discussion**
+
+- Markdown readmes on the package page; see [Features](#features).
+
+**For the repository owner**
+
+- The release settings under [For the repository owner](#for-the-repository-owner):
+  0.7.0 ran attestation and cosign signing for real, but whether the `release`
+  environment, the tag ruleset and crates.io trusted publishing exist has not
+  been checked from here.
+- An open question from the review of 2026-09-30: move its `SEC-…` findings
+  from this public file into a private security advisory? Every one of them
+  is fixed and released since 0.6.0.
+- The internalizer's [open questions](#open-questions), above all the Windows
+  license for the golden images (needed before `INT-13` ships) and the
+  release scheme for the tool.
+
+## Review of 2026-10-19
+
+A multi-expert review of `main` after 0.7.0 (auth and web, package parsing,
+database and protocol, operations, UI and performance). PR #63 fixes what
+it found that fits one pull request; the entries below are what it leaves
+open. File and line references are from `main` at `a193027`.
+
+### Correctness and data integrity
+
+- [ ] **`COR-26` `pending-only` overwrite skips other feeds' license policy.**
+  `src/database/sqlite/packages.rs:147-192`, `src/indexing.rs:286-330`. With
+  `allow_overwrite = "pending-only"`, a push to feed A replaces the global
+  build for feed B too, where the same version is pending; only A's policy is
+  checked and only A's `flagged` is recomputed. *Fix:* in the same
+  transaction, check the policy of every feed that holds the version, or
+  re-flag it there.
+- [ ] **`COR-27` Memberships of removed or renamed feeds stay behind.** Then
+  `purge_global_data` never runs for those versions, an overwrite answers
+  `409`, and the renamed feed looks empty. *Fix:* warn at startup and in
+  `yanuget config check`, and add a command that migrates or removes them.
+- [ ] **`COR-28` `max_age_days` counts from the global `published`**
+  (`src/retention.rs:178`), not from `feed_packages.added`, so an old version
+  promoted into prod is deleted there by the next sweep. Count from `added`,
+  or document the behaviour.
+- [ ] **`COR-29` A mirror takes the upstream's listing state only once**
+  (`src/mirror.rs:1581, 1649, 1675`), on the first mirror. A version unlisted
+  upstream later stays listed here. *Fix:* reconcile on refresh while no
+  admin has set the state.
+- [ ] **`COR-30` Backup verification compares sizes only** (`verify` in
+  `src/backup.rs`). Under `allow_overwrite`, new bytes of the same size leave
+  a copy whose hash no longer matches its row. *Fix:* compare `package_hash`
+  for the files copied in the last pass.
+
+### Operations and documentation
+
+- [ ] **`DEP-08` `sudo -u yanuget yanuget …` does not see the unit's
+  environment** (`contrib/systemd/yanuget.service`, `docs/backup.md`,
+  `docs/deployment.md:153`). `data_dir` then falls back to `./data` in the
+  current directory, and `restore` writes there and reports success. *Fix:*
+  the install steps put an absolute `data_dir` into the TOML file, and
+  `restore` prints its target and refuses a relative `data_dir`.
+- [ ] **`DEP-09` No warning for unknown `YANUGET_*` variables** in the
+  server, as the internalizer has (`check_env_names`). `YANUGET_ADMIN_KEY`
+  instead of `YANUGET_ADMIN_API_KEY` silently turns `/admin` off.
+- [ ] **`PERF-04` `/metrics` and `/health/status` without a token** run three
+  aggregate scans per feed on every request. *Fix:* cache `gather()` for a
+  few seconds.
+
+### Hardening
+
+- [ ] **`SEC-28` A wrong preview key answers `404`, not `401`**
+  (`src/web/protocol.rs:122-138`), so it does not count toward
+  `max_failed_auth`.
+- [ ] **`SEC-29` Free-space checks do not reserve.** Without a running
+  reservation, N concurrent uploads each pass the check alone, and the number
+  of open tus sessions per feed is not capped. PR #63 re-checks
+  `min_free_disk_bytes` while an upload streams; the reservation and the cap
+  remain.
+- [ ] **`SEC-30` `rewrite` and `[Content_Types].xml`.** New types are inserted
+  at `rfind("</Types>")` (`crates/yanuget-pkg/src/rewrite.rs:421`), which a
+  comment can contain, and control characters in part names are not refused.
+  Matters once the internalizer rewrites packages (`INT-20`).
+
+### Performance and UI
+
+- [ ] **`PERF-05` No response compression** (tower-http's `compression-*`
+  features are off): large registration and search JSON goes out
+  uncompressed when no proxy compresses it.
+- [ ] **`PERF-06` Mirror JSON is decompressed on the async thread and parsed
+  into `serde_json::Value`** (`src/mirror.rs:510-570`; `:745` clones the
+  items). *Fix:* `spawn_blocking` and typed structs.
+- [ ] **`PERF-07` The bundled docs have no `Cache-Control` or `ETag`**, and
+  each request copies the file (`into_owned()`, `src/web/docs.rs:57-75`).
+- [ ] **`PERF-08` Gallery header queries.** The header needs the headline
+  and a `COUNT(*)` per id, not more. (The cap on `take` is in PR #63.)
+- [ ] **`UI-01` The admin dashboard is a flat list** without paging and
+  without marking pending or flagged versions (`src/web/admin.rs:103-110`).
+  *Fix:* badges with counts, pending first, filters.
+
+---
+
 ## Review of 2026-09-30
 
 A full review of `main` at `4e086c5` (0.5.1 plus everything under
@@ -93,8 +247,10 @@ These need settings no commit can change; the release workflow expects them
 5. Give this repository *Write* access to the `thoscut/yanuget` package on
    ghcr (package settings → Manage Actions access).
 
-Not yet exercised: the attestation, cosign, trusted-publishing and
-environment steps (they run only on a release), and
+Exercised by the 0.7.0 release: build provenance for the archives and the
+image, and the image's cosign signature (`cosign verify` from SECURITY.md
+passes with cosign 3; see `DOC-09`). Not yet exercised: crates.io trusted
+publishing (`PUBLISH_TO_CRATES_IO` is unset), and
 `scripts/Send-YanugetFile.ps1`, which was reviewed but not run.
 
 ---
@@ -757,6 +913,16 @@ Not yet implemented (contributions welcome):
   timestamps).
 - A Chocolatey internalizer, planned in detail under
   [Chocolatey internalizer](#chocolatey-internalizer) (`INT-…`).
+- Markdown readmes on the package page. NuGet readmes are Markdown, and
+  nuget.org renders them; descriptions are plain text and stay so, in the list
+  and on the package page. Sketch: `pulldown-cmark` with a filter over its
+  events that emits raw HTML as text and sends every link and image URL
+  through `safe_href`; external images as links with their alt text (the CSP
+  blocks them anyway); a cap on the HTML produced. This would be the first
+  place package data becomes markup, so it needs a documented exception to the
+  escaping rule of `MNT-01`, a `SEC-…` entry of its own and an XSS corpus in
+  `tests/http_security.rs`. Assessed on 2026-10-02 at one to two days; not
+  started.
 
 ---
 
@@ -909,6 +1075,17 @@ Every server change the tool relies on, in one release (see
   never computes one. Verify the premise first: if the helpers do send source
   credentials, the item shrinks to a test. Either way, a security review
   before it is built.
+  *Premise checked* on 2026-10-19 against Chocolatey CLI's helpers
+  (`chocolatey/choco` at `c8659d4`): `Get-WebFile` and `Get-WebHeaders` set
+  only `CredentialCache::DefaultCredentials` (the Windows logon, for
+  integrated authentication) and proxy credentials; the source's user name
+  and password never reach PowerShell, and none of the variables the CLI sets
+  for a script carries them. So a read-gated feed cannot serve its files to
+  `choco install` today, and the item stands. The one alternative the helpers
+  allow: `-Options @{Headers = @{…}}` adds any request header, so a prelude
+  could send `Authorization` from a variable set on each client. That puts a
+  read key on every client and needs per-client setup, where the token needs
+  none; it stays a fallback.
 - [x] **`INT-32` Read access to pending versions.** A per-feed
   `preview_api_key` that can download pending packages and their files and do
   nothing else: no approve, no push. For `INT-26`, and for anyone who wants to

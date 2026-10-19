@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/thoscut/yanuget/actions/workflows/ci.yml/badge.svg)](https://github.com/thoscut/yanuget/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Rust 1.88+](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org)
+[![Rust 1.89+](https://img.shields.io/badge/rust-1.89%2B-orange.svg)](https://www.rust-lang.org)
 
 **Yet Another NuGet server** — a fast, streaming [NuGet v3](https://learn.microsoft.com/en-us/nuget/api/overview)
 server written in Rust. YANuget is a from-scratch reimplementation of
@@ -104,7 +104,7 @@ the image.
 ### From source
 
 ```bash
-# Build (Rust 1.88+)
+# Build (Rust 1.89+)
 cargo build --release
 
 # Run with an API key and a data directory

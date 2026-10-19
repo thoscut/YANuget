@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::version::NuGetVersion;
 
-pub use yanuget_pkg::models::{Dependency, DependencyGroup, PackageType};
+pub use yanuget_pkg::models::{depends_on_semver2, Dependency, DependencyGroup, PackageType};
 
 /// A fully indexed package version, as stored in the database.
 ///

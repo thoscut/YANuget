@@ -2,10 +2,11 @@
 //!
 //! Both paths run on `axum-server`, so they share what the plain path used to
 //! lack: a deadline on graceful shutdown (set by whoever holds the
-//! [`Handle`]), a time limit on reading a request's headers, and a cap on
-//! concurrent connections. Without the last two, a client that opens sockets
-//! and trickles a byte at a time holds each one — and its file descriptor —
-//! for as long as it likes.
+//! [`Handle`]), a time limit on a connection's first bytes and on reading a
+//! request's headers, and a cap on concurrent connections. Without the time
+//! limits, a client that opens sockets and sends nothing, or trickles a byte at
+//! a time, holds each one — its file descriptor and its connection slot — for
+//! as long as it likes.
 
 use std::future::Future;
 use std::io;
@@ -36,13 +37,22 @@ pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 /// `upload_idle_timeout_secs` instead.
 pub const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How often an idle HTTP/2 connection is pinged, and how long the answer may
+/// take before the connection is closed. HTTP/2 has no header timeout between
+/// requests, so this is what frees the slot of a peer that went away.
+const HTTP2_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(60);
+const HTTP2_KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// The connection-level limits a server runs with.
 #[derive(Debug, Clone, Copy)]
 pub struct ServeLimits {
     /// Concurrent connections; `0` is unlimited. A connection over the cap is
     /// closed as soon as it is accepted.
     pub max_connections: usize,
-    /// See [`HEADER_READ_TIMEOUT`].
+    /// See [`HEADER_READ_TIMEOUT`]. The same limit applies to a new
+    /// connection's first bytes (after the TLS handshake, with TLS on): until
+    /// they arrive, hyper cannot tell HTTP/1 from HTTP/2, and neither
+    /// protocol's own timeout has started.
     pub header_read_timeout: Duration,
 }
 
@@ -65,12 +75,11 @@ impl ServeLimits {
 pub async fn serve(
     app: axum::Router,
     config: &Config,
-    handle: Handle,
+    handle: Handle<SocketAddr>,
     limits: ServeLimits,
 ) -> Result<()> {
     let addr = config.socket_addr();
     let make_service = app.into_make_service_with_connect_info::<SocketAddr>();
-    let acceptor = ConnectionLimit::new(DefaultAcceptor, limits.max_connections);
 
     if config.tls_enabled {
         // The process-wide provider; a second install (tests, or a second
@@ -82,12 +91,16 @@ pub async fn serve(
         let tls = RustlsConfig::from_pem_file(&paths.cert, &paths.key)
             .await
             .map_err(|e| Error::Other(anyhow::anyhow!("failed to load TLS certificate: {e}")))?;
-        let mut server = axum_server::bind(addr)
-            .handle(handle)
-            .acceptor(RustlsAcceptor::new(tls).acceptor(acceptor));
+        // The limit wraps the TLS acceptor, so the first-bytes deadline covers
+        // the handshake and the first request bytes after it alike.
+        let acceptor = ConnectionLimit::new(RustlsAcceptor::new(tls), limits.max_connections)
+            .first_bytes_timeout(limits.header_read_timeout);
+        let mut server = axum_server::bind(addr).handle(handle).acceptor(acceptor);
         limit_headers(server.http_builder(), limits);
         server.serve(make_service).await?;
     } else {
+        let acceptor = ConnectionLimit::new(DefaultAcceptor, limits.max_connections)
+            .first_bytes_timeout(limits.header_read_timeout);
         let mut server = axum_server::bind(addr).handle(handle).acceptor(acceptor);
         limit_headers(server.http_builder(), limits);
         server.serve(make_service).await?;
@@ -101,6 +114,11 @@ fn limit_headers(builder: &mut Builder<TokioExecutor>, limits: ServeLimits) {
         .http1()
         .timer(TokioTimer::new())
         .header_read_timeout(limits.header_read_timeout);
+    builder
+        .http2()
+        .timer(TokioTimer::new())
+        .keep_alive_interval(HTTP2_KEEP_ALIVE_INTERVAL)
+        .keep_alive_timeout(HTTP2_KEEP_ALIVE_TIMEOUT);
 }
 
 /// An acceptor that holds one permit per open connection and turns away
@@ -112,6 +130,7 @@ fn limit_headers(builder: &mut Builder<TokioExecutor>, limits: ServeLimits) {
 pub struct ConnectionLimit<A> {
     inner: A,
     slots: Option<Arc<Semaphore>>,
+    first_bytes: Option<Duration>,
 }
 
 impl<A> ConnectionLimit<A> {
@@ -120,7 +139,15 @@ impl<A> ConnectionLimit<A> {
         Self {
             inner,
             slots: (max > 0).then(|| Arc::new(Semaphore::new(max))),
+            first_bytes: None,
         }
+    }
+
+    /// Close a connection that has not delivered a byte within `timeout` of
+    /// being accepted, counting the time `inner` takes to accept it.
+    pub fn first_bytes_timeout(mut self, timeout: Duration) -> Self {
+        self.first_bytes = Some(timeout);
+        self
     }
 }
 
@@ -151,6 +178,9 @@ where
                 }
             },
         };
+        let deadline = self
+            .first_bytes
+            .map(|timeout| Box::pin(tokio::time::sleep(timeout)));
         let inner = self.inner.accept(stream, service);
         Box::pin(async move {
             let (stream, service) = inner.await?;
@@ -158,6 +188,7 @@ where
                 Limited {
                     inner: stream,
                     _permit: permit,
+                    first_bytes: deadline,
                 },
                 service,
             ))
@@ -165,11 +196,14 @@ where
     }
 }
 
-/// A connection that gives its [`ConnectionLimit`] slot back when dropped.
+/// A connection that gives its [`ConnectionLimit`] slot back when dropped,
+/// and fails its reads once the first-bytes deadline passes with nothing read.
 #[derive(Debug)]
 pub struct Limited<S> {
     inner: S,
     _permit: Option<OwnedSemaphorePermit>,
+    /// Cleared by the first read that returns data.
+    first_bytes: Option<Pin<Box<tokio::time::Sleep>>>,
 }
 
 impl<S: AsyncRead + Unpin> AsyncRead for Limited<S> {
@@ -178,7 +212,21 @@ impl<S: AsyncRead + Unpin> AsyncRead for Limited<S> {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_read(cx, buf)
+        let before = buf.filled().len();
+        let polled = Pin::new(&mut self.inner).poll_read(cx, buf);
+        if let Some(deadline) = &mut self.first_bytes {
+            match &polled {
+                Poll::Ready(Ok(())) if buf.filled().len() > before => self.first_bytes = None,
+                Poll::Pending if deadline.as_mut().poll(cx).is_ready() => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "no request within the header read timeout",
+                    )));
+                }
+                _ => {}
+            }
+        }
+        polled
     }
 }
 

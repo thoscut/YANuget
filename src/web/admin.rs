@@ -15,7 +15,7 @@ use axum::routing::post;
 use serde::Deserialize;
 
 use super::forms::{form_field, form_fields, lenient};
-use super::helpers::{check_id, parse_version};
+use super::helpers::{check_id, detached, parse_version};
 use super::{hosted, ui, AppState, FeedCounters, FeedMeta};
 use crate::database::{Membership, MembershipChange};
 use crate::error::{Error, Result};
@@ -558,16 +558,24 @@ pub(super) async fn admin_bulk(
     match op {
         BulkOp::Enable | BulkOp::Disable | BulkOp::Approve | BulkOp::Pin | BulkOp::Unpin => {}
         BulkOp::Delete => {
-            for v in &versions {
-                retention::purge_version(
-                    state.storage.as_ref(),
-                    state.db.as_ref(),
-                    state.feed(),
-                    &id,
-                    v,
-                )
-                .await?;
-            }
+            // Detached, like a push: a client that disconnects must not stop
+            // a purge between the membership and its tombstone.
+            let purging = state.clone();
+            let (id, versions) = (id.clone(), versions.clone());
+            detached(async move {
+                for v in &versions {
+                    retention::purge_version(
+                        purging.storage.as_ref(),
+                        purging.db.as_ref(),
+                        purging.feed(),
+                        &id,
+                        v,
+                    )
+                    .await?;
+                }
+                Ok(())
+            })
+            .await?;
         }
         BulkOp::Copy | BulkOp::Move => {
             let name = form_field(&body, "target").unwrap_or_default();
@@ -602,10 +610,19 @@ pub(super) async fn admin_bulk(
             } else {
                 Transfer::Copy
             };
-            let mut tally = Tally::default();
-            for v in &versions {
-                tally.count(transfer_version(&state, target, &id, v, mode).await?);
-            }
+            // Detached: a move that a disconnect stops between removing the
+            // membership and writing the tombstone leaves no tombstone.
+            let moving = state.clone();
+            let task_target = target.clone();
+            let (task_id, task_versions) = (id.clone(), versions.clone());
+            let tally = detached(async move {
+                let mut tally = Tally::default();
+                for v in &task_versions {
+                    tally.count(transfer_version(&moving, &task_target, &task_id, v, mode).await?);
+                }
+                Ok(tally)
+            })
+            .await?;
             tracing::info!(
                 from = %state.feed(),
                 to = %target.name,
@@ -740,15 +757,22 @@ pub(super) async fn admin_delete(
     check_id(&id)?;
     require_admin_action(&state, &headers, &body)?;
     let v = parse_version(&version)?;
-    if !retention::purge_version(
-        state.storage.as_ref(),
-        state.db.as_ref(),
-        state.feed(),
-        &id,
-        &v,
-    )
-    .await?
-    {
+    // Detached, like a push: a client that disconnects must not stop the
+    // purge between the membership and its tombstone.
+    let purging = state.clone();
+    let (task_id, task_v) = (id.clone(), v.clone());
+    let removed = detached(async move {
+        retention::purge_version(
+            purging.storage.as_ref(),
+            purging.db.as_ref(),
+            purging.feed(),
+            &task_id,
+            &task_v,
+        )
+        .await
+    })
+    .await?;
+    if !removed {
         return Err(Error::PackageNotFound);
     }
     // Back to the package page if other versions remain, else the dashboard.

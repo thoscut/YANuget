@@ -197,6 +197,9 @@ services:
   yanuget:
     image: ghcr.io/thoscut/yanuget:latest
     restart: unless-stopped
+    # The server drains for up to ten seconds on SIGTERM, Docker's own
+    # default before it kills the container; leave it room to exit cleanly.
+    stop_grace_period: 15s
     ports:
       - "5000:5000"
     environment:

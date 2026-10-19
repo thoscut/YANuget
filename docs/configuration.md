@@ -23,10 +23,10 @@ A fully commented template lives in
 | `api_key` | `YANUGET_API_KEY` | string | *(none)* | Required to push/delete. |
 | `api_keys` | `YANUGET_API_KEYS` | string[] | `[]` | Additional accepted push/delete keys (env: comma-separated). Any of these or `api_key` authenticates. |
 | `admin_api_key` | `YANUGET_ADMIN_API_KEY` | string | *(none)* | Protects `/admin` (Basic auth). Unset ⇒ admin area off. |
-| `gallery_page_size` | `YANUGET_GALLERY_PAGE_SIZE` | int | `20` | Packages per gallery page (`?take=` overrides). |
+| `gallery_page_size` | `YANUGET_GALLERY_PAGE_SIZE` | int | `20` | Packages per gallery page (`?take=` overrides, up to 100 or this size, whichever is larger). |
 | `max_package_size_bytes` | `YANUGET_MAX_PACKAGE_SIZE_BYTES` | int | *(unlimited)* | Upload cap; streamed either way. |
 | `upload_idle_timeout_secs` | `YANUGET_UPLOAD_IDLE_TIMEOUT_SECS` | int | `300` | Abort an upload after this long without a byte arriving (`408`). Only silence counts; a slow transfer is never cut off. `0` waits forever. |
-| `min_free_disk_bytes` | `YANUGET_MIN_FREE_DISK_BYTES` | int | `2147483648` (2 GiB) | Refuse an upload (`507`) that would leave less than this free on the storage volume. Checked against the declared size when there is one. Mirror fetches and `yanuget migrate` downloads are held to it too, against the upstream's `Content-Length`. `0` turns the check off. |
+| `min_free_disk_bytes` | `YANUGET_MIN_FREE_DISK_BYTES` | int | `2147483648` (2 GiB) | Refuse an upload (`507`) that would leave less than this free on the storage volume. Checked against the declared size when there is one, and again every 64 MiB while a body streams in, so an upload without a `Content-Length` is held to it too; a resumable upload is checked again on every `PATCH`. Mirror fetches and `yanuget migrate` downloads are held to it too, against the upstream's `Content-Length`. `0` turns the check off. |
 | `max_connections` | `YANUGET_MAX_CONNECTIONS` | int | `4096` | Concurrent connections accepted; one over the cap is closed at once. `0` is unlimited. |
 | `allow_overwrite` | `YANUGET_ALLOW_OVERWRITE` | bool \| string | `false` | Re-push an existing version: `false`, `true`, `"prerelease-only"` (overwrite pre-releases only), or `"pending-only"` (replace a version only while it is pending in every feed that holds it; see below). |
 | `hard_delete_enabled` | `YANUGET_HARD_DELETE_ENABLED` | bool | `false` | DELETE removes vs. unlists. |
@@ -82,6 +82,10 @@ secret store:
   key list holds one key per line, or comma-separated keys. Setting both the
   variable and its `_FILE` is an error, and so is a file that is missing or
   empty: an empty push key would otherwise open the feed to anyone.
+- **A blank variable is an error**, not a removal: Compose writes `${UNSET}`
+  as an empty string, and a blank `..._READ_API_KEY` would otherwise make a
+  read-gated feed public. To drop a key the TOML file sets, take it out of
+  the file; unset the variable to keep the file's key.
 
 With systemd, `LoadCredential=` puts the files where only the service can
 read them:
@@ -234,10 +238,10 @@ cache keys on the inputs that determine those URLs.
 With `base_url` set, the server answers only requests whose `Host` names the
 host of `base_url`, or one of `allowed_hosts`; anything else gets
 `421 Misdirected Request`. From a trusted proxy, `X-Forwarded-Host` is checked
-instead of `Host`. The comparison ignores case, the port and a trailing dot.
-With neither `base_url` nor `allowed_hosts` set, any host is accepted, as
-before; `allowed_hosts = ["*"]` accepts any host explicitly even with
-`base_url` set.
+instead of `Host` — its rightmost entry, the one the proxy itself wrote. The
+comparison ignores case, the port and a trailing dot. With neither `base_url`
+nor `allowed_hosts` set, any host is accepted, as before;
+`allowed_hosts = ["*"]` accepts any host explicitly even with `base_url` set.
 
 This is what stops **DNS rebinding**: a hostile web page can point a name it
 controls at your feed's internal address and make a visitor's browser talk to
@@ -245,11 +249,22 @@ it, but the browser still sends the hostile name as `Host`. Without the check
 such a page could read an intranet-only feed, and — on a feed without an API
 key — push or delete.
 
-Behind a proxy, either forward the original host (`proxy_set_header Host
-$host;` in nginx) or send `X-Forwarded-Host` from a trusted proxy. To reach the
-server by another name as well (`localhost` on the box itself, say), list it
-in `allowed_hosts`. `/health`, `/health/live` and `/health/ready` answer
-whatever the host, since container and Kubernetes probes use an address.
+Behind a proxy, the proxy must **set** `X-Forwarded-Host` to the host it was
+asked for (`proxy_set_header X-Forwarded-Host $host;` in nginx), or append to
+it (Apache's `mod_proxy`). nginx passes a client's own `X-Forwarded-Host`
+through unless told otherwise, and that value would then be what is checked:
+with `proxy_set_header Host $host;` alone, a rebinding page can send
+`X-Forwarded-Host: feed.example.com` and pass. Alternatively, forward the
+original `Host` and have the proxy drop `X-Forwarded-Host`
+(`proxy_set_header X-Forwarded-Host "";`).
+
+`Host` is not checked as well when `X-Forwarded-Host` is present, because
+proxies that rewrite `Host` to the upstream's name (nginx's and Apache's
+default) would then be refused everything. To reach the server by another
+name as well (`localhost` on the box itself, say), list it in
+`allowed_hosts`. `/health` and the paths under `/health/` answer whatever the
+host, since container and Kubernetes probes use an address; a feed whose name
+merely starts with `health` is checked like any other.
 
 Two related guards apply whatever the host settings:
 
@@ -488,7 +503,9 @@ How the mirror keeps up, and what it does not repeat:
   for again within `refresh_secs`; a version that failed (absent, over the size
   cap, the wrong identity, refused by policy) not for 15 minutes; and an
   upstream that fails is backed off, from 30 seconds doubling up to 30
-  minutes. A feed with `requires_approval` does not re-list on every read
+  minutes. A download that failed for a moment (a timeout, a dropped
+  connection, a `5xx`) only backs off the upstream; it does not block the
+  version. A feed with `requires_approval` does not re-list on every read
   while its mirrored versions wait for approval.
 * **Concurrent requests share one fetch.** A request for a package another
   request is fetching waits for it (up to a minute) rather than answering
@@ -646,9 +663,12 @@ responses also carry a `Strict-Transport-Security` header (one year).
   carry a `Content-Security-Policy` of `default-src 'none'` whose only permitted
   inline style and script are the two the server itself emits, pinned by
   SHA-256 — so an escaping bug could not become script execution.
-- A client gets 30 seconds to send a request's headers, and at most
+- A client gets 30 seconds to send a request's headers, and a new connection
+  as long for its first bytes (TLS handshake included), and at most
   `max_connections` connections are open at once, so clients that open
-  sockets and trickle bytes cannot hold them indefinitely. (Request bodies are
+  sockets and send nothing, or trickle bytes, cannot hold them indefinitely.
+  An idle HTTP/2 connection is pinged every 60 seconds and closed when a ping
+  goes unanswered for 20. (Request bodies are
   bounded by `upload_idle_timeout_secs` instead.) On shutdown, in-flight
   requests get 10 seconds, on plain HTTP as on HTTPS, and background work (a
   retention sweep, an inbox scan) is allowed to finish within the same

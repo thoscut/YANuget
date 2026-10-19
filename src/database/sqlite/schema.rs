@@ -47,6 +47,7 @@
 use sqlx::{Connection, Row, SqliteConnection};
 
 use crate::error::{Error, Result};
+use crate::models::{depends_on_semver2, DependencyGroup};
 
 /// One numbered schema change.
 struct Migration {
@@ -96,6 +97,11 @@ const MIGRATIONS: &[Migration] = &[
         description: "tie memberships, tags, files and symbols to their version with foreign keys",
         step: Step::AddForeignKeys,
     },
+    Migration {
+        version: 8,
+        description: "mark versions with a SemVer 2.0.0 dependency range as SemVer 2.0.0",
+        step: Step::SemVer2Dependencies,
+    },
 ];
 
 /// What a [`Migration`] runs. An enum rather than a function pointer in the
@@ -110,6 +116,7 @@ enum Step {
     LegacyShape,
     DropDeadColumns,
     AddForeignKeys,
+    SemVer2Dependencies,
 }
 
 async fn apply(step: Step, c: &mut SqliteConnection) -> Result<()> {
@@ -121,6 +128,7 @@ async fn apply(step: Step, c: &mut SqliteConnection) -> Result<()> {
         Step::LegacyShape => legacy_shape(c).await,
         Step::DropDeadColumns => drop_dead_columns(c).await,
         Step::AddForeignKeys => add_foreign_keys(c).await,
+        Step::SemVer2Dependencies => semver2_dependencies(c).await,
     }
 }
 
@@ -867,6 +875,49 @@ async fn add_foreign_keys(c: &mut SqliteConnection) -> Result<()> {
             "{} rows still refer to package versions that do not exist",
             violations.len()
         )));
+    }
+    Ok(())
+}
+
+/// Step 8: recompute `is_semver2` for versions whose dependencies have a
+/// SemVer 2.0.0 range.
+///
+/// Earlier builds looked only at the version itself, so a `1.0.0` that
+/// depends on `[2.0.0-beta.1, )` was shown to SemVer 1.0.0 clients, which
+/// cannot resolve that dependency; nuget.org hides such a version from them.
+/// The flag only ever goes from 0 to 1 here: a version that is SemVer 2.0.0
+/// by its own version stays so. A dependency list that does not decode is
+/// left as it is rather than failing the upgrade.
+async fn semver2_dependencies(c: &mut SqliteConnection) -> Result<()> {
+    let rows = sqlx::query(
+        "SELECT lower_id, normalized_version, dependencies FROM packages \
+         WHERE is_semver2 = 0 AND dependencies <> '[]'",
+    )
+    .fetch_all(&mut *c)
+    .await?;
+    let mut marked = 0u64;
+    for row in rows {
+        let dependencies: String = row.try_get("dependencies")?;
+        let Ok(groups) = serde_json::from_str::<Vec<DependencyGroup>>(&dependencies) else {
+            continue;
+        };
+        if !depends_on_semver2(&groups) {
+            continue;
+        }
+        sqlx::query(
+            "UPDATE packages SET is_semver2 = 1 WHERE lower_id = ?1 AND normalized_version = ?2",
+        )
+        .bind(row.try_get::<String, _>("lower_id")?)
+        .bind(row.try_get::<String, _>("normalized_version")?)
+        .execute(&mut *c)
+        .await?;
+        marked += 1;
+    }
+    if marked > 0 {
+        tracing::info!(
+            versions = marked,
+            "marked versions with a SemVer 2.0.0 dependency range as SemVer 2.0.0"
+        );
     }
     Ok(())
 }

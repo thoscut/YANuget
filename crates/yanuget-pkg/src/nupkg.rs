@@ -7,7 +7,7 @@
 //! the (potentially 25 GiB+) package body. The blocking ZIP work runs on a
 //! dedicated thread via [`tokio::task::spawn_blocking`].
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -127,10 +127,9 @@ pub fn open_archive(path: &Path) -> Result<zip::ZipArchive<File>, Error> {
     // The crate decodes a name when it is asked for, not when it reads the
     // directory. Decoding them all here keeps a name that is neither UTF-8
     // nor CP437 a reason to refuse the package as a whole, rather than an
-    // error in whichever reader happens to ask for that entry.
-    for i in 0..archive.len() {
-        entry_name(&archive, i)?;
-    }
+    // error in whichever reader happens to ask for that entry. The same pass
+    // refuses names that collide once normalized.
+    reject_colliding_entries(&archive)?;
     Ok(archive)
 }
 
@@ -144,6 +143,20 @@ pub fn entry_name<R: std::io::Read + std::io::Seek>(
         .transpose()
         .map(|name| name.map(|n| n.into_owned()))
         .map_err(|e| Error::InvalidPackage(format!("an entry name cannot be decoded: {e}")))
+}
+
+/// Every entry's index, keyed by its normalized name (see [`normalize_entry`]),
+/// from the central directory alone. [`open_archive`] guarantees the names are
+/// distinct, so building this once replaces a linear [`entry_index`] scan per
+/// lookup.
+pub fn entry_indices(archive: &zip::ZipArchive<File>) -> HashMap<String, usize> {
+    let mut indices = HashMap::with_capacity(archive.len());
+    for i in 0..archive.len() {
+        if let Ok(Some(name)) = entry_name(archive, i) {
+            indices.entry(normalize_entry(&name)).or_insert(i);
+        }
+    }
+    indices
 }
 
 /// The index of the entry named `normalized` (see [`normalize_entry`]), from the
@@ -570,6 +583,35 @@ fn reject_duplicate_entries(records: u64, unique: usize) -> Result<(), Error> {
     Ok(())
 }
 
+/// Reject an archive with two file entries whose names differ only in case or
+/// in `\\` against `/`.
+///
+/// Everything here looks entries up by [`normalize_entry`], and NuGet extracts
+/// onto case-insensitive file systems, so such names mean one file. Kept, they
+/// let `x/a.pdb`, `X/A.pdb` and `x\\a.pdb` count once against a cap yet be
+/// extracted many times, and let a readme or icon lookup take a
+/// different one of them than a client would. Directory entries (a name
+/// ending in `/`) carry no data and are not compared.
+fn reject_colliding_entries(archive: &zip::ZipArchive<File>) -> Result<(), Error> {
+    let mut seen = HashSet::with_capacity(archive.len());
+    for i in 0..archive.len() {
+        let Some(name) = entry_name(archive, i)? else {
+            continue;
+        };
+        let normalized = normalize_entry(&name);
+        if normalized.ends_with('/') {
+            continue;
+        }
+        if !seen.insert(normalized) {
+            return Err(Error::InvalidPackage(format!(
+                "archive names {name} more than once (differing only in case or path \
+                 separators); they would extract to the same file, so it is refused"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn u16_at(buf: &[u8], at: usize) -> u16 {
     u16::from_le_bytes([buf[at], buf[at + 1]])
 }
@@ -944,6 +986,56 @@ mod tests {
             matches!(&err, Error::InvalidPackage(m) if m.contains("more than once")),
             "unexpected error: {err}"
         );
+    }
+
+    /// Names that differ only in case or separator are one file to every
+    /// lookup here and to a case-insensitive extraction; counting them once
+    /// but extracting each let a symbol package slip past its PDB cap.
+    #[tokio::test]
+    async fn rejects_entry_names_that_collide_after_normalization() {
+        let only = manifest("Only.Id");
+        let pdb = b"pdb".to_vec();
+        for other in ["LIB/A.PDB", "lib\\a.pdb", "Lib\\A.pdb"] {
+            let bytes =
+                zip_with_entries(&[("P.nuspec", &only), ("lib/a.pdb", &pdb), (other, &pdb)]);
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("collide.nupkg");
+            std::fs::write(&path, &bytes).unwrap();
+
+            refused(read_archive(&path).await, "differing only in case");
+            let err =
+                extract_entries_to_files(&path, &["lib/a.pdb".to_string()], dir.path(), 1024, 1024)
+                    .await
+                    .unwrap_err();
+            assert!(err.to_string().contains("differing only in case"), "{err}");
+        }
+    }
+
+    /// Directory entries hold no data, so two spellings of one folder are not a
+    /// collision; and distinct files that merely share a folder are fine.
+    #[tokio::test]
+    async fn directory_entries_and_distinct_names_do_not_collide() {
+        let only = manifest("Only.Id");
+        let empty: &[u8] = b"";
+        let bytes = zip_with_entries(&[
+            ("P.nuspec", &only),
+            ("[Content_Types].xml", b"<Types/>"),
+            ("_rels/.rels", b"<Relationships/>"),
+            ("lib/", empty),
+            ("Lib/", empty),
+            ("lib/a.dll", b"MZ"),
+            ("lib/a.pdb", b"pdb"),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ok.nupkg");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let contents = read_archive(&path).await.unwrap();
+        assert!(contents.contains("LIB\\A.PDB"));
+        let archive = open_archive(&path).unwrap();
+        let indices = entry_indices(&archive);
+        assert_eq!(indices.get("lib/a.dll"), Some(&5));
+        assert_eq!(entry_index(&archive, "lib/a.pdb"), Some(6));
     }
 
     /// The same shape without the duplicate must still be accepted — the check

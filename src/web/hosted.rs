@@ -417,7 +417,7 @@ pub(super) async fn put(
     );
     let streamed = streaming::stream_to_writer_sha256(
         stream,
-        &mut file,
+        &mut state.reserve_guard(&mut file),
         state.config.max_file_size_bytes(),
         state.config.upload_idle_timeout(),
     )
@@ -740,6 +740,9 @@ pub(super) async fn tus_patch(
     if offset != s.received {
         return built(tus_response(StatusCode::CONFLICT).header("upload-offset", s.received));
     }
+    // Checked at creation for the whole upload, but a resumed one may come
+    // back hours later to a fuller disk.
+    state.ensure_disk_space(Some(s.length - s.received))?;
     let part = part_path(&state, &upload);
     resume_hash(&mut hashing, &part, s.received).await?;
     // Out of the slot while bytes go in: if this request is cancelled
@@ -763,7 +766,7 @@ pub(super) async fn tus_patch(
     );
     let (written, streamed) = streaming::append_hashed(
         &mut body,
-        &mut file,
+        &mut state.reserve_guard(&mut file),
         &mut h.hasher,
         s.length - s.received,
         state.config.upload_idle_timeout(),

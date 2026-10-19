@@ -36,7 +36,9 @@ pub use admin::{
     RetentionNotice, RetentionView, TransferNotice, TransferOp, VersionReport, CSRF_FIELD,
 };
 pub use escape::escape_html;
-pub use gallery::{feeds_index_page, gallery_page, tags_page, GalleryView, MAX_CLOUD_TAGS};
+pub use gallery::{
+    feeds_index_page, gallery_page, tags_page, GalleryView, MAX_CLOUD_TAGS, MAX_PAGE_SIZE,
+};
 pub(in crate::web) use layout::FONT_URL;
 pub use layout::{error_page, CSP};
 pub use package::{detail_page, Detail};

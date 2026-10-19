@@ -2108,6 +2108,11 @@ async fn gallery_pager_goes_to_a_page_and_snaps_to_page_starts() {
     assert!(body.contains("<select id=\"pg-take\""), "{body}");
     assert!(!body.contains("pg-page"), "{body}");
 
+    // No page is larger than the largest size the pager offers.
+    let body = get_text(&server, "/packages?take=1000").await;
+    assert!(body.contains("value=\"100\""), "{body}");
+    assert!(!body.contains("value=\"1000\""), "{body}");
+
     // The search text survives the round trip through the forms.
     let body = get_text(&server, "/packages?q=pp&page=3").await;
     assert!(body.contains("5\u{2013}5 of 5"), "{body}");
@@ -2303,13 +2308,15 @@ async fn forwarded_headers_drive_generated_urls() {
 }
 
 #[tokio::test]
-async fn forwarded_host_takes_first_of_a_list() {
+async fn forwarded_host_takes_the_last_of_a_list() {
+    // The rightmost entry is the one the trusted proxy wrote; anything to its
+    // left came from the client.
     let server = spawn_with(|c| c.trusted_proxies = vec!["private".into()]).await;
     let index: serde_json::Value = server
         .client
         .get(server.url("/v3/index.json"))
-        .header("X-Forwarded-Proto", "https, http")
-        .header("X-Forwarded-Host", "first.example.com, second.example.com")
+        .header("X-Forwarded-Proto", "http, https")
+        .header("X-Forwarded-Host", "client.example.net, proxy.example.com")
         .send()
         .await
         .unwrap()
@@ -2318,7 +2325,7 @@ async fn forwarded_host_takes_first_of_a_list() {
         .unwrap();
     assert_eq!(
         package_base_address(&index),
-        "https://first.example.com/v3/package/"
+        "https://proxy.example.com/v3/package/"
     );
 }
 
@@ -3654,6 +3661,10 @@ async fn admin_actions_require_a_csrf_token() {
         .await
         .unwrap();
     assert_eq!(bad_token.status(), reqwest::StatusCode::BAD_REQUEST);
+    // The page a browser gets says what to do about it.
+    let page = bad_token.text().await.unwrap();
+    assert!(page.contains("(reload the page)"), "{page}");
+    assert!(page.contains("<html"), "{page}");
 
     // A browser that tells us the request came from another site is refused
     // even when it somehow carries the token — by the server-wide guard on
@@ -4390,6 +4401,40 @@ async fn a_symbol_package_with_absurdly_many_pdbs_is_refused_quickly() {
         elapsed < std::time::Duration::from_secs(10),
         "took {elapsed:?}; the entry count should be rejected before any extraction"
     );
+}
+
+/// Entry names that differ only in case or separator used to count once
+/// against the PDB cap — the listing is normalized — yet each was extracted
+/// and verified, so a few hundred spellings of one PDB multiplied the work.
+/// Such an archive is now refused before anything is extracted.
+#[tokio::test]
+async fn a_symbol_package_spelling_one_pdb_many_ways_is_refused() {
+    let server = spawn().await;
+    push_multipart(&server, API_KEY, build_nupkg("Same.Pdb", "1.0.0", b"dll")).await;
+
+    let mut cursor = Cursor::new(Vec::new());
+    {
+        let mut zip = zip::ZipWriter::new(&mut cursor);
+        let opts =
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        zip.start_file("Same.Pdb.nuspec", opts).unwrap();
+        zip.write_all(
+            br#"<?xml version="1.0"?><package><metadata><id>Same.Pdb</id>
+                <version>1.0.0</version><authors>a</authors>
+                <description>d</description></metadata></package>"#,
+        )
+        .unwrap();
+        for name in ["lib/net8.0/a.pdb", "LIB/net8.0/A.pdb", "lib\\net8.0\\a.PDB"] {
+            zip.start_file(name, opts).unwrap();
+            zip.write_all(&[0u8; 64]).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+
+    let response = push_symbol(&server, API_KEY, cursor.into_inner()).await;
+    assert_eq!(response.status(), 400);
+    let body = response.text().await.unwrap();
+    assert!(body.contains("differing only in case"), "{body}");
 }
 
 /// Overwriting a version must not leave the previous build's symbols behind.
@@ -5351,6 +5396,20 @@ async fn the_preview_key_downloads_pending_versions_and_nothing_else() {
         reqwest::StatusCode::NOT_FOUND,
         "still pending"
     );
+
+    // Once approved, the preview key still gets a preview: private, never
+    // immutable, the same as for a pending version.
+    let approve = admin_action(&server, "/intake/admin/packages/preview.pkg/1.0.0/approve").await;
+    assert_eq!(approve.status(), reqwest::StatusCode::SEE_OTHER);
+    let read = get(nupkg, "reader-key").await.unwrap();
+    assert!(read.status().is_success());
+    for path in [nupkg, file] {
+        let r = get(path, PREVIEW_KEY).await.unwrap();
+        assert!(r.status().is_success(), "{path}: {}", r.status());
+        let cache = r.headers()["cache-control"].to_str().unwrap().to_string();
+        assert!(cache.starts_with("private"), "{path}: {cache}");
+        assert!(!cache.contains("immutable"), "{path}: {cache}");
+    }
 
     // A disabled version stays withheld from the preview key too.
     let disable = admin_action(&server, "/intake/admin/packages/preview.pkg/1.0.0/disable").await;

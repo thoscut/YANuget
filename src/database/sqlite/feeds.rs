@@ -199,7 +199,7 @@ pub(super) async fn recent_packages(
 ) -> Result<Vec<Package>> {
     let rows = sqlx::query(concat!(
         feed_select!(),
-        " WHERE fp.feed = ?1 AND fp.enabled = 1 AND fp.pending = 0 \
+        " WHERE fp.feed = ?1 AND fp.listed = 1 AND fp.enabled = 1 AND fp.pending = 0 \
          ORDER BY p.published DESC LIMIT ?2"
     ))
     .bind(feed)
@@ -323,5 +323,27 @@ mod tests {
         assert_eq!(recent[0].id, "New");
         assert_eq!(recent[1].id, "Old");
         assert_eq!(db.recent_packages(FEED, 1).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn recent_packages_shows_only_what_search_shows() {
+        let db = SqliteDatabase::in_memory().await.unwrap();
+        for id in ["Listed", "Unlisted", "Disabled"] {
+            db.add_to_feed(FEED, &sample(id, "1.0.0")).await.unwrap();
+        }
+        let pending = sample("Pending", "1.0.0");
+        db.upsert_package_data(&pending).await.unwrap();
+        db.add_membership(&Membership {
+            pending: true,
+            ..Membership::active(FEED, &pending)
+        })
+        .await
+        .unwrap();
+        let v = NuGetVersion::parse("1.0.0").unwrap();
+        assert!(db.set_listed(FEED, "unlisted", &v, false).await.unwrap());
+        assert!(db.set_enabled(FEED, "disabled", &v, false).await.unwrap());
+        let recent = db.recent_packages(FEED, 10).await.unwrap();
+        let ids: Vec<&str> = recent.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(ids, vec!["Listed"]);
     }
 }

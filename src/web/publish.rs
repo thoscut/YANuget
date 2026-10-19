@@ -124,9 +124,15 @@ async fn write_upload(
             .map_err(|e| Error::BadRequest(format!("invalid multipart field: {e}")))?
             .ok_or_else(|| Error::BadRequest("multipart body contained no file".into()))?;
         let stream = Box::pin(field.map(|r| r.map_err(to_io_err)));
-        streaming::stream_to_writer_limited(stream, file, limit, state.config.upload_idle_timeout())
-            .await
-            .map_err(map_upload_err)
+        let mut file = state.reserve_guard(file);
+        streaming::stream_to_writer_limited(
+            stream,
+            &mut file,
+            limit,
+            state.config.upload_idle_timeout(),
+        )
+        .await
+        .map_err(map_upload_err)
     } else {
         let stream = Box::pin(
             request
@@ -134,9 +140,15 @@ async fn write_upload(
                 .into_data_stream()
                 .map(|r| r.map_err(to_io_err)),
         );
-        streaming::stream_to_writer_limited(stream, file, limit, state.config.upload_idle_timeout())
-            .await
-            .map_err(map_upload_err)
+        let mut file = state.reserve_guard(file);
+        streaming::stream_to_writer_limited(
+            stream,
+            &mut file,
+            limit,
+            state.config.upload_idle_timeout(),
+        )
+        .await
+        .map_err(map_upload_err)
     }
 }
 
@@ -153,14 +165,20 @@ pub(super) async fn delete_package(
 
     if state.feed.hard_delete_enabled {
         // Hard delete removes this feed's membership (and, when it was the last
-        // feed, the payload, sidecars and indexed symbols).
-        let removed = retention::purge_version(
-            state.storage.as_ref(),
-            state.db.as_ref(),
-            state.feed(),
-            &id,
-            &version,
-        )
+        // feed, the payload, sidecars and indexed symbols). Detached, so a
+        // client that disconnects cannot stop it between the membership and
+        // the tombstone that keeps a mirror from fetching the version back.
+        let purging = state.clone();
+        let removed = detached(async move {
+            retention::purge_version(
+                purging.storage.as_ref(),
+                purging.db.as_ref(),
+                purging.feed(),
+                &id,
+                &version,
+            )
+            .await
+        })
         .await?;
         if removed {
             Ok(StatusCode::NO_CONTENT.into_response())
