@@ -9,10 +9,11 @@ at them. The plan is the "Chocolatey internalizer" section of
 
 **Not released, and not usable yet.** The command line, the configuration and
 its check (`INT-10`), the upstream client (`INT-11`), the dependency closure
-(`INT-12`), the capture parser (`INT-16`), the downloader (`INT-17`) and file
-naming (`INT-18`) exist; the sandbox runners and publishing follow. `plan`
-shows the closure of the packages it is given and then stops with an error;
-`run` stops before it fetches anything.
+(`INT-12`), the capture parser (`INT-16`), the downloader (`INT-17`), file
+naming (`INT-18`), publishing (`INT-20`) and the report (`INT-21`) exist; the
+sandbox runners and the prelude follow, and `run` is wired up with them.
+`plan` shows the closure of the packages it is given and then stops with an
+error; `run` stops before it fetches anything.
 
 ## Command line
 
@@ -124,7 +125,62 @@ redirects or the package, and the extension from the name, the captured file
 type or the content itself (`MZ`, the OLE header of an `.msi`, `PK`). Two
 different files on one name are told apart by a prefix of their SHA-256. A
 file whose extension the feed does not accept is reported, never renamed to
-pass.
+pass. The extensions the feed accepts are `target.allowed_extensions`, which
+has to match the feed's own `allowed_extensions`.
+
+## Report
+
+Every package of a run gets a report, in the schema the server reads
+(`yanuget_pkg::report`, version 1):
+
+| Status | When |
+| --- | --- |
+| `internalized` | Every download was fetched and can be attached. |
+| `unchanged` | Nothing to download: an embedded or a meta package. |
+| `needs-override` | The capture cannot be trusted for it: the install failed or ran out of time, the capture was rejected, a helper was called from an extension's module or from outside the package's scripts, or a file has a type the feed does not take. |
+| `failed` | The sandbox failed, or a download did (an error answer, a checksum that does not match, the size cap). |
+
+A failure outranks an override, and the report lists every reason, failures
+first. It names the upstream source and hash, the image and the Chocolatey
+version the scripts ran with, the tool's version, each download with its
+helper, file name, size, SHA-256 and checksum status, and the warnings. One
+capture covers a whole closure, so what makes the capture untrustworthy marks
+every package in it; a single call marks only its own package.
+
+A run prints the reports as text, or as one JSON document for pipelines:
+`{"outcome": "needs-attention", "packages": [...]}`, the outcome being what
+the exit code says. The report also goes inside the package as
+`internalizer/report.json`, covered by the package hash, so a promotion, a
+copy, `yanuget migrate` and `yanuget backup` keep it with the package.
+
+## Publishing
+
+A package that is `internalized` or `unchanged` is rewritten with its report
+(and, with `INT-19`, the prelude), pushed to `target.url` with the push key,
+and its files are attached under `api/v2/files/…` with their SHA-256 for the
+feed to check. The tool then reads the feed's flat container, which lists
+approved versions only, and warns when the version is served at once: the
+feed does not require approval.
+
+The push key cannot see pending versions, so a push is how the tool learns
+what the feed holds:
+
+- `201`: new. The files are attached.
+- `409`: the feed has the version and kept it, which a run takes as already
+  internalized. While the version is pending, the files are attached again:
+  the same file is a no-op, so a run that stopped half-way is completed by
+  the next one. A version the feed serves already, or one a read-gated feed
+  cannot tell about, gets nothing attached, since an attach is not reviewed.
+- With `--replace-pending`, a `409` is an error: the version is approved, or
+  the feed does not set `allow_overwrite = "pending-only"`. That mode needs
+  YANuget 0.8.0, which the tool checks up front where `/health/status` says
+  the server's version. On such a feed every push replaces a pending
+  version, with or without the flag.
+
+An attach that breaks off or meets a server error is tried again. A file the
+feed refuses (its type, a different file under the name) fails the package.
+Each request may take `target.timeout_secs`, plus a second for every MiB of
+its file.
 
 ## Sandboxes
 

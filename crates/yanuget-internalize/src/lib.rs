@@ -6,6 +6,7 @@
 //! so everything around it builds and is tested on any host against
 //! [`sandbox::fake::FakeSandbox`].
 
+pub mod assess;
 pub mod capture;
 pub mod check;
 pub mod cli;
@@ -14,6 +15,8 @@ pub mod config;
 pub mod download;
 pub mod naming;
 pub mod outcome;
+pub mod publish;
+pub mod report;
 pub mod sandbox;
 pub mod target;
 pub mod upstream;
