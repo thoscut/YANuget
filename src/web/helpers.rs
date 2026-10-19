@@ -95,6 +95,8 @@ pub(super) fn map_upload_err(e: std::io::Error) -> Error {
         Error::PayloadTooLarge(e.to_string())
     } else if e.kind() == std::io::ErrorKind::TimedOut {
         Error::UploadTimeout(e.to_string())
+    } else if e.kind() == std::io::ErrorKind::StorageFull {
+        Error::InsufficientStorage(e.to_string())
     } else {
         Error::Io(e)
     }

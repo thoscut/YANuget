@@ -82,6 +82,10 @@ expected to change incompatibly at any version.
 - `yanuget restore --force` copies every file from the backup. It skipped live
   files with the same size and modification time, so one damaged in place was
   kept, although the store is meant to match the backup exactly.
+- `min_free_disk_bytes` is checked again every 64 MiB while an upload streams
+  in, and on every resumable-upload `PATCH`. A chunked body without a
+  `Content-Length` was only checked against the reserve itself, once, so it
+  could fill the volume.
 
 ## [0.7.0] — 2026-10-15
 

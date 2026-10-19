@@ -124,9 +124,15 @@ async fn write_upload(
             .map_err(|e| Error::BadRequest(format!("invalid multipart field: {e}")))?
             .ok_or_else(|| Error::BadRequest("multipart body contained no file".into()))?;
         let stream = Box::pin(field.map(|r| r.map_err(to_io_err)));
-        streaming::stream_to_writer_limited(stream, file, limit, state.config.upload_idle_timeout())
-            .await
-            .map_err(map_upload_err)
+        let mut file = state.reserve_guard(file);
+        streaming::stream_to_writer_limited(
+            stream,
+            &mut file,
+            limit,
+            state.config.upload_idle_timeout(),
+        )
+        .await
+        .map_err(map_upload_err)
     } else {
         let stream = Box::pin(
             request
@@ -134,9 +140,15 @@ async fn write_upload(
                 .into_data_stream()
                 .map(|r| r.map_err(to_io_err)),
         );
-        streaming::stream_to_writer_limited(stream, file, limit, state.config.upload_idle_timeout())
-            .await
-            .map_err(map_upload_err)
+        let mut file = state.reserve_guard(file);
+        streaming::stream_to_writer_limited(
+            stream,
+            &mut file,
+            limit,
+            state.config.upload_idle_timeout(),
+        )
+        .await
+        .map_err(map_upload_err)
     }
 }
 

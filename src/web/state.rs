@@ -304,6 +304,19 @@ impl AppState {
         Ok(())
     }
 
+    /// `writer`, made to fail part-way once the storage volume drops below
+    /// `min_free_disk_bytes` (see [`streaming::DiskReserve`]): the check
+    /// [`Self::ensure_disk_space`] makes up front cannot see a body that
+    /// declared no size.
+    ///
+    /// [`streaming::DiskReserve`]: crate::streaming::DiskReserve
+    pub(super) fn reserve_guard<'a, W>(
+        &'a self,
+        writer: &'a mut W,
+    ) -> crate::streaming::DiskReserve<'a, W> {
+        crate::streaming::DiskReserve::new(writer, &self.temp_dir, self.config.min_free_disk_bytes)
+    }
+
     /// Create a fresh temp file for an incoming upload, removed again when the
     /// returned [`TempPath`] is dropped unless it has been moved into the store.
     pub(super) async fn create_temp(&self) -> Result<(TempPath, tokio::fs::File)> {
