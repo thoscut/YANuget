@@ -12,6 +12,27 @@ expected to change incompatibly at any version.
 
 ## [Unreleased]
 
+## [0.8.0] — 2026-10-19
+
+**Upgrading from 0.7.x needs attention.** Two changes can stop a deployment that
+ran under 0.7.0, and the database moves to a schema 0.7.0 cannot open:
+
+- **A blank key variable stops startup.** `YANUGET_API_KEY`,
+  `YANUGET_API_KEYS`, `YANUGET_FEED_{NAME}_READ_API_KEY` and the other key
+  variables used to drop the key when set to an empty string; now the server
+  refuses to start. Compose turns `${UNSET}` into an empty string, so check
+  your `environment:` entries and remove a variable rather than leaving it
+  empty.
+- **The reverse proxy must set `X-Forwarded-Host` and `X-Forwarded-Proto`
+  itself.** From a trusted proxy these headers are now read from the right,
+  as `X-Forwarded-For` already was. A proxy that passes the client's own
+  headers through unchanged lets the client choose the host the check and the
+  generated URLs see; configure it to set (or append to) them.
+- The database is migrated on first start to schema version 8, which marks
+  versions that depend on a SemVer 2.0.0 range. Afterwards 0.7.0 refuses to
+  open it, so **back the database up first** if you may need to go back.
+- The minimum supported Rust for `cargo install` is 1.89.
+
 ### Added
 
 - A feed can set its own file types for attached files in `[feeds.files]`
@@ -806,7 +827,8 @@ Beyond the defaults:
 - Symbol downloads require read authorisation and resolve to a package the
   requester is allowed to see.
 
-[Unreleased]: https://github.com/thoscut/yanuget/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/thoscut/yanuget/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/thoscut/yanuget/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/thoscut/yanuget/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/thoscut/yanuget/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/thoscut/yanuget/compare/v0.5.0...v0.5.1

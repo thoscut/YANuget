@@ -615,7 +615,7 @@ GET /metrics        → 200 Prometheus text format
 ```json
 {
   "status": "degraded",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "uptime_seconds": 86400,
   "database": "ok",
   "feeds": [
