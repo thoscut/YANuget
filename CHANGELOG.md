@@ -15,8 +15,8 @@ expected to change incompatibly at any version.
 ## [0.8.0] — 2026-10-19
 
 **Upgrading from 0.7.x needs attention.** One change can stop a deployment that
-ran under 0.7.0, one changes what a reverse proxy must send, and the database
-moves to a schema 0.7.0 cannot open:
+ran under 0.7.0, one changes what a reverse proxy must send, the database
+moves to a schema 0.7.0 cannot open, and old clients see fewer versions:
 
 - **A blank key variable stops startup.** `YANUGET_API_KEY`,
   `YANUGET_API_KEYS`, `YANUGET_FEED_{NAME}_READ_API_KEY` and the other key
@@ -31,7 +31,14 @@ moves to a schema 0.7.0 cannot open:
   generated URLs see; configure it to set (or append to) them.
 - The database is migrated on first start to schema version 8, which marks
   versions that depend on a SemVer 2.0.0 range. Afterwards 0.7.0 refuses to
-  open it, so **back the database up first** if you may need to go back.
+  open it, so **back the database up first** if you may need to go back, and
+  go back with **0.7.0's** `yanuget restore`: this release's `restore`
+  migrates the restored database to version 8 as it opens it.
+- Versions that depend on a SemVer 2.0.0 range drop out of what SemVer 1.0.0
+  clients see (search and registration without `semVerLevel=2.0.0`, as
+  nuget.exe before 4.3 and some Chocolatey setups request them). A package
+  whose versions all do answers `404` there. Clients that send
+  `semVerLevel=2.0.0`, as `dotnet` and current NuGet do, see no change.
 - The minimum supported Rust for `cargo install` is 1.89.
 
 ### Added
