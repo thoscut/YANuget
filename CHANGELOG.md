@@ -68,6 +68,17 @@ expected to change incompatibly at any version.
   reads packages entry by entry), so no released version was exposed. A
   package with an entry name that is neither UTF-8 nor CP437 is still
   refused when it is opened.
+- From a trusted proxy, `X-Forwarded-Host` and `X-Forwarded-Proto` are read
+  from the **right**, as `X-Forwarded-For` already was: a proxy that appends
+  leaves the client's own value on the left, and that value passed the host
+  check and chose the generated URLs. A proxy must set or append these
+  headers, not pass on the client's.
+
+### Fixed
+
+- The host check exempted every path starting with `/health`, so a feed named
+  `healthcare` answered any `Host`. Only `/health` and the paths under
+  `/health/` are exempt now.
 
 ### Fixed
 

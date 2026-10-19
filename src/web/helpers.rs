@@ -63,11 +63,21 @@ pub(super) fn is_semver2_level(level: Option<&str>) -> bool {
     }
 }
 
+/// The value a trusted proxy put in the forwarding header `name`: the
+/// **rightmost** entry, across all of the header's lines.
+///
+/// A proxy that appends (Apache's `mod_proxy`) leaves whatever the client sent
+/// on the left, so the leftmost entry is the client's choice, not the proxy's.
+/// The rightmost is the one the last hop — the trusted peer — wrote, as for
+/// `X-Forwarded-For` in [`crate::ratelimit`].
 pub(super) fn forwarded(headers: &HeaderMap, name: &str) -> Option<String> {
     headers
-        .get(name)
+        .get_all(name)
+        .iter()
+        .next_back()
         .and_then(|v| v.to_str().ok())
-        .map(|s| s.split(',').next().unwrap_or(s).trim().to_string())
+        .and_then(|s| s.rsplit(',').next())
+        .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
 }
 

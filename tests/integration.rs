@@ -2303,13 +2303,15 @@ async fn forwarded_headers_drive_generated_urls() {
 }
 
 #[tokio::test]
-async fn forwarded_host_takes_first_of_a_list() {
+async fn forwarded_host_takes_the_last_of_a_list() {
+    // The rightmost entry is the one the trusted proxy wrote; anything to its
+    // left came from the client.
     let server = spawn_with(|c| c.trusted_proxies = vec!["private".into()]).await;
     let index: serde_json::Value = server
         .client
         .get(server.url("/v3/index.json"))
-        .header("X-Forwarded-Proto", "https, http")
-        .header("X-Forwarded-Host", "first.example.com, second.example.com")
+        .header("X-Forwarded-Proto", "http, https")
+        .header("X-Forwarded-Host", "client.example.net, proxy.example.com")
         .send()
         .await
         .unwrap()
@@ -2318,7 +2320,7 @@ async fn forwarded_host_takes_first_of_a_list() {
         .unwrap();
     assert_eq!(
         package_base_address(&index),
-        "https://first.example.com/v3/package/"
+        "https://proxy.example.com/v3/package/"
     );
 }
 

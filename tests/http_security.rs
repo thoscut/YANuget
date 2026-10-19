@@ -481,6 +481,68 @@ async fn a_request_for_another_host_is_misdirected() {
 }
 
 #[tokio::test]
+async fn a_feed_named_like_the_health_probes_is_still_host_checked() {
+    let server = spawn_feeds(|c| {
+        c.base_url = Some("https://feed.example.com".into());
+        c.feeds = vec![feed("healthcare"), feed("other")];
+    })
+    .await;
+    let get = |host: &'static str| {
+        server
+            .client
+            .get(server.url("/healthcare/v3/index.json"))
+            .header("Host", host)
+            .send()
+    };
+    assert_eq!(
+        get("evil.example.net").await.unwrap().status(),
+        StatusCode::MISDIRECTED_REQUEST
+    );
+    assert_eq!(
+        get("feed.example.com").await.unwrap().status(),
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn behind_a_proxy_the_host_check_reads_the_proxys_forwarded_host() {
+    let server = spawn_with(|c| {
+        c.base_url = Some("https://feed.example.com".into());
+        c.trusted_proxies = vec!["private".into()];
+    })
+    .await;
+    let get = |forwarded_host: &'static str| {
+        server
+            .client
+            .get(server.url("/v3/index.json"))
+            .header("Host", "upstream.internal")
+            .header("X-Forwarded-Host", forwarded_host)
+            .send()
+    };
+    // A proxy that appends puts the name it was asked for last. The client's
+    // own X-Forwarded-Host, on the left, decides nothing.
+    assert_eq!(
+        get("feed.example.com, evil.example.net")
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::MISDIRECTED_REQUEST
+    );
+    assert_eq!(
+        get("evil.example.net, feed.example.com")
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    // A proxy that rewrites Host to its upstream's name keeps working.
+    assert_eq!(
+        get("feed.example.com").await.unwrap().status(),
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
 async fn cross_origin_access_is_read_only() {
     let server = spawn_with(|c| c.cors_allowed_origins = vec!["*".into()]).await;
     let preflight = |method: &'static str| {

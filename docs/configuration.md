@@ -234,10 +234,10 @@ cache keys on the inputs that determine those URLs.
 With `base_url` set, the server answers only requests whose `Host` names the
 host of `base_url`, or one of `allowed_hosts`; anything else gets
 `421 Misdirected Request`. From a trusted proxy, `X-Forwarded-Host` is checked
-instead of `Host`. The comparison ignores case, the port and a trailing dot.
-With neither `base_url` nor `allowed_hosts` set, any host is accepted, as
-before; `allowed_hosts = ["*"]` accepts any host explicitly even with
-`base_url` set.
+instead of `Host` — its rightmost entry, the one the proxy itself wrote. The
+comparison ignores case, the port and a trailing dot. With neither `base_url`
+nor `allowed_hosts` set, any host is accepted, as before;
+`allowed_hosts = ["*"]` accepts any host explicitly even with `base_url` set.
 
 This is what stops **DNS rebinding**: a hostile web page can point a name it
 controls at your feed's internal address and make a visitor's browser talk to
@@ -245,11 +245,22 @@ it, but the browser still sends the hostile name as `Host`. Without the check
 such a page could read an intranet-only feed, and — on a feed without an API
 key — push or delete.
 
-Behind a proxy, either forward the original host (`proxy_set_header Host
-$host;` in nginx) or send `X-Forwarded-Host` from a trusted proxy. To reach the
-server by another name as well (`localhost` on the box itself, say), list it
-in `allowed_hosts`. `/health`, `/health/live` and `/health/ready` answer
-whatever the host, since container and Kubernetes probes use an address.
+Behind a proxy, the proxy must **set** `X-Forwarded-Host` to the host it was
+asked for (`proxy_set_header X-Forwarded-Host $host;` in nginx), or append to
+it (Apache's `mod_proxy`). nginx passes a client's own `X-Forwarded-Host`
+through unless told otherwise, and that value would then be what is checked:
+with `proxy_set_header Host $host;` alone, a rebinding page can send
+`X-Forwarded-Host: feed.example.com` and pass. Alternatively, forward the
+original `Host` and have the proxy drop `X-Forwarded-Host`
+(`proxy_set_header X-Forwarded-Host "";`).
+
+`Host` is not checked as well when `X-Forwarded-Host` is present, because
+proxies that rewrite `Host` to the upstream's name (nginx's and Apache's
+default) would then be refused everything. To reach the server by another
+name as well (`localhost` on the box itself, say), list it in
+`allowed_hosts`. `/health` and the paths under `/health/` answer whatever the
+host, since container and Kubernetes probes use an address; a feed whose name
+merely starts with `health` is checked like any other.
 
 Two related guards apply whatever the host settings:
 
