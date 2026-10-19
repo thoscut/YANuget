@@ -8,8 +8,9 @@ at them. The plan is the "Chocolatey internalizer" section of
 [ROADMAP.md](../../ROADMAP.md).
 
 **Not released, and not usable yet.** The command line, the configuration and
-its check (`INT-10`), the upstream client (`INT-11`) and the dependency
-closure (`INT-12`) exist; the sandbox runners and publishing follow. `plan`
+its check (`INT-10`), the upstream client (`INT-11`), the dependency closure
+(`INT-12`), the capture parser (`INT-16`), the downloader (`INT-17`) and file
+naming (`INT-18`) exist; the sandbox runners and publishing follow. `plan`
 shows the closure of the packages it is given and then stops with an error;
 `run` stops before it fetches anything.
 
@@ -95,6 +96,35 @@ to the Chocolatey CLI the image has, and listed as such.
 With `target.url` set, each package the target feed serves already is marked.
 A read-gated feed cannot say, since the tool holds a push key only; pending
 versions are not listed either. Pushing such a version again answers `409`.
+
+## Capture and downloads
+
+What the recording helpers in the sandbox write is parsed as hostile input,
+since the package's own code runs next to them: schema version 1, one JSON
+object a line, unknown fields refused, caps on lines, calls and size, no
+control or bidirectional characters, `http` and `https` URLs only, a hex
+checksum of its type's length, and every call attributed to a package of the
+closure. A capture that breaks a rule is rejected whole, with every reason,
+and nothing in it is repaired.
+
+Each captured URL is then downloaded into `cache_dir/files`, under the file's
+SHA-256, while it is hashed with SHA-256 and with the algorithm the script
+declares. A declared checksum that does not match fails the package. A match
+on SHA-256 or SHA-512 verifies the file; MD5, SHA-1 or no checksum leaves it
+trust-on-first-use, which the report says. URLs and redirects that lead to
+loopback, private or link-local addresses are refused unless
+`downloads.allow_private_hosts` names the host, and no credentials are sent.
+A transfer that breaks off is resumed with a `Range` where the host offers
+ranges and a validator, and restarted where it does not.
+
+A file is attached under the URL's own name when that is valid for the feed
+(1 to 128 characters of `A-Z a-z 0-9 . _ -`) and its extension fits the
+content. Otherwise the name comes from `Content-Disposition`, the URL after
+redirects or the package, and the extension from the name, the captured file
+type or the content itself (`MZ`, the OLE header of an `.msi`, `PK`). Two
+different files on one name are told apart by a prefix of their SHA-256. A
+file whose extension the feed does not accept is reported, never renamed to
+pass.
 
 ## Sandboxes
 

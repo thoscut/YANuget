@@ -1203,12 +1203,24 @@ packages whose downloads go through Chocolatey's helpers.
   and takes jobs over a Unix socket. It cannot keep `PrivateDevices=yes`
   (`DevicePolicy=closed` instead); whether QEMU under KVM runs with
   `MemoryDenyWriteExecute=yes` is *(to verify)*.
-- [ ] **`INT-16` Treat the capture as untrusted input.** Untrusted code wrote
+- [x] **`INT-16` Treat the capture as untrusted input.** Untrusted code wrote
   it: a versioned schema, strict types, caps on line length, entry count and
   total size, no control characters, `http`/`https` URLs only, and attribution
   to a package of the closure. Anything else marks the package
   `needs-override`; nothing is repaired.
-- [ ] **`INT-17` Downloader.** Stream each captured URL to disk while hashing
+  *Landed:* `yanuget_internalize::capture`, schema version 1, which the
+  helpers of `INT-14` write: one JSON object a line with `schema`, `package`,
+  `version`, `helper`, `url`, `url64`, `checksum`, `checksumType`,
+  `checksum64`, `checksumType64`, `fileType`, `fileFullPath` and `caller`,
+  unknown fields refused. Caps: 16 KiB a line, 1,000 calls, 16 MiB in all,
+  4,096 characters a URL, 1,024 a path. Control characters and the
+  bidirectional controls are refused in every string. A checksum must be hex
+  of its type's length; one without a type is MD5, as Chocolatey takes it.
+  The helper must be one of the nine that record. A rejection lists every
+  reason, up to twenty. The caller's path tells the package's own scripts
+  (`lib\{id}\`) from an extension's module (`extensions\{name}\`) for
+  `INT-21`.
+- [x] **`INT-17` Downloader.** Stream each captured URL to disk while hashing
   with SHA-256 and with the algorithm the script declares (MD5, SHA-1, SHA-256,
   SHA-512); a declared checksum that does not match fails the package. A call
   with no checksum, or only MD5 or SHA-1, is marked trust-on-first-use in the
@@ -1218,7 +1230,18 @@ packages whose downloads go through Chocolatey's helpers.
   untrusted scripts, and a package pointing at an internal host would
   otherwise get that host's answer published into the feed. Size cap, retries,
   resume.
-- [ ] **`INT-18` File names.** Attached file names are 1–128 characters of
+  *Landed:* `yanuget_internalize::download`, configured in `[downloads]`
+  (`concurrency`, `timeout_secs`, `max_file_bytes`, default 8 GiB,
+  `resume_attempts`, `allow_private_hosts`, `proxy`). Files land in
+  `cache_dir/files` under their SHA-256; a declared SHA-256 finds a file
+  there without a download, after hashing it again. The upstream's HTTP client
+  is shared, without credentials: the address policy on every hop, no
+  https-to-http redirect, `429`/`503` waited out. An allow-listed host is
+  resolved without the filter. A transfer that breaks off is resumed with
+  `Range` and `If-Range` (a strong `ETag`, else `Last-Modified`) where the
+  host offers byte ranges, and restarted otherwise. A failed download leaves
+  nothing in the cache.
+- [x] **`INT-18` File names.** Attached file names are 1–128 characters of
   `A-Z a-z 0-9 . _ -` with an allowed extension; upstream names carry spaces
   and `+`, or there is no name at all (`?product=…&os=win64`). Keep the
   original name where it is valid; otherwise derive it from
@@ -1226,6 +1249,17 @@ packages whose downloads go through Chocolatey's helpers.
   extension against the content (`MZ`, the OLE header of `.msi`, `PK`), and
   break collisions with a hash prefix. A file the feed's `allowed_extensions`
   refuses is reported, not renamed to pass.
+  *Landed:* `yanuget_internalize::naming`. The server's rule moved to
+  `yanuget_pkg::files`, so the server's attach check and the tool's names are
+  one definition. The URL's own name is kept when it is valid and its
+  extension fits the content. Otherwise the name comes from
+  `Content-Disposition` (`filename*` first), the URL after redirects, the URL
+  as captured, and last the package (`git.install-2.51.0`). Disallowed runs
+  become `_` and long stems are cut. The extension is the name's own if it
+  fits the content, else the captured `fileType` if that fits, else the
+  content's (`MZ`, OLE, `PK`, 7z, `MSCF`, gzip). The same file keeps the
+  name it was given, and a different file on a taken name gets the first
+  eight hex digits of its SHA-256 in front.
 - [ ] **`INT-19` Prelude.** The wrappers are proxy commands
   (`[System.Management.Automation.ProxyCommand]::Create`) generated from the
   pinned Chocolatey version's helper metadata, so positional calls and
