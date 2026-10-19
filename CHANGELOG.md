@@ -118,6 +118,10 @@ expected to change incompatibly at any version.
   push does. Stopped between removing the version from the feed and recording
   the deletion, they left no tombstone, so a read-through mirror fetched the
   version back.
+- A mirror download that failed for a moment (a timeout, a reset connection, a
+  `5xx`) no longer blocks that version for 15 minutes. Only a failure that
+  would repeat (absent upstream, over the size cap, the wrong identity, refused
+  by policy) does; transient ones back off the upstream as before.
 
 ## [0.7.0] — 2026-10-15
 

@@ -503,7 +503,9 @@ How the mirror keeps up, and what it does not repeat:
   for again within `refresh_secs`; a version that failed (absent, over the size
   cap, the wrong identity, refused by policy) not for 15 minutes; and an
   upstream that fails is backed off, from 30 seconds doubling up to 30
-  minutes. A feed with `requires_approval` does not re-list on every read
+  minutes. A download that failed for a moment (a timeout, a dropped
+  connection, a `5xx`) only backs off the upstream; it does not block the
+  version. A feed with `requires_approval` does not re-list on every read
   while its mirrored versions wait for approval.
 * **Concurrent requests share one fetch.** A request for a package another
   request is fetching waits for it (up to a minute) rather than answering

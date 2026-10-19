@@ -499,10 +499,12 @@ impl MirrorClient {
         } else {
             String::new()
         };
-        Err(Error::Other(anyhow::anyhow!(
-            "upstream {what} {} answered {status}{hint}",
-            redact_url(resp.url().as_str())
-        )))
+        Err(Error::Other(anyhow::Error::new(UpstreamAnswer {
+            what: what.to_string(),
+            url: redact_url(resp.url().as_str()),
+            status,
+            hint,
+        })))
     }
 
     /// Fetch and parse one upstream JSON document: the single path every
@@ -1117,6 +1119,33 @@ impl Backoff {
 /// Whether an upstream answer means the upstream is not usable: a server
 /// error, a refusal of the credentials, or a rate limit. A `404` is a normal
 /// answer (the upstream lacks that package), and so is anything else.
+/// An upstream answer that was not a success, as [`MirrorClient::check_status`]
+/// reports it. A type of its own so [`permanent_download_failure`] can tell
+/// an absent package from an upstream having a bad moment.
+#[derive(Debug, thiserror::Error)]
+#[error("upstream {what} {url} answered {status}{hint}")]
+struct UpstreamAnswer {
+    what: String,
+    url: String,
+    status: reqwest::StatusCode,
+    hint: String,
+}
+
+/// Whether a failed package download will fail the same way when asked
+/// again soon: the upstream refused this request (a `4xx` other than a
+/// timeout or a rate limit; `404` and `410` above all), or the package is
+/// over the size cap. A timeout, a reset connection, a `5xx` or a full disk
+/// is transient, and the upstream's own back-off already spaces out retries.
+fn permanent_download_failure(e: &Error) -> bool {
+    match e {
+        Error::PayloadTooLarge(_) => true,
+        Error::Other(e) => e
+            .downcast_ref::<UpstreamAnswer>()
+            .is_some_and(|s| s.status.is_client_error() && !matches!(s.status.as_u16(), 408 | 429)),
+        _ => false,
+    }
+}
+
 fn upstream_failed(status: reqwest::StatusCode) -> bool {
     status.is_server_error() || matches!(status.as_u16(), 401 | 403 | 407 | 429)
 }
@@ -1699,8 +1728,9 @@ impl MirrorTarget<'_> {
     }
 
     /// Download and index one version. Every failure but the download itself
-    /// is logged here; a version that failed is not asked for again for a
-    /// while, so a broken one cannot turn each read into a fresh download.
+    /// is logged here; a version that failed for good (see
+    /// [`permanent_download_failure`]) is not asked for again for a while, so
+    /// a broken one cannot turn each read into a fresh download.
     async fn fetch_one(&self, lower_id: &str, version: &NuGetVersion) -> Fetched {
         let (feed, options) = (self.feed, self.options);
         let normalized = version.normalized().to_lowercase();
@@ -1715,7 +1745,11 @@ impl MirrorTarget<'_> {
             Ok(summary) => summary,
             Err(e) => {
                 let _ = tokio::fs::remove_file(&temp_path).await;
-                self.remember_bad(lower_id, version);
+                // Only a failure that would repeat blocks the version for a
+                // while; a transient one may be retried on the next read.
+                if permanent_download_failure(&e) {
+                    self.remember_bad(lower_id, version);
+                }
                 self.client
                     .health
                     .mirror_failures
