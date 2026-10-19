@@ -93,7 +93,7 @@ RUN touch src/main.rs src/lib.rs build.rs \
     && cp "target/$(cat /rust-target)/release/yanuget" /yanuget
 
 # Runtime stage
-FROM debian:trixie-slim@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a AS runtime
+FROM debian:trixie-slim@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f AS runtime
 
 LABEL org.opencontainers.image.title="YANuget" \
       org.opencontainers.image.description="Yet Another NuGet server — a fast, streaming NuGet v3 server in Rust" \
