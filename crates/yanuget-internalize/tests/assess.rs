@@ -92,6 +92,7 @@ async fn a_capture_becomes_reports_and_files() {
             sources: Vec::new(),
             timeout: std::time::Duration::from_secs(60),
             max_capture_bytes: 1 << 20,
+            package_parameters: None,
         })
         .await;
 

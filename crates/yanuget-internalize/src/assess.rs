@@ -31,9 +31,13 @@ const SUCCESS_CODES: [i32; 3] = [0, 1641, 3010];
 pub struct Wanted {
     pub url: Url,
     pub checksum: Option<Checksum>,
-    pub helper: Helper,
+    /// The helper that asked; `None` for a download an override adds.
+    pub helper: Option<Helper>,
     /// The captured `fileType`.
     pub file_type: Option<String>,
+    /// Where to fetch it instead, by an override's rewrite. The package keeps
+    /// asking for `url`.
+    pub fetch_from: Option<Url>,
 }
 
 /// A downloaded file and the name it is attached under.
@@ -149,8 +153,9 @@ fn add_call(draft: &mut Draft, wanted: &mut Vec<Wanted>, call: Call) {
         let w = Wanted {
             url,
             checksum,
-            helper,
+            helper: Some(helper),
             file_type: file_type.clone(),
+            fetch_from: None,
         };
         // `url64` is often `url` again; one download serves both.
         if !wanted
@@ -182,7 +187,8 @@ pub async fn fetch(
         .collect();
     let results: Vec<_> = futures_util::stream::iter(jobs)
         .map(|(i, w)| async move {
-            let got = downloader.fetch(&w.url, w.checksum.as_ref()).await;
+            let from = w.fetch_from.as_ref().unwrap_or(&w.url);
+            let got = downloader.fetch(from, w.checksum.as_ref()).await;
             (i, w, got)
         })
         .buffered(concurrency.max(1))
@@ -233,7 +239,7 @@ pub async fn fetch(
         };
         draft.download(Download {
             url: w.url.to_string(),
-            helper: Some(w.helper.as_str().to_string()),
+            helper: Some(w.helper.map_or("override", Helper::as_str).to_string()),
             file: name,
             size: Some(file.size),
             sha256: Some(file.sha256),

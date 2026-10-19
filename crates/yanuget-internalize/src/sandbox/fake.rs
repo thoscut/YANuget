@@ -97,6 +97,7 @@ mod tests {
             sources: vec![],
             timeout: Duration::from_secs(1),
             max_capture_bytes: cap,
+            package_parameters: None,
         }
     }
 

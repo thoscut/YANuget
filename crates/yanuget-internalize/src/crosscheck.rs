@@ -355,8 +355,9 @@ $bare = 'https://'
         let wanted = [Wanted {
             url: url("https://example.com/2.0/tool.msi"),
             checksum: None,
-            helper: Helper::InstallChocolateyPackage,
+            helper: Some(Helper::InstallChocolateyPackage),
             file_type: None,
+            fetch_from: None,
         }];
         warn(&mut draft, &scan, &wanted);
         let report = draft.finish("t");

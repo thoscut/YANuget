@@ -105,6 +105,17 @@ pub fn check_loaded(config: &Config, host: &Host, report: &mut Report) {
             ));
         }
     }
+    if let Some(dir) = &config.overrides_dir {
+        match crate::overrides::Overrides::load(dir) {
+            Ok(o) => report.notes.push(format!(
+                "{} override{} in {}",
+                o.len(),
+                if o.len() == 1 { "" } else { "s" },
+                dir.display()
+            )),
+            Err(e) => report.errors.push(format!("overrides: {e}")),
+        }
+    }
     if config.cache_dir == config.work_dir {
         report.warnings.push(
             "cache_dir and work_dir are the same directory; a run clears its work \
@@ -555,5 +566,22 @@ mod tests {
         check_env_names(&host, &mut r);
         assert_eq!(r.warnings.len(), 1, "{:?}", r.warnings);
         assert!(has(&r.warnings, "TARGET_APIKEY"));
+    }
+
+    #[test]
+    fn overrides_are_loaded_by_the_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut config, host) = good(dir.path());
+        let overrides = dir.path().join("overrides");
+        std::fs::create_dir(&overrides).unwrap();
+        std::fs::write(overrides.join("vlc.toml"), "skip = \"desktop team\"").unwrap();
+        config.overrides_dir = Some(overrides.clone());
+        let r = checked(&config, &host);
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert!(has(&r.notes, "1 override in"), "{:?}", r.notes);
+
+        std::fs::write(overrides.join("git.toml"), "skipp = 1").unwrap();
+        let r = checked(&config, &host);
+        assert!(has(&r.errors, "overrides: git.toml"), "{:?}", r.errors);
     }
 }

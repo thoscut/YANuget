@@ -37,6 +37,7 @@ impl Draft {
                 environment: None,
                 downloads: Vec::new(),
                 warnings: Vec::new(),
+                overrides: Vec::new(),
                 prelude: None,
                 generated_at: None,
             },
@@ -76,6 +77,11 @@ impl Draft {
 
     pub fn warn(&mut self, warning: impl Into<String>) {
         push_once(&mut self.report.warnings, warning.into());
+    }
+
+    /// An override that was used, as the report lists it.
+    pub fn overridden(&mut self, what: impl Into<String>) {
+        push_once(&mut self.report.overrides, what.into());
     }
 
     /// A captured download, in the order the scripts asked for it.
@@ -207,6 +213,9 @@ pub fn text(report: &Report) -> String {
         ));
         let _ = writeln!(out, "    {}", parts.join(", "));
     }
+    for o in &r.overrides {
+        let _ = writeln!(out, "  override: {o}");
+    }
     if let Some(prelude) = &r.prelude {
         let _ = writeln!(out, "  prelude: {prelude}");
     }
@@ -334,6 +343,7 @@ mod tests {
             ..download(None)
         });
         d.needs_override("setup.bin: the feed takes no .bin files");
+        d.overridden("package parameters \"/Quiet\"");
         d.warn("something to know");
         let text = text(&d.finish("2026-10-19T12:00:00Z"));
         let expected = "\
@@ -345,6 +355,7 @@ git.install 2.51.0: needs-override
     Git-2.51.0-64-bit.exe, 60.2 MiB, sha256 abababababab…, checksum verified (sha256)
   Install-ChocolateyPackage https://github.com/git-for-windows/git/releases/download/v2.51.0.windows.1/Git-2.51.0-64-bit.exe
     not attached, checksum trust-on-first-use
+  override: package parameters \"/Quiet\"
   warning: something to know
 ";
         assert_eq!(text, expected);

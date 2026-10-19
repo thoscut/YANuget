@@ -32,6 +32,9 @@ pub struct CaptureJob {
     pub timeout: Duration,
     /// The most the capture may hold; more is [`SandboxError::CaptureTooLarge`].
     pub max_capture_bytes: u64,
+    /// Passed as `--params` to the root's install: from an override
+    /// (`INT-25`), one line, never a shell word of its own.
+    pub package_parameters: Option<String>,
 }
 
 /// What came back from a capture, as the sandbox found it.
@@ -98,5 +101,6 @@ pub fn job(config: &SandboxConfig, package: PackageRef, sources: Vec<PathBuf>) -
         sources,
         timeout: Duration::from_secs(config.timeout_secs),
         max_capture_bytes: config.max_capture_bytes,
+        package_parameters: None,
     }
 }

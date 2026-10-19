@@ -10,8 +10,8 @@ at them. The plan is the "Chocolatey internalizer" section of
 **Not released, and not usable yet.** The command line, the configuration and
 its check (`INT-10`), the upstream client (`INT-11`), the dependency closure
 (`INT-12`), the capture parser (`INT-16`), the downloader (`INT-17`), file
-naming (`INT-18`), publishing (`INT-20`), the report (`INT-21`) and the
-static cross-check (`INT-23`) exist; the sandbox runners and the prelude
+naming (`INT-18`), publishing (`INT-20`), the report (`INT-21`), the
+static cross-check (`INT-23`) and overrides (`INT-25`) exist; the sandbox runners and the prelude
 follow, and `run` is wired up with them.
 `plan` shows the closure of the packages it is given and then stops with an
 error; `run` stops before it fetches anything.
@@ -192,6 +192,37 @@ An attach that breaks off or meets a server error is tried again. A file the
 feed refuses (its type, a different file under the name) fails the package.
 Each request may take `target.timeout_secs`, plus a second for every MiB of
 its file.
+
+## Overrides
+
+What the capture cannot find out, a person writes down: one TOML file per
+package id in `overrides_dir`, named for the id (`git.install.toml`).
+Unknown keys are refused, and one file that does not check out stops the
+run, so no override is silently left out. `config check` loads them.
+
+```toml
+versions = "[2.51,)"                       # the versions it applies to; all without
+package_parameters = "/NoShellIntegration" # --params for the install, as the root
+script = "git.install.ps1"                 # replaces chocolateyInstall.ps1
+
+[[download]]                               # a download the capture misses
+url = "https://example.com/extra.cab"
+sha256 = "…"                               # verifies it; without, trust-on-first-use
+file_type = "cab"
+
+[[rewrite]]                                # fetch a captured URL from elsewhere
+from = "https://example.com/gone/setup.exe"
+to = "https://mirror.example.com/setup.exe"
+```
+
+Or, alone in the file, `skip = "why"`: the package is left out of runs, and
+`plan` says so. The script is a path inside `overrides_dir`; it goes into the
+package before the capture, under the name the package's own has, so the
+capture runs it and the feed gets it. A rewritten URL is still the one the
+package asks for, and the prelude maps it to the attached file. Every
+override used is listed in the report under `overrides`; a rewrite that
+matches no captured URL, or a download the capture saw anyway, is a warning,
+so stale overrides surface.
 
 ## Sandboxes
 
