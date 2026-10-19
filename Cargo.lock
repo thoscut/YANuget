@@ -3653,6 +3653,7 @@ dependencies = [
  "async-trait",
  "axum",
  "base64 0.23.1",
+ "chrono",
  "clap",
  "flate2",
  "futures-util",
@@ -3670,6 +3671,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "yanuget",
  "yanuget-pkg",
  "zip",
 ]

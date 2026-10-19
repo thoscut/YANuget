@@ -24,15 +24,14 @@ list is the index.
 - `INT-31` Attached files on read-gated feeds: the premise holds (Chocolatey's
   helpers never send source credentials); a security review of the token
   design comes next, before it is built. 0.8.0 shipped without it.
-- `INT-21` Report: fix schema version 1 for the tool. 0.8.0 already reads
-  version 1 as it stands, so fixing it may add fields but not change the
-  ones 0.8.0 reads.
 
 **Internalizer 0.1.0**
 
-- `INT-13` to `INT-20` and `INT-22`: golden images, capture helpers, the KVM
-  runner, capture validation, downloader, file names, prelude, publish, and the
-  regression corpus. `INT-13` waits on the licensing question below.
+- `INT-13` to `INT-15`, `INT-19` and `INT-22`: golden images, capture
+  helpers, the KVM runner, the prelude, and the regression corpus. `INT-13`
+  waits on the licensing question below. Capture validation, downloader, file
+  names, publish and the report (`INT-16` to `INT-18`, `INT-20`, `INT-21`)
+  have landed.
 
 **Dependencies and toolchain**
 
@@ -1272,7 +1271,7 @@ packages whose downloads go through Chocolatey's helpers.
   ever emitted as PowerShell; the report carries the originals. The server's
   base URL sits in one variable at the top, overridable by an environment
   variable for a host move.
-- [ ] **`INT-20` Publish.** Rewrite the package (`INT-02`) with the new
+- [x] **`INT-20` Publish.** Rewrite the package (`INT-02`) with the new
   `chocolateyInstall.ps1` and the report, push it to the intake feed, attach
   the files, and check that the feed withholds the version; warn when it is
   served at once. Attach is idempotent (same content, `200`), so a re-run
@@ -1281,7 +1280,21 @@ packages whose downloads go through Chocolatey's helpers.
   and nothing more. `--replace-pending` needs YANuget 0.8.0: when
   `/health/status` is reachable the tool checks the server version up front,
   otherwise its error for a refused replace names the version it needs.
-- [ ] **`INT-21` Report.** Per package: `internalized`, `unchanged` (no
+  *Landed:* `yanuget_internalize::publish`. The package is rewritten with
+  `internalizer/report.json` and the entries `INT-19` will supply, pushed to
+  `api/v2/package`, and its files attached with `x-checksum-sha256`. Whether
+  the feed serves the version comes from its flat container, which lists
+  approved versions only. After a `409` the files are attached only while the
+  version is withheld: an attach is not reviewed, so a version the feed
+  serves, or one a read-gated feed cannot tell about, gets nothing. On a
+  `pending-only` feed every push replaces a pending version, flag or not; the
+  push key cannot see it to ask first. An attach is tried three times; a
+  request may take `target.timeout_secs` plus a second per MiB. The feed's
+  file types are `target.allowed_extensions`. Tested against the server
+  itself: held back until approved, report inside, a re-run completing a
+  pending version, a refused type and a changed file failing. `run` calls it
+  once a sandbox backend captures.
+- [x] **`INT-21` Report.** Per package: `internalized`, `unchanged` (no
   downloads: embedded or meta packages), `needs-override` (network use outside
   the helpers, a script that failed, an unmapped call, a download from inside
   an extension module) or `failed`, each with reasons. It lists the upstream
@@ -1293,6 +1306,16 @@ packages whose downloads go through Chocolatey's helpers.
   versioned and defined in `yanuget-pkg` (`INT-01`); YANuget 0.8.0 reads
   version 1, so fixing it may add fields but not change the ones 0.8.0 reads,
   and a reader ignores fields it does not know.
+  *Landed:* `yanuget_internalize::report` and `::assess`, schema version 1
+  unchanged. A failure outranks an override, and every reason is listed,
+  failures first. A failed sandbox fails every package of the capture; an
+  install that failed (exit codes other than 0, 1641 and 3010), ran out of
+  time or left a rejected capture marks every package of it
+  `needs-override`; a helper called from an extension's module or from
+  outside the package's scripts, or a file of a type the feed does not take,
+  marks its own package. `url64` that repeats `url` is one download. Text for
+  people, and `{"outcome", "packages"}` as JSON. Network use outside the
+  helpers needs the sandbox's own record (`INT-15`).
 - [ ] **`INT-22` Regression corpus and CI.** A pinned list of the most
   installed community packages (id, version, upstream hash), cached rather than
   committed, run through `plan` whenever the capture helpers or the prelude

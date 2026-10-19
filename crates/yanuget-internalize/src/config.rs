@@ -71,8 +71,12 @@ pub struct TargetConfig {
     pub url: Option<String>,
     /// A push key of that feed, and nothing more.
     pub api_key: Option<Secret>,
-    /// How long one request to the feed may take, a push included.
+    /// How long one request to the feed may take, a push included. An attach
+    /// gets a second more for every MiB of its file.
     pub timeout_secs: u64,
+    /// The file types the feed takes as attached files: its
+    /// `allowed_extensions`, which a download must fit to be attached.
+    pub allowed_extensions: Vec<String>,
 }
 
 impl Default for TargetConfig {
@@ -81,6 +85,9 @@ impl Default for TargetConfig {
             url: None,
             api_key: None,
             timeout_secs: 300,
+            allowed_extensions: ["exe", "msi", "msix", "msu", "zip", "7z", "cab"]
+                .map(String::from)
+                .to_vec(),
         }
     }
 }
@@ -293,6 +300,7 @@ pub const KNOWN_ENV: &[&str] = &[
     "YANUGET_INTERNALIZE_TARGET_API_KEY",
     "YANUGET_INTERNALIZE_TARGET_API_KEY_FILE",
     "YANUGET_INTERNALIZE_TARGET_TIMEOUT_SECS",
+    "YANUGET_INTERNALIZE_TARGET_ALLOWED_EXTENSIONS",
     "YANUGET_INTERNALIZE_UPSTREAM_URL",
     "YANUGET_INTERNALIZE_UPSTREAM_CONCURRENCY",
     "YANUGET_INTERNALIZE_UPSTREAM_TIMEOUT_SECS",
@@ -386,6 +394,9 @@ impl Config {
         if let Some(v) = get("YANUGET_INTERNALIZE_TARGET_TIMEOUT_SECS")? {
             self.target.timeout_secs = parse_int("YANUGET_INTERNALIZE_TARGET_TIMEOUT_SECS", &v)?;
         }
+        if let Some(v) = get("YANUGET_INTERNALIZE_TARGET_ALLOWED_EXTENSIONS")? {
+            self.target.allowed_extensions = list(&v);
+        }
 
         if let Some(v) = get("YANUGET_INTERNALIZE_UPSTREAM_URL")? {
             self.upstream.url = v.trim().to_string();
@@ -432,13 +443,7 @@ impl Config {
             d.resume_attempts = parse_int("YANUGET_INTERNALIZE_DOWNLOADS_RESUME_ATTEMPTS", &v)?;
         }
         if let Some(v) = get("YANUGET_INTERNALIZE_DOWNLOADS_ALLOW_PRIVATE_HOSTS")? {
-            // Comma-separated, as the server's list settings are.
-            d.allow_private_hosts = v
-                .split(',')
-                .map(str::trim)
-                .filter(|h| !h.is_empty())
-                .map(str::to_string)
-                .collect();
+            d.allow_private_hosts = list(&v);
         }
         if let Some(v) = get("YANUGET_INTERNALIZE_DOWNLOADS_PROXY")? {
             d.proxy = opt_str(v);
@@ -496,6 +501,23 @@ impl Config {
                     .filter(|u| matches!(u.scheme(), "http" | "https"))
                     .ok_or_else(|| ConfigError(format!("{name} is not a proxy URL")))?;
             }
+        }
+        if self.target.allowed_extensions.is_empty() {
+            return Err(ConfigError(
+                "target.allowed_extensions is empty; the feed takes no attached files then".into(),
+            ));
+        }
+        for ext in &mut self.target.allowed_extensions {
+            let bare = ext.trim().trim_start_matches('.');
+            if bare.is_empty()
+                || bare.len() > 16
+                || !bare.bytes().all(|b| b.is_ascii_alphanumeric())
+            {
+                return Err(ConfigError(format!(
+                    "target.allowed_extensions: {ext:?} is not a file extension"
+                )));
+            }
+            *ext = bare.to_ascii_lowercase();
         }
         for host in &self.downloads.allow_private_hosts {
             let valid = !host.is_empty()
@@ -576,6 +598,15 @@ impl Config {
         }
         Ok(())
     }
+}
+
+/// A comma-separated list, as the server's list settings are.
+fn list(v: &str) -> Vec<String> {
+    v.split(',')
+        .map(str::trim)
+        .filter(|h| !h.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 /// An `http` or `https` URL with a host and no credentials, query or
@@ -864,6 +895,28 @@ mod tests {
             ),
         ] {
             assert!(load(Some(toml), vars).is_err(), "{toml} {vars:?}");
+        }
+    }
+
+    #[test]
+    fn allowed_extensions_are_bare_and_lower_case() {
+        let c = load(None, &[]).unwrap();
+        assert!(c.target.allowed_extensions.contains(&"msi".to_string()));
+        let c = load(
+            Some("[target]\nallowed_extensions = [\".EXE\", \"msi\"]\n"),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(c.target.allowed_extensions, ["exe", "msi"]);
+        let c = load(
+            None,
+            &[("YANUGET_INTERNALIZE_TARGET_ALLOWED_EXTENSIONS", "exe, Zip")],
+        )
+        .unwrap();
+        assert_eq!(c.target.allowed_extensions, ["exe", "zip"]);
+        for bad in ["[]", "[\"\"]", "[\"tar.gz\"]", "[\"e x e\"]"] {
+            let toml = format!("[target]\nallowed_extensions = {bad}\n");
+            assert!(load(Some(&toml), &[]).is_err(), "{bad}");
         }
     }
 

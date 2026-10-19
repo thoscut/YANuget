@@ -21,7 +21,12 @@ work_dir = "./work"
 # A push key of that feed, and nothing more. Better from the environment or
 # a key file than from here.
 # api_key = ""
+# One request to the feed; an attach gets a second more for every MiB.
 timeout_secs = 300
+# The file types the feed takes as attached files: the same list as the
+# feed's own allowed_extensions. A download of any other type is reported, and
+# the package needs an override.
+allowed_extensions = ["exe", "msi", "msix", "msu", "zip", "7z", "cab"]
 
 [upstream]
 # A v2 feed, or a v3 service index (a URL ending in .json).

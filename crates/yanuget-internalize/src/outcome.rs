@@ -28,6 +28,15 @@ impl Outcome {
         }
     }
 
+    /// The outcome as the JSON report names it.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Outcome::Done => "done",
+            Outcome::NeedsAttention => "needs-attention",
+            Outcome::Failed => "failed",
+        }
+    }
+
     /// What one package's status means for the run. A status this version
     /// does not know is a failure: nothing it cannot read is called done.
     pub fn of(status: Status) -> Self {

@@ -21,6 +21,7 @@ anyhow = "1"
 async-trait = "0.1"
 clap = { version = "4", features = ["derive", "env"] }
 base64 = "0.23"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 flate2 = "1"
 futures-util = "0.3"
 hex = "0.4"
@@ -39,6 +40,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 axum = "0.8"
+# The server, to publish to in the tests.
+yanuget = { path = "../.." }
 zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
 tempfile = "3"
 tokio = { version = "1", features = ["net", "io-util"] }
