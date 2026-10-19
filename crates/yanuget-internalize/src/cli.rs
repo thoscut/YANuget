@@ -7,8 +7,11 @@ use anyhow::{bail, Context};
 use clap::{Args, Parser, Subcommand};
 use yanuget_pkg::NuGetVersion;
 
+use crate::closure::{self, Closure};
 use crate::config::{Config, CONFIG_ENV};
 use crate::outcome::Outcome;
+use crate::target::Target;
+use crate::upstream::Upstream;
 
 /// Internalize Chocolatey packages into a YANuget feed: capture what their
 /// scripts download in an offline sandbox, attach the files, and push a copy
@@ -159,6 +162,19 @@ pub async fn run(cli: Cli) -> anyhow::Result<Outcome> {
         Command::Plan(args) => {
             let config = Config::load(config_path).context("cannot load the configuration")?;
             prepare(&config, &args.packages)?;
+            let upstream = Upstream::new(&config.upstream, &config.cache_dir)?;
+            let target = Target::new(&config.target)?;
+            // Metadata only: nothing is downloaded before the plan is shown.
+            for spec in &args.packages {
+                let root = upstream
+                    .resolve(&spec.id, spec.version.as_ref())
+                    .await
+                    .with_context(|| format!("cannot resolve {spec}"))?;
+                let closure = closure::resolve(&upstream, &root)
+                    .await
+                    .with_context(|| format!("cannot resolve the dependencies of {spec}"))?;
+                print_closure(&closure, target.as_ref()).await?;
+            }
             not_built_yet()
         }
         Command::Run(args) => {
@@ -187,8 +203,51 @@ fn prepare(config: &Config, packages: &[PackageSpec]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// One root and its dependencies, one package a line, each marked when the
+/// target feed serves it already.
+async fn print_closure(closure: &Closure, target: Option<&Target>) -> anyhow::Result<()> {
+    let mut held = 0;
+    let mut unknown = false;
+    for (i, p) in closure.packages.iter().enumerate() {
+        let holds = match target {
+            Some(target) => match target.versions(&p.info.id).await? {
+                Some(versions) => versions.contains(&p.info.version),
+                None => {
+                    unknown = true;
+                    false
+                }
+            },
+            None => false,
+        };
+        held += usize::from(holds);
+        println!(
+            "{}{} {}{}",
+            if i == 0 { "" } else { "  " },
+            p.info.id,
+            p.info.version.normalized(),
+            if holds { " (the target holds it)" } else { "" }
+        );
+    }
+    for (dependent, range) in &closure.provided {
+        println!("  chocolatey {range}: left to the Chocolatey CLI (for {dependent})");
+    }
+    let total = closure.packages.len();
+    println!(
+        "{total} package{}, {} to internalize",
+        if total == 1 { "" } else { "s" },
+        total - held
+    );
+    if unknown {
+        tracing::warn!(
+            "the target feed is read-gated and the tool holds a push key only, \
+             so it cannot tell what the feed holds already"
+        );
+    }
+    Ok(())
+}
+
 fn not_built_yet() -> anyhow::Result<Outcome> {
-    bail!("nothing was done: fetching packages from the upstream is not built yet")
+    bail!("nothing was done: capturing in the sandbox is not built yet")
 }
 
 #[cfg(test)]

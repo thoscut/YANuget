@@ -1119,19 +1119,45 @@ packages whose downloads go through Chocolatey's helpers.
   and the qcow2 images, or a Windows host and a digest-pinned image. Both
   backends check their host and refuse every capture until their runners
   land, so `plan` and `run` stop before they fetch anything.
-- [ ] **`INT-11` Upstream client.** The Chocolatey Community Repository over v2
+- [x] **`INT-11` Upstream client.** The Chocolatey Community Repository over v2
   OData (`FindPackagesById()`, package download), any v3 feed through its
   service index, and the auth modes of `[feeds.mirror]`. Each download is
   verified against the feed's `PackageHash`. A local cache keyed by hash,
   backoff on `429`, and a low default concurrency: the community repository
   rate-limits heavy users. Like a mirror since 0.7.0, it logs once when an
   upstream stops answering and once when it answers again.
-- [ ] **`INT-12` Dependency closure.** Resolve dependencies with
+  *Landed:* `yanuget_internalize::upstream`. v2 pages through
+  `FindPackagesById()` (checked against the community repository's real
+  answers: paging, `PackageHash`, `Dependencies`); v3 reads the registration,
+  or the flat container without one. A download must match the feed's hash
+  and carry a manifest with the id and version asked for before it enters
+  the cache (`cache_dir/packages`, keyed by that hash and re-hashed on use).
+  Most v3 feeds state no hash: their packages are cached by identity and
+  marked unverified, for the report to say so. The mirror's address policy
+  and its hop-by-hop redirects apply, credentials go to the upstream's
+  origin only, `429`/`503` are retried after `Retry-After` or a doubling
+  backoff. `config check` probes the upstream too; `plan` resolves its
+  packages before it stops.
+- [x] **`INT-12` Dependency closure.** Resolve dependencies with
   `VersionRange` (`INT-01`), extension packages (`*.extension`) included, since
   scripts call their helpers. Pick the versions Chocolatey CLI v2 would install
   for the same command *(to verify against the client)*, and skip what the
   target already holds. `plan` shows the whole closure before anything is
   downloaded.
+  *Landed:* `yanuget_internalize::closure`. Chocolatey CLI v2's source
+  (`NugetService`, `NugetCommon`) runs NuGet's resolver with
+  `DependencyBehavior.Highest` and `AnyFramework`, and lets pre-release
+  dependencies in only for a pre-release root; the closure does the same,
+  with backtracking when ranges clash. As NuGet's `ResolverComparer` orders
+  candidates, an unlisted version is taken only when no listed one fits. A
+  dependency on `chocolatey` is left to
+  the CLI in the image. A v3 feed with only a flat container gives its
+  dependencies through the manifests. `plan` marks what the target serves
+  already, read from its flat container; a read-gated target cannot say, and
+  pending versions are not listed, so `INT-20` still takes a `409` as "already
+  internalized". Checked against the community repository: `git`,
+  `vscode`, `googlechrome`, `vlc` and `dotnet-8.0-desktopruntime` (eleven
+  packages through `vcredist140` and the `KB` updates) resolve.
 - [ ] **`INT-13` Golden images.** `contrib/internalizer/` builds, unattended
   and without network access, two qcow2 images from a Windows Server Core ISO
   (Windows PowerShell 5.1, which package scripts target). The *stock* image has

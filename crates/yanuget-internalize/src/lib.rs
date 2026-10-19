@@ -8,9 +8,12 @@
 
 pub mod check;
 pub mod cli;
+pub mod closure;
 pub mod config;
 pub mod outcome;
 pub mod sandbox;
+pub mod target;
+pub mod upstream;
 
 /// What the tool calls itself in HTTP requests.
 pub const USER_AGENT: &str = concat!("yanuget-internalize/", env!("CARGO_PKG_VERSION"));

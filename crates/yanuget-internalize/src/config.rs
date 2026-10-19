@@ -10,6 +10,7 @@
 //! A variable's name is its TOML path in capitals, joined by `_`:
 //! `[sandbox.kvm] capture_image` is `YANUGET_INTERNALIZE_SANDBOX_KVM_CAPTURE_IMAGE`.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::PathBuf;
 
@@ -86,11 +87,31 @@ impl Default for TargetConfig {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct UpstreamConfig {
-    /// A v2 feed (the community repository by default) or a v3 service index.
+    /// A v2 feed (the community repository by default) or a v3 service index
+    /// (a URL ending in `.json`).
     pub url: String,
     /// Requests to the upstream at a time. Low by default: the community
     /// repository rate-limits heavy users.
     pub concurrency: usize,
+    /// For connecting, for any silence while the upstream answers, and for a
+    /// whole metadata request.
+    pub timeout_secs: u64,
+    /// The largest package taken from the upstream.
+    pub max_package_bytes: u64,
+    /// Allow upstream URLs, redirects included, that lead to loopback,
+    /// private or link-local addresses. For an upstream on the internal
+    /// network; off, a feed cannot steer the tool at internal hosts.
+    pub allow_private: bool,
+    /// An outbound proxy (`http://proxy:3128`). Without one the tool connects
+    /// directly and ignores `HTTP(S)_PROXY`.
+    pub proxy: Option<String>,
+    /// HTTP Basic user name, sent with `password`.
+    pub username: Option<String>,
+    pub password: Option<Secret>,
+    /// Sent as `Authorization: Bearer …`.
+    pub token: Option<Secret>,
+    /// Extra request headers, an API key header for example.
+    pub headers: BTreeMap<String, Secret>,
 }
 
 impl Default for UpstreamConfig {
@@ -98,6 +119,14 @@ impl Default for UpstreamConfig {
         UpstreamConfig {
             url: COMMUNITY_REPOSITORY.to_string(),
             concurrency: 2,
+            timeout_secs: 60,
+            max_package_bytes: 2 * 1024 * 1024 * 1024,
+            allow_private: false,
+            proxy: None,
+            username: None,
+            password: None,
+            token: None,
+            headers: BTreeMap::new(),
         }
     }
 }
@@ -227,6 +256,15 @@ pub const KNOWN_ENV: &[&str] = &[
     "YANUGET_INTERNALIZE_TARGET_TIMEOUT_SECS",
     "YANUGET_INTERNALIZE_UPSTREAM_URL",
     "YANUGET_INTERNALIZE_UPSTREAM_CONCURRENCY",
+    "YANUGET_INTERNALIZE_UPSTREAM_TIMEOUT_SECS",
+    "YANUGET_INTERNALIZE_UPSTREAM_MAX_PACKAGE_BYTES",
+    "YANUGET_INTERNALIZE_UPSTREAM_ALLOW_PRIVATE",
+    "YANUGET_INTERNALIZE_UPSTREAM_PROXY",
+    "YANUGET_INTERNALIZE_UPSTREAM_USERNAME",
+    "YANUGET_INTERNALIZE_UPSTREAM_PASSWORD",
+    "YANUGET_INTERNALIZE_UPSTREAM_PASSWORD_FILE",
+    "YANUGET_INTERNALIZE_UPSTREAM_TOKEN",
+    "YANUGET_INTERNALIZE_UPSTREAM_TOKEN_FILE",
     "YANUGET_INTERNALIZE_SANDBOX_BACKEND",
     "YANUGET_INTERNALIZE_SANDBOX_TIMEOUT_SECS",
     "YANUGET_INTERNALIZE_SANDBOX_MAX_PARALLEL",
@@ -310,6 +348,30 @@ impl Config {
         if let Some(v) = get("YANUGET_INTERNALIZE_UPSTREAM_CONCURRENCY")? {
             self.upstream.concurrency = parse_int("YANUGET_INTERNALIZE_UPSTREAM_CONCURRENCY", &v)?;
         }
+        if let Some(v) = get("YANUGET_INTERNALIZE_UPSTREAM_TIMEOUT_SECS")? {
+            self.upstream.timeout_secs =
+                parse_int("YANUGET_INTERNALIZE_UPSTREAM_TIMEOUT_SECS", &v)?;
+        }
+        if let Some(v) = get("YANUGET_INTERNALIZE_UPSTREAM_MAX_PACKAGE_BYTES")? {
+            self.upstream.max_package_bytes =
+                parse_int("YANUGET_INTERNALIZE_UPSTREAM_MAX_PACKAGE_BYTES", &v)?;
+        }
+        if let Some(v) = get("YANUGET_INTERNALIZE_UPSTREAM_ALLOW_PRIVATE")? {
+            self.upstream.allow_private =
+                parse_bool("YANUGET_INTERNALIZE_UPSTREAM_ALLOW_PRIVATE", &v)?;
+        }
+        if let Some(v) = get("YANUGET_INTERNALIZE_UPSTREAM_PROXY")? {
+            self.upstream.proxy = opt_str(v);
+        }
+        if let Some(v) = get("YANUGET_INTERNALIZE_UPSTREAM_USERNAME")? {
+            self.upstream.username = opt_str(v);
+        }
+        if let Some(v) = secret_var("YANUGET_INTERNALIZE_UPSTREAM_PASSWORD", &get)? {
+            self.upstream.password = opt_str(v).map(Secret);
+        }
+        if let Some(v) = secret_var("YANUGET_INTERNALIZE_UPSTREAM_TOKEN", &get)? {
+            self.upstream.token = opt_str(v).map(Secret);
+        }
 
         let s = &mut self.sandbox;
         if let Some(v) = get("YANUGET_INTERNALIZE_SANDBOX_BACKEND")? {
@@ -353,6 +415,44 @@ impl Config {
             self.target.url = Some(normalize_url("target.url", url)?);
         }
         self.upstream.url = normalize_url("upstream.url", &self.upstream.url)?;
+        if let Some(proxy) = &self.upstream.proxy {
+            reqwest::Url::parse(proxy)
+                .ok()
+                .filter(|u| matches!(u.scheme(), "http" | "https"))
+                .ok_or_else(|| ConfigError("upstream.proxy is not a proxy URL".into()))?;
+        }
+        let u = &self.upstream;
+        match (&u.username, &u.password, &u.token) {
+            (Some(_), None, _) => {
+                return Err(ConfigError(
+                    "upstream.username needs upstream.password".into(),
+                ))
+            }
+            (None, Some(_), _) => {
+                return Err(ConfigError(
+                    "upstream.password needs upstream.username".into(),
+                ))
+            }
+            (Some(_), Some(_), Some(_)) => {
+                return Err(ConfigError(
+                    "upstream sets both username (HTTP Basic) and token (Bearer); \
+                     both need the Authorization header, so set only one"
+                        .into(),
+                ))
+            }
+            _ => {}
+        }
+        for name in u.headers.keys() {
+            let valid = reqwest::header::HeaderName::from_bytes(name.as_bytes()).is_ok();
+            if !valid
+                || name.eq_ignore_ascii_case("authorization")
+                    && (u.username.is_some() || u.token.is_some())
+            {
+                return Err(ConfigError(format!(
+                    "upstream.headers: {name:?} is not a header name, or repeats the Authorization header"
+                )));
+            }
+        }
         if self
             .target
             .api_key
@@ -366,6 +466,11 @@ impl Config {
         for (name, value) in [
             ("target.timeout_secs", self.target.timeout_secs),
             ("upstream.concurrency", self.upstream.concurrency as u64),
+            ("upstream.timeout_secs", self.upstream.timeout_secs),
+            (
+                "upstream.max_package_bytes",
+                self.upstream.max_package_bytes,
+            ),
             ("sandbox.timeout_secs", self.sandbox.timeout_secs),
             ("sandbox.max_parallel", self.sandbox.max_parallel as u64),
             ("sandbox.max_capture_bytes", self.sandbox.max_capture_bytes),
@@ -384,7 +489,8 @@ impl Config {
 }
 
 /// An `http` or `https` URL with a host and no credentials, query or
-/// fragment, ending in `/` so relative paths join under it.
+/// fragment, ending in `/` so relative paths join under it, unless it names
+/// a document (a v3 service index ending in `.json`).
 fn normalize_url(name: &str, raw: &str) -> Result<String> {
     let url = reqwest::Url::parse(raw.trim())
         .map_err(|e| ConfigError(format!("{name} {raw:?} is not a URL: {e}")))?;
@@ -407,10 +513,23 @@ fn normalize_url(name: &str, raw: &str) -> Result<String> {
         )));
     }
     let mut s = url.to_string();
-    if !s.ends_with('/') {
+    if !s.ends_with('/') && !url.path().ends_with(".json") {
         s.push('/');
     }
     Ok(s)
+}
+
+/// The spellings a boolean variable accepts; anything else is refused rather
+/// than read as `false`.
+fn parse_bool(name: &str, v: &str) -> Result<bool> {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => Err(env_error(
+            name,
+            &format!("must be one of 1/true/yes/on or 0/false/no/off, not {v:?}"),
+        )),
+    }
 }
 
 fn env_error(name: &str, why: &str) -> ConfigError {
@@ -577,7 +696,16 @@ mod tests {
             )],
         )
         .unwrap();
-        assert_eq!(c.upstream.url, "https://feed.example/v3/index.json/");
+        assert_eq!(c.upstream.url, "https://feed.example/v3/index.json");
+        let c = load(
+            None,
+            &[(
+                "YANUGET_INTERNALIZE_UPSTREAM_URL",
+                "https://feed.example/api/v2",
+            )],
+        )
+        .unwrap();
+        assert_eq!(c.upstream.url, "https://feed.example/api/v2/");
         // A blank variable clears an optional value from the TOML.
         let c = load(
             Some("[target]\nurl = \"https://a.example/\"\n"),
@@ -614,6 +742,42 @@ mod tests {
     }
 
     #[test]
+    fn upstream_credentials_have_to_fit_together() {
+        let c = load(
+            Some("[upstream]\nusername = \"me\"\n[upstream.headers]\nX-Api-Key = \"h\"\n"),
+            &[
+                ("YANUGET_INTERNALIZE_UPSTREAM_PASSWORD", "pw"),
+                ("YANUGET_INTERNALIZE_UPSTREAM_ALLOW_PRIVATE", "yes"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(c.upstream.password.unwrap().expose(), "pw");
+        assert!(c.upstream.allow_private);
+        assert_eq!(c.upstream.headers["X-Api-Key"].expose(), "h");
+
+        for (toml, vars) in [
+            ("[upstream]\nusername = \"me\"\n", &[][..]),
+            ("", &[("YANUGET_INTERNALIZE_UPSTREAM_PASSWORD", "pw")][..]),
+            (
+                "[upstream]\nusername = \"me\"\npassword = \"pw\"\ntoken = \"t\"\n",
+                &[][..],
+            ),
+            (
+                "[upstream]\ntoken = \"t\"\n[upstream.headers]\nAuthorization = \"x\"\n",
+                &[][..],
+            ),
+            ("[upstream.headers]\n\"bad header\" = \"x\"\n", &[][..]),
+            ("[upstream]\nproxy = \"not a url\"\n", &[][..]),
+            (
+                "",
+                &[("YANUGET_INTERNALIZE_UPSTREAM_ALLOW_PRIVATE", "maybe")][..],
+            ),
+        ] {
+            assert!(load(Some(toml), vars).is_err(), "{toml} {vars:?}");
+        }
+    }
+
+    #[test]
     fn a_secret_never_shows_in_debug_output() {
         let c = load(
             None,
@@ -639,7 +803,10 @@ mod tests {
             if piece.starts_with(ENV_PREFIX) {
                 assert!(KNOWN_ENV.contains(&piece), "{piece} is not in KNOWN_ENV");
                 read.insert(piece.to_string());
-                if piece.ends_with("_API_KEY") {
+                if ["_API_KEY", "_PASSWORD", "_TOKEN"]
+                    .iter()
+                    .any(|s| piece.ends_with(s))
+                {
                     read.insert(format!("{piece}_FILE"));
                 }
             }
