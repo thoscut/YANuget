@@ -22,8 +22,9 @@ hold the detail; this list is the index.
 
 **Server 0.8.0** ([Target releases](#target-releases))
 
-- `INT-31` Attached files on read-gated feeds: verify the premise, then a
-  security review before it is built. Blocks 0.8.0.
+- `INT-31` Attached files on read-gated feeds: the premise holds (Chocolatey's
+  helpers never send source credentials); a security review of the token
+  design comes next, before it is built. Blocks 0.8.0.
 - `INT-21` Report: fix schema version 1 for the tool. Blocks 0.8.0.
 
 **Internalizer 0.1.0**
