@@ -14,8 +14,9 @@ expected to change incompatibly at any version.
 
 ## [0.8.0] — 2026-10-19
 
-**Upgrading from 0.7.x needs attention.** Two changes can stop a deployment that
-ran under 0.7.0, and the database moves to a schema 0.7.0 cannot open:
+**Upgrading from 0.7.x needs attention.** One change can stop a deployment that
+ran under 0.7.0, one changes what a reverse proxy must send, and the database
+moves to a schema 0.7.0 cannot open:
 
 - **A blank key variable stops startup.** `YANUGET_API_KEY`,
   `YANUGET_API_KEYS`, `YANUGET_FEED_{NAME}_READ_API_KEY` and the other key
@@ -44,23 +45,35 @@ ran under 0.7.0, and the database moves to a schema 0.7.0 cannot open:
   behaves as before. (`INT-03`)
 - `allow_overwrite = "pending-only"` (also `YANUGET_ALLOW_OVERWRITE=pending-only`
   and per feed): a push may replace a version while it is pending in every feed
-  that holds it, and the old build's attached files are deleted with it. A
-  version approved in any feed stays immutable; the check runs in the same
-  transaction as the replacement, so an approval racing a push is never lost.
-  Downloads stay `immutable` under it. `yanuget config check` warns when a
-  feed sets it without `requires_approval`. (`INT-04`)
+  that holds it. A different build takes the old build's attached files with
+  it; pushing the same build again keeps them, so a re-run can finish what an
+  earlier one left. A version approved in any feed stays immutable; the check
+  runs in the same transaction as the replacement, so an approval racing a
+  push is never lost. The new build is held to the license policy of every
+  feed that holds the version: one that blocks it refuses the push, one that
+  warns flags the version there. Downloads stay `immutable` under it.
+  `yanuget config check` warns when a feed sets it without
+  `requires_approval`. (`INT-04`, `COR-26`)
 - A per-feed `preview_api_key` (also `YANUGET_FEED_{NAME}_PREVIEW_API_KEY`,
-  with `_FILE`) downloads pending versions and their attached files from the
-  flat container and the file URLs, and does nothing else: no search, push,
-  approve or admin. Its responses are private, never `immutable`, and not
-  counted as downloads. (`INT-32`)
+  with `_FILE`) downloads pending versions as well as approved ones (never
+  disabled ones), and their attached files, from the flat container and the
+  file URLs, and does nothing else: no search, push, approve or admin. Its
+  responses are private, never `immutable`, and not counted as downloads. The
+  feed's settings page says whether pending versions can be previewed, and
+  `yanuget config check` warns when the preview key repeats another key of the
+  feed or is short. (`INT-32`)
 - The admin page of a package shows the internalizer report
   (`internalizer/report.json`, schema version 1) of each pending version that
   carries one: upstream, downloads with their files and checksum status,
-  warnings and prelude, all escaped. A report listing files that are not
-  attached, or that differ, is flagged and its **Approve** asks for
-  confirmation. The schema lives in `yanuget-pkg` as `report::Report`.
-  (`INT-30`)
+  warnings, the overrides a person set for the package, and the prelude, all
+  escaped. A report listing files that are not attached, or that differ, is
+  flagged and its **Approve** asks for confirmation. **Approve** on the page
+  approves the build the page showed: when a push has replaced it since the
+  page was loaded, the approval answers `409` and asks for a reload. An
+  approval sent without the page's form field, from a script, approves what
+  is pending, as before. The schema lives in `yanuget-pkg` as
+  `report::Report`; its optional `overrides` field is new and does not change
+  the schema version. (`INT-30`, `INT-25`)
 - `yanuget-pkg` can rewrite a `.nupkg` (`rewrite::Rewrite`): replace, add or
   remove entries and the manifest while every other entry is copied raw,
   without recompressing, in memory that does not grow with the package. It
@@ -68,6 +81,10 @@ ran under 0.7.0, and the database moves to a schema 0.7.0 cannot open:
   properties anew from a replaced manifest, and drops `.signature.p7s`.
   Copies are checked against the source after writing, and entries of 4 GiB
   and more keep their sizes. (`INT-02`)
+- `yanuget-pkg` has the rule for the names of attached files (`files`:
+  `file_name_problem`, `extension_allowed`), so a tool names its files by the
+  definition the server enforces. The server accepts and refuses the same
+  names as before, with the same messages. (`INT-18`)
 
 ### Changed
 
@@ -80,7 +97,9 @@ ran under 0.7.0, and the database moves to a schema 0.7.0 cannot open:
   (`crates/yanuget-pkg/`): NuGet versions, the `.nuspec` parser, `.nupkg`
   reading and the upstream address policy, with no axum or sqlx dependency and
   an error type of its own. The server re-exports the modules under their old
-  paths and behaves as before. The crate adds `VersionRange`, NuGet's interval
+  paths and behaves as before. For code that uses `yanuget` as a library,
+  `validation::validate_file_name` takes the allowed extensions as
+  `&[String]`, and the `nupkg` functions return `yanuget_pkg::Error`. The crate adds `VersionRange`, NuGet's interval
   notation (parse, normalize, `contains`, best match), for tools that resolve
   dependencies. A release that publishes to crates.io publishes `yanuget-pkg`
   first; see RELEASING.md. (`INT-01`)
@@ -117,6 +136,8 @@ ran under 0.7.0, and the database moves to a schema 0.7.0 cannot open:
   but were all extracted, so a symbol package could pass the 512-PDB cap many
   times over and have each copy verified; a readme or icon lookup could also
   take a different one than the client. Directory entries are not compared.
+  A package with such names stored before the upgrade is still served, but
+  the admin page reports its internalizer report as unreadable.
 - `yanuget backup` refuses a destination inside a `storage_path` that lies
   outside the data directory, or one containing it; the copy used to recurse
   into itself. `yanuget restore` refuses a backup in such a place too.
@@ -126,7 +147,8 @@ ran under 0.7.0, and the database moves to a schema 0.7.0 cannot open:
 - `min_free_disk_bytes` is checked again every 64 MiB while an upload streams
   in, and on every resumable-upload `PATCH`. A chunked body without a
   `Content-Length` was only checked against the reserve itself, once, so it
-  could fill the volume.
+  could fill the volume. An upload that runs into the reserve is answered
+  with `507 Insufficient Storage`.
 - A version whose own number is SemVer 1.0.0 but which depends on a SemVer
   2.0.0 range (`[2.0.0-beta.1, )`, build metadata) is now SemVer 2.0.0, as on
   nuget.org: it is withheld from SemVer 1.0.0 clients, which cannot resolve the
