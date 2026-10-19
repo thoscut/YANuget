@@ -1116,9 +1116,6 @@ impl Backoff {
     }
 }
 
-/// Whether an upstream answer means the upstream is not usable: a server
-/// error, a refusal of the credentials, or a rate limit. A `404` is a normal
-/// answer (the upstream lacks that package), and so is anything else.
 /// An upstream answer that was not a success, as [`MirrorClient::check_status`]
 /// reports it. A type of its own so [`permanent_download_failure`] can tell
 /// an absent package from an upstream having a bad moment.
@@ -1146,6 +1143,9 @@ fn permanent_download_failure(e: &Error) -> bool {
     }
 }
 
+/// Whether an upstream answer means the upstream is not usable: a server
+/// error, a refusal of the credentials, or a rate limit. A `404` is a normal
+/// answer (the upstream lacks that package), and so is anything else.
 fn upstream_failed(status: reqwest::StatusCode) -> bool {
     status.is_server_error() || matches!(status.as_u16(), 401 | 403 | 407 | 429)
 }
