@@ -10,15 +10,8 @@ requests can reference them, and ticked off rather than deleted when they land.
 ## Open items
 
 Everything still open across this file and the project's working threads, as
-of 2026-10-19 (0.7.0 released). The entries further down hold the detail; this
+of 2026-10-19 (0.8.0 released). The entries further down hold the detail; this
 list is the index.
-
-**In review**
-
-- PR #58: `INT-11` (upstream client) and `INT-12` (dependency closure). Its
-  `zip` 9 commit is in `main` already (#59).
-- PR #63: the fixes from the [review of 2026-10-19](#review-of-2026-10-19);
-  what it leaves open is listed there.
 
 **From the review of 2026-10-19**
 
@@ -26,12 +19,14 @@ list is the index.
   Hardening: `SEC-28` to `SEC-30`. Performance and UI: `PERF-04` to
   `PERF-08`, `UI-01`.
 
-**Server 0.8.0** ([Target releases](#target-releases))
+**Server, after 0.8.0** ([Target releases](#target-releases))
 
 - `INT-31` Attached files on read-gated feeds: the premise holds (Chocolatey's
   helpers never send source credentials); a security review of the token
-  design comes next, before it is built. Blocks 0.8.0.
-- `INT-21` Report: fix schema version 1 for the tool. Blocks 0.8.0.
+  design comes next, before it is built. 0.8.0 shipped without it.
+- `INT-21` Report: fix schema version 1 for the tool. 0.8.0 already reads
+  version 1 as it stands, so fixing it may add fields but not change the
+  ones 0.8.0 reads.
 
 **Internalizer 0.1.0**
 
@@ -1261,8 +1256,9 @@ packages whose downloads go through Chocolatey's helpers.
   JSON for pipelines, as text for people, and inside the package as
   `internalizer/report.json`, covered by the package hash and carried along by
   promotion, copy, `yanuget migrate` and `yanuget backup`. The schema is
-  versioned and defined in `yanuget-pkg` (`INT-01`); version 1 is fixed with
-  YANuget 0.8.0, and a reader ignores fields it does not know.
+  versioned and defined in `yanuget-pkg` (`INT-01`); YANuget 0.8.0 reads
+  version 1, so fixing it may add fields but not change the ones 0.8.0 reads,
+  and a reader ignores fields it does not know.
 - [ ] **`INT-22` Regression corpus and CI.** A pinned list of the most
   installed community packages (id, version, upstream hash), cached rather than
   committed, run through `plan` whenever the capture helpers or the prelude
@@ -1392,8 +1388,9 @@ A proposal on top of 0.7.0, in the order the items depend on each other.
 
 | Release | Items | Notes |
 | --- | --- | --- |
-| YANuget 0.8.0 | `INT-01`–`INT-05`, `INT-30`–`INT-32` | Every server change the tool needs. Additive: upgrading from 0.7.x should need no change to the configuration or the database. Blocked by the security review of `INT-31` and by version 1 of the report schema (`INT-21`). |
-| internalizer 0.1.0 | `INT-10`–`INT-22` | KVM backend; needs YANuget 0.8.0. |
+| YANuget 0.8.0 | `INT-01`–`INT-05`, `INT-30`, `INT-32` | Released 2026-10-19, together with the fixes from the review of 2026-10-19, two of which need attention when upgrading (see CHANGELOG.md). |
+| YANuget, after 0.8.0 | `INT-31`, the server side of `INT-21` | The rest of what the tool needs. `INT-31` waits on the security review of its token design. |
+| internalizer 0.1.0 | `INT-10`–`INT-22` | KVM backend; needs YANuget 0.8.0, and the release with `INT-31` for read-gated feeds. |
 | internalizer 0.2.0 | `INT-23`–`INT-28` | Needs nothing beyond YANuget 0.8.0. |
 | internalizer 0.3.0 | `INT-29` | Optional. |
 | YANuget, later | `INT-33` | Only if the open question is answered for it; needs a schema migration. |
