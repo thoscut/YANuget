@@ -12,6 +12,7 @@ pub mod check;
 pub mod cli;
 pub mod closure;
 pub mod config;
+pub mod crosscheck;
 pub mod download;
 pub mod naming;
 pub mod outcome;

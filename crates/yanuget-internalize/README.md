@@ -10,8 +10,9 @@ at them. The plan is the "Chocolatey internalizer" section of
 **Not released, and not usable yet.** The command line, the configuration and
 its check (`INT-10`), the upstream client (`INT-11`), the dependency closure
 (`INT-12`), the capture parser (`INT-16`), the downloader (`INT-17`), file
-naming (`INT-18`), publishing (`INT-20`) and the report (`INT-21`) exist; the
-sandbox runners and the prelude follow, and `run` is wired up with them.
+naming (`INT-18`), publishing (`INT-20`), the report (`INT-21`) and the
+static cross-check (`INT-23`) exist; the sandbox runners and the prelude
+follow, and `run` is wired up with them.
 `plan` shows the closure of the packages it is given and then stops with an
 error; `run` stops before it fetches anything.
 
@@ -146,6 +147,16 @@ version the scripts ran with, the tool's version, each download with its
 helper, file name, size, SHA-256 and checksum status, and the warnings. One
 capture covers a whole closure, so what makes the capture untrustworthy marks
 every package in it; a single call marks only its own package.
+
+Capture runs the install script only, down the branches the sandbox takes.
+So every PowerShell file in the package (`*.ps1`, `*.psm1`, `*.psd1`,
+`chocolateyUninstall.ps1` and `chocolateyBeforeModify.ps1` included) is
+also scanned for `http` and `https` URLs outside comments, and each one the
+capture did not ask for becomes a warning: the internalized package would
+fail where it reaches for it. A URL built from variables
+(`https://example.com/$version/setup.exe`) counts as seen when a captured
+URL starts with its literal part. The scan cannot tell a download from a
+link to a project page, so it only warns, up to twenty URLs a package.
 
 A run prints the reports as text, or as one JSON document for pipelines:
 `{"outcome": "needs-attention", "packages": [...]}`, the outcome being what
