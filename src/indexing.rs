@@ -12,7 +12,7 @@ use chrono::Utc;
 use crate::config::{LicensePolicyConfig, OverwriteMode, ReservedPrefix};
 use crate::database::{Membership, PackageDatabase, PackageFile};
 use crate::error::{Error, Result};
-use crate::models::Package;
+use crate::models::{depends_on_semver2, Package};
 use crate::nuspec::{self, Nuspec};
 use crate::policy;
 use crate::storage::{AuxFile, PackageContent, PackageStorage};
@@ -625,7 +625,7 @@ fn build_package(
 ) -> Package {
     Package {
         id: n.id.clone(),
-        is_semver2: version.is_semver2(),
+        is_semver2: version.is_semver2() || depends_on_semver2(&n.dependency_groups),
         version,
         listed: true,
         enabled: true,
@@ -741,6 +741,29 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(readme, b"# Hello");
+        assert!(!pkg.is_semver2);
+    }
+
+    #[tokio::test]
+    async fn a_semver2_dependency_range_makes_the_version_semver2() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let storage = FilesystemStorage::new(store_dir.path()).await.unwrap();
+        let db = SqliteDatabase::in_memory().await.unwrap();
+        let nuspec = NUSPEC.replace(
+            "<tags>",
+            r#"<dependencies><dependency id="Dep" version="[2.0.0-beta.1, )" /></dependencies><tags>"#,
+        );
+        let (_d, temp) = make_package(&nuspec, true).await;
+        let summary = summary_for(&temp).await;
+        let result = index_package(&storage, &db, FEED, temp, summary, &IndexOptions::default())
+            .await
+            .unwrap();
+        let pkg = db
+            .find(FEED, "contoso.utils", &result.version)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(pkg.is_semver2, "1.2.3 depends on a SemVer 2.0.0 range");
     }
 
     #[tokio::test]

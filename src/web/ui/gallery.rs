@@ -486,11 +486,17 @@ fn first_run_panel(urls: &UrlBuilder) -> String {
     )
 }
 
+/// The largest page size the pager offers itself. The gallery takes no more
+/// than this, or the configured default when that is larger: each package on
+/// a page loads all of its versions, so an anonymous `?take=1000` was a
+/// thousand packages' worth of rows per request.
+pub const MAX_PAGE_SIZE: i64 = 100;
+
 /// The page sizes the pager offers: a fixed ladder, plus the configured default
 /// and the size in use, so the select always shows the real size. There is no
-/// "all": `take` is capped at 1000.
+/// "all": `take` is capped at [`MAX_PAGE_SIZE`] or the configured default.
 fn page_sizes(take: i64, default_take: i64) -> Vec<i64> {
-    let mut sizes = vec![20, 50, 100, take, default_take.max(1)];
+    let mut sizes = vec![20, 50, MAX_PAGE_SIZE, take, default_take.max(1)];
     sizes.sort_unstable();
     sizes.dedup();
     sizes

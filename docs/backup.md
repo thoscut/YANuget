@@ -13,7 +13,9 @@ sudo -u yanuget yanuget --config /etc/yanuget/yanuget.toml backup /srv/backup/ya
 ```
 
 The directory is created if needed, and must not be inside the data directory
-(a backup on the same disk goes with it). It ends up holding:
+(a backup on the same disk goes with it), nor inside the package store or
+contain it when `storage_path` points elsewhere (the copy would recurse into
+itself). It ends up holding:
 
 ```
 /srv/backup/yanuget/
@@ -156,7 +158,10 @@ current schema.
 
 By default the target must be empty. To replace existing data, pass `--force`:
 the database is replaced, and the package store is made to match the backup
-exactly, which **deletes files the backup does not have**.
+exactly, which **deletes files the backup does not have**. Every file is copied
+from the backup, even one that already has the same size and modification
+time, so a live file damaged in place is replaced too. A backup inside the
+package store, or one containing it, is refused.
 
 Run it as the service user, so the restored files belong to the server. If you
 restore as root, `chown -R yanuget:yanuget` the data directory afterwards.

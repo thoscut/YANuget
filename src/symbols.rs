@@ -199,6 +199,9 @@ struct Verified {
 /// assemblies, and how many PDBs were not Portable ones.
 fn verify(package: &Path, entries: &[(String, PathBuf)]) -> Result<(Vec<Verified>, usize)> {
     let mut archive = nupkg::open_archive(package)?;
+    // Built once: looking each assembly up by scanning the directory made the
+    // check quadratic in the entry count.
+    let indices = nupkg::entry_indices(&archive);
     let mut verified: BTreeMap<(String, String), Verified> = BTreeMap::new();
     let mut skipped = 0;
     for (name, path) in entries {
@@ -218,7 +221,7 @@ fn verify(package: &Path, entries: &[(String, PathBuf)]) -> Result<(Vec<Verified
         let stem = normalized.strip_suffix(".pdb").unwrap_or(&normalized);
         let Some(index) = [".dll", ".exe"]
             .iter()
-            .find_map(|ext| nupkg::entry_index(&archive, &format!("{stem}{ext}")))
+            .find_map(|ext| indices.get(&format!("{stem}{ext}")).copied())
         else {
             return Err(refuse(format!(
                 "the package has no {stem}.dll or {stem}.exe for it to belong to"

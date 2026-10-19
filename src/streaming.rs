@@ -4,6 +4,10 @@
 //! memory. A 25 GiB upload is written to disk chunk-by-chunk while its SHA-512
 //! hash is computed incrementally, so peak memory stays at a single buffer.
 
+use std::path::Path;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
 use base64::Engine;
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
@@ -144,6 +148,83 @@ where
     Ok((size, hex::encode(hasher.finalize())))
 }
 
+/// How many bytes [`DiskReserve`] lets through between two measurements.
+pub const RESERVE_CHECK_INTERVAL: u64 = 64 * 1024 * 1024;
+
+/// A writer that keeps measuring the free space of the volume holding `dir`
+/// while bytes go through it, and fails with
+/// [`std::io::ErrorKind::StorageFull`] once less than `reserve` is left.
+///
+/// The check before an upload only knows the size the client declared, and a
+/// chunked body declares none: without this, such an upload could fill the
+/// volume past the configured reserve. Free space is measured every
+/// [`RESERVE_CHECK_INTERVAL`] bytes, one `statvfs` each; a reserve of zero
+/// turns it off, and a volume that cannot be measured is let through, as by
+/// the check up front.
+pub struct DiskReserve<'a, W> {
+    inner: &'a mut W,
+    dir: &'a Path,
+    reserve: u64,
+    unchecked: u64,
+}
+
+impl<'a, W> DiskReserve<'a, W> {
+    pub fn new(inner: &'a mut W, dir: &'a Path, reserve: u64) -> Self {
+        Self {
+            inner,
+            dir,
+            reserve,
+            unchecked: 0,
+        }
+    }
+
+    fn check(&mut self) -> std::io::Result<()> {
+        if self.reserve == 0 || self.unchecked < RESERVE_CHECK_INTERVAL {
+            return Ok(());
+        }
+        self.unchecked = 0;
+        match fs4::available_space(self.dir) {
+            Ok(available) if available < self.reserve => Err(std::io::Error::new(
+                std::io::ErrorKind::StorageFull,
+                format!(
+                    "{available} bytes free on the storage volume, {} needed (the configured \
+                     reserve)",
+                    self.reserve
+                ),
+            )),
+            Ok(_) => Ok(()),
+            Err(e) => {
+                tracing::warn!(error = %e, "could not measure free disk space");
+                Ok(())
+            }
+        }
+    }
+}
+
+impl<W: AsyncWrite + Unpin> AsyncWrite for DiskReserve<'_, W> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        this.check()?;
+        let poll = Pin::new(&mut *this.inner).poll_write(cx, buf);
+        if let Poll::Ready(Ok(n)) = &poll {
+            this.unchecked += *n as u64;
+        }
+        poll
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut *self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut *self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
 /// The next item of `stream`, or a [`std::io::ErrorKind::TimedOut`] error when
 /// `idle` passes without one.
 pub(crate) async fn next_chunk<S>(
@@ -260,6 +341,29 @@ mod tests {
         .unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn an_unmeetable_reserve_stops_a_stream_part_way() {
+        let dir = tempfile::tempdir().unwrap();
+        let chunks = (0..3).map(|_| Ok(Bytes::from(vec![0u8; RESERVE_CHECK_INTERVAL as usize])));
+        let mut sink = tokio::io::sink();
+        let mut guarded = DiskReserve::new(&mut sink, dir.path(), u64::MAX);
+        let err = stream_to_writer(futures::stream::iter(chunks), &mut guarded)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::StorageFull);
+        // The first interval goes through unmeasured; the up-front check
+        // covers it.
+        assert_eq!(guarded.unchecked, 0);
+
+        // A reserve of zero never measures.
+        let chunks = (0..3).map(|_| Ok(Bytes::from(vec![0u8; RESERVE_CHECK_INTERVAL as usize])));
+        let mut off = DiskReserve::new(&mut sink, dir.path(), 0);
+        let summary = stream_to_writer(futures::stream::iter(chunks), &mut off)
+            .await
+            .unwrap();
+        assert_eq!(summary.size, 3 * RESERVE_CHECK_INTERVAL);
     }
 
     #[tokio::test]

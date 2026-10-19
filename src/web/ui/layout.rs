@@ -431,15 +431,19 @@ pub(super) fn layout_with_chrome(
 /// A styled error page for the gallery, so a browser never sees a bare JSON
 /// error body.
 ///
-/// The text is derived from the status alone. The JSON body it replaces is
-/// deliberately not parsed through: a 5xx message is generic on purpose (the
-/// underlying I/O, SQL or upstream detail goes to the log), and re-rendering an
-/// error string into HTML is a needless place to get escaping wrong.
+/// The heading is derived from the status alone. A 5xx always gets generic
+/// text: its message is generic on purpose (the underlying I/O, SQL or
+/// upstream detail goes to the log). A 4xx shows `message`, the handler's own
+/// explanation, escaped — "reload the page" for an expired form token, or why
+/// a feed's license policy refused a move, is the one thing the person needs.
+/// A 401, 404 or 429 keeps the text written here, which says more than the
+/// handler's "unauthorized" or "package not found".
 pub fn error_page(
     urls: &UrlBuilder,
     status: axum::http::StatusCode,
     admin: bool,
     admin_login: bool,
+    message: Option<&str>,
 ) -> String {
     use axum::http::StatusCode;
     let (heading, detail) = match status {
@@ -479,6 +483,14 @@ pub fn error_page(
         ),
         _ => ("That did not work", "The request could not be completed."),
     };
+    let own_text = matches!(
+        status,
+        StatusCode::UNAUTHORIZED | StatusCode::NOT_FOUND | StatusCode::TOO_MANY_REQUESTS
+    );
+    let detail = match message.map(str::trim) {
+        Some(m) if status.is_client_error() && !own_text && !m.is_empty() => escape_html(m),
+        _ => detail.to_string(),
+    };
     let body = format!(
         "<div class=\"empty\"><h1 class=\"title\">{heading}</h1>\
          <p>{detail}</p>\
@@ -517,7 +529,7 @@ mod tests {
             StatusCode::SERVICE_UNAVAILABLE,
             StatusCode::BAD_REQUEST,
         ] {
-            let html = error_page(&urls, status, false, false);
+            let html = error_page(&urls, status, false, false, None);
             let text = html
                 .split("<p>")
                 .nth(1)
@@ -527,11 +539,46 @@ mod tests {
                 .unwrap();
             assert!(!text.contains("  "), "{status}: {text:?}");
         }
-        let admin = error_page(&urls, StatusCode::UNAUTHORIZED, true, true);
+        let admin = error_page(&urls, StatusCode::UNAUTHORIZED, true, true, None);
         assert!(admin.contains("admin key"), "{admin}");
         assert!(!admin.contains("for reading"), "{admin}");
-        let read = error_page(&urls, StatusCode::UNAUTHORIZED, false, false);
+        let read = error_page(&urls, StatusCode::UNAUTHORIZED, false, false, None);
         assert!(read.contains("for reading"), "{read}");
+    }
+
+    #[test]
+    fn a_client_error_page_says_what_the_handler_said_escaped() {
+        use axum::http::StatusCode;
+        let urls = UrlBuilder::new("https://host");
+        let csrf = error_page(
+            &urls,
+            StatusCode::BAD_REQUEST,
+            true,
+            false,
+            Some("missing, expired or invalid token (reload the page) <b>"),
+        );
+        assert!(
+            csrf.contains("<p>missing, expired or invalid token (reload the page) &lt;b&gt;</p>"),
+            "{csrf}"
+        );
+        assert!(!csrf.contains("Check the address"), "{csrf}");
+        // A server fault, and the statuses with text of their own, do not.
+        let fault = error_page(
+            &urls,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            false,
+            false,
+            Some("internal server error"),
+        );
+        assert!(fault.contains("details are in its log"), "{fault}");
+        let missing = error_page(
+            &urls,
+            StatusCode::NOT_FOUND,
+            false,
+            false,
+            Some("package not found"),
+        );
+        assert!(missing.contains("may have been deleted"), "{missing}");
     }
 
     /// The CSP pins the inline `<style>` and `<script>` by SHA-256, so a page

@@ -78,6 +78,8 @@ struct Behaviour {
     redirect_downloads: Option<String>,
     /// Answer version lists with a 500, as an upstream in an outage does.
     fail_listing: bool,
+    /// Answer this many `.nupkg` requests with a 503 before serving them.
+    unavailable_downloads: usize,
     /// Hold every `.nupkg` response this long before answering.
     download_delay: Option<std::time::Duration>,
     /// Send every `.nupkg` body in four pieces with this pause between them:
@@ -230,7 +232,11 @@ async fn handle(State(state): State<Arc<UpstreamState>>, uri: Uri, headers: Head
         feed_key: header("x-feed-key"),
     });
     let (delay, trickle) = if path.ends_with(".nupkg") {
-        let b = state.behaviour.lock().unwrap();
+        let mut b = state.behaviour.lock().unwrap();
+        if b.unavailable_downloads > 0 {
+            b.unavailable_downloads -= 1;
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
         (b.download_delay, b.trickle)
     } else {
         (None, None)
@@ -908,6 +914,21 @@ async fn an_id_the_upstream_lacks_is_not_asked_for_on_every_read() {
         assert!(server.versions("no.such.pkg").await.is_none());
     }
     assert_eq!(upstream.hits("/flat/no.such.pkg/index.json"), 1);
+}
+
+#[tokio::test]
+async fn a_download_the_upstream_could_not_serve_for_a_moment_is_tried_again() {
+    let upstream = Upstream::start().await;
+    upstream.publish("Flaky.Pkg", "1.0.0");
+    upstream.behave(|b| b.unavailable_downloads = 1);
+    let server = spawn_mirror(&upstream, |_| {}).await;
+    // The listing's fetch of the version meets a 503 ...
+    assert_eq!(server.versions("flaky.pkg").await, None);
+    assert_eq!(upstream.hits("/flaky.pkg.1.0.0.nupkg"), 1);
+    // ... which does not block the version: asking for it fetches it.
+    let resp = server.download("flaky.pkg", "1.0.0").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(upstream.hits("/flaky.pkg.1.0.0.nupkg"), 2);
 }
 
 #[tokio::test]

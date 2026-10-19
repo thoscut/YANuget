@@ -77,7 +77,8 @@ Configuration choices that matter most:
   empty by default, so forwarding headers are ignored — which is what keeps a
   client from steering the URLs handed to other clients, or rotating
   `X-Forwarded-For` to walk through the rate limiter. Behind a proxy, list that
-  proxy's address.
+  proxy's address, and have it set `X-Forwarded-Host` itself rather than pass
+  on the client's (see [Host validation](docs/configuration.md#host-validation)).
 - **Set `cors_allowed_origins` only if a browser really needs cross-origin
   access.** It is empty by default, so no CORS headers are sent. `*` makes the
   feed's whole inventory readable by any page a user with network reach

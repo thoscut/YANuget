@@ -127,6 +127,9 @@ pub async fn backup(
             );
         }
     }
+    // The store may live outside the data directory; either one inside the
+    // other makes the copy recurse into itself.
+    check_apart(dest, &config.storage_path(), "back up somewhere else")?;
     let _lock = lock(dest)?;
 
     // From here until the end the directory is not a backup.
@@ -146,8 +149,10 @@ pub async fn backup(
         progress.set_message(format!("pass {attempts}: copying the package store"));
         let tree = {
             let (src, dst, bar) = (config.storage_path(), packages.clone(), progress.clone());
-            tokio::task::spawn_blocking(move || copy_tree(&src, &dst, &SCRATCH_DIRS, &bar))
-                .await??
+            tokio::task::spawn_blocking(move || {
+                copy_tree(&src, &dst, &SCRATCH_DIRS, Existing::KeepUnchanged, &bar)
+            })
+            .await??
         };
         copied += tree.copied;
         copied_bytes += tree.copied_bytes;
@@ -176,7 +181,10 @@ pub async fn backup(
     let tls = live_tls.is_dir();
     if tls {
         let (src, dst, bar) = (live_tls, dest.join(TLS), progress.clone());
-        let t = tokio::task::spawn_blocking(move || copy_tree(&src, &dst, &[], &bar)).await??;
+        let t = tokio::task::spawn_blocking(move || {
+            copy_tree(&src, &dst, &[], Existing::KeepUnchanged, &bar)
+        })
+        .await??;
         let dst = dest.join(TLS);
         tokio::task::spawn_blocking(move || prune(&dst, &t.seen)).await??;
     } else {
@@ -239,13 +247,19 @@ pub async fn restore(
         }
     }
 
+    // Copying a backup inside the store onto the store would recurse, and the
+    // prune afterwards would delete the backup itself.
+    std::fs::create_dir_all(&storage).with_context(|| format!("creating {}", storage.display()))?;
+    check_apart(src, &storage, "restore from somewhere else")?;
+
     // The files first and the database last: until the database is in place
     // the old one (or none) is what a start would open.
     let progress = progress_bar(draw);
     progress.set_message("copying the package store");
     let tree = {
         let (from, to, bar) = (src.join(PACKAGES), storage.clone(), progress.clone());
-        tokio::task::spawn_blocking(move || copy_tree(&from, &to, &[], &bar)).await??
+        tokio::task::spawn_blocking(move || copy_tree(&from, &to, &[], Existing::Replace, &bar))
+            .await??
     };
     let removed = {
         let (to, seen) = (storage.clone(), tree.seen);
@@ -253,7 +267,8 @@ pub async fn restore(
     };
     if manifest.tls {
         let (from, to, bar) = (src.join(TLS), config.data_dir.join(TLS), progress.clone());
-        tokio::task::spawn_blocking(move || copy_tree(&from, &to, &[], &bar)).await??;
+        tokio::task::spawn_blocking(move || copy_tree(&from, &to, &[], Existing::Replace, &bar))
+            .await??;
     }
     progress.finish_and_clear();
 
@@ -283,6 +298,21 @@ pub async fn restore(
         copied: tree.copied,
         removed,
     })
+}
+
+/// Refuse a backup directory and a package store that contain each other.
+/// Paths that do not resolve cannot overlap anything yet.
+fn check_apart(backup: &Path, storage: &Path, advice: &str) -> anyhow::Result<()> {
+    if let (Ok(b), Ok(s)) = (backup.canonicalize(), storage.canonicalize()) {
+        if b.starts_with(&s) || s.starts_with(&b) {
+            bail!(
+                "the backup {} and the package store {} must not contain each other; {advice}",
+                backup.display(),
+                storage.display()
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Read and check a backup's manifest.
@@ -461,14 +491,27 @@ struct TreeCopy {
     copied_bytes: u64,
 }
 
+/// What [`copy_tree`] does with a file `dst` already has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Existing {
+    /// Leave it alone when its size and modification time match: what makes
+    /// a repeated backup incremental. A file damaged in place keeps both, so
+    /// this trusts the destination.
+    KeepUnchanged,
+    /// Copy over it regardless. A restore makes the store match the backup,
+    /// and the live files are the ones it cannot trust.
+    Replace,
+}
+
 /// Make every regular file under `src` exist under `dst` with the same
 /// content, skipping the top-level directories in `skip` and any temp file.
-/// A file already in `dst` with the same size and modification time is left
-/// alone. Removes nothing; see [`prune`].
+/// What happens to a file already in `dst` is up to `existing`. Removes
+/// nothing; see [`prune`].
 fn copy_tree(
     src: &Path,
     dst: &Path,
     skip: &[&str],
+    existing: Existing,
     progress: &ProgressBar,
 ) -> anyhow::Result<TreeCopy> {
     let mut out = TreeCopy {
@@ -508,7 +551,7 @@ fn copy_tree(
                 continue;
             }
             let (from, to) = (src.join(&child), dst.join(&child));
-            if !same_file(&meta, &to) {
+            if existing == Existing::Replace || !same_file(&meta, &to) {
                 match copy_file(&from, &to) {
                     Ok(()) => {}
                     Err(e) if is_not_found(&e) => continue,
@@ -681,7 +724,14 @@ mod tests {
         touch(&src.path().join("a/1.0.0/store-1.tmp"), b"staged");
         let bar = ProgressBar::hidden();
 
-        let first = copy_tree(src.path(), dst.path(), &SCRATCH_DIRS, &bar).unwrap();
+        let first = copy_tree(
+            src.path(),
+            dst.path(),
+            &SCRATCH_DIRS,
+            Existing::KeepUnchanged,
+            &bar,
+        )
+        .unwrap();
         assert_eq!((first.files, first.copied), (1, 1));
         assert_eq!(
             std::fs::read(dst.path().join("a/1.0.0/a.1.0.0.nupkg")).unwrap(),
@@ -691,7 +741,14 @@ mod tests {
         assert!(!dst.path().join(".migrate").exists());
         assert!(!dst.path().join("a/1.0.0/store-1.tmp").exists());
 
-        let again = copy_tree(src.path(), dst.path(), &SCRATCH_DIRS, &bar).unwrap();
+        let again = copy_tree(
+            src.path(),
+            dst.path(),
+            &SCRATCH_DIRS,
+            Existing::KeepUnchanged,
+            &bar,
+        )
+        .unwrap();
         assert_eq!((again.files, again.copied), (1, 0), "nothing changed");
     }
 
@@ -702,10 +759,10 @@ mod tests {
         let file = src.path().join("a/1.0.0/a.1.0.0.nupkg");
         touch(&file, b"old");
         let bar = ProgressBar::hidden();
-        copy_tree(src.path(), dst.path(), &[], &bar).unwrap();
+        copy_tree(src.path(), dst.path(), &[], Existing::KeepUnchanged, &bar).unwrap();
 
         touch(&file, b"newer content");
-        let again = copy_tree(src.path(), dst.path(), &[], &bar).unwrap();
+        let again = copy_tree(src.path(), dst.path(), &[], Existing::KeepUnchanged, &bar).unwrap();
         assert_eq!(again.copied, 1);
         assert_eq!(
             std::fs::read(dst.path().join("a/1.0.0/a.1.0.0.nupkg")).unwrap(),

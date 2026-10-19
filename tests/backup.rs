@@ -215,3 +215,78 @@ async fn a_file_missing_from_the_live_store_is_reported_not_hidden() {
     assert_eq!(summary.manifest.missing, ["beta/1.0.0/beta.1.0.0.nupkg"]);
     assert_eq!(summary.attempts, 3, "it retried before settling");
 }
+
+/// The package store can live outside the data directory. A backup inside it
+/// — or one that contains it — used to be refused only relative to the data
+/// directory, and the copy then recursed into itself.
+#[tokio::test]
+async fn a_backup_and_a_store_outside_the_data_directory_must_not_contain_each_other() {
+    let live = tempfile::tempdir().unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let store = elsewhere.path().join("store");
+    let config = Config {
+        storage_path: Some(store.clone()),
+        ..config_for(live.path())
+    };
+    let base = serve(config.clone()).await;
+    push(&base, "Alpha", "1.0.0").await;
+
+    for dest in [store.join("backup"), elsewhere.path().to_path_buf()] {
+        let err = yanuget::backup::backup(&config, &dest, hidden())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("must not contain each other"), "{err}");
+    }
+
+    let backups = tempfile::tempdir().unwrap();
+    yanuget::backup::backup(&config, backups.path(), hidden())
+        .await
+        .unwrap();
+    // Restoring from a copy inside the store is refused too: the prune after
+    // the copy would delete the backup being restored.
+    let inside = store.join("copy");
+    std::fs::create_dir_all(&inside).unwrap();
+    for name in ["backup.json", "yanuget.db"] {
+        std::fs::copy(backups.path().join(name), inside.join(name)).unwrap();
+    }
+    let err = yanuget::backup::restore(&config, &inside, true, hidden())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("must not contain each other"), "{err}");
+}
+
+/// `restore --force` makes the store match the backup exactly, so a live file
+/// damaged in place — same size, same modification time — is replaced rather
+/// than taken for the backup's copy.
+#[tokio::test]
+async fn a_forced_restore_replaces_a_file_damaged_in_place() {
+    let live = tempfile::tempdir().unwrap();
+    let base = serve(config_for(live.path())).await;
+    push(&base, "Alpha", "1.0.0").await;
+    let backups = tempfile::tempdir().unwrap();
+    yanuget::backup::backup(&config_for(live.path()), backups.path(), hidden())
+        .await
+        .unwrap();
+
+    let file = live.path().join("packages/alpha/1.0.0/alpha.1.0.0.nupkg");
+    let good = std::fs::read(&file).unwrap();
+    let modified = std::fs::metadata(&file).unwrap().modified().unwrap();
+    let mut bad = good.clone();
+    bad[0] ^= 0xff;
+    std::fs::write(&file, &bad).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&file)
+        .unwrap()
+        .set_modified(modified)
+        .unwrap();
+
+    let summary =
+        yanuget::backup::restore(&config_for(live.path()), backups.path(), true, hidden())
+            .await
+            .unwrap();
+    assert!(summary.copied > 0);
+    assert_eq!(std::fs::read(&file).unwrap(), good);
+}

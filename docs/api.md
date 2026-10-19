@@ -183,7 +183,8 @@ index:
 | SemVer2 | `/v3/registration-semver2/` | `…/3.6.0`, `…/Versioned` | Every version |
 
 A version is SemVer2 when it carries build metadata or more than one
-dot-separated pre-release identifier (`2.0.0-alpha.1`, `3.0.0+build`). Those are
+dot-separated pre-release identifier (`2.0.0-alpha.1`, `3.0.0+build`), or when
+either end of one of its dependency ranges does (`[2.0.0-beta.1, )`). Those are
 withheld from the SemVer1 hive — advertising a single hive under both sets of
 `@type`s would hand an older client versions it chokes on. Each hive's documents
 keep their self-references inside that hive, and a SemVer2-only version returns

@@ -62,9 +62,12 @@ pub(super) async fn gallery(
     state.require_read(&headers)?;
     let query = params.q.unwrap_or_default();
     let default_take = state.config.gallery_page_size.max(1);
+    // No larger than the pager offers: every package on a page loads all of
+    // its versions.
+    let max_take = ui::MAX_PAGE_SIZE.max(default_take).min(MAX_SEARCH_TAKE);
     let take = lenient(params.take.as_deref())
         .unwrap_or(default_take)
-        .clamp(1, MAX_SEARCH_TAKE);
+        .clamp(1, max_take);
     // `page` wins over `skip`, and either way the offset snaps to the start of
     // a page. That makes "page N" one exact page, and it is what lets the
     // page-size form send the current `skip`: at the new size, the page shown

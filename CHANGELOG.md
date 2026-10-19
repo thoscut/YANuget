@@ -68,6 +68,71 @@ expected to change incompatibly at any version.
   reads packages entry by entry), so no released version was exposed. A
   package with an entry name that is neither UTF-8 nor CP437 is still
   refused when it is opened.
+- A key variable that is set but blank (`YANUGET_API_KEY`, `..._API_KEYS`,
+  `YANUGET_FEED_{NAME}_READ_API_KEY` and the rest) stops the server at
+  startup instead of removing the key. Compose writes `${UNSET}` as an empty
+  string, and a blank read key made a read-gated feed public; the `_FILE`
+  form already refused an empty file. To remove a key, unset the variable.
+- From a trusted proxy, `X-Forwarded-Host` and `X-Forwarded-Proto` are read
+  from the **right**, as `X-Forwarded-For` already was: a proxy that appends
+  leaves the client's own value on the left, and that value passed the host
+  check and chose the generated URLs. A proxy must set or append these
+  headers, not pass on the client's.
+
+### Fixed
+
+- The host check exempted every path starting with `/health`, so a feed named
+  `healthcare` answered any `Host`. Only `/health` and the paths under
+  `/health/` are exempt now.
+- A connection that sent nothing held one of `max_connections` slots for as
+  long as it stayed open: until the first bytes arrive the server cannot tell
+  HTTP/1 from HTTP/2, and no timeout ran. It now gets the header timeout (30
+  seconds, counted from accept and covering the TLS handshake) to send them,
+  and idle HTTP/2 connections are pinged every 60 seconds and closed when a
+  ping goes unanswered for 20.
+- The statistics page listed unlisted versions among the recent packages.
+- An archive whose entry names differ only in case or in `\` against `/`
+  (`lib/a.pdb`, `LIB/A.pdb`, `lib\a.pdb`) is refused. They counted as one name
+  but were all extracted, so a symbol package could pass the 512-PDB cap many
+  times over and have each copy verified; a readme or icon lookup could also
+  take a different one than the client. Directory entries are not compared.
+- `yanuget backup` refuses a destination inside a `storage_path` that lies
+  outside the data directory, or one containing it; the copy used to recurse
+  into itself. `yanuget restore` refuses a backup in such a place too.
+- `yanuget restore --force` copies every file from the backup. It skipped live
+  files with the same size and modification time, so one damaged in place was
+  kept, although the store is meant to match the backup exactly.
+- `min_free_disk_bytes` is checked again every 64 MiB while an upload streams
+  in, and on every resumable-upload `PATCH`. A chunked body without a
+  `Content-Length` was only checked against the reserve itself, once, so it
+  could fill the volume.
+- A version whose own number is SemVer 1.0.0 but which depends on a SemVer
+  2.0.0 range (`[2.0.0-beta.1, )`, build metadata) is now SemVer 2.0.0, as on
+  nuget.org: it is withheld from SemVer 1.0.0 clients, which cannot resolve the
+  dependency. Schema step 8 marks the versions already stored.
+- A hard delete (`nuget delete` with `hard_delete_enabled`) and an admin delete,
+  bulk delete or move now run to completion when the client disconnects, as a
+  push does. Stopped between removing the version from the feed and recording
+  the deletion, they left no tombstone, so a read-through mirror fetched the
+  version back.
+- A mirror download that failed for a moment (a timeout, a reset connection, a
+  `5xx`) no longer blocks that version for 15 minutes. Only a failure that
+  would repeat (absent upstream, over the size cap, the wrong identity, refused
+  by policy) does; transient ones back off the upstream as before.
+- The error page of the gallery and the admin area shows what went wrong for a
+  client error (`400`, `403`, `409`, `413` …), escaped, instead of generic
+  text: an expired form says to reload the page, and a copy or move the target
+  feed's license policy refuses says why. Server errors stay generic, and
+  `401`, `404` and `429` keep their own text.
+- The gallery's `?take=` is capped at 100, the largest page size its pager
+  offers (or `gallery_page_size` when that is larger), instead of 1000: every
+  package on a page loads all of its versions, so one anonymous request could
+  load a thousand packages' worth.
+- Shutdown takes at most the documented ten seconds. Requests and background
+  work now drain against one deadline set when the signal arrives; the
+  background tasks used to get a second ten seconds after the server stopped.
+  The Compose example in the deployment guide sets `stop_grace_period: 15s`, so
+  `docker stop` does not kill the server at the moment its grace runs out.
 
 ## [0.7.0] — 2026-10-15
 
