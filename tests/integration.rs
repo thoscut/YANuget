@@ -2717,6 +2717,101 @@ async fn approval_ring_withholds_until_approved() {
     assert!(live.status().is_success());
 }
 
+/// Under `pending-only` a push can replace a pending build while a reviewer
+/// reads the admin page: approving from that page must not approve the build
+/// it never showed.
+#[tokio::test]
+async fn approving_from_the_admin_page_approves_the_build_it_showed() {
+    let server = spawn_feeds(|c| {
+        c.api_key = Some(API_KEY.into());
+        c.admin_api_key = Some(ADMIN_KEY.into());
+        let mut gated = feed("gated");
+        gated.requires_approval = true;
+        gated.allow_overwrite = Some(yanuget::config::OverwriteMode::PendingOnly);
+        c.feeds = vec![gated];
+    })
+    .await;
+    let push = |content: &'static [u8]| {
+        push_to(
+            &server,
+            "/gated/api/v2/package",
+            API_KEY,
+            build_nupkg("Ring.Pkg", "1.0.0", content),
+        )
+    };
+    assert_eq!(push(b"first").await.status(), reqwest::StatusCode::CREATED);
+
+    let shown_build = || async {
+        let page = server
+            .client
+            .get(server.url("/gated/admin/packages/ring.pkg"))
+            .basic_auth("admin", Some(ADMIN_KEY))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        let marker = "name=\"build\" value=\"";
+        let start = page.find(marker).expect("the page names the build") + marker.len();
+        let shown = page[start..].split('"').next().unwrap().to_string();
+        assert!(shown.starts_with("1.0.0:"), "{shown}");
+        format!(
+            "build={}",
+            shown
+                .replace('+', "%2B")
+                .replace('/', "%2F")
+                .replace('=', "%3D")
+                .replace(':', "%3A")
+        )
+    };
+    let shown_field = shown_build().await;
+
+    // A new build arrives while the page is open.
+    assert_eq!(push(b"second").await.status(), reqwest::StatusCode::CREATED);
+    let approve = |body: String| {
+        no_redirect()
+            .post(server.url("/gated/admin/packages/ring.pkg/1.0.0/approve"))
+            .basic_auth("admin", Some(ADMIN_KEY))
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(body)
+            .send()
+    };
+    let refused = approve(format!("{}&{shown_field}", admin_body(ADMIN_KEY)))
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), reqwest::StatusCode::CONFLICT);
+    let bulk = admin_bulk(
+        &server,
+        "/gated",
+        "ring.pkg",
+        ADMIN_KEY,
+        &format!("op=approve&v=1.0.0&{shown_field}"),
+    )
+    .await;
+    assert_eq!(bulk.status(), reqwest::StatusCode::CONFLICT);
+    let index = server.url("/gated/v3/package/ring.pkg/index.json");
+    assert_eq!(
+        server.client.get(&index).send().await.unwrap().status(),
+        reqwest::StatusCode::NOT_FOUND,
+        "still pending"
+    );
+
+    // The page as it is now shows the new build, and approves it.
+    let approved = approve(format!("{}&{}", admin_body(ADMIN_KEY), shown_build().await))
+        .await
+        .unwrap();
+    assert_eq!(approved.status(), reqwest::StatusCode::SEE_OTHER);
+    assert!(server
+        .client
+        .get(&index)
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .is_success());
+}
+
 #[tokio::test]
 async fn promotion_moves_a_version_into_the_next_ring() {
     let server = spawn_feeds(|c| {
@@ -5461,6 +5556,7 @@ async fn the_admin_page_shows_a_pending_versions_report() {
                 "checksum": {{"status": "trust-on-first-use"}}}}
             ],
             "warnings": ["<script>alert(1)</script>"],
+            "overrides": ["download <b>setup.exe</b> replaced"],
             "prelude": "tools/prelude.ps1",
             "a_later_field": true}}"#,
         size = setup.len(),
@@ -5513,6 +5609,8 @@ async fn the_admin_page_shows_a_pending_versions_report() {
     assert!(html.contains("setup.exe?a=1&amp;b=&lt;2&gt;"));
     assert!(html.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
     assert!(!html.contains("<script>alert(1)"));
+    assert!(html
+        .contains("<h3>Overrides</h3><ul><li>download &lt;b&gt;setup.exe&lt;/b&gt; replaced</li>"));
     assert!(html.contains("tools/prelude.ps1"));
     assert!(html.contains("https://feed") && html.contains("# &lt;b&gt;"));
     assert!(html.contains("2.4.3"));
