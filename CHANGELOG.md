@@ -107,6 +107,13 @@ expected to change incompatibly at any version.
   `Content-Length` was only checked against the reserve itself, once, so it
   could fill the volume.
 
+### Fixed
+
+- A version whose own number is SemVer 1.0.0 but which depends on a SemVer
+  2.0.0 range (`[2.0.0-beta.1, )`, build metadata) is now SemVer 2.0.0, as on
+  nuget.org: it is withheld from SemVer 1.0.0 clients, which cannot resolve the
+  dependency. Schema step 8 marks the versions already stored.
+
 ## [0.7.0] — 2026-10-15
 
 Upgrading from 0.6.x needs no change to the configuration or the database.

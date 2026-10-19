@@ -800,3 +800,45 @@ async fn a_failed_step_changes_nothing() {
             .unwrap();
     assert_eq!(exists, 0, "step 2's tables were rolled back with it");
 }
+
+/// Step 8 marks a version whose dependency range is SemVer 2.0.0, and only
+/// that one.
+#[tokio::test]
+async fn a_semver2_dependency_range_marks_the_version_semver2() {
+    use crate::models::{Dependency, DependencyGroup};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("old.db").to_string_lossy().into_owned();
+    let depends_on = |range: &str| {
+        vec![DependencyGroup {
+            target_framework: None,
+            dependencies: vec![Dependency {
+                id: "Dep".into(),
+                version_range: Some(range.into()),
+                include: None,
+                exclude: None,
+            }],
+        }]
+    };
+    {
+        let db = SqliteDatabase::connect(&path).await.unwrap();
+        // What an earlier build stored: the flag from the version alone.
+        let mut dotted = sample("Dotted", "1.0.0");
+        dotted.dependencies = depends_on("[2.0.0-beta.1, )");
+        let mut plain = sample("Plain", "1.0.0");
+        plain.dependencies = depends_on("[2.0.0-beta, 3.0.0)");
+        for p in [&dotted, &plain] {
+            assert!(!p.is_semver2);
+            db.add_to_feed(FEED, p).await.unwrap();
+        }
+        sqlx::query("PRAGMA user_version = 7")
+            .execute(pool(&db))
+            .await
+            .unwrap();
+    }
+    let db = SqliteDatabase::connect(&path).await.unwrap();
+    assert_eq!(user_version(&db).await, LATEST);
+    let dotted = db.find(FEED, "dotted", &v("1.0.0")).await.unwrap().unwrap();
+    assert!(dotted.is_semver2);
+    let plain = db.find(FEED, "plain", &v("1.0.0")).await.unwrap().unwrap();
+    assert!(!plain.is_semver2);
+}
