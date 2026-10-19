@@ -875,13 +875,13 @@ impl Config {
         // the TOML or in the unit's environment.
         let secret = |name: &str| secret_var(name, &get);
         if let Some(v) = secret("YANUGET_API_KEY")? {
-            self.api_key = optional_key(&v);
+            self.api_key = Some(env_key("YANUGET_API_KEY", &v)?);
         }
         if let Some(v) = secret("YANUGET_API_KEYS")? {
-            self.api_keys = split_keys(&v);
+            self.api_keys = env_keys("YANUGET_API_KEYS", &v)?;
         }
         if let Some(v) = secret("YANUGET_ADMIN_API_KEY")? {
-            self.admin_api_key = optional_key(&v);
+            self.admin_api_key = Some(env_key("YANUGET_ADMIN_API_KEY", &v)?);
         }
         self.apply_feed_env(&secret)?;
         if let Some(v) = get("YANUGET_GALLERY_PAGE_SIZE")? {
@@ -1032,28 +1032,33 @@ impl Config {
         }
 
         for f in &mut self.feeds {
-            let var =
-                |suffix: &str| secret(&format!("YANUGET_FEED_{}_{suffix}", feed_env_name(&f.name)));
-            if let Some(v) = var("API_KEY")? {
-                f.api_key = optional_key(&v);
+            let prefix = format!("YANUGET_FEED_{}_", feed_env_name(&f.name));
+            // The value of `{prefix}{suffix}`, checked to be a key.
+            let key = |suffix: &str| -> Result<Option<String>> {
+                let name = format!("{prefix}{suffix}");
+                secret(&name)?.map(|v| env_key(&name, &v)).transpose()
+            };
+            if let Some(v) = key("API_KEY")? {
+                f.api_key = Some(v);
             }
-            if let Some(v) = var("API_KEYS")? {
-                f.api_keys = split_keys(&v);
+            let list = format!("{prefix}API_KEYS");
+            if let Some(v) = secret(&list)? {
+                f.api_keys = env_keys(&list, &v)?;
             }
-            if let Some(v) = var("READ_API_KEY")? {
-                f.read_api_key = optional_key(&v);
+            if let Some(v) = key("READ_API_KEY")? {
+                f.read_api_key = Some(v);
             }
-            if let Some(v) = var("PREVIEW_API_KEY")? {
-                f.preview_api_key = optional_key(&v);
+            if let Some(v) = key("PREVIEW_API_KEY")? {
+                f.preview_api_key = Some(v);
             }
-            if let Some(v) = var("ADMIN_API_KEY")? {
-                f.admin_api_key = optional_key(&v);
+            if let Some(v) = key("ADMIN_API_KEY")? {
+                f.admin_api_key = Some(v);
             }
-            if let Some(v) = var("MIRROR_PASSWORD")? {
-                f.mirror.auth.password = optional_key(&v);
+            if let Some(v) = key("MIRROR_PASSWORD")? {
+                f.mirror.auth.password = Some(v);
             }
-            if let Some(v) = var("MIRROR_TOKEN")? {
-                f.mirror.auth.token = optional_key(&v);
+            if let Some(v) = key("MIRROR_TOKEN")? {
+                f.mirror.auth.token = Some(v);
             }
         }
         Ok(())
@@ -1561,19 +1566,40 @@ fn secret_var(name: &str, get: &impl Fn(&str) -> Result<Option<String>>) -> Resu
     }
 }
 
-/// A single key from the environment: blank clears it.
-fn optional_key(v: &str) -> Option<String> {
-    (!v.trim().is_empty()).then(|| v.trim().to_string())
+/// A single key from the variable `name` (or its key file), trimmed.
+///
+/// A blank value is an error, not "no key": Compose writes `${UNSET}` as an
+/// empty string, and reading that as a removal would quietly drop a feed's
+/// read key — making it public — or its push key. A key comes out of the
+/// configuration by unsetting the variable and removing it from the TOML.
+fn env_key(name: &str, v: &str) -> Result<String> {
+    let v = v.trim();
+    if v.is_empty() {
+        return Err(env_error(
+            name,
+            "is set but blank; give it a key, or unset it to keep the configuration file's",
+        ));
+    }
+    Ok(v.to_string())
 }
 
-/// A key list from the environment or a key file: comma- or line-separated,
-/// so a file can hold one key per line.
-fn split_keys(v: &str) -> Vec<String> {
-    v.split([',', '\n'])
+/// A key list from the variable `name` (or its key file): comma- or
+/// line-separated, so a file can hold one key per line. A list with no key in
+/// it is refused, as for [`env_key`].
+fn env_keys(name: &str, v: &str) -> Result<Vec<String>> {
+    let keys: Vec<String> = v
+        .split([',', '\n'])
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string)
-        .collect()
+        .collect();
+    if keys.is_empty() {
+        return Err(env_error(
+            name,
+            "is set but holds no key; give it one, or unset it to keep the configuration file's",
+        ));
+    }
+    Ok(keys)
 }
 
 fn split_list(v: &str) -> Vec<String> {
@@ -2137,6 +2163,39 @@ mod tests {
         ] {
             assert!(env_over(two_feeds(), &vars).is_err(), "{vars:?}");
         }
+    }
+
+    #[test]
+    fn a_blank_key_variable_is_an_error_not_a_removal() {
+        // Compose writes `${UNSET}` as an empty string. Read as "no key", that
+        // would make a read-gated feed public, or drop its push key.
+        let mut gated = two_feeds();
+        gated.feeds[1].read_api_key = Some("reader".into());
+        for name in [
+            "YANUGET_API_KEY",
+            "YANUGET_API_KEYS",
+            "YANUGET_ADMIN_API_KEY",
+            "YANUGET_FEED_STAGE_API_KEY",
+            "YANUGET_FEED_STAGE_API_KEYS",
+            "YANUGET_FEED_PRE_PROD_READ_API_KEY",
+            "YANUGET_FEED_PRE_PROD_PREVIEW_API_KEY",
+            "YANUGET_FEED_PRE_PROD_ADMIN_API_KEY",
+            "YANUGET_FEED_PRE_PROD_MIRROR_PASSWORD",
+            "YANUGET_FEED_PRE_PROD_MIRROR_TOKEN",
+        ] {
+            for blank in ["", "  "] {
+                let err = env_over(gated.clone(), &[(name, blank)])
+                    .unwrap_err()
+                    .to_string();
+                assert!(err.contains(name), "{name}={blank:?}: {err}");
+            }
+        }
+        // A list of separators only holds no key either.
+        assert!(env_over(gated.clone(), &[("YANUGET_FEED_STAGE_API_KEYS", " , ,")]).is_err());
+        // Unset, the configuration file's keys stand.
+        let c = env_over(gated, &[]).unwrap();
+        assert_eq!(c.feeds[0].api_key.as_deref(), Some("from-toml"));
+        assert_eq!(c.feeds[1].read_api_key.as_deref(), Some("reader"));
     }
 
     #[test]

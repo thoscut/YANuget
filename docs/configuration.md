@@ -82,6 +82,10 @@ secret store:
   key list holds one key per line, or comma-separated keys. Setting both the
   variable and its `_FILE` is an error, and so is a file that is missing or
   empty: an empty push key would otherwise open the feed to anyone.
+- **A blank variable is an error**, not a removal: Compose writes `${UNSET}`
+  as an empty string, and a blank `..._READ_API_KEY` would otherwise make a
+  read-gated feed public. To drop a key the TOML file sets, take it out of
+  the file; unset the variable to keep the file's key.
 
 With systemd, `LoadCredential=` puts the files where only the service can
 read them:

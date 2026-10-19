@@ -68,6 +68,11 @@ expected to change incompatibly at any version.
   reads packages entry by entry), so no released version was exposed. A
   package with an entry name that is neither UTF-8 nor CP437 is still
   refused when it is opened.
+- A key variable that is set but blank (`YANUGET_API_KEY`, `..._API_KEYS`,
+  `YANUGET_FEED_{NAME}_READ_API_KEY` and the rest) stops the server at
+  startup instead of removing the key. Compose writes `${UNSET}` as an empty
+  string, and a blank read key made a read-gated feed public; the `_FILE`
+  form already refused an empty file. To remove a key, unset the variable.
 - From a trusted proxy, `X-Forwarded-Host` and `X-Forwarded-Proto` are read
   from the **right**, as `X-Forwarded-For` already was: a proxy that appends
   leaves the client's own value on the left, and that value passed the host
