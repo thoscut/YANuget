@@ -21,6 +21,7 @@ error; `run` stops before it fetches anything.
 ```text
 yanuget-internalize [-c PATH] plan PACKAGE...
 yanuget-internalize [-c PATH] run [--replace-pending] PACKAGE...
+yanuget-internalize [-c PATH] sync [--dry-run]
 yanuget-internalize [-c PATH] config check [--offline]
 ```
 
@@ -223,6 +224,57 @@ package asks for, and the prelude maps it to the attached file. Every
 override used is listed in the report under `overrides`; a rewrite that
 matches no captured URL, or a download the capture saw anyway, is a warning,
 so stale overrides surface.
+
+## Keeping feeds current
+
+`sync` internalizes, for each entry of the watch list (`[sync] watch_list`),
+the newest listed upstream version in its range that no earlier sync
+handled, and lists what waits for approval. A pre-release counts only when a
+bound of the range is one. A version released and superseded between two
+syncs is not fetched.
+
+```toml
+# watch.toml
+[[package]]
+id = "git"
+
+[[package]]                 # an id may be listed once per range
+id = "dotnet-8.0-sdk"
+versions = "[8.0,9.0)"
+```
+
+It is meant for a timer on the worker. What it did lives in
+`[sync] state_file`, saved after every package, so a sync is idempotent and
+safe to interrupt; a lock file next to it keeps a second sync from starting.
+Each version a sync handled is:
+
+| Status | Means | Next sync |
+| --- | --- | --- |
+| `pending` | Pushed; the target feed does not serve it yet. | Waits. |
+| `approved` | The target feed serves it. | Nothing. |
+| `needs-override` | A package of its closure needs an override. | Tries again once any override changes. |
+| `failed` | The run failed. | Tries again. |
+
+A sync never pushes a version twice, so a version an admin deletes or leaves
+pending stays out. It stops counting as pending once a newer version in the
+same range is approved, or at once when an override skips it
+(`versions = "[2.51.0]"`, `skip = "why"`). Ids taken off the watch list are
+forgotten. Fixing a version that is already approved stays a manual `run`.
+Whether a version is approved comes from the target's flat container; on a
+read-gated target the tool cannot tell, and says so.
+
+With `[sync] metrics_file` set, each sync writes its metrics in the
+Prometheus text format, atomically, for node_exporter's textfile collector:
+
+| Metric | Means |
+| --- | --- |
+| `yanuget_internalize_sync_last_run_timestamp_seconds` | When the last sync ended. Alert when it is old: a sync that cannot start writes nothing. |
+| `yanuget_internalize_sync_outcome{outcome}` | 1 for how the last sync ended (`done`, `needs-attention`, `failed`). |
+| `yanuget_internalize_sync_versions{status}` | Versions in the state, per status above. |
+| `yanuget_internalize_sync_oldest_pending_seconds` | How long the oldest pending version has waited; 0 when none. |
+
+`sync --dry-run` says what a sync would internalize and changes nothing. Until
+a sandbox backend captures, `sync` records each new version as failed.
 
 ## Sandboxes
 

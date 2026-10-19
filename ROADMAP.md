@@ -1376,7 +1376,7 @@ packages whose downloads go through Chocolatey's helpers.
   see: web installers that pass capture and fetch their payload when they run.
   Needs read access to pending versions (`INT-32`). On the container backend
   the same restriction needs its own design (`INT-29`).
-- [ ] **`INT-27` Keep feeds current.** A watch list of ids, optionally with
+- [x] **`INT-27` Keep feeds current.** A watch list of ids, optionally with
   ranges; `sync` finds new upstream versions, internalizes them into the intake
   feed and reports what waits for approval. Meant as a systemd timer on the
   worker (a scheduled task with the container backend); idempotent and safe to
@@ -1384,6 +1384,19 @@ packages whose downloads go through Chocolatey's helpers.
   pending version in the Prometheus text format of `[monitoring]`, as a file
   for node_exporter's textfile collector, so a stuck sync shows up next to the
   server's metrics.
+  *Landed:* `yanuget_internalize::sync` and `[sync]` in the configuration.
+  Each watch entry (`[[package]]`, an id and an optional `versions` range)
+  follows its newest listed version, a pre-release only under a pre-release
+  bound. A state file records each version as `pending`, `approved`,
+  `needs-override` or `failed`; it is saved after every package and guarded
+  by a lock file. A version is never pushed twice; a failure is tried again,
+  an override need once any override changes. Approval is read from the
+  target's flat container; a pending version stops counting once a newer one
+  in its range is approved or an override skips it. The metrics file adds the
+  time and outcome of the last sync. `sync --dry-run` changes nothing;
+  `config check` loads the watch list and the state. Fixing an approved
+  version stays a manual `run`. The pipeline is behind a trait, so `sync`
+  records each version as failed until a sandbox backend captures.
 - [ ] **`INT-28` Embedding for other feeds.** For targets that are not YANuget:
   store the files under `tools/` in the package, streamed (`INT-02`), with the
   prelude mapping to paths under the package folder. Whether the helpers take a

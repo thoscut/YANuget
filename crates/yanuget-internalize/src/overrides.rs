@@ -168,6 +168,14 @@ impl Overrides {
             .get(&id.to_ascii_lowercase())
             .filter(|o| o.versions.as_ref().is_none_or(|r| r.contains(version)))
     }
+
+    /// A hash of every override, scripts included: it changes when any file
+    /// does, which tells `sync` (`INT-27`) to try a package that needed an
+    /// override again.
+    pub fn fingerprint(&self) -> String {
+        use sha2::{Digest, Sha256};
+        hex::encode(Sha256::digest(format!("{:?}", self.by_id)))
+    }
 }
 
 fn load_one(dir: &Path, id: &str, path: &Path) -> Result<Override, String> {

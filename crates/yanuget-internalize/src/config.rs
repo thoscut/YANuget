@@ -45,6 +45,7 @@ pub struct Config {
     /// One TOML file per package id with what the capture cannot find out
     /// (`INT-25`); none without.
     pub overrides_dir: Option<PathBuf>,
+    pub sync: SyncConfig,
     pub target: TargetConfig,
     pub upstream: UpstreamConfig,
     pub downloads: DownloadsConfig,
@@ -57,10 +58,36 @@ impl Default for Config {
             cache_dir: PathBuf::from("./cache"),
             work_dir: PathBuf::from("./work"),
             overrides_dir: None,
+            sync: SyncConfig::default(),
             target: TargetConfig::default(),
             upstream: UpstreamConfig::default(),
             downloads: DownloadsConfig::default(),
             sandbox: SandboxConfig::default(),
+        }
+    }
+}
+
+/// What `sync` keeps current and where it keeps track (`INT-27`).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct SyncConfig {
+    /// The watch list: a TOML file of package ids, each optionally with a
+    /// version range. `sync` needs one.
+    pub watch_list: Option<PathBuf>,
+    /// What earlier syncs did, so a sync is idempotent. A lock file sits next
+    /// to it (`<state_file>.lock`).
+    pub state_file: PathBuf,
+    /// Where each sync writes its metrics in the Prometheus text format, for
+    /// node_exporter's textfile collector (a `.prom` file in its directory).
+    pub metrics_file: Option<PathBuf>,
+}
+
+impl Default for SyncConfig {
+    fn default() -> Self {
+        SyncConfig {
+            watch_list: None,
+            state_file: PathBuf::from("./state/sync.json"),
+            metrics_file: None,
         }
     }
 }
@@ -301,6 +328,9 @@ pub const KNOWN_ENV: &[&str] = &[
     "YANUGET_INTERNALIZE_CACHE_DIR",
     "YANUGET_INTERNALIZE_WORK_DIR",
     "YANUGET_INTERNALIZE_OVERRIDES_DIR",
+    "YANUGET_INTERNALIZE_SYNC_WATCH_LIST",
+    "YANUGET_INTERNALIZE_SYNC_STATE_FILE",
+    "YANUGET_INTERNALIZE_SYNC_METRICS_FILE",
     "YANUGET_INTERNALIZE_TARGET_URL",
     "YANUGET_INTERNALIZE_TARGET_API_KEY",
     "YANUGET_INTERNALIZE_TARGET_API_KEY_FILE",
@@ -391,6 +421,15 @@ impl Config {
         }
         if let Some(v) = get("YANUGET_INTERNALIZE_OVERRIDES_DIR")? {
             self.overrides_dir = opt_path(v);
+        }
+        if let Some(v) = get("YANUGET_INTERNALIZE_SYNC_WATCH_LIST")? {
+            self.sync.watch_list = opt_path(v);
+        }
+        if let Some(v) = get("YANUGET_INTERNALIZE_SYNC_STATE_FILE")? {
+            self.sync.state_file = path(v);
+        }
+        if let Some(v) = get("YANUGET_INTERNALIZE_SYNC_METRICS_FILE")? {
+            self.sync.metrics_file = opt_path(v);
         }
 
         if let Some(v) = get("YANUGET_INTERNALIZE_TARGET_URL")? {
@@ -963,6 +1002,12 @@ mod tests {
         )
         .unwrap();
         assert!(!format!("{c:?}").contains("s3cret-value"));
+    }
+
+    #[test]
+    fn the_example_file_is_the_defaults() {
+        let example = Config::from_toml(include_str!("../yanuget-internalize.example.toml"));
+        assert_eq!(example.unwrap(), Config::default());
     }
 
     #[test]
