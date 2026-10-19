@@ -3656,6 +3656,10 @@ async fn admin_actions_require_a_csrf_token() {
         .await
         .unwrap();
     assert_eq!(bad_token.status(), reqwest::StatusCode::BAD_REQUEST);
+    // The page a browser gets says what to do about it.
+    let page = bad_token.text().await.unwrap();
+    assert!(page.contains("(reload the page)"), "{page}");
+    assert!(page.contains("<html"), "{page}");
 
     // A browser that tells us the request came from another site is refused
     // even when it somehow carries the token — by the server-wide guard on

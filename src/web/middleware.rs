@@ -362,6 +362,27 @@ fn wants_json_only(headers: &axum::http::HeaderMap) -> bool {
     accept.iter().any(|t| t == "application/json") && !accept.iter().any(|t| t == "text/html")
 }
 
+/// The human-readable message of an error body: the `error` of the JSON every
+/// [`Error`] answers with, or a short plain-text body such as axum's own
+/// rejections. Anything else, or anything long, is not shown.
+async fn error_message(headers: &axum::http::HeaderMap, body: axum::body::Body) -> Option<String> {
+    const MAX_MESSAGE: usize = 2048;
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let bytes = axum::body::to_bytes(body, MAX_MESSAGE).await.ok()?;
+    let text = if content_type.starts_with("application/json") {
+        let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+        value.get("error")?.as_str()?.to_string()
+    } else if content_type.starts_with("text/plain") {
+        String::from_utf8(bytes.to_vec()).ok()?
+    } else {
+        return None;
+    };
+    Some(text).filter(|t| !t.trim().is_empty())
+}
+
 /// Re-render an error from a gallery route as an HTML page.
 ///
 /// These routes are read in a browser, and every one of them could answer with
@@ -392,7 +413,14 @@ pub(super) async fn html_errors(
     // Keep whatever headers the error already carried — notably the
     // `WWW-Authenticate` challenge on a 401, without which a browser never
     // prompts — and replace only the body and its content type.
-    let (mut parts, _) = response.into_parts();
+    let (mut parts, body) = response.into_parts();
+    // A client error's message says what to do about it; a server error's
+    // is never shown (see `ui::error_page`).
+    let message = if status.is_client_error() {
+        error_message(&parts.headers, body).await
+    } else {
+        None
+    };
     // The admin area's challenge names its own realm; its page must ask for
     // the admin key, not the read key.
     let admin_login = parts
@@ -405,6 +433,7 @@ pub(super) async fn html_errors(
         status,
         state.feed.admin.is_enabled(),
         admin_login,
+        message.as_deref(),
     );
     parts.headers.remove(header::CONTENT_LENGTH);
     parts.headers.insert(

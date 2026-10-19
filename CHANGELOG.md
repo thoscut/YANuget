@@ -122,6 +122,11 @@ expected to change incompatibly at any version.
   `5xx`) no longer blocks that version for 15 minutes. Only a failure that
   would repeat (absent upstream, over the size cap, the wrong identity, refused
   by policy) does; transient ones back off the upstream as before.
+- The error page of the gallery and the admin area shows what went wrong for a
+  client error (`400`, `403`, `409`, `413` …), escaped, instead of generic
+  text: an expired form says to reload the page, and a copy or move the target
+  feed's license policy refuses says why. Server errors stay generic, and
+  `401`, `404` and `429` keep their own text.
 
 ## [0.7.0] — 2026-10-15
 
