@@ -194,7 +194,9 @@ fn pick(file: &Source<'_>) -> String {
         .or_else(|| file.kind.extensions().first().map(|e| e.to_string()))
         .unwrap_or_default();
     if ext.is_empty() {
-        return fit(&stem);
+        // Without an extension, a dot in the stem would make one of a
+        // version number (`Setup_1.0`) or of a type the content is not.
+        return fit(&stem.replace('.', "_"));
     }
     fit(&format!("{stem}.{ext}"))
 }
@@ -424,6 +426,17 @@ mod tests {
             .name(&source(&u, Kind::Other, SHA_A), &allowed())
             .unwrap_err();
         assert!(err.contains("takes no ."), "{err}");
+        // A dropped extension leaves no part of the stem to stand in for it.
+        for (u, stem) in [
+            ("https://example.com/Setup_1.0.exe", "Setup_1_0"),
+            ("https://example.com/archive.7z.exe", "archive_7z"),
+        ] {
+            let err = Names::new()
+                .name(&source(&url(u), Kind::Other, SHA_A), &allowed())
+                .unwrap_err();
+            assert!(err.starts_with(&format!("{stem}: ")), "{err}");
+            assert!(err.contains("takes no . files"), "{err}");
+        }
     }
 
     #[test]

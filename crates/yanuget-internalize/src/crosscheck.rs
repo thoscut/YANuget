@@ -173,7 +173,7 @@ pub fn urls_in(text: &str) -> Vec<(usize, String)> {
                 .find(|c: char| {
                     c.is_whitespace()
                         || matches!(c, '\'' | '"' | '`' | '<' | '>' | '|' | ';' | '(' | ')')
-                        || c.is_control()
+                        || crate::capture::is_forbidden(c)
                 })
                 .unwrap_or(code.len() - start);
             let url = code[start..start + len].trim_end_matches(['.', ',', ':']);
@@ -223,7 +223,9 @@ pub fn warn(draft: &mut Draft, scan: &Scan, wanted: &[Wanted]) {
         if warned < MAX_WARNINGS {
             draft.warn(format!(
                 "{} line {} mentions {}, which the capture did not see",
-                m.entry, m.line, m.url
+                shown(&m.entry),
+                m.line,
+                m.url
             ));
             warned += 1;
         } else {
@@ -237,10 +239,26 @@ pub fn warn(draft: &mut Draft, scan: &Scan, wanted: &[Wanted]) {
     }
     for entry in &scan.skipped {
         draft.warn(format!(
-            "{entry} is larger than {} MiB and was not scanned for URLs",
+            "{} is larger than {} MiB and was not scanned for URLs",
+            shown(entry),
             MAX_SCRIPT_BYTES / (1024 * 1024)
         ));
     }
+}
+
+/// An entry name for a warning: the package chose it, so control and
+/// bidirectional characters are replaced and cannot make it read as
+/// something else.
+fn shown(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if crate::capture::is_forbidden(c) {
+                '\u{FFFD}'
+            } else {
+                c
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -377,5 +395,38 @@ $bare = 'https://'
         );
         // Warnings only: the status is untouched.
         assert_eq!(report.status, yanuget_pkg::report::Status::Unchanged);
+    }
+
+    #[test]
+    fn bidirectional_controls_reach_no_warning() {
+        // A URL ends at one, as at any control character.
+        assert_eq!(
+            urls_in("$u = 'https://example.com/a\u{202E}exe.msi'"),
+            [(1, "https://example.com/a".to_string())]
+        );
+        let mut draft = Draft::new(
+            PackageRef {
+                id: "tool".into(),
+                version: "2.0.0".into(),
+            },
+            Upstream {
+                source: "s".into(),
+                sha512: None,
+            },
+        );
+        let scan = Scan {
+            mentions: vec![Mention {
+                entry: "tools/x\u{202E}1sp.ps1".into(),
+                line: 1,
+                url: "https://example.com/a".into(),
+            }],
+            skipped: vec!["tools/\u{2066}big\u{0007}.ps1".into()],
+        };
+        warn(&mut draft, &scan, &[]);
+        let report = draft.finish("t");
+        for w in &report.warnings {
+            assert!(!w.chars().any(crate::capture::is_forbidden), "{w:?}");
+        }
+        assert!(report.warnings[0].starts_with("tools/x\u{FFFD}1sp.ps1 line 1"));
     }
 }

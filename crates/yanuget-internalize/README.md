@@ -69,7 +69,8 @@ packages cached under their identity and marked as unverified.
 
 URLs, redirects included, that lead to private, loopback or link-local
 addresses are refused unless `upstream.allow_private` is set; names are
-checked as they resolve. Redirects are followed one hop at a time, never from
+checked as they resolve, and behind `upstream.proxy` resolved here first, as
+for downloads below. Redirects are followed one hop at a time, never from
 https to http, and credentials go only to the upstream's own origin. A `429`
 or `503` is waited out and tried again; when the upstream stops answering,
 and when it answers again, the tool logs it once.
@@ -117,7 +118,13 @@ on SHA-256 or SHA-512 verifies the file; MD5, SHA-1 or no checksum leaves it
 trust-on-first-use, which the report says. URLs and redirects that lead to
 loopback, private or link-local addresses are refused unless
 `downloads.allow_private_hosts` names the host, and no credentials are sent.
-A transfer that breaks off is resumed with a `Range` where the host offers
+Behind `downloads.proxy` the proxy resolves the names, so each host is also
+resolved here first and refused when it is private or does not resolve; the
+proxy resolves again on its own, so let it refuse private destinations too. A
+file that came over plain HTTP with nothing to verify it is a warning. The
+name a download got (its URL after redirects, `Content-Disposition`,
+`Content-Type`) is kept next to it, so a file taken from the cache is
+attached under the same name. A transfer that breaks off is resumed with a `Range` where the host offers
 ranges and a validator, and restarted where it does not.
 
 A file is attached under the URL's own name when that is valid for the feed
@@ -128,7 +135,8 @@ type or the content itself (`MZ`, the OLE header of an `.msi`, `PK`). Two
 different files on one name are told apart by a prefix of their SHA-256. A
 file whose extension the feed does not accept is reported, never renamed to
 pass. The extensions the feed accepts are `target.allowed_extensions`, which
-has to match the feed's own `allowed_extensions`.
+has to match the feed's own `allowed_extensions`. A report larger than
+YANuget reads (1 MiB) fails the package before it is pushed.
 
 ## Report
 
@@ -199,7 +207,8 @@ its file.
 What the capture cannot find out, a person writes down: one TOML file per
 package id in `overrides_dir`, named for the id (`git.install.toml`).
 Unknown keys are refused, and one file that does not check out stops the
-run, so no override is silently left out. `config check` loads them.
+run, as do two files for one id (`Git.toml`, `git.toml`), so no override is
+silently left out. `config check` loads them.
 
 ```toml
 versions = "[2.51,)"                       # the versions it applies to; all without

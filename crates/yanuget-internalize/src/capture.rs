@@ -334,7 +334,7 @@ fn parse_line(line: &[u8], closure: &[(&str, &NuGetVersion)]) -> Result<Call, St
 
 /// Control characters (C0, DEL, C1) and the bidirectional controls that make
 /// text read differently from what it is.
-fn is_forbidden(c: char) -> bool {
+pub(crate) fn is_forbidden(c: char) -> bool {
     c.is_control()
         || matches!(c, '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
 }

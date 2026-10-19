@@ -210,6 +210,16 @@ fn check_upstream(config: &Config, report: &mut Report) {
             upstream.concurrency
         ));
     }
+    // Downloads come from untrusted scripts; the upstream's own URL the
+    // operator chose.
+    if config.downloads.proxy.is_some() {
+        report.notes.push(
+            "downloads.proxy: each download host is also resolved here and refused when \
+             it is private or does not resolve; the proxy resolves again on its own, so \
+             let it refuse private destinations too"
+                .into(),
+        );
+    }
 }
 
 fn check_kvm(kvm: &KvmConfig, host: &Host, report: &mut Report) {
