@@ -50,6 +50,11 @@ expected to change incompatibly at any version.
 
 ### Changed
 
+- The minimum supported Rust is 1.89 (from 1.88), for `uuid` 1.27 and later;
+  the container image is built with 1.89. (`DEP-07`)
+- `axum-server` 0.8 replaces 0.7, which drops the unmaintained
+  `rustls-pemfile` (RUSTSEC-2025-0134) from the dependencies: certificates
+  are read through `rustls-pki-types`. (`DEP-06`)
 - Package handling moved into a workspace crate, `yanuget-pkg`
   (`crates/yanuget-pkg/`): NuGet versions, the `.nuspec` parser, `.nupkg`
   reading and the upstream address policy, with no axum or sqlx dependency and

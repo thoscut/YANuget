@@ -35,11 +35,12 @@ hold the detail; this list is the index.
 
 **Dependencies and toolchain**
 
-- [ ] **`DEP-06` `axum-server` 0.8.** It no longer depends on `rustls-pemfile`
+- [x] **`DEP-06` `axum-server` 0.8.** It no longer depends on `rustls-pemfile`
   (`RUSTSEC-2025-0134`, see `DEP-01`): 0.8.0 reads PEM through
   `rustls-pki-types` and needs Rust 1.82. Upgrade, then drop the comment on
   that advisory in `ci.yml`.
-- [ ] **`DEP-07` MSRV policy.** The floor is 1.88 (`Cargo.toml`, the MSRV
+  *Done:* `rustls-pemfile` is gone from `Cargo.lock`.
+- [x] **`DEP-07` MSRV policy.** The floor was 1.88 (`Cargo.toml`, the MSRV
   job, the Dockerfile builder stage, README, CONTRIBUTING). `uuid` 1.27 needs
   1.89, which is why Dependabot's #47 was closed unmerged; the next `uuid`
   bump fails the same way, because Dependabot does not ignore it. `sqlx` 0.9
@@ -47,6 +48,7 @@ hold the detail; this list is the index.
   floor to 1.89 now (cheap; 1.89 is over a year old), or hold `uuid` in
   Dependabot too. `sqlx` 0.9 waits for a release that raises the floor to
   1.94.
+  *Done:* raised to 1.89 everywhere the floor is stated, `uuid` is at 1.28.
 
 **Documentation**
 

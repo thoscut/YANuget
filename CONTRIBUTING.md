@@ -9,7 +9,7 @@ one — see [SECURITY.md](SECURITY.md).
 ## Getting set up
 
 ```bash
-# Rust 1.88 or newer (rust-toolchain.toml pins stable).
+# Rust 1.89 or newer (rust-toolchain.toml pins stable).
 cargo build
 
 # The docs site is optional for building — a placeholder page is embedded when

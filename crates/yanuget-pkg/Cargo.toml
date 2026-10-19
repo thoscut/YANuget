@@ -2,7 +2,7 @@
 name = "yanuget-pkg"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.88"
+rust-version = "1.89"
 description = "NuGet package handling shared by YANuget and its tools: versions and version ranges, .nuspec parsing, .nupkg reading."
 license = "MIT"
 repository = "https://github.com/thoscut/yanuget"

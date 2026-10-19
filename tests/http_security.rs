@@ -1013,7 +1013,7 @@ async fn promotion_does_not_republish_what_the_source_withholds() {
 
 struct Served {
     addr: SocketAddr,
-    handle: axum_server::Handle,
+    handle: axum_server::Handle<std::net::SocketAddr>,
     task: tokio::task::JoinHandle<yanuget::Result<()>>,
     dir: tempfile::TempDir,
 }

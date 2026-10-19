@@ -2,7 +2,7 @@
 name = "yanuget-internalize"
 version = "0.0.0"
 edition = "2021"
-rust-version = "1.88"
+rust-version = "1.89"
 description = "Internalizes Chocolatey packages into a YANuget feed: captures what their scripts download, attaches the files, and pushes a copy that installs offline."
 license = "MIT"
 repository = "https://github.com/thoscut/yanuget"

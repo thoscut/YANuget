@@ -99,7 +99,7 @@ jobs:
         run: cargo build --release
 
   msrv:
-    name: Minimum supported Rust (1.88)
+    name: Minimum supported Rust (1.89)
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -107,13 +107,13 @@ jobs:
         with:
           persist-credentials: false
 
-      # rust-toolchain.toml pins `stable`; an explicit `+1.88.0` on the command
+      # rust-toolchain.toml pins `stable`; an explicit `+1.89.0` on the command
       # line overrides it so this job really exercises the declared MSRV.
-      # (1.88 is the floor required by transitive deps, e.g. time 0.3.49.)
-      - name: Install Rust 1.88.0
+      # (1.89 is the floor required by transitive deps, e.g. uuid 1.27.)
+      - name: Install Rust 1.89.0
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
-          toolchain: 1.88.0
+          toolchain: 1.89.0
 
       - name: Cache cargo
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -126,10 +126,10 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-msrv-
 
       # The tests run here, not just a `check`: the container image is built
-      # with 1.88, so this is the compiler the image ships, and a behaviour
+      # with 1.89, so this is the compiler the image ships, and a behaviour
       # difference between it and stable would otherwise go unnoticed.
       - name: Test against MSRV
-        run: cargo +1.88.0 test --workspace --all-targets --all-features
+        run: cargo +1.89.0 test --workspace --all-targets --all-features
 
   audit:
     name: Dependency audit
@@ -155,11 +155,6 @@ jobs:
       # build never compiles. Verified rather than assumed: `cargo tree -i rsa
       # -e normal` finds nothing, so the crate is in `Cargo.lock` and not in the
       # binary. Ignored deliberately; revisit if a fix ships.
-      #
-      # RUSTSEC-2025-0134 (rustls-pemfile, unmaintained) arrives via
-      # axum-server 0.7, which has no release that drops it. It is a PEM parser
-      # used once at startup on operator-supplied certificate files, so the
-      # exposure is small — but it is tracked, not forgotten.
       - name: Audit dependencies for known vulnerabilities
         run: cargo audit --ignore RUSTSEC-2023-0071
 
