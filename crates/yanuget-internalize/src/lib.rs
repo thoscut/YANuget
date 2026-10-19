@@ -6,6 +6,7 @@
 //! so everything around it builds and is tested on any host against
 //! [`sandbox::fake::FakeSandbox`].
 
+pub mod capture;
 pub mod check;
 pub mod cli;
 pub mod closure;

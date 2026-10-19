@@ -1208,11 +1208,23 @@ packages whose downloads go through Chocolatey's helpers.
   and takes jobs over a Unix socket. It cannot keep `PrivateDevices=yes`
   (`DevicePolicy=closed` instead); whether QEMU under KVM runs with
   `MemoryDenyWriteExecute=yes` is *(to verify)*.
-- [ ] **`INT-16` Treat the capture as untrusted input.** Untrusted code wrote
+- [x] **`INT-16` Treat the capture as untrusted input.** Untrusted code wrote
   it: a versioned schema, strict types, caps on line length, entry count and
   total size, no control characters, `http`/`https` URLs only, and attribution
   to a package of the closure. Anything else marks the package
   `needs-override`; nothing is repaired.
+  *Landed:* `yanuget_internalize::capture`, schema version 1, which the
+  helpers of `INT-14` write: one JSON object a line with `schema`, `package`,
+  `version`, `helper`, `url`, `url64`, `checksum`, `checksumType`,
+  `checksum64`, `checksumType64`, `fileType`, `fileFullPath` and `caller`,
+  unknown fields refused. Caps: 16 KiB a line, 1,000 calls, 16 MiB in all,
+  4,096 characters a URL, 1,024 a path. Control characters and the
+  bidirectional controls are refused in every string. A checksum must be hex
+  of its type's length; one without a type is MD5, as Chocolatey takes it.
+  The helper must be one of the nine that record. A rejection lists every
+  reason, up to twenty. The caller's path tells the package's own scripts
+  (`lib\{id}\`) from an extension's module (`extensions\{name}\`) for
+  `INT-21`.
 - [ ] **`INT-17` Downloader.** Stream each captured URL to disk while hashing
   with SHA-256 and with the algorithm the script declares (MD5, SHA-1, SHA-256,
   SHA-512); a declared checksum that does not match fails the package. A call
