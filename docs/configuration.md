@@ -661,9 +661,12 @@ responses also carry a `Strict-Transport-Security` header (one year).
   carry a `Content-Security-Policy` of `default-src 'none'` whose only permitted
   inline style and script are the two the server itself emits, pinned by
   SHA-256 — so an escaping bug could not become script execution.
-- A client gets 30 seconds to send a request's headers, and at most
+- A client gets 30 seconds to send a request's headers, and a new connection
+  as long for its first bytes (TLS handshake included), and at most
   `max_connections` connections are open at once, so clients that open
-  sockets and trickle bytes cannot hold them indefinitely. (Request bodies are
+  sockets and send nothing, or trickle bytes, cannot hold them indefinitely.
+  An idle HTTP/2 connection is pinged every 60 seconds and closed when a ping
+  goes unanswered for 20. (Request bodies are
   bounded by `upload_idle_timeout_secs` instead.) On shutdown, in-flight
   requests get 10 seconds, on plain HTTP as on HTTPS, and background work (a
   retention sweep, an inbox scan) is allowed to finish within the same

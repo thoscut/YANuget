@@ -1206,6 +1206,30 @@ async fn connections_over_the_cap_are_turned_away() {
 }
 
 #[tokio::test]
+async fn a_connection_that_sends_nothing_is_closed() {
+    use tokio::io::AsyncReadExt;
+    // Until its first bytes arrive, hyper cannot tell HTTP/1 from HTTP/2 and
+    // neither protocol's timeout runs; without a deadline of its own such a
+    // connection would hold its slot forever.
+    let served = serve_real(
+        |_| {},
+        |l| {
+            l.max_connections = 1;
+            l.header_read_timeout = Duration::from_millis(300);
+        },
+    )
+    .await;
+    let mut silent = tokio::net::TcpStream::connect(served.addr).await.unwrap();
+    let mut buf = Vec::new();
+    let closed = tokio::time::timeout(Duration::from_secs(2), silent.read_to_end(&mut buf)).await;
+    assert!(
+        matches!(closed, Ok(Ok(0)) | Ok(Err(_))),
+        "the silent connection was still open: {closed:?}"
+    );
+    served.handle.shutdown();
+}
+
+#[tokio::test]
 async fn plain_http_shutdown_has_a_deadline() {
     use tokio::io::AsyncWriteExt;
     // A client in the middle of a request, with nothing to cut it off but

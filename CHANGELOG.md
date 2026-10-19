@@ -84,6 +84,12 @@ expected to change incompatibly at any version.
 - The host check exempted every path starting with `/health`, so a feed named
   `healthcare` answered any `Host`. Only `/health` and the paths under
   `/health/` are exempt now.
+- A connection that sent nothing held one of `max_connections` slots for as
+  long as it stayed open: until the first bytes arrive the server cannot tell
+  HTTP/1 from HTTP/2, and no timeout ran. It now gets the header timeout (30
+  seconds, counted from accept and covering the TLS handshake) to send them,
+  and idle HTTP/2 connections are pinged every 60 seconds and closed when a
+  ping goes unanswered for 20.
 
 ### Fixed
 
