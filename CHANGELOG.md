@@ -12,7 +12,7 @@ expected to change incompatibly at any version.
 
 ## [Unreleased]
 
-## [0.8.0] — 2026-10-19
+## [0.8.0] — 2026-10-20
 
 **Upgrading from 0.7.x needs attention.** One change can stop a deployment that
 ran under 0.7.0, one changes what a reverse proxy must send, the database

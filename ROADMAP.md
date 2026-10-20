@@ -10,7 +10,7 @@ requests can reference them, and ticked off rather than deleted when they land.
 ## Open items
 
 Everything still open across this file and the project's working threads, as
-of 2026-10-19 (0.8.0 released). The entries further down hold the detail; this
+of 2026-10-20 (0.8.0 released). The entries further down hold the detail; this
 list is the index.
 
 **From the review of 2026-10-19**
@@ -1472,7 +1472,7 @@ A proposal on top of 0.7.0, in the order the items depend on each other.
 
 | Release | Items | Notes |
 | --- | --- | --- |
-| YANuget 0.8.0 | `INT-01`–`INT-05`, `INT-30`, `INT-32` | Released 2026-10-19, together with the fixes from the review of 2026-10-19, two of which need attention when upgrading (see CHANGELOG.md). |
+| YANuget 0.8.0 | `INT-01`–`INT-05`, `INT-30`, `INT-32` | Released 2026-10-20, together with the fixes from the review of 2026-10-19, some of which need attention when upgrading (see CHANGELOG.md). |
 | YANuget, after 0.8.0 | `INT-31`, the server side of `INT-21` | The rest of what the tool needs. `INT-31` waits on the security review of its token design. |
 | internalizer 0.1.0 | `INT-10`–`INT-22` | KVM backend; needs YANuget 0.8.0, and the release with `INT-31` for read-gated feeds. |
 | internalizer 0.2.0 | `INT-23`–`INT-28` | Needs nothing beyond YANuget 0.8.0. |
