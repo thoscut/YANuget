@@ -1450,10 +1450,11 @@ packages whose downloads go through Chocolatey's helpers.
 
 ### Open questions
 
-- **Fixing an approved version.** It cannot be replaced, and the package fix
-  version (`1.2.3.20261015`) breaks the exact pin of a meta package on its
-  `.install` package. Re-internalize the dependents with the pin rewritten, or
-  allow a documented delete-and-repush? Decide before `INT-27`.
+- ~~**Fixing an approved version.**~~ *Decided 2026-10-20:* delete and
+  re-push. The package fix version (`1.2.3.20261015`) would break the exact pin
+  of a meta package on its `.install` package, so an approved version is
+  removed for good (from the admin area, or with `hard_delete_enabled`) and
+  internalized again with `run`. `sync` never re-pushes a version it handled.
 - **Downloads from extension modules.** The prelude only redirects calls made
   by the package's own script. A helper inside an extension that downloads
   (the Visual Studio extension's bootstrapper, for example) is captured but not

@@ -268,7 +268,10 @@ A sync never pushes a version twice, so a version an admin deletes or leaves
 pending stays out. It stops counting as pending once a newer version in the
 same range is approved, or at once when an override skips it
 (`versions = "[2.51.0]"`, `skip = "why"`). Ids taken off the watch list are
-forgotten. Fixing a version that is already approved stays a manual `run`.
+forgotten. To fix a version that is already approved, delete it for good in
+the feed (from the admin area, or with `hard_delete_enabled`) and internalize
+it again with `run`; a package fix version would break the exact pin of a
+meta package on its `.install` package.
 Whether a version is approved comes from the target's flat container; on a
 read-gated target the tool cannot tell, and says so.
 
