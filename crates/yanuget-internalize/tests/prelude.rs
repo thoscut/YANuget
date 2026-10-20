@@ -266,7 +266,14 @@ $ErrorActionPreference = 'Stop'
 $env:ChocolateyPackageName = 'tool.install'
 $env:ChocolateyPackageVersion = '1.0.0'
 New-Module -Name chocolateyInstaller -ScriptBlock ([scriptblock]::Create((Get-Content -Raw (Join-Path $env:YANUGET_TEST_DIR 'module.ps1')))) | Import-Module
-& (Join-Path $env:YANUGET_TEST_DIR 'pkg/tools/chocolateyInstall.ps1')
+# The message on one line: PowerShell's own error view wraps it at the
+# console's width.
+try {
+    & (Join-Path $env:YANUGET_TEST_DIR 'pkg/tools/chocolateyInstall.ps1')
+} catch {
+    [Console]::Error.WriteLine($_.Exception.Message)
+    exit 1
+}
 "#;
 
 #[tokio::test(flavor = "multi_thread")]
