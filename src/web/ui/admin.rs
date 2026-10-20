@@ -322,13 +322,27 @@ pub fn admin_package_page(
         let report = extras.reports.iter().find(|r| r.version == v);
         let problems = report.map(|r| r.problems(extras.files)).unwrap_or_default();
         if fv.pending {
+            // The build this page shows, so approving it cannot approve one
+            // pushed after the page was loaded.
+            let build = format!(
+                "<input type=\"hidden\" name=\"build\" value=\"{}\">",
+                escape_html(&format!("{v}:{}", p.package_hash))
+            );
+            actions.push_str(&format!(
+                "<input type=\"hidden\" name=\"build\" value=\"{}\" form=\"bulk\">",
+                escape_html(&format!("{v}:{}", p.package_hash))
+            ));
             if problems.is_empty() {
-                actions.push_str(&button(&v, "approve", "Approve"));
+                actions.push_str(&format!(
+                    "<form method=\"post\" action=\"{}\">{csrf}{build}\
+                     <button type=\"submit\">Approve</button></form>",
+                    action(&v, "approve")
+                ));
             } else {
                 // Not refused: the reviewer may know better (a file attached
                 // under another name, a report from an older run). Asked.
                 actions.push_str(&format!(
-                    "<form method=\"post\" action=\"{a}\" data-confirm=\"{confirm}\">{csrf}\
+                    "<form method=\"post\" action=\"{a}\" data-confirm=\"{confirm}\">{csrf}{build}\
                      <button type=\"submit\">Approve</button></form>",
                     a = action(&v, "approve"),
                     confirm = escape_html(&format!(
@@ -640,6 +654,16 @@ fn report_body(
             .map(|w| format!("<li>{}</li>", escape_html(w)))
             .collect();
         out.push_str(&format!("<h3>Warnings</h3><ul>{items}</ul>"));
+    }
+    // A person's overrides change what the package installs, so the reviewer
+    // sees them next to the warnings.
+    if !report.overrides.is_empty() {
+        let items: String = report
+            .overrides
+            .iter()
+            .map(|o| format!("<li>{}</li>", escape_html(o)))
+            .collect();
+        out.push_str(&format!("<h3>Overrides</h3><ul>{items}</ul>"));
     }
     if let (Some(entry), Some(Ok(text))) = (report.prelude.as_deref(), prelude) {
         out.push_str(&format!(

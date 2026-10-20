@@ -31,6 +31,12 @@ pub(super) async fn push_package(
         // A push is self-describing: the manifest defines the identity.
         expect: None,
         reserved_elsewhere: state.feed.reserved_elsewhere.clone(),
+        other_license_policies: state
+            .feeds
+            .iter()
+            .filter(|f| f.name != state.feed.name)
+            .map(|f| (f.name.clone(), f.license_policy.clone()))
+            .collect(),
     };
     let state = state.clone();
     detached(async move {

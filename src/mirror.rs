@@ -1782,6 +1782,8 @@ impl MirrorTarget<'_> {
                 version: version.clone(),
             }),
             reserved_elsewhere: options.reserved_elsewhere.clone(),
+            // A mirrored version is never overwritten.
+            other_license_policies: Vec::new(),
         };
         match indexing::index_package(self.storage, self.db, feed, temp_path, summary, &opts).await
         {

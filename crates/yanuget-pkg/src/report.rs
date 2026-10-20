@@ -41,7 +41,8 @@ pub struct Report {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
     /// The overrides a person set for the package that were used, one line
-    /// each. Added to schema version 1 after YANuget 0.8.0, which ignores it.
+    /// each. Optional in schema version 1; a reader that predates it ignores
+    /// it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub overrides: Vec<String>,
     /// The package entry holding the prelude that points the install scripts

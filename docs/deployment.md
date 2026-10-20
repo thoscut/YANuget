@@ -276,7 +276,9 @@ default `client_max_body_size` will reject the push outright.
 Schema changes are applied automatically at startup and are additive, so an
 upgrade needs no migration command and re-running it is a no-op. **Downgrading
 is not supported**: an older binary may not understand columns a newer one
-added. Roll back by restoring the backup.
+added. Roll back by restoring the backup **with the older release's binary**:
+`yanuget restore` opens the restored database the way the server does, so a
+newer binary migrates it to its own schema again.
 
 Package payloads are never rewritten by an upgrade, so a restore only ever needs
 to roll back the database.

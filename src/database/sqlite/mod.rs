@@ -222,8 +222,9 @@ impl PackageDatabase for SqliteDatabase {
         package: &Package,
         membership: &Membership,
         drop_files: bool,
+        others: &[(String, crate::policy::PolicyOutcome)],
     ) -> Result<Vec<PackageFile>> {
-        packages::replace_pending_version(self, package, membership, drop_files).await
+        packages::replace_pending_version(self, package, membership, drop_files, others).await
     }
 
     async fn approved_in(&self, id: &str, version: &NuGetVersion) -> Result<Vec<String>> {

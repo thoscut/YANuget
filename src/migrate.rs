@@ -307,6 +307,9 @@ pub async fn run(
         // id/version and must not be able to answer with a different package.
         expect: None,
         reserved_elsewhere: feed.reserved_elsewhere.clone(),
+        // A migration overwrites with `Enabled` or not at all, never
+        // `pending-only`, which is the only mode that reads these.
+        other_license_policies: Vec::new(),
     };
 
     let outcomes: Vec<Outcome> = stream::iter(work)

@@ -842,3 +842,42 @@ async fn a_semver2_dependency_range_marks_the_version_semver2() {
     let plain = db.find(FEED, "plain", &v("1.0.0")).await.unwrap().unwrap();
     assert!(!plain.is_semver2);
 }
+
+/// Step 8 reads the store in pages; every page is marked, not only the first.
+#[tokio::test]
+async fn step_8_marks_versions_past_its_first_page() {
+    use crate::models::{Dependency, DependencyGroup};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("old.db").to_string_lossy().into_owned();
+    let semver2 = vec![DependencyGroup {
+        target_framework: None,
+        dependencies: vec![Dependency {
+            id: "Dep".into(),
+            version_range: Some("[2.0.0-beta.1, )".into()),
+            include: None,
+            exclude: None,
+        }],
+    }];
+    {
+        let db = SqliteDatabase::connect(&path).await.unwrap();
+        for i in 0..2_100 {
+            let mut p = sample(&format!("Bulk{i:04}"), "1.0.0");
+            p.dependencies = semver2.clone();
+            db.add_to_feed(FEED, &p).await.unwrap();
+        }
+        sqlx::query("UPDATE packages SET is_semver2 = 0")
+            .execute(pool(&db))
+            .await
+            .unwrap();
+        sqlx::query("PRAGMA user_version = 7")
+            .execute(pool(&db))
+            .await
+            .unwrap();
+    }
+    let db = SqliteDatabase::connect(&path).await.unwrap();
+    let unmarked: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM packages WHERE is_semver2 = 0")
+        .fetch_one(pool(&db))
+        .await
+        .unwrap();
+    assert_eq!(unmarked, 0);
+}
