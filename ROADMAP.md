@@ -1269,7 +1269,7 @@ packages whose downloads go through Chocolatey's helpers.
   content's (`MZ`, OLE, `PK`, 7z, `MSCF`, gzip). The same file keeps the
   name it was given, and a different file on a taken name gets the first
   eight hex digits of its SHA-256 in front.
-- [ ] **`INT-19` Prelude.** The wrappers are proxy commands
+- [x] **`INT-19` Prelude.** The wrappers are proxy commands
   (`[System.Management.Automation.ProxyCommand]::Create`) generated from the
   pinned Chocolatey version's helper metadata, so positional calls and
   parameter aliases bind exactly as they do against the real helpers. A
@@ -1281,6 +1281,22 @@ packages whose downloads go through Chocolatey's helpers.
   ever emitted as PowerShell; the report carries the originals. The server's
   base URL sits in one variable at the top, overridable by an environment
   variable for a host move.
+  *Landed:* `yanuget_internalize::prelude`. The package's
+  `chocolateyInstall.ps1` becomes a loader that dot-sources
+  `internalizer/prelude.ps1` and then the package's own script, which moves
+  to `chocolateyInstall.upstream.ps1` beside it. The proxy commands are made
+  on the client at install time from the helpers it has, not from pinned
+  metadata. That binds against the Chocolatey that actually runs the
+  script, and needs no PowerShell on the worker. The wrapper calls
+  `chocolateyInstaller\{helper}` by its module-qualified name, because
+  `ProxyCommand::Create` names a module's function without its module and
+  would call the wrapper itself. `Get-WebFile` takes no checksum, so its file
+  is checked once it is written. The map's keys are the SHA-256 of the URL
+  as the report records it. The wrapper tries the URL as written, then
+  `[Uri]::AbsoluteUri`. The variable is `YANUGET_INTERNALIZED_FEED_URL`.
+  Tested with PowerShell 7 against a real server and a stand-in for the
+  helpers. Windows PowerShell 5.1 and the real helpers come with the
+  regression corpus (`INT-22`).
 - [x] **`INT-20` Publish.** Rewrite the package (`INT-02`) with the new
   `chocolateyInstall.ps1` and the report, push it to the intake feed, attach
   the files, and check that the feed withholds the version; warn when it is

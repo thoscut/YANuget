@@ -17,6 +17,7 @@ pub mod download;
 pub mod naming;
 pub mod outcome;
 pub mod overrides;
+pub mod prelude;
 pub mod publish;
 pub mod report;
 pub mod sandbox;
