@@ -84,11 +84,16 @@ pub(super) async fn replace_version(
 /// The check runs inside the write transaction (`BEGIN IMMEDIATE`), so an
 /// approval either commits before it and is seen, or waits until the
 /// replacement has committed: an approved version is never replaced.
+///
+/// The new build replaces the version in every other feed that holds it, so
+/// each of those feeds' verdicts in `others` applies there: one that blocks
+/// refuses the replacement, the others set the feed's flag.
 pub(super) async fn replace_pending_version(
     db: &SqliteDatabase,
     p: &Package,
     m: &Membership,
     drop_files: bool,
+    others: &[(String, crate::policy::PolicyOutcome)],
 ) -> Result<Vec<crate::database::PackageFile>> {
     let mut tx = db.write_tx().await?;
     let approved: Vec<String> = sqlx::query_scalar(
@@ -104,7 +109,44 @@ pub(super) async fn replace_pending_version(
             p, &approved,
         )));
     }
+    let holders: Vec<String> = sqlx::query_scalar(
+        "SELECT feed FROM feed_packages \
+         WHERE lower_id = ?1 AND normalized_version = ?2 AND feed <> ?3 ORDER BY feed",
+    )
+    .bind(p.lower_id())
+    .bind(p.normalized_version())
+    .bind(&m.feed)
+    .fetch_all(&mut *tx)
+    .await?;
+    let verdicts: Vec<(&str, &crate::policy::PolicyOutcome)> = holders
+        .iter()
+        .filter_map(|feed| {
+            others
+                .iter()
+                .find(|(name, _)| name == feed)
+                .map(|(name, outcome)| (name.as_str(), outcome))
+        })
+        .collect();
+    if let Some((feed, outcome)) = verdicts.iter().find(|(_, o)| !o.allowed) {
+        let why = outcome.violation.as_deref().unwrap_or("license policy");
+        return Err(Error::PolicyViolation(format!(
+            "{why} in feed '{feed}', which holds this version too"
+        )));
+    }
     replace_rows(&mut tx, p, m).await?;
+    for (feed, outcome) in verdicts {
+        sqlx::query(
+            "UPDATE feed_packages SET flagged = ?1, flag_reason = ?2 \
+             WHERE feed = ?3 AND lower_id = ?4 AND normalized_version = ?5",
+        )
+        .bind(i64::from(outcome.violation.is_some()))
+        .bind(&outcome.violation)
+        .bind(feed)
+        .bind(p.lower_id())
+        .bind(p.normalized_version())
+        .execute(&mut *tx)
+        .await?;
+    }
     let mut dropped = Vec::new();
     if drop_files {
         let rows = sqlx::query(

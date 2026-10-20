@@ -109,7 +109,7 @@ existing tag points at.
 | Job | Result |
 | --- | --- |
 | `guard` | Refuses the release unless the tag exists, the run started from it, and the tag, `Cargo.toml` and `CHANGELOG.md` agree. Every later job builds the commit it resolved. |
-| `build` | Compiles for five targets (Linux x86-64/aarch64, macOS x86-64/aarch64, Windows x86-64) with the rendered docs embedded, and packages each with the README, licence, changelog and example config. Read-only token, no caches. |
+| `build` | Compiles for five targets (Linux x86-64/aarch64, macOS x86-64/aarch64, Windows x86-64) with the rendered docs embedded, and packages each with the README, licence, changelog and example config, plus the systemd unit and its `sysusers.d` file on Linux. Read-only token, no caches. |
 | `image` | Publishes `ghcr.io/thoscut/yanuget` for `linux/amd64` and `linux/arm64`, tagged `X.Y.Z`, `X.Y` and `latest`; attests its build provenance and signs it with cosign (keyless). |
 | `release` | Attests the provenance of every archive and `SHA256SUMS`, and attaches them to a GitHub Release whose notes are the changelog section for this version. |
 | `crates-io` | Publishes `yanuget-pkg` (when crates.io does not have its version yet), then `yanuget`, through trusted publishing — **only** when the repository variable `PUBLISH_TO_CRATES_IO` is `true`. Off by default: a crates.io version can be yanked but never replaced. |

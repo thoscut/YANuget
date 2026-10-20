@@ -548,12 +548,26 @@ pub(super) async fn admin_bulk(
         BulkOp::Unpin => Some(MembershipChange::Pinned(false)),
         BulkOp::Delete | BulkOp::Copy | BulkOp::Move => None,
     };
+    // An approval takes each version's lock, in a fixed order, so it never
+    // lands in the middle of a push replacing the build, and checks that the
+    // builds are the ones the page showed.
+    let mut _guards = Vec::new();
+    if matches!(op, BulkOp::Approve) {
+        let mut keys: Vec<String> = versions.iter().map(|v| v.normalized()).collect();
+        keys.sort_unstable();
+        keys.dedup();
+        for key in &keys {
+            _guards.push(crate::locks::lock_version(&id, key).await);
+        }
+        check_shown_builds(&state, &body, &id, &versions).await?;
+    }
     if let Some(change) = flag {
         state
             .db
             .update_memberships(state.feed(), &id, &versions, change)
             .await?;
     }
+    drop(_guards);
 
     match op {
         BulkOp::Enable | BulkOp::Disable | BulkOp::Approve | BulkOp::Pin | BulkOp::Unpin => {}
@@ -706,10 +720,51 @@ pub(super) async fn admin_approve(
     check_id(&id)?;
     require_admin_action(&state, &headers, &body)?;
     let v = parse_version(&version)?;
+    // Under the version's lock, so an approval never lands in the middle of
+    // a push replacing the build.
+    let _guard = crate::locks::lock_version(&id, &v.normalized()).await;
+    check_shown_builds(&state, &body, &id, std::slice::from_ref(&v)).await?;
     if !state.db.approve_membership(state.feed(), &id, &v).await? {
         return Err(Error::PackageNotFound);
     }
     Ok(Redirect::to(&admin_package_url(&state.feed.prefix, &id)).into_response())
+}
+
+/// Refuse to approve a version whose build is not the one the page showed.
+///
+/// The admin page sends `build=<version>:<package hash>` for each pending
+/// version it shows. Under `allow_overwrite = "pending-only"` a push can
+/// replace a pending build while a reviewer reads the page, and approving
+/// would then publish a build nobody looked at. A request without the field,
+/// from a script, approves what is there, as before.
+async fn check_shown_builds(
+    state: &AppState,
+    body: &str,
+    id: &str,
+    versions: &[NuGetVersion],
+) -> Result<()> {
+    let shown = form_fields(body, "build");
+    for v in versions {
+        let normalized = v.normalized();
+        let Some(hash) = shown.iter().find_map(|b| {
+            let (sv, hash) = b.split_once(':')?;
+            sv.eq_ignore_ascii_case(&normalized).then_some(hash)
+        }) else {
+            continue;
+        };
+        let current = state
+            .db
+            .get_package_data(id, v)
+            .await?
+            .ok_or(Error::PackageNotFound)?;
+        if current.package_hash != hash {
+            return Err(Error::Conflict(format!(
+                "{id} {normalized} was replaced by a new build after this page was \
+                 loaded; reload the page and review the new build before approving it"
+            )));
+        }
+    }
+    Ok(())
 }
 
 pub(super) async fn admin_promote(

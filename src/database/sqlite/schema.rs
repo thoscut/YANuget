@@ -889,29 +889,47 @@ async fn add_foreign_keys(c: &mut SqliteConnection) -> Result<()> {
 /// by its own version stays so. A dependency list that does not decode is
 /// left as it is rather than failing the upgrade.
 async fn semver2_dependencies(c: &mut SqliteConnection) -> Result<()> {
-    let rows = sqlx::query(
-        "SELECT lower_id, normalized_version, dependencies FROM packages \
-         WHERE is_semver2 = 0 AND dependencies <> '[]'",
-    )
-    .fetch_all(&mut *c)
-    .await?;
+    // In pages by key, so a large store is not read into memory at once
+    // while the server waits to start.
+    const PAGE: i64 = 1000;
+    let mut after = (String::new(), String::new());
     let mut marked = 0u64;
-    for row in rows {
-        let dependencies: String = row.try_get("dependencies")?;
-        let Ok(groups) = serde_json::from_str::<Vec<DependencyGroup>>(&dependencies) else {
-            continue;
-        };
-        if !depends_on_semver2(&groups) {
-            continue;
-        }
-        sqlx::query(
-            "UPDATE packages SET is_semver2 = 1 WHERE lower_id = ?1 AND normalized_version = ?2",
+    loop {
+        let rows = sqlx::query(
+            "SELECT lower_id, normalized_version, dependencies FROM packages \
+             WHERE is_semver2 = 0 AND dependencies <> '[]' \
+               AND (lower_id, normalized_version) > (?1, ?2) \
+             ORDER BY lower_id, normalized_version LIMIT ?3",
         )
-        .bind(row.try_get::<String, _>("lower_id")?)
-        .bind(row.try_get::<String, _>("normalized_version")?)
-        .execute(&mut *c)
+        .bind(&after.0)
+        .bind(&after.1)
+        .bind(PAGE)
+        .fetch_all(&mut *c)
         .await?;
-        marked += 1;
+        let Some(last) = rows.last() else {
+            break;
+        };
+        after = (
+            last.try_get("lower_id")?,
+            last.try_get("normalized_version")?,
+        );
+        for row in &rows {
+            let dependencies: String = row.try_get("dependencies")?;
+            let Ok(groups) = serde_json::from_str::<Vec<DependencyGroup>>(&dependencies) else {
+                continue;
+            };
+            if !depends_on_semver2(&groups) {
+                continue;
+            }
+            sqlx::query(
+                "UPDATE packages SET is_semver2 = 1 WHERE lower_id = ?1 AND normalized_version = ?2",
+            )
+            .bind(row.try_get::<String, _>("lower_id")?)
+            .bind(row.try_get::<String, _>("normalized_version")?)
+            .execute(&mut *c)
+            .await?;
+            marked += 1;
+        }
     }
     if marked > 0 {
         tracing::info!(
