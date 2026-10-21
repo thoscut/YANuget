@@ -21,6 +21,7 @@ error; `run` stops before it fetches anything.
 ```text
 yanuget-internalize [-c PATH] plan PACKAGE...
 yanuget-internalize [-c PATH] run [--replace-pending] PACKAGE...
+yanuget-internalize [-c PATH] sync [--dry-run]
 yanuget-internalize [-c PATH] config check [--offline]
 ```
 
@@ -68,7 +69,8 @@ packages cached under their identity and marked as unverified.
 
 URLs, redirects included, that lead to private, loopback or link-local
 addresses are refused unless `upstream.allow_private` is set; names are
-checked as they resolve. Redirects are followed one hop at a time, never from
+checked as they resolve, and behind `upstream.proxy` resolved here first, as
+for downloads below. Redirects are followed one hop at a time, never from
 https to http, and credentials go only to the upstream's own origin. A `429`
 or `503` is waited out and tried again; when the upstream stops answering,
 and when it answers again, the tool logs it once.
@@ -116,7 +118,13 @@ on SHA-256 or SHA-512 verifies the file; MD5, SHA-1 or no checksum leaves it
 trust-on-first-use, which the report says. URLs and redirects that lead to
 loopback, private or link-local addresses are refused unless
 `downloads.allow_private_hosts` names the host, and no credentials are sent.
-A transfer that breaks off is resumed with a `Range` where the host offers
+Behind `downloads.proxy` the proxy resolves the names, so each host is also
+resolved here first and refused when it is private or does not resolve; the
+proxy resolves again on its own, so let it refuse private destinations too. A
+file that came over plain HTTP with nothing to verify it is a warning. The
+name a download got (its URL after redirects, `Content-Disposition`,
+`Content-Type`) is kept next to it, so a file taken from the cache is
+attached under the same name. A transfer that breaks off is resumed with a `Range` where the host offers
 ranges and a validator, and restarted where it does not.
 
 A file is attached under the URL's own name when that is valid for the feed
@@ -127,7 +135,8 @@ type or the content itself (`MZ`, the OLE header of an `.msi`, `PK`). Two
 different files on one name are told apart by a prefix of their SHA-256. A
 file whose extension the feed does not accept is reported, never renamed to
 pass. The extensions the feed accepts are `target.allowed_extensions`, which
-has to match the feed's own `allowed_extensions`.
+has to match the feed's own `allowed_extensions`. A report larger than
+YANuget reads (1 MiB) fails the package before it is pushed.
 
 ## Report
 
@@ -198,7 +207,8 @@ its file.
 What the capture cannot find out, a person writes down: one TOML file per
 package id in `overrides_dir`, named for the id (`git.install.toml`).
 Unknown keys are refused, and one file that does not check out stops the
-run, so no override is silently left out. `config check` loads them.
+run, as do two files for one id (`Git.toml`, `git.toml`), so no override is
+silently left out. `config check` loads them.
 
 ```toml
 versions = "[2.51,)"                       # the versions it applies to; all without
@@ -223,6 +233,60 @@ package asks for, and the prelude maps it to the attached file. Every
 override used is listed in the report under `overrides`; a rewrite that
 matches no captured URL, or a download the capture saw anyway, is a warning,
 so stale overrides surface.
+
+## Keeping feeds current
+
+`sync` internalizes, for each entry of the watch list (`[sync] watch_list`),
+the newest listed upstream version in its range that no earlier sync
+handled, and lists what waits for approval. A pre-release counts only when a
+bound of the range is one. A version released and superseded between two
+syncs is not fetched.
+
+```toml
+# watch.toml
+[[package]]
+id = "git"
+
+[[package]]                 # an id may be listed once per range
+id = "dotnet-8.0-sdk"
+versions = "[8.0,9.0)"
+```
+
+It is meant for a timer on the worker. What it did lives in
+`[sync] state_file`, saved after every package, so a sync is idempotent and
+safe to interrupt; a lock file next to it keeps a second sync from starting.
+Each version a sync handled is:
+
+| Status | Means | Next sync |
+| --- | --- | --- |
+| `pending` | Pushed; the target feed does not serve it yet. | Waits. |
+| `approved` | The target feed serves it. | Nothing. |
+| `needs-override` | A package of its closure needs an override. | Tries again once any override changes. |
+| `failed` | The run failed. | Tries again. |
+
+A sync never pushes a version twice, so a version an admin deletes or leaves
+pending stays out. It stops counting as pending once a newer version in the
+same range is approved, or at once when an override skips it
+(`versions = "[2.51.0]"`, `skip = "why"`). Ids taken off the watch list are
+forgotten. To fix a version that is already approved, delete it for good in
+the feed (from the admin area, or with `hard_delete_enabled`) and internalize
+it again with `run`; a package fix version would break the exact pin of a
+meta package on its `.install` package.
+Whether a version is approved comes from the target's flat container; on a
+read-gated target the tool cannot tell, and says so.
+
+With `[sync] metrics_file` set, each sync writes its metrics in the
+Prometheus text format, atomically, for node_exporter's textfile collector:
+
+| Metric | Means |
+| --- | --- |
+| `yanuget_internalize_sync_last_run_timestamp_seconds` | When the last sync ended. Alert when it is old: a sync that cannot start writes nothing. |
+| `yanuget_internalize_sync_outcome{outcome}` | 1 for how the last sync ended (`done`, `needs-attention`, `failed`). |
+| `yanuget_internalize_sync_versions{status}` | Versions in the state, per status above. |
+| `yanuget_internalize_sync_oldest_pending_seconds` | How long the oldest pending version has waited; 0 when none. |
+
+`sync --dry-run` says what a sync would internalize and changes nothing. Until
+a sandbox backend captures, `sync` records each new version as failed.
 
 ## Sandboxes
 

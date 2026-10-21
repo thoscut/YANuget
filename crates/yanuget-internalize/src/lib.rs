@@ -20,6 +20,7 @@ pub mod overrides;
 pub mod publish;
 pub mod report;
 pub mod sandbox;
+pub mod sync;
 pub mod target;
 pub mod upstream;
 

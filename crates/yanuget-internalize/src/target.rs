@@ -41,6 +41,9 @@ impl Target {
             .map_err(|e| TargetError(format!("target.url: {e}")))?;
         let client = reqwest::Client::builder()
             .user_agent(crate::USER_AGENT)
+            // Directly, as the publisher reaches it: not through a proxy
+            // from the environment.
+            .no_proxy()
             .timeout(Duration::from_secs(config.timeout_secs.min(60)))
             .build()
             .map_err(|e| TargetError(format!("cannot build an HTTP client: {e}")))?;

@@ -116,6 +116,33 @@ pub fn check_loaded(config: &Config, host: &Host, report: &mut Report) {
             Err(e) => report.errors.push(format!("overrides: {e}")),
         }
     }
+    if let Some(path) = &config.sync.watch_list {
+        match crate::sync::WatchList::load(path) {
+            Ok(w) => report.notes.push(format!(
+                "{} package{} on the watch list {}",
+                w.len(),
+                if w.len() == 1 { "" } else { "s" },
+                path.display()
+            )),
+            Err(e) => report.errors.push(e.to_string()),
+        }
+    }
+    if let Err(e) = crate::sync::State::load(&config.sync.state_file) {
+        report.errors.push(e.to_string());
+    }
+    if let Some(dir) = config
+        .sync
+        .metrics_file
+        .as_deref()
+        .and_then(std::path::Path::parent)
+        .filter(|d| !d.as_os_str().is_empty() && !d.is_dir())
+    {
+        report.warnings.push(format!(
+            "sync.metrics_file: {} does not exist yet; a sync creates it, but \
+             node_exporter's textfile collector has to read that directory",
+            dir.display()
+        ));
+    }
     if config.cache_dir == config.work_dir {
         report.warnings.push(
             "cache_dir and work_dir are the same directory; a run clears its work \
@@ -182,6 +209,16 @@ fn check_upstream(config: &Config, report: &mut Report) {
              rate-limits heavy users; 2 to 4 is safer",
             upstream.concurrency
         ));
+    }
+    // Downloads come from untrusted scripts; the upstream's own URL the
+    // operator chose.
+    if config.downloads.proxy.is_some() {
+        report.notes.push(
+            "downloads.proxy: each download host is also resolved here and refused when \
+             it is private or does not resolve; the proxy resolves again on its own, so \
+             let it refuse private destinations too"
+                .into(),
+        );
     }
 }
 
@@ -583,5 +620,39 @@ mod tests {
         std::fs::write(overrides.join("git.toml"), "skipp = 1").unwrap();
         let r = checked(&config, &host);
         assert!(has(&r.errors, "overrides: git.toml"), "{:?}", r.errors);
+    }
+
+    #[test]
+    fn the_watch_list_and_the_state_are_loaded_by_the_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut config, host) = good(dir.path());
+        let watch = dir.path().join("watch.toml");
+        std::fs::write(
+            &watch,
+            "[[package]]\nid = \"git\"\n[[package]]\nid = \"vlc\"\nversions = \"[3.0,4.0)\"\n",
+        )
+        .unwrap();
+        config.sync.watch_list = Some(watch.clone());
+        config.sync.state_file = dir.path().join("state/sync.json");
+        config.sync.metrics_file = Some(dir.path().join("textfile/internalize.prom"));
+        let r = checked(&config, &host);
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert!(
+            has(&r.notes, "2 packages on the watch list"),
+            "{:?}",
+            r.notes
+        );
+        assert!(has(&r.warnings, "sync.metrics_file"), "{:?}", r.warnings);
+
+        std::fs::write(&watch, "[[package]]\nid = \"a..b\"\n").unwrap();
+        std::fs::create_dir(dir.path().join("state")).unwrap();
+        std::fs::write(
+            dir.path().join("state/sync.json"),
+            "{\"schema\": 9, \"versions\": []}",
+        )
+        .unwrap();
+        let r = checked(&config, &host);
+        assert!(has(&r.errors, "not a package id"), "{:?}", r.errors);
+        assert!(has(&r.errors, "schema 9"), "{:?}", r.errors);
     }
 }

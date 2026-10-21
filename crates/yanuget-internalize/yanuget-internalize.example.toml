@@ -17,6 +17,16 @@ work_dir = "./work"
 # package parameters, a replacement script, extra downloads, URL rewrites.
 # overrides_dir = "./overrides"
 
+[sync]
+# The packages `sync` keeps current: a TOML file of [[package]] entries, each
+# an id and optionally a version range. `sync` needs one.
+# watch_list = "./watch.toml"
+# What earlier syncs did; a lock file sits next to it.
+state_file = "./state/sync.json"
+# The metrics of each sync, in the Prometheus text format, for node_exporter's
+# textfile collector.
+# metrics_file = "/var/lib/prometheus/node-exporter/yanuget_internalize.prom"
+
 [target]
 # The intake feed (requires_approval = true) to push to, where its
 # v3/index.json is. `plan` works without one; `run` does not.

@@ -171,14 +171,22 @@ async fn checksums_decide_what_a_file_is_worth() {
     assert_eq!(std::fs::read(&got.path).unwrap(), body);
     assert_eq!(got.size, body.len() as u64);
     assert_eq!(got.head, body[..16]);
-    assert!(got.final_url.unwrap().path().ends_with("/plain/setup.exe"));
+    let got_final = got.final_url.clone();
+    assert!(got_final
+        .as_ref()
+        .unwrap()
+        .path()
+        .ends_with("/plain/setup.exe"));
     assert_eq!(
         got.content_disposition.as_deref(),
         Some("attachment; filename=\"Setup 1.0.exe\"")
     );
-    // The second time it comes from the cache.
+    // The second time it comes from the cache, named as the download was,
+    // so a re-run attaches it under the same name.
     let again = d.fetch(&url, Some(&declared)).await.unwrap();
-    assert!(again.final_url.is_none());
+    assert_eq!(again.final_url, got_final);
+    assert_eq!(again.content_disposition, got.content_disposition);
+    assert_eq!(again.content_type, got.content_type);
     assert_eq!(again.head, body[..16]);
 
     // MD5 and nothing are trust-on-first-use, a matching MD5 included.
@@ -206,7 +214,11 @@ async fn checksums_decide_what_a_file_is_worth() {
         matches!(err, DownloadError::ChecksumMismatch { .. }),
         "{err}"
     );
-    assert_eq!(files(cache.path()), [format!("sha256-{}", sha256(&body))]);
+    let hex = sha256(&body);
+    assert_eq!(
+        files(cache.path()),
+        [format!("sha256-{hex}"), format!("sha256-{hex}.names.json")]
+    );
 
     let missing = format!("{base}/missing").parse().unwrap();
     let err = d.fetch(&missing, None).await.unwrap_err();
@@ -298,4 +310,52 @@ async fn size_and_addresses_are_policed() {
         .filter(|n| n.starts_with("partial-"))
         .collect();
     assert!(partials.is_empty(), "{partials:?}");
+}
+
+#[tokio::test]
+async fn behind_a_proxy_each_host_is_resolved_here_first() {
+    // The test host answers absolute-form requests too, so it stands in for
+    // the proxy.
+    let (base, _) = host().await;
+    let cache = tempfile::tempdir().unwrap();
+    let port = base.rsplit(':').next().unwrap();
+    let proxied = DownloadsConfig {
+        proxy: Some(base.clone()),
+        timeout_secs: 5,
+        ..DownloadsConfig::default()
+    };
+
+    // The proxy would resolve `localhost` itself; the tool refuses first.
+    let named: reqwest::Url = format!("http://localhost:{port}/plain/setup.exe")
+        .parse()
+        .unwrap();
+    let err = downloader(&proxied, cache.path())
+        .fetch(&named, None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, DownloadError::Http(UpstreamError::Refused(_))),
+        "{err}"
+    );
+    assert!(err.to_string().contains("private address"), "{err}");
+
+    // A name that does not resolve here cannot be told apart, so it is
+    // refused too.
+    let unknown: reqwest::Url = "http://nothing-here.invalid/setup.exe".parse().unwrap();
+    let err = downloader(&proxied, cache.path())
+        .fetch(&unknown, None)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("cannot resolve"), "{err}");
+
+    // An allowed host goes through the proxy.
+    let allowed = DownloadsConfig {
+        allow_private_hosts: vec!["localhost".into()],
+        ..proxied
+    };
+    let got = downloader(&allowed, cache.path())
+        .fetch(&named, None)
+        .await
+        .unwrap();
+    assert_eq!(got.size, content().len() as u64);
 }

@@ -11,6 +11,7 @@ use crate::closure::{self, Closure};
 use crate::config::{Config, CONFIG_ENV};
 use crate::outcome::Outcome;
 use crate::overrides::Overrides;
+use crate::sync::{self, State, SyncStatus, WatchList};
 use crate::target::Target;
 use crate::upstream::Upstream;
 
@@ -39,6 +40,10 @@ pub enum Command {
     Plan(PlanArgs),
     /// Capture, download, rewrite and push to the target feed.
     Run(RunArgs),
+    /// Internalize the newest version of each package on the watch list that
+    /// no earlier sync handled, and report what waits for approval. Meant for
+    /// a timer: idempotent, safe to interrupt, one sync at a time.
+    Sync(SyncArgs),
     /// Work with the configuration.
     Config(ConfigArgs),
 }
@@ -60,6 +65,14 @@ pub struct RunArgs {
     /// `allow_overwrite = "pending-only"` there, YANuget 0.8.0 or later).
     #[arg(long)]
     pub replace_pending: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct SyncArgs {
+    /// Say what a sync would internalize; change nothing, write no state and
+    /// no metrics.
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 #[derive(Debug, Args)]
@@ -193,6 +206,104 @@ pub async fn run(cli: Cli) -> anyhow::Result<Outcome> {
             prepare(&config, &args.packages)?;
             not_built_yet()
         }
+        Command::Sync(args) => sync(config_path, args.dry_run).await,
+    }
+}
+
+/// `sync`: everything but the pipeline itself, which `run` will share.
+async fn sync(config_path: Option<&str>, dry_run: bool) -> anyhow::Result<Outcome> {
+    let config = Config::load(config_path).context("cannot load the configuration")?;
+    let Some(watch_list) = &config.sync.watch_list else {
+        bail!("`sync` needs sync.watch_list, the packages to keep current");
+    };
+    let watch = WatchList::load(watch_list)?;
+    if !dry_run {
+        if config.target.url.is_none() {
+            bail!("`sync` needs target.url, the feed to push to");
+        }
+        if config.target.api_key.is_none() {
+            bail!("`sync` needs target.api_key, a push key of the target feed");
+        }
+        crate::sandbox::from_config(&config.sandbox)?;
+    }
+    let state_file = &config.sync.state_file;
+    let _lock = if dry_run {
+        None
+    } else {
+        Some(sync::lock(state_file)?)
+    };
+    let mut state = State::load(state_file)?;
+    let upstream = Upstream::new(&config.upstream, &config.cache_dir)?;
+    let target = Target::new(&config.target)?;
+    let overrides = match &config.overrides_dir {
+        Some(dir) => Overrides::load(dir)?,
+        None => Overrides::none(),
+    };
+    let options = sync::Options {
+        dry_run,
+        now: chrono::Utc::now(),
+    };
+    let mut save = |s: &State| s.save(state_file);
+    let result = sync::sync(
+        &watch,
+        &upstream,
+        target.as_ref().map(|t| t as &dyn sync::Feed),
+        &overrides,
+        &NotBuilt,
+        &mut state,
+        &options,
+        &mut save,
+    )
+    .await;
+
+    let outcome = match &result {
+        Ok(summary) => summary.outcome(),
+        Err(_) => Outcome::Failed,
+    };
+    if !dry_run {
+        if let Some(path) = &config.sync.metrics_file {
+            let text = sync::metrics(&state, outcome, chrono::Utc::now());
+            if let Err(e) = sync::write_atomic(path, text.as_bytes()) {
+                tracing::error!(path = %path.display(), "cannot write the metrics: {e}");
+            }
+        }
+    }
+    let summary = result?;
+    for line in &summary.lines {
+        println!("{line}");
+    }
+    for w in &summary.warnings {
+        tracing::warn!("{w}");
+    }
+    let pending: Vec<_> = state
+        .entries()
+        .filter(|e| e.status == SyncStatus::Pending)
+        .collect();
+    if !pending.is_empty() {
+        println!(
+            "{} version{} wait{} for approval:",
+            pending.len(),
+            if pending.len() == 1 { "" } else { "s" },
+            if pending.len() == 1 { "s" } else { "" }
+        );
+        for e in pending {
+            println!("  {} {} since {}", e.id, e.version.normalized(), e.since);
+        }
+    }
+    Ok(outcome)
+}
+
+/// The pipeline `sync` hands each version to, until a sandbox backend
+/// captures.
+struct NotBuilt;
+
+#[async_trait::async_trait]
+impl sync::Internalize for NotBuilt {
+    async fn internalize(
+        &self,
+        _root: &crate::upstream::PackageInfo,
+    ) -> anyhow::Result<Vec<yanuget_pkg::report::Report>> {
+        bail!("capturing in the sandbox is not built yet")
     }
 }
 
@@ -310,6 +421,8 @@ mod tests {
         ])
         .unwrap();
         Cli::try_parse_from(["yanuget-internalize", "config", "check", "--offline"]).unwrap();
+        Cli::try_parse_from(["yanuget-internalize", "sync", "--dry-run"]).unwrap();
+        assert!(Cli::try_parse_from(["yanuget-internalize", "sync", "git"]).is_err());
         // A package is required, and a bad one is a usage error.
         assert!(Cli::try_parse_from(["yanuget-internalize", "plan"]).is_err());
         assert!(Cli::try_parse_from(["yanuget-internalize", "plan", "a..b"]).is_err());

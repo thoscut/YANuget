@@ -456,3 +456,23 @@ async fn replace_pending_needs_a_server_that_can() {
     let p = publisher(format!("http://{addr}/"), PUSH_KEY);
     p.check_replace_pending().await.unwrap();
 }
+
+#[tokio::test]
+async fn a_report_the_server_would_refuse_is_not_pushed() {
+    let dir = tempfile::tempdir().unwrap();
+    let nupkg = write_nupkg(dir.path());
+    let mut report = report(&[]);
+    report.warnings = vec!["w".repeat(1024); 1100];
+    // Nothing listens there: the refusal has to come before any request.
+    let p = publisher("http://127.0.0.1:9/intake/".into(), PUSH_KEY);
+    let err = p
+        .publish(
+            release(&nupkg, &report, &[]),
+            &dir.path().join("work"),
+            false,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, PublishError::Report(_)), "{err}");
+    assert!(err.to_string().contains("1024 KiB at most"), "{err}");
+}

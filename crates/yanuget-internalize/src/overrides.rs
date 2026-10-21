@@ -141,7 +141,16 @@ impl Overrides {
             };
             match load_one(dir, id, &path) {
                 Ok(o) => {
-                    by_id.insert(id.to_ascii_lowercase(), o);
+                    // Ids ignore case, so `Git.toml` and `git.toml` would
+                    // have one replace the other at random.
+                    if let Some(earlier) = by_id.insert(id.to_ascii_lowercase(), o) {
+                        let mut names = [format!("{}.toml", earlier.id), format!("{id}.toml")];
+                        names.sort();
+                        errors.push(format!(
+                            "{} and {} are for the same package; keep one",
+                            names[0], names[1]
+                        ));
+                    }
                 }
                 Err(e) => errors.push(e),
             }
@@ -167,6 +176,14 @@ impl Overrides {
         self.by_id
             .get(&id.to_ascii_lowercase())
             .filter(|o| o.versions.as_ref().is_none_or(|r| r.contains(version)))
+    }
+
+    /// A hash of every override, scripts included: it changes when any file
+    /// does, which tells `sync` (`INT-27`) to try a package that needed an
+    /// override again.
+    pub fn fingerprint(&self) -> String {
+        use sha2::{Digest, Sha256};
+        hex::encode(Sha256::digest(format!("{:?}", self.by_id)))
     }
 }
 
@@ -495,6 +512,17 @@ sha256 = "AA"
             assert!(err.contains(why), "{name} {text:?}: {err}");
         }
         assert!(Overrides::load(Path::new("/nonexistent/overrides")).is_err());
+
+        // Two files for one id: neither silently wins. (On a file system
+        // that ignores case they cannot both exist.)
+        let dir = dir_with(&[("git.toml", "skip = \"a\""), ("Git.toml", "skip = \"b\"")]);
+        if std::fs::read_dir(dir.path()).unwrap().count() == 2 {
+            let err = Overrides::load(dir.path()).unwrap_err().to_string();
+            assert!(
+                err.contains("Git.toml and git.toml are for the same package"),
+                "{err}"
+            );
+        }
     }
 
     fn wanted(url: &str) -> Wanted {
