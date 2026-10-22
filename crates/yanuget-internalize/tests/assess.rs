@@ -142,6 +142,14 @@ async fn a_capture_becomes_reports_and_files() {
         app.downloads[1].checksum.status,
         ChecksumStatus::TrustOnFirstUse
     );
+    // The test host is plain HTTP: the verified installer passes, the zip
+    // nothing vouches for is a warning.
+    assert_eq!(app.warnings.len(), 1, "{:?}", app.warnings);
+    assert!(
+        app.warnings[0].contains("/dl/tool.zip came over plain HTTP"),
+        "{:?}",
+        app.warnings
+    );
     assert_eq!(
         app.environment.as_ref().unwrap().image_sha256.as_deref(),
         Some("11".repeat(32).as_str())

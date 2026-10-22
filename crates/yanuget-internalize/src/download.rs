@@ -9,7 +9,10 @@
 //! policy applies to each of them and every redirect: loopback, private and
 //! link-local addresses are refused unless `downloads.allow_private_hosts`
 //! names the host. Without that, a script could make the tool fetch from an
-//! internal host and publish the answer into the feed. Transfers that break
+//! internal host and publish the answer into the feed. Behind
+//! `downloads.proxy` the proxy resolves the names, so each host is resolved
+//! here first as well, and one that does not resolve here is refused; the
+//! proxy should refuse private destinations too. Transfers that break
 //! off are resumed where the host allows it and restarted where it does not.
 
 use std::path::{Path, PathBuf};
@@ -61,8 +64,8 @@ pub struct Downloaded {
     pub sha256: String,
     /// What the script's checksum vouched for, as the report says it.
     pub checksum: ReportChecksum,
-    /// Where the file came from in the end, after redirects; `None` when it
-    /// was in the cache already.
+    /// Where the file came from in the end, after redirects. A file from the
+    /// cache has what its download had, kept next to it.
     pub final_url: Option<Url>,
     /// The host's `Content-Disposition` and `Content-Type`, for naming the
     /// file.
@@ -70,6 +73,14 @@ pub struct Downloaded {
     pub content_type: Option<String>,
     /// The file's first bytes, to tell what it is ([`crate::naming::Kind`]).
     pub head: Vec<u8>,
+}
+
+/// What names a downloaded file, kept next to it in the cache.
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct Names {
+    final_url: Option<String>,
+    content_disposition: Option<String>,
+    content_type: Option<String>,
 }
 
 /// How many of a file's first bytes [`Downloaded::head`] keeps.
@@ -132,10 +143,40 @@ impl Downloader {
             PARTIAL.fetch_add(1, Ordering::Relaxed)
         ));
         let result = self.download(url, declared, &partial).await;
-        if result.is_err() {
-            let _ = tokio::fs::remove_file(&partial).await;
+        match &result {
+            Ok(file) => self.write_names(file).await,
+            Err(_) => {
+                let _ = tokio::fs::remove_file(&partial).await;
+            }
         }
         result
+    }
+
+    /// Where the naming inputs of a cached file are kept, so a file taken
+    /// from the cache gets the name a fresh download would.
+    fn names_path(&self, sha256: &str) -> PathBuf {
+        self.dir.join(format!("sha256-{sha256}.names.json"))
+    }
+
+    /// Keep what names `file` next to it. Best effort: without it a later
+    /// run names the file from its URL alone.
+    async fn write_names(&self, file: &Downloaded) {
+        let names = Names {
+            final_url: file.final_url.as_ref().map(Url::to_string),
+            content_disposition: file.content_disposition.clone(),
+            content_type: file.content_type.clone(),
+        };
+        let bytes = serde_json::to_vec(&names).expect("names serialize");
+        if let Err(e) = tokio::fs::write(self.names_path(&file.sha256), bytes).await {
+            tracing::warn!(sha256 = %file.sha256, "cannot keep the file's naming inputs: {e}");
+        }
+    }
+
+    async fn read_names(&self, sha256: &str) -> Names {
+        let Ok(bytes) = tokio::fs::read(self.names_path(sha256)).await else {
+            return Names::default();
+        };
+        serde_json::from_slice(&bytes).unwrap_or_default()
     }
 
     /// A file a declared SHA-256 names, if the cache holds it and it still
@@ -168,14 +209,15 @@ impl Downloader {
             tokio::fs::remove_file(&path).await?;
             return Ok(None);
         }
+        let names = self.read_names(&sum.hex).await;
         Ok(Some(Downloaded {
             path,
             size: bytes,
             sha256: sum.hex.clone(),
             checksum: report_checksum(Some(sum)),
-            final_url: None,
-            content_disposition: None,
-            content_type: None,
+            final_url: names.final_url.and_then(|u| Url::parse(&u).ok()),
+            content_disposition: names.content_disposition,
+            content_type: names.content_type,
             head,
         }))
     }

@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use reqwest::{Body, Method, StatusCode, Url};
 use serde_json::Value;
-use yanuget_pkg::report::{Report, REPORT_PATH};
+use yanuget_pkg::report::{Report, MAX_REPORT_BYTES, REPORT_PATH};
 use yanuget_pkg::rewrite::{self, Rewrite, Source};
 use yanuget_pkg::NuGetVersion;
 
@@ -45,6 +45,9 @@ pub enum PublishError {
     Feed(String),
     #[error("cannot rewrite the package: {0}")]
     Rewrite(#[from] yanuget_pkg::Error),
+    /// The report is larger than YANuget reads (`MAX_REPORT_BYTES`).
+    #[error("{0}")]
+    Report(String),
     #[error("work directory: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -130,6 +133,9 @@ impl Publisher {
         }
         let client = reqwest::Client::builder()
             .user_agent(crate::USER_AGENT)
+            // The feed is reached directly: a proxy from the environment
+            // would be an egress path nobody chose, for the push key too.
+            .no_proxy()
             .connect_timeout(Duration::from_secs(config.timeout_secs.min(60)))
             // A push key goes to the feed and nowhere else.
             .redirect(reqwest::redirect::Policy::none())
@@ -203,7 +209,17 @@ impl Publisher {
         let package = &release.report.package;
         tokio::fs::create_dir_all(work_dir).await?;
         let rewritten = rewritten_path(work_dir, &package.id, &package.version);
-        let mut plan = Rewrite::new().put(REPORT_PATH, Source::Bytes(release.report.to_vec()));
+        let report = release.report.to_vec();
+        if report.len() as u64 > MAX_REPORT_BYTES {
+            return Err(PublishError::Report(format!(
+                "the report of {} {} is {} KiB, and YANuget reads {} KiB at most",
+                package.id,
+                package.version,
+                report.len().div_ceil(1024),
+                MAX_REPORT_BYTES / 1024
+            )));
+        }
+        let mut plan = Rewrite::new().put(REPORT_PATH, Source::Bytes(report));
         for (name, source) in release.entries {
             plan = plan.put(name, source);
         }

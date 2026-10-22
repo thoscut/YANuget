@@ -149,6 +149,58 @@ fn plan_stops_on_a_sandbox_that_cannot_run_here() {
     );
 }
 
+#[test]
+fn sync_needs_a_watch_list_a_target_and_a_sandbox() {
+    let dir = tempfile::tempdir().unwrap();
+    let o = internalize(dir.path(), &["sync"], &[]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(stderr(&o).contains("sync.watch_list"), "{}", stderr(&o));
+
+    std::fs::write(
+        dir.path().join("watch.toml"),
+        "[[package]]\nid = \"a..b\"\n",
+    )
+    .unwrap();
+    let watch = [("YANUGET_INTERNALIZE_SYNC_WATCH_LIST", "watch.toml")];
+    let o = internalize(dir.path(), &["sync", "--dry-run"], &watch);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(stderr(&o).contains("not a package id"), "{}", stderr(&o));
+
+    std::fs::write(dir.path().join("watch.toml"), "[[package]]\nid = \"git\"\n").unwrap();
+    let o = internalize(dir.path(), &["sync"], &watch);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(stderr(&o).contains("target.url"), "{}", stderr(&o));
+
+    // The container backend never runs on the hosts CI tests on.
+    if cfg!(windows) {
+        return;
+    }
+    let o = internalize(
+        dir.path(),
+        &["sync"],
+        &[
+            watch[0],
+            (
+                "YANUGET_INTERNALIZE_TARGET_URL",
+                "https://nuget.example.com/intake/",
+            ),
+            (
+                "YANUGET_INTERNALIZE_TARGET_API_KEY",
+                "a-push-key-of-the-intake-feed",
+            ),
+            ("YANUGET_INTERNALIZE_SANDBOX_BACKEND", "windows-container"),
+        ],
+    );
+    assert_eq!(o.status.code(), Some(1));
+    assert!(
+        stderr(&o).contains("needs a Windows host"),
+        "{}",
+        stderr(&o)
+    );
+    // It stopped before it took the lock or wrote any state.
+    assert!(!dir.path().join("state").exists());
+}
+
 /// Serve `responses` in order, one per connection, on a local port; return
 /// the feed URL.
 async fn serve(responses: Vec<&'static str>) -> String {

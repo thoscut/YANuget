@@ -13,7 +13,7 @@ use std::path::PathBuf;
 
 use futures_util::StreamExt;
 use reqwest::Url;
-use yanuget_pkg::report::Download;
+use yanuget_pkg::report::{ChecksumStatus, Download};
 use yanuget_pkg::NuGetVersion;
 
 use crate::capture::{self, Call, Checksum, Helper, Origin};
@@ -206,6 +206,18 @@ pub async fn fetch(
                 continue;
             }
         };
+        let from = w.fetch_from.as_ref().unwrap_or(&w.url);
+        let plain = from.scheme() == "http"
+            || file
+                .final_url
+                .as_ref()
+                .is_some_and(|u| u.scheme() == "http");
+        if plain && file.checksum.status != ChecksumStatus::Verified {
+            draft.warn(format!(
+                "{from} came over plain HTTP without a SHA-256 or SHA-512 to verify it, \
+                 so anyone on the way could have changed it"
+            ));
+        }
         let fallback = format!("{}-{}", draft.package().id, draft.package().version);
         let named = names[i].name(
             &Source {

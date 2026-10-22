@@ -12,7 +12,7 @@ use std::time::Duration;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, AUTHORIZATION, LOCATION, RETRY_AFTER};
 use reqwest::{StatusCode, Url};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
-use yanuget_pkg::address::{is_private_host, GuardedResolver};
+use yanuget_pkg::address::{is_private_host, is_private_ip_addr, GuardedResolver};
 
 use super::UpstreamError;
 use crate::config::UpstreamConfig;
@@ -100,6 +100,9 @@ pub struct HttpClient {
     credentials: HeaderMap,
     allow_private: bool,
     allowed_private_hosts: Vec<String>,
+    /// A proxy resolves the names itself, past the guarded resolver, so each
+    /// host is also resolved here before a request.
+    proxied: bool,
     hint: &'static str,
     watch_health: bool,
     timeout: Duration,
@@ -176,6 +179,7 @@ impl HttpClient {
             credentials: options.credentials,
             allow_private: options.allow_private,
             allowed_private_hosts: options.allowed_private_hosts,
+            proxied: options.proxy.is_some(),
             hint: options.hint,
             watch_health: options.watch_health,
             timeout,
@@ -221,6 +225,51 @@ impl HttpClient {
                     )));
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// [`Self::check`], and behind a proxy the host's addresses as well: the
+    /// proxy resolves the name itself, so the guarded resolver never sees it.
+    /// A name that does not resolve here is refused, since its address
+    /// cannot be told. The proxy resolves again, so a DNS answer that changes
+    /// in between gets past this; the proxy should refuse private
+    /// destinations too.
+    async fn vet(&self, url: &Url, what: &str) -> Result<(), UpstreamError> {
+        self.check(url, what)?;
+        let Some(host) = url.host_str() else {
+            return Ok(());
+        };
+        if !self.proxied
+            || self.allow_private
+            || allowed(&self.allowed_private_hosts, host)
+            // A literal address was classified by `check`.
+            || host
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .parse::<std::net::IpAddr>()
+                .is_ok()
+        {
+            return Ok(());
+        }
+        let label = self.label;
+        let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host, 0))
+            .await
+            .map_err(|e| {
+                UpstreamError::Refused(format!(
+                    "{label} {what} {}: cannot resolve {host} here to check its address ({e}); \
+                     behind a proxy every host is also resolved locally",
+                    redact(url)
+                ))
+            })?
+            .collect();
+        if let Some(private) = addrs.iter().find(|a| is_private_ip_addr(a.ip())) {
+            return Err(UpstreamError::Refused(format!(
+                "{label} {what} {}: {host} resolves to the private address {}; {}",
+                redact(url),
+                private.ip(),
+                self.hint
+            )));
         }
         Ok(())
     }
@@ -318,7 +367,7 @@ impl HttpClient {
         headers: &HeaderMap,
     ) -> Result<reqwest::Response, UpstreamError> {
         let label = self.label;
-        self.check(url, what)?;
+        self.vet(url, what).await?;
         let mut current = url.clone();
         for _ in 0..=MAX_REDIRECTS {
             let mut request = self.client.get(current.clone()).headers(headers.clone());
@@ -358,7 +407,7 @@ impl HttpClient {
                     redact(&current)
                 )));
             }
-            self.check(&next, what)?;
+            self.vet(&next, what).await?;
             current = next;
         }
         Err(UpstreamError::Invalid(format!(
