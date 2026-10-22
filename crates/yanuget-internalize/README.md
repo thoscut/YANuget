@@ -11,8 +11,8 @@ at them. The plan is the "Chocolatey internalizer" section of
 its check (`INT-10`), the upstream client (`INT-11`), the dependency closure
 (`INT-12`), the capture parser (`INT-16`), the downloader (`INT-17`), file
 naming (`INT-18`), publishing (`INT-20`), the report (`INT-21`), the
-static cross-check (`INT-23`) and overrides (`INT-25`) exist; the sandbox runners and the prelude
-follow, and `run` is wired up with them.
+static cross-check (`INT-23`), overrides (`INT-25`) and the prelude (`INT-19`)
+exist; the sandbox runners follow, and `run` is wired up with them.
 `plan` shows the closure of the packages it is given and then stops with an
 error; `run` stops before it fetches anything.
 
@@ -176,7 +176,7 @@ copy, `yanuget migrate` and `yanuget backup` keep it with the package.
 ## Publishing
 
 A package that is `internalized` or `unchanged` is rewritten with its report
-(and, with `INT-19`, the prelude), pushed to `target.url` with the push key,
+(and, when files were attached, the prelude), pushed to `target.url` with the push key,
 and its files are attached under `api/v2/files/…` with their SHA-256 for the
 feed to check. The tool then reads the feed's flat container, which lists
 approved versions only, and warns when the version is served at once: the
@@ -201,6 +201,48 @@ An attach that breaks off or meets a server error is tried again. A file the
 feed refuses (its type, a different file under the name) fails the package.
 Each request may take `target.timeout_secs`, plus a second for every MiB of
 its file.
+
+## Prelude
+
+A package with attached files gets three entries. `internalizer/prelude.ps1`
+is the prelude. The package's own `chocolateyInstall.ps1` moves to
+`chocolateyInstall.upstream.ps1` in the same folder, so `$toolsDir` and
+`$MyInvocation` still lead there. In its place goes a loader that
+dot-sources the prelude and then the package's own script. A package that
+already has entries under those names is refused.
+
+The prelude wraps `Get-ChocolateyWebFile`, `Get-WebFile`, `Get-FtpFile`,
+`Install-ChocolateyPackage`, `Install-ChocolateyZipPackage`,
+`Install-ChocolateyVsixPackage` and `Install-ChocolateyPowershellCommand` in
+proxy commands. The client makes them at install time from the helpers it
+has (`ProxyCommand::Create`), so positional parameters and aliases bind as
+they do against those helpers, whatever Chocolatey version is installed. A
+wrapper:
+
+- replaces each `http(s)` or `ftp(s)` URL with the attached file's URL;
+- replaces the checksum with the file's SHA-256, whatever the package
+  declared;
+- for `Get-WebFile`, which takes no checksum, checks the file it wrote.
+
+A URL that is not in the map stops the install with a message naming the
+package; it never falls back to the internet. A local path is left alone.
+Calls the helpers make among themselves are not wrapped, so they keep the
+URL they were given.
+
+The map is keyed by the SHA-256 of the URL as the report records it. The
+wrapper looks up the URL as the package spelled it, then in the canonical
+form .NET gives it (`[Uri]::AbsoluteUri`), so a URL that the capture
+recorded in canonical form still matches. No text a package wrote is
+written into the prelude, only hashes, the file names `INT-18` checked and
+the feed's URL. That URL is `target.url`. A client sets
+`YANUGET_INTERNALIZED_FEED_URL` to fetch from another address, after a host
+move.
+
+A package with no attached files is published as it is. A feed with a
+`read_api_key` cannot serve the files to `choco install` yet (`INT-31`).
+`tests/prelude.rs` installs a package from a real server through the
+prelude, with a stand-in for Chocolatey's helpers. It runs where `pwsh` is
+installed, or where `YANUGET_TEST_PWSH` names it.
 
 ## Overrides
 
