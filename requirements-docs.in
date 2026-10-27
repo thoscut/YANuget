@@ -16,4 +16,4 @@
 #
 #   uv pip compile --universal --generate-hashes --python-version 3.10 \
 #       requirements-docs.in -o requirements-docs.txt
-mkdocs-material>=9.5,<10
+mkdocs-material>=9.8.0,<10
