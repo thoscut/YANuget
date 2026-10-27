@@ -11,8 +11,12 @@ see [Large packages](large-packages.md).
 | --- | --- | --- |
 | Container image (`ghcr.io/thoscut/yanuget`) | ✅ | Most deployments |
 | Release archive from GitHub | ✅ | Bare metal, systemd |
-| `cargo install yanuget` | ❌ (placeholder page) | Trying it out, custom builds |
+| `cargo install --git … --tag vX.Y.Z yanuget` | ❌ (placeholder page) | Trying it out, custom builds |
 | `cargo build --release` | Only if you ran `mkdocs build` first | Development |
+
+YANuget is not on crates.io yet, so `cargo install` builds a release tag from
+the repository:
+`cargo install --git https://github.com/thoscut/yanuget --tag vX.Y.Z --locked yanuget`.
 
 The binary has no runtime dependencies beyond a C runtime. For mirroring and
 migration it trusts the Mozilla root certificates built into it *and* the
@@ -83,7 +87,7 @@ Use `yanuget backup`: it takes a consistent copy of the database, the package
 store and the self-signed TLS pair while the server runs, incrementally on
 every run after the first, and `yanuget restore` puts it back. See
 [Backup, restore and moving hosts](backup.md), which also covers moving the
-server to a new host.
+server to a new host and [running both in a container](backup.md#in-a-container).
 
 The database and the package store must be backed up **together and
 consistently**. Copying the data directory with `cp` or `rsync` while the
@@ -276,17 +280,32 @@ default `client_max_body_size` will reject the push outright.
 Schema changes are applied automatically at startup and are additive, so an
 upgrade needs no migration command and re-running it is a no-op. **Downgrading
 is not supported**: an older binary may not understand columns a newer one
-added. Roll back by restoring the backup **with the older release's binary**:
-`yanuget restore` opens the restored database the way the server does, so a
-newer binary migrates it to its own schema again.
+added. Roll back by restoring the backup from step 2 **with the older release's
+binary**: `yanuget restore` opens the restored database the way the server does,
+so a newer binary migrates it to its own schema again.
 
-Package payloads are never rewritten by an upgrade, so a restore only ever needs
-to roll back the database.
+```bash
+systemctl stop yanuget
+# Put the older binary back first, then restore with it.
+sudo -u yanuget yanuget --config /etc/yanuget/yanuget.toml restore --force /srv/backup/yanuget
+systemctl start yanuget
+```
+
+A rollback is a restore of the whole server, not just of the database: there is
+no database-only mode, and `--force` makes the package store match the backup
+exactly. The server returns to the state of the backup: **packages pushed
+since then are lost** (their files are removed from the store, and the restored
+database has no rows for them), and deletes, listing changes and promotions made
+since then are undone. Take the backup right before the upgrade, and decide on a
+rollback before clients push to the new version.
+See [Restoring](backup.md#restoring).
 
 ## Operational notes
 
 - **Logging** — the default filter is `info,yanuget=info,tower_http=info`; set
-  `RUST_LOG=yanuget=debug` for request-level detail. `5xx` responses are
+  `RUST_LOG=info,yanuget=debug,tower_http=debug` for request-level detail (the
+  request spans come from `tower_http`, so a filter that leaves it out, such as
+  `yanuget=debug` alone, hides them). `5xx` responses are
   deliberately generic, and the underlying I/O, SQL or upstream error appears
   only in the log.
 - **Rate limiting** is per-IP and on by default. Behind a proxy it is only

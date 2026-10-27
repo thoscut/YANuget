@@ -105,7 +105,8 @@ impl GlobalLayers {
 /// Apply the process-wide middleware shared by every served app: an unbounded
 /// body limit (uploads stream straight to disk, so axum's small default cap is
 /// removed; the configured size limit is still enforced while streaming),
-/// permissive CORS, request tracing, per-IP rate limiting (when enabled),
+/// CORS for the configured `cors_allowed_origins` (none by default, read-only
+/// methods only), request tracing, per-IP rate limiting (when enabled),
 /// baseline security response headers and — when TLS is on — HSTS.
 ///
 /// `.layer()` wraps what came before it, so the **last** layer added is the

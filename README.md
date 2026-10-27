@@ -111,9 +111,15 @@ cargo build --release
 YANUGET_API_KEY=change-me ./target/release/yanuget
 ```
 
-Or `cargo install yanuget` — same binary, except that `/docs` serves a
-placeholder linking to the online documentation, since the rendered site is
-generated rather than shipped in the crate.
+Or install a release tag with Cargo (YANuget is not on crates.io yet):
+
+```bash
+cargo install --git https://github.com/thoscut/yanuget --tag vX.Y.Z --locked yanuget
+```
+
+Same binary, except that `/docs` serves a placeholder linking to the online
+documentation, since the rendered site is generated rather than kept in the
+repository.
 
 The server prints its listen address and service index URL on startup.
 **TLS is on by default**, so it listens on `https://0.0.0.0:5000` with an
