@@ -101,6 +101,22 @@ jobs:
           fi
           echo "releasing $TAG ($sha) from Cargo.toml version $version"
 
+  # The whole CI workflow, run against the commit being released: tests on
+  # stable and the MSRV, clippy, the Windows/macOS check, cargo audit and
+  # cargo deny, packaging and the real NuGet client. Nothing is published
+  # unless it passes, so a tag on a commit that never went through CI, or
+  # went through it red, does not become a release. It runs alongside the
+  # binary builds, which publish nothing themselves. CI needs no secrets, so
+  # none are passed, and its token can read and nothing more.
+  ci:
+    name: CI
+    needs: guard
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yml
+    with:
+      ref: ${{ needs.guard.outputs.sha }}
+
   # Build a release binary per target and upload it as an artifact.
   build:
     name: Build ${{ matrix.target }}
@@ -214,7 +230,7 @@ jobs:
   # release to go with it.
   image:
     name: Publish container image
-    needs: [guard, build]
+    needs: [guard, ci, build]
     runs-on: ubuntu-latest
     timeout-minutes: 90
     environment: release
@@ -300,7 +316,7 @@ jobs:
   # Collect all built artifacts, attest them and publish a GitHub Release.
   release:
     name: Publish GitHub Release
-    needs: [guard, build]
+    needs: [guard, ci, build]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     environment: release
@@ -378,7 +394,7 @@ jobs:
   # publisher (see RELEASING.md).
   crates-io:
     name: Publish to crates.io
-    needs: [guard, release]
+    needs: [guard, ci, release]
     if: vars.PUBLISH_TO_CRATES_IO == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30

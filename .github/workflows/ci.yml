@@ -11,6 +11,16 @@ on:
   schedule:
     - cron: "23 5 * * 1"
   workflow_dispatch:
+  # The release workflow runs this whole workflow against the commit it is
+  # about to publish, and publishes nothing unless every job here passes. It
+  # passes that commit as `ref`; every other trigger leaves it empty and each
+  # checkout takes the event's own commit.
+  workflow_call:
+    inputs:
+      ref:
+        description: "Commit SHA to check out and test"
+        required: true
+        type: string
 
 # Nothing here writes to the repository. Every job runs code from the pull
 # request (build scripts, proc macros, the docs toolchain), so the token it
@@ -19,9 +29,12 @@ permissions:
   contents: read
 
 # A newer push to the same pull request makes the older run moot. Pushes to
-# `main` are left to finish, so every commit there keeps a result.
+# `main` are left to finish, so every commit there keeps a result. The group
+# is named literally rather than after `github.workflow`: called from the
+# release workflow, that is the caller's name, and sharing the caller's group
+# would leave this run waiting on the run that is waiting on it.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ci-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
@@ -37,7 +50,9 @@ env:
 # Caches are keyed per job and per compiler (`cachekey` is a hash of the rustc
 # version), so a new stable release starts a fresh `target/` instead of
 # restoring one full of artifacts it cannot use, and no job's restore prefix
-# matches another job's cache.
+# matches another job's cache. When the release workflow calls this one
+# (`inputs.ref` is set) nothing is restored: a release is checked from a clean
+# state, as it is built.
 jobs:
   test:
     name: Build, test & lint
@@ -46,6 +61,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.ref }}
           persist-credentials: false
 
       - name: Install Rust toolchain
@@ -56,6 +72,7 @@ jobs:
           components: rustfmt, clippy
 
       - name: Cache cargo
+        if: ${{ !inputs.ref }}
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -111,6 +128,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.ref }}
           persist-credentials: false
 
       # rust-toolchain.toml pins `stable`; an explicit `+1.89.0` on the command
@@ -123,6 +141,7 @@ jobs:
           toolchain: 1.89.0
 
       - name: Cache cargo
+        if: ${{ !inputs.ref }}
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -154,6 +173,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.ref }}
           persist-credentials: false
 
       - name: Install Rust toolchain
@@ -163,6 +183,7 @@ jobs:
           toolchain: stable
 
       - name: Cache cargo
+        if: ${{ !inputs.ref }}
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -184,6 +205,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.ref }}
           persist-credentials: false
 
       - name: Install Rust toolchain
@@ -230,6 +252,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.ref }}
           persist-credentials: false
 
       - name: Install Rust toolchain
@@ -239,6 +262,7 @@ jobs:
           toolchain: stable
 
       - name: Cache cargo
+        if: ${{ !inputs.ref }}
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -306,6 +330,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.ref }}
           persist-credentials: false
 
       - name: Install Rust toolchain
@@ -315,6 +340,7 @@ jobs:
           toolchain: stable
 
       - name: Cache cargo
+        if: ${{ !inputs.ref }}
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
