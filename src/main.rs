@@ -193,6 +193,9 @@ async fn run_server(config_path: Option<&str>) -> anyhow::Result<()> {
     tokio::fs::create_dir_all(&config.data_dir).await?;
     tokio::fs::create_dir_all(config.storage_path()).await?;
 
+    for name in config.unknown_env() {
+        tracing::warn!(variable = %name, "environment variable {name} is not a setting and is ignored");
+    }
     let feeds = config.resolved_feeds()?;
     for feed in &feeds {
         if feed.api_keys.is_empty() {

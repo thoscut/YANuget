@@ -43,6 +43,11 @@ pub fn check(path: Option<&str>) -> Report {
         }
     };
     check_loaded(&config, &mut report);
+    for name in config.unknown_env() {
+        report.warnings.push(format!(
+            "environment variable {name} is not a setting and is ignored"
+        ));
+    }
     report
 }
 
