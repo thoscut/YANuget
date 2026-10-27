@@ -13,6 +13,11 @@ updates:
       # the queue readable and leaves majors as individual, reviewable PRs.
       minor-and-patch:
         update-types: [minor, patch]
+      # md-5, sha1 and sha2 share one `digest` trait: a major of one alone
+      # leaves two trait versions in a crate and does not build (#75, #76).
+      rustcrypto-hashes:
+        patterns: ["md-5", "sha1", "sha2", "digest"]
+        update-types: [major]
     ignore:
       # sqlx 0.9 requires rustc 1.94 — five minor versions past this crate's
       # declared MSRV of 1.89. Taking it is not a dependency decision, it is a
