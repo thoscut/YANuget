@@ -367,6 +367,16 @@ async fn transfer_version(
     if !state.db.exists(state.feed(), id, v).await? {
         return Err(Error::PackageNotFound);
     }
+    // Under the same lock as a push or a purge of this version, so the build
+    // judged against the target's policy, the checks below and the membership
+    // changes after them see one consistent state. Taken after the policy
+    // check, a pending-only push could swap in a build the target's policy
+    // blocks between the two. And without it a retention sweep that drops the
+    // last membership in between deletes the shared data, and the insert then
+    // leaves a membership pointing at a package row that no longer exists —
+    // invisible to every query (they all inner-join) yet enough to make a
+    // later push conflict.
+    let _guard = crate::locks::lock_version(id, &v.normalized()).await;
     let package = state
         .db
         .get_package_data(id, v)
@@ -386,13 +396,6 @@ async fn transfer_version(
         )));
     }
 
-    // Under the same lock as a push or a purge of this version, so the checks
-    // below and the membership changes after them see one consistent state.
-    // Without it a retention sweep that drops the last membership in between
-    // deletes the shared data, and the insert then leaves a membership
-    // pointing at a package row that no longer exists — invisible to every
-    // query (they all inner-join) yet enough to make a later push conflict.
-    let _guard = crate::locks::lock_version(id, &v.normalized()).await;
     let Some(here) = state.db.get_membership(state.feed(), id, v).await? else {
         return Err(Error::PackageNotFound);
     };
