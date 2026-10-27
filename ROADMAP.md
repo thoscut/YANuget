@@ -15,9 +15,14 @@ list is the index.
 
 **From the review of 2026-10-19**
 
-- Correctness: `COR-27` to `COR-31`. Operations: `DEP-08`, `DEP-09`.
-  Hardening: `SEC-28` to `SEC-30`. Performance and UI: `PERF-04` to
+- Correctness: `COR-27` to `COR-31`. Operations: `DEP-08`.
+  Hardening: `SEC-29`, `SEC-30`. Performance and UI: `PERF-04` to
   `PERF-08`, `UI-01`.
+
+**From the review of 2026-10-27** ([detail](#review-of-2026-10-27))
+
+- Correctness: `COR-35` to `COR-37`. Maintainability: `MNT-06`.
+  Internalizer: `INT-35`, `INT-36`. Release: `0.8.1`.
 
 **Server, after 0.8.0** ([Target releases](#target-releases))
 
@@ -85,6 +90,58 @@ These had their only entry here; they stay for the record.
   license for the golden images (needed before `INT-13` ships) and the
   release scheme for the tool.
 
+## Review of 2026-10-27
+
+A multi-expert review of `main` after 0.8.0 (architecture and correctness,
+security, Rust code, tests and CI, operations and documentation), at
+`2c35bca`. The fixed findings landed with it; the open ones are below.
+
+### Fixed with the review
+
+- [x] **`COR-32` An overwrite kept the old build's SemVer 2.0.0 flag.** The
+  `ON CONFLICT` update of `replace_version` left `is_semver2` out, so since
+  `24cf7ad` a new build with a SemVer 2.0.0 dependency range was served to
+  SemVer 1.0.0 clients, or the reverse.
+- [x] **`COR-33` A promotion judged the build before taking the version
+  lock** (`transfer_version` in `src/web/admin.rs`): a pending-only push in
+  between swapped in a build the target's policy blocks.
+- [x] **`COR-34` The shutdown did not wait for detached request work.** A
+  restart dropped an overwrite or a move part-way, the gap `COR-21` closed
+  for disconnects. Detached work now runs on a tracker the shutdown waits for.
+- [x] **`SEC-31` A blank `YANUGET_MONITORING_TOKEN` removed the token** and
+  left `/metrics` and `/health/status` open. It is read like a key now (blank
+  is an error, `_FILE` works), and `config check` warns about monitoring
+  without a token.
+- [x] **`DEP-10` Dependabot's md-5 and sha1 0.11 did not build** (#75, #76):
+  they share `digest` with sha2. All three moved together in the internalizer
+  (#77), and Dependabot groups their majors now. The server stays on sha2
+  0.10: digest 0.11 drops the `io::Write` impl `src/symbols.rs` hashes with.
+
+### Open
+
+- [ ] **`0.8.1`** 0.8.0 shipped `rustls-webpki` 0.103.15 (RUSTSEC-2026-0382,
+  RUSTSEC-2026-0381); `main` has 0.103.16. A patch release carries it with the
+  fixes above.
+- [ ] **`COR-35` Approving checks the package hash only**
+  (`check_shown_builds`): attached files can still change between the page
+  and the approval, the pending side of `COR-31`.
+- [ ] **`COR-36` A move removes the membership and writes the tombstone in
+  two steps**; a failure between them lets the mirror fetch the version back.
+- [ ] **`COR-37` Blobs a detach leaves are never collected.**
+- [ ] **`MNT-06` Two NuGet v3 readers.** The mirror takes `@type` only as a
+  string and does not resolve a relative `@id` (`src/mirror.rs`), the
+  internalizer does both (`upstream/v3.rs`). Typed structs in `yanuget-pkg`
+  would serve both and settle `PERF-06`.
+- [ ] **`INT-35` Overrides apply only `skip`.** `Override::apply` and
+  `with_script` have no caller outside tests and `package_parameters` is
+  always `None`, while `INT-25` and the README describe all of them.
+- [ ] **`INT-36` Prelude and downloader hardening.** The prelude passes on any
+  value that does not match `^(https?|ftps?)://` exactly (a leading space,
+  `https:\\`, a UNC path); it wraps only the first `chocolateyInstall.ps1`;
+  the downloader has no overall timeout per file; `write_atomic` in `sync.rs`
+  uses a fixed temporary name and follows links. None of it is reachable
+  before `run` and `sync` are wired.
+
 ## Review of 2026-10-19
 
 A multi-expert review of `main` after 0.7.0 (auth and web, package parsing,
@@ -136,18 +193,23 @@ open. File and line references are from `main` at `a193027`.
   current directory, and `restore` writes there and reports success. *Fix:*
   the install steps put an absolute `data_dir` into the TOML file, and
   `restore` prints its target and refuses a relative `data_dir`.
-- [ ] **`DEP-09` No warning for unknown `YANUGET_*` variables** in the
+- [x] **`DEP-09` No warning for unknown `YANUGET_*` variables** in the
   server, as the internalizer has (`check_env_names`). `YANUGET_ADMIN_KEY`
   instead of `YANUGET_ADMIN_API_KEY` silently turns `/admin` off.
+  *Done:* the server warns at startup about every `YANUGET_*` variable
+  nothing reads, and `config check` reports it. (`YANUGET_ADMIN_KEY` itself
+  is the admin commands' key, so it is a known name.)
 - [ ] **`PERF-04` `/metrics` and `/health/status` without a token** run three
   aggregate scans per feed on every request. *Fix:* cache `gather()` for a
   few seconds.
 
 ### Hardening
 
-- [ ] **`SEC-28` A wrong preview key answers `404`, not `401`**
+- [x] **`SEC-28` A wrong preview key answers `404`, not `401`**
   (`src/web/protocol.rs:122-138`), so it does not count toward
   `max_failed_auth`.
+  *Done:* on a feed with a preview key, a download miss that carries a
+  credential which is neither the read key nor the preview key is a `401`.
 - [ ] **`SEC-29` Free-space checks do not reserve.** Without a running
   reservation, N concurrent uploads each pass the check alone, and the number
   of open tus sessions per feed is not capped. PR #63 re-checks

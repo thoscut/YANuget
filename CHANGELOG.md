@@ -12,6 +12,34 @@ expected to change incompatibly at any version.
 
 ## [Unreleased]
 
+### Security
+
+- `rustls-webpki` 0.103.16 (RUSTSEC-2026-0382, RUSTSEC-2026-0381), used by
+  the TLS server and by the mirror's and `migrate`'s client. 0.8.0 shipped
+  0.103.15.
+- A blank `YANUGET_MONITORING_TOKEN` is an error, as for the keys; it used to
+  remove the token and leave `/metrics` and `/health/status` open. It can come
+  from `YANUGET_MONITORING_TOKEN_FILE` too.
+- On a feed with a preview key, a download that carries a wrong credential is
+  answered `401` instead of `404`, so guessing the preview key counts toward
+  `max_failed_auth`.
+
+### Fixed
+
+- Overwriting a version takes the new build's SemVer 2.0.0 flag; the old
+  build's decided which clients saw the new one.
+- A promotion or copy checks the target feed's license policy under the
+  version lock, so a pending-only push at the same moment cannot slip a
+  blocked build past it.
+- The shutdown waits, within its grace period, for a push, overwrite, move or
+  attach that a disconnected client left running.
+
+### Added
+
+- The server warns at startup about `YANUGET_*` variables nothing reads, and
+  `yanuget config check` reports them along with monitoring enabled without a
+  token.
+
 ## [0.8.0] — 2026-10-20
 
 **Upgrading from 0.7.x needs attention.** One change can stop a deployment that
