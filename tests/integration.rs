@@ -5370,6 +5370,45 @@ async fn files_of_a_pending_version_are_withheld_until_approval() {
 
 const PREVIEW_KEY: &str = "preview-key-of-the-intake-feed";
 
+/// `SEC-28`: on a feed with open reads, a wrong preview key is a failed
+/// authentication, not a miss, so `max_failed_auth` counts it.
+#[tokio::test]
+async fn a_wrong_preview_key_is_unauthorized_on_an_open_feed() {
+    let server = spawn_feeds(|c| {
+        c.api_key = Some(API_KEY.into());
+        let mut intake = feed("intake");
+        intake.requires_approval = true;
+        intake.preview_api_key = Some(PREVIEW_KEY.into());
+        c.feeds = vec![intake];
+    })
+    .await;
+    let pushed = push_to(
+        &server,
+        "/intake/api/v2/package",
+        API_KEY,
+        build_nupkg("Guess.Pkg", "1.0.0", b"x"),
+    )
+    .await;
+    assert_eq!(pushed.status(), reqwest::StatusCode::CREATED);
+    let nupkg = "/intake/v3/package/guess.pkg/1.0.0/guess.pkg.1.0.0.nupkg";
+    let get = |key: Option<&str>| {
+        let mut req = server.client.get(server.url(nupkg));
+        if let Some(key) = key {
+            req = req.header("X-NuGet-ApiKey", key);
+        }
+        req.send()
+    };
+    assert_eq!(
+        get(Some("a-guess")).await.unwrap().status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        get(None).await.unwrap().status(),
+        reqwest::StatusCode::NOT_FOUND
+    );
+    assert!(get(Some(PREVIEW_KEY)).await.unwrap().status().is_success());
+}
+
 /// `INT-32`: the preview key downloads a pending version and its files, and
 /// nothing else.
 #[tokio::test]

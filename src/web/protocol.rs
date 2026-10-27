@@ -136,7 +136,7 @@ pub(super) async fn download_package(
             state
                 .download_access(&headers, &id, &version)
                 .await?
-                .ok_or(Error::PackageNotFound)?
+                .ok_or_else(|| state.download_miss(&headers))?
         }
     };
 
