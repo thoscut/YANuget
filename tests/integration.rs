@@ -4942,26 +4942,62 @@ async fn await_downloads(server: &TestServer, id: &str, expected: u64) {
 async fn a_stalled_upload_is_cut_off() {
     use futures::StreamExt;
     let server = spawn_with(|c| c.upload_idle_timeout_secs = 1).await;
-    // A few bytes, then nothing for longer than the limit.
-    let stream =
-        futures::stream::once(async { Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"PK")) })
-            .chain(futures::stream::once(async {
-                tokio::time::sleep(std::time::Duration::from_secs(4)).await;
-                Ok(bytes::Bytes::from_static(b"never mind"))
-            }));
+    // A real package, split in two with a pause longer than the limit in the
+    // middle. Were the stall not cut off, the second half would arrive and the
+    // package would be published, which is what the checks below would catch.
+    let nupkg = build_nupkg("Stalled.Upload", "1.0.0", b"x");
+    let (head, tail) = nupkg.split_at(nupkg.len() / 2);
+    let (head, tail) = (
+        bytes::Bytes::from(head.to_vec()),
+        bytes::Bytes::from(tail.to_vec()),
+    );
+    let stall = std::time::Duration::from_secs(4);
+    let stream = futures::stream::once(async move { Ok::<_, std::io::Error>(head) }).chain(
+        futures::stream::once(async move {
+            tokio::time::sleep(stall).await;
+            Ok(tail)
+        }),
+    );
+    let started = std::time::Instant::now();
     let result = server
         .client
         .put(server.url("/api/v2/package"))
         .header("X-NuGet-ApiKey", API_KEY)
+        .header("Content-Type", "application/octet-stream")
         .body(reqwest::Body::wrap_stream(stream))
         .send()
         .await;
     // The server answers 408 and drops the connection; depending on timing the
-    // client sees the answer or only the dropped connection. Either way,
-    // nothing was published.
-    if let Ok(resp) = result {
-        assert_eq!(resp.status(), reqwest::StatusCode::REQUEST_TIMEOUT);
+    // client sees the answer or only the dropped connection.
+    match result {
+        Ok(resp) => assert_eq!(resp.status(), reqwest::StatusCode::REQUEST_TIMEOUT),
+        Err(e) => assert!(
+            !e.is_builder() && !e.is_status(),
+            "the upload failed for another reason than a dropped connection: {e}"
+        ),
     }
+    // The answer came before the client would have finished on its own.
+    assert!(
+        started.elapsed() < stall,
+        "the server waited out the stall: {:?}",
+        started.elapsed()
+    );
+    // Nothing was published, and the half-received upload is not left behind.
+    assert_eq!(
+        status_of(&server, "/v3/package/stalled.upload/index.json").await,
+        reqwest::StatusCode::NOT_FOUND
+    );
+    let staging = server._dir.path().join("packages/.uploads");
+    let staged = || -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(&staging)
+            .map(|rd| rd.filter_map(|e| e.ok().map(|e| e.path())).collect())
+            .unwrap_or_default()
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !staged().is_empty() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(staged(), Vec::<std::path::PathBuf>::new());
 }
 
 #[tokio::test]
