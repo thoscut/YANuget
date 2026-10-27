@@ -10,7 +10,7 @@ requests can reference them, and ticked off rather than deleted when they land.
 ## Open items
 
 Everything still open across this file and the project's working threads, as
-of 2026-10-20 (0.8.0 released). The entries further down hold the detail; this
+of 2026-10-27 (0.8.0 released). The entries further down hold the detail; this
 list is the index.
 
 **From the review of 2026-10-19**
@@ -27,13 +27,26 @@ list is the index.
 
 **Internalizer 0.1.0**
 
-- `INT-13` to `INT-15`, `INT-19` and `INT-22`: golden images, capture
-  helpers, the KVM runner, the prelude, and the regression corpus. `INT-13`
-  waits on the licensing question below. Capture validation, downloader, file
-  names, publish and the report (`INT-16` to `INT-18`, `INT-20`, `INT-21`)
-  have landed.
+- `INT-13` to `INT-15` and `INT-22`: golden images, capture helpers, the KVM
+  runner, and the regression corpus. `INT-13` waits on the licensing question
+  below. Capture validation, downloader, file names, the prelude, publish and
+  the report (`INT-16` to `INT-21`) have landed.
 
-**Dependencies and toolchain**
+**Internalizer 0.2.0 and later**
+
+- `INT-24` environment variants, `INT-26` validation install, `INT-28`
+  embedding for other feeds; `INT-23`, `INT-25` and `INT-27` have landed.
+- `INT-29` Windows container backend (0.3.0, optional).
+- `INT-34` documentation and threat model, shipped in parts with each release.
+
+**Server, later**
+
+- `INT-33` internalization requests, if the open question about it is
+  answered for it.
+
+**Done since the last update of this list**
+
+These had their only entry here; they stay for the record.
 
 - [x] **`DEP-06` `axum-server` 0.8.** It no longer depends on `rustls-pemfile`
   (`RUSTSEC-2025-0134`, see `DEP-01`): 0.8.0 reads PEM through
@@ -49,13 +62,11 @@ list is the index.
   Dependabot too. `sqlx` 0.9 waits for a release that raises the floor to
   1.94.
   *Done:* raised to 1.89 everywhere the floor is stated, `uuid` is at 1.28.
-
-**Documentation**
-
-- [ ] **`DOC-09` cosign 3.** The 0.7.0 image signature is stored as a
+- [x] **`DOC-09` cosign 3.** The 0.7.0 image signature is stored as a
   Sigstore bundle, which `cosign verify` finds from cosign 3 on; cosign 2.5
   reports "no signatures found". SECURITY.md and RELEASING.md should say which
   cosign version the command needs.
+  *Done:* both say cosign 3 or newer.
 
 **Features under discussion**
 
@@ -187,8 +198,8 @@ How to read the entries:
   on how a third-party client behaves.
 - Entries describe the defect and the fix, not an exploit. Anything that turns
   out worse than written here should go through [SECURITY.md](SECURITY.md).
-- **Unreleased** marks code that has not shipped in a tagged release yet; those
-  items block the next release.
+- **Unreleased** marked code that had not shipped in a tagged release at the
+  time of the review; all of it shipped in 0.6.0.
 
 ### Status
 
@@ -1489,7 +1500,7 @@ packages whose downloads go through Chocolatey's helpers.
   The answer decides whether KVM can be the default for every operator, and is
   needed before `INT-13` ships in a release.
 - **Requests on the server or in the watch list?** `INT-33` needs a schema
-  migration (step 8 in `src/database/sqlite/schema.rs`), after which older
+  migration (step 9 in `src/database/sqlite/schema.rs`; 0.8.0 took step 8), after which older
   builds refuse the database (`check_known`), and it widens `PackageDatabase`
   for every future backend. The watch list of `INT-27`, kept in a reviewed
   repository, covers the same need without touching the server; what is lost
