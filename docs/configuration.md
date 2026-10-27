@@ -65,8 +65,8 @@ Every key can be kept out of the TOML file, so `yanuget.toml` can be
 world-readable, managed by Puppet or committed, while the keys come from a
 secret store:
 
-- **Global keys** are `YANUGET_API_KEY`, `YANUGET_API_KEYS` and
-  `YANUGET_ADMIN_API_KEY` (above).
+- **Global keys** are `YANUGET_API_KEY`, `YANUGET_API_KEYS`,
+  `YANUGET_ADMIN_API_KEY` (above) and `YANUGET_MONITORING_TOKEN`.
 - **A feed's keys** are `YANUGET_FEED_{NAME}_API_KEY`, `..._API_KEYS`,
   `..._READ_API_KEY`, `..._PREVIEW_API_KEY`, `..._ADMIN_API_KEY`, and for its mirror
   `..._MIRROR_PASSWORD` and `..._MIRROR_TOKEN`. `{NAME}` is the feed's name
@@ -150,7 +150,7 @@ ones included) and each mirror's upstream host. The probes `/health`,
 | TOML key | Env var | Type | Default | Description |
 | --- | --- | --- | --- | --- |
 | `monitoring.enabled` | `YANUGET_MONITORING_ENABLED` | bool | `false` | Serve `/metrics` and `/health/status`. |
-| `monitoring.token` | `YANUGET_MONITORING_TOKEN` | string | *(none)* | When set, both endpoints require `Authorization: Bearer <token>`. Unset, anyone who can reach the server can read them. |
+| `monitoring.token` | `YANUGET_MONITORING_TOKEN` | string | *(none)* | When set, both endpoints require `Authorization: Bearer <token>`. Unset, anyone who can reach the server can read them. Like the keys, it can come from `YANUGET_MONITORING_TOKEN_FILE`, and a blank variable is an error. |
 
 Like the health probes, `/metrics` answers whatever the `Host`, so a scraper
 can use the server's address. A Prometheus job:

@@ -946,8 +946,9 @@ impl Config {
         if let Some(b) = bool_var("YANUGET_MONITORING_ENABLED")? {
             self.monitoring.enabled = b;
         }
-        if let Some(v) = get("YANUGET_MONITORING_TOKEN")? {
-            self.monitoring.token = (!v.trim().is_empty()).then(|| v.trim().to_string());
+        // A key like the others: a blank value would quietly open /metrics.
+        if let Some(v) = secret("YANUGET_MONITORING_TOKEN")? {
+            self.monitoring.token = Some(env_key("YANUGET_MONITORING_TOKEN", &v)?);
         }
         if let Some(b) = bool_var("YANUGET_RATELIMIT_ENABLED")? {
             self.rate_limit.enabled = b;
@@ -2169,6 +2170,7 @@ mod tests {
             "YANUGET_API_KEY",
             "YANUGET_API_KEYS",
             "YANUGET_ADMIN_API_KEY",
+            "YANUGET_MONITORING_TOKEN",
             "YANUGET_FEED_STAGE_API_KEY",
             "YANUGET_FEED_STAGE_API_KEYS",
             "YANUGET_FEED_PRE_PROD_READ_API_KEY",

@@ -62,6 +62,13 @@ pub fn check_loaded(config: &Config, report: &mut Report) {
         }
     }
     check_tls(config, report);
+    if config.monitoring.enabled && config.monitoring.token.is_none() {
+        report.warnings.push(
+            "monitoring is enabled without a token: anyone who can reach the server \
+             reads /metrics and /health/status (feed names, mirror upstreams)"
+                .into(),
+        );
+    }
 
     if config.data_dir.exists() && !config.data_dir.is_dir() {
         report.errors.push(format!(
@@ -320,6 +327,19 @@ mod tests {
             .iter()
             .any(|w| w.contains("feed stage: a push key is shorter")));
         assert!(!report.warnings.iter().any(|w| w.contains("production")));
+    }
+
+    #[test]
+    fn monitoring_without_a_token_is_warned_about() {
+        let mut config = Config {
+            tls_enabled: false,
+            ..Config::default()
+        };
+        config.monitoring.enabled = true;
+        let open = |r: &Report| r.warnings.iter().any(|w| w.contains("monitoring"));
+        assert!(open(&checked(config.clone())));
+        config.monitoring.token = Some("t".repeat(32));
+        assert!(!open(&checked(config)));
     }
 
     #[test]
