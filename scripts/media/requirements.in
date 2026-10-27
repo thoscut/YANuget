@@ -5,4 +5,4 @@
 #
 #   uv pip compile --universal --generate-hashes --python-version 3.10 \
 #       scripts/media/requirements.in -o scripts/media/requirements.txt
-Pillow>=11,<13
+Pillow>=13.0.0,<14
