@@ -3,8 +3,9 @@
 
 use super::escape::{enc_path, escape_html};
 use super::format::{group_digits, human_size, kv, kv_html, plural};
+use super::gallery::{pager, Paging};
 use super::layout::{layout, Nav};
-use crate::database::PackageFile;
+use crate::database::{AdminFilter, AdminOverview, PackageFile};
 use crate::nuget::UrlBuilder;
 
 /// The form field (and header) carrying the admin CSRF token.
@@ -16,37 +17,181 @@ const ADMIN_NAV: Nav<'static> = Nav {
     admin: true,
 };
 
-/// The admin dashboard: every package id, linking to its management page.
-pub fn admin_dashboard_page(urls: &UrlBuilder, ids: &[String]) -> String {
+/// What the admin dashboard was asked to show: a filter and a page.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DashboardView {
+    pub filter: AdminFilter,
+    pub skip: i64,
+    pub take: i64,
+    /// The configured page size (`gallery_page_size`).
+    pub default_take: i64,
+}
+
+impl DashboardView {
+    /// The dashboard's URL with `filter`, from `skip`, escaped for an
+    /// attribute. The defaults are left out, so plain `/admin` stays the
+    /// address of the first page of everything.
+    fn href(&self, urls: &UrlBuilder, filter: AdminFilter, skip: i64) -> String {
+        let mut query = Vec::new();
+        if filter != AdminFilter::All {
+            query.push(format!("filter={}", filter.as_str()));
+        }
+        if skip > 0 {
+            query.push(format!("skip={skip}"));
+        }
+        if self.take != self.default_take.max(1) {
+            query.push(format!("take={}", self.take));
+        }
+        let mut href = escape_html(&urls.app("/admin"));
+        if !query.is_empty() {
+            href.push('?');
+            href.push_str(&query.join("&amp;"));
+        }
+        href
+    }
+}
+
+/// The admin dashboard: the feed's packages, those waiting for approval
+/// first, each linking to its management page, with a filter and a pager.
+pub fn admin_dashboard_page(
+    urls: &UrlBuilder,
+    overview: &AdminOverview,
+    view: &DashboardView,
+) -> String {
+    let view = DashboardView {
+        skip: view.skip.max(0),
+        take: view.take.max(1),
+        ..*view
+    };
     let retention = format!(
         "<a href=\"{}\">Retention: preview and clean up</a>",
         escape_html(&urls.app("/admin/retention"))
     );
-    let body = if ids.is_empty() {
-        format!(
-            "<div class=\"bar\"><h1 class=\"title\">Admin</h1>{retention}</div>\
-             <p class=\"muted\">No packages published yet.</p>"
-        )
+    let bar = format!("<div class=\"bar\"><h1 class=\"title\">Admin</h1>{retention}</div>");
+    if overview.total == 0 {
+        let body = format!("{bar}<p class=\"muted\">No packages published yet.</p>");
+        return layout(urls, "Admin \u{2014} YANuget", ADMIN_NAV, &body);
+    }
+
+    // One click each, from the first page, as the gallery's orders are.
+    let mut links = String::new();
+    for (filter, label) in [
+        (AdminFilter::All, "All"),
+        (AdminFilter::Pending, "Pending"),
+        (AdminFilter::Flagged, "Flagged"),
+    ] {
+        let current = if filter == view.filter {
+            " aria-current=\"true\""
+        } else {
+            ""
+        };
+        links.push_str(&format!(
+            "<a href=\"{}\"{current}>{label} ({})</a>",
+            view.href(urls, filter, 0),
+            group_digits(overview.matching(filter)),
+        ));
+    }
+    let filters = format!(
+        "<nav class=\"sort\" aria-label=\"Filter\">Show <span class=\"seg\">{links}</span></nav>"
+    );
+
+    let matching = overview.matching(view.filter);
+    let list = if overview.packages.is_empty() {
+        let (empty, back) = if matching > 0 {
+            // Past the end: a bookmark, or a page an approval emptied.
+            (
+                "There is nothing on this page",
+                format!(
+                    "<a href=\"{}\">Back to the first page</a>",
+                    view.href(urls, view.filter, 0)
+                ),
+            )
+        } else {
+            let empty = match view.filter {
+                AdminFilter::Pending => "No version waits for approval",
+                AdminFilter::Flagged => "No version is flagged",
+                AdminFilter::All => "No packages",
+            };
+            (
+                empty,
+                format!(
+                    "<a href=\"{}\">Show every package</a>",
+                    view.href(urls, AdminFilter::All, 0)
+                ),
+            )
+        };
+        format!("<div class=\"empty\"><h2>{empty}</h2><p>{back}</p></div>")
     } else {
         let mut list = String::from("<ul class=\"rank\">");
-        for id in ids {
+        for p in &overview.packages {
+            let mut badges = String::new();
+            if p.pending > 0 {
+                badges.push_str(&format!(
+                    " <span class=\"badge pre\">{} pending</span>",
+                    group_digits(p.pending)
+                ));
+            }
+            if p.flagged > 0 {
+                badges.push_str(&format!(
+                    " <span class=\"badge\" title=\"policy\">{} flagged</span>",
+                    group_digits(p.flagged)
+                ));
+            }
             list.push_str(&format!(
-                "<li><a href=\"{href}\">{id}</a></li>",
-                href = escape_html(
-                    &urls.app(&format!("/admin/packages/{}", enc_path(&id.to_lowercase())))
-                ),
-                id = escape_html(id),
+                "<li><span><a class=\"id\" href=\"{href}\">{id}</a>{badges}</span>\
+                 <span class=\"muted\">{n} version{s}</span></li>",
+                href = escape_html(&urls.app(&format!(
+                    "/admin/packages/{}",
+                    enc_path(&p.id.to_lowercase())
+                ))),
+                id = escape_html(&p.id),
+                n = group_digits(p.versions),
+                s = plural(p.versions),
             ));
         }
         list.push_str("</ul>");
+        list
+    };
+
+    let hidden = if view.filter == AdminFilter::All {
+        String::new()
+    } else {
         format!(
-            "<div class=\"bar\"><h1 class=\"title\">Admin</h1>{retention}</div>\
-             <p class=\"muted\">Pick a package to approve, disable, pin, delete or move its \
-             versions.</p>\
-             <div class=\"card\">{list}</div>"
+            "<input type=\"hidden\" name=\"filter\" value=\"{}\">",
+            view.filter.as_str()
         )
     };
-    layout(urls, "Admin \u{2014} YANuget", ADMIN_NAV, &body)
+    let pager = pager(
+        &Paging {
+            action: escape_html(&urls.app("/admin")),
+            href: &|skip| view.href(urls, view.filter, skip),
+            hidden,
+            skip: view.skip,
+            take: view.take,
+            default_take: view.default_take,
+        },
+        overview.packages.len() as i64,
+        matching,
+    );
+    let body = format!(
+        "{bar}<p class=\"muted\">Pick a package to approve, disable, pin, delete or move its \
+         versions.</p>{filters}<div class=\"card\">{list}{pager}</div>"
+    );
+
+    // A filter or a later page has a title of its own, as in the gallery.
+    let pages = (matching + view.take - 1) / view.take;
+    let current = view.skip / view.take + 1;
+    let filtered = match view.filter {
+        AdminFilter::All => String::new(),
+        AdminFilter::Pending => ": pending".into(),
+        AdminFilter::Flagged => ": flagged".into(),
+    };
+    let title = if current > 1 && !overview.packages.is_empty() {
+        format!("Admin{filtered}, page {current} of {pages} \u{2014} YANuget")
+    } else {
+        format!("Admin{filtered} \u{2014} YANuget")
+    };
+    layout(urls, &title, ADMIN_NAV, &body)
 }
 
 /// What the per-package admin page offers besides the versions themselves.
@@ -956,9 +1101,123 @@ pub fn admin_retention_page(urls: &UrlBuilder, view: &RetentionView) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::web::ui::fixtures::{feed_version, sample, text_of};
+    use crate::web::ui::fixtures::{dashboard, feed_version, overview_of, sample, text_of};
     use crate::web::ui::layout::COPY_SCRIPT_BODY;
     use crate::web::ui::package::{detail_page, Detail};
+
+    #[test]
+    fn the_dashboard_marks_pending_and_flagged_and_filters_by_them() {
+        let urls = UrlBuilder::new("https://host");
+        let overview = overview_of(&[
+            ("Waits.<b>", 3, 2, 0),
+            ("Flagged.Pkg", 1, 0, 1),
+            ("Plain.Pkg", 1, 0, 0),
+        ]);
+        let html = admin_dashboard_page(&urls, &overview, &dashboard(AdminFilter::All, 0, 20));
+        // Escaped like every id, with its counts as badges.
+        assert!(
+            html.contains(
+                "<li><span><a class=\"id\" href=\"/admin/packages/waits.%3Cb%3E\">\
+                 Waits.&lt;b&gt;</a> <span class=\"badge pre\">2 pending</span></span>\
+                 <span class=\"muted\">3 versions</span></li>"
+            ),
+            "{html}"
+        );
+        assert!(
+            html.contains(" <span class=\"badge\" title=\"policy\">1 flagged</span>"),
+            "{html}"
+        );
+        assert!(html.contains(">Plain.Pkg</a></span><span class=\"muted\">1 version</span>"));
+        // The filters, with what each would show, and the current one marked.
+        assert!(
+            html.contains(
+                "<nav class=\"sort\" aria-label=\"Filter\">Show <span class=\"seg\">\
+                 <a href=\"/admin\" aria-current=\"true\">All (3)</a>\
+                 <a href=\"/admin?filter=pending\">Pending (1)</a>\
+                 <a href=\"/admin?filter=flagged\">Flagged (1)</a></span></nav>"
+            ),
+            "{html}"
+        );
+        assert!(
+            html.contains("<title>Admin \u{2014} YANuget</title>"),
+            "{html}"
+        );
+        // Three packages need no pager.
+        assert!(!html.contains("class=\"pager\""), "{html}");
+
+        // A filtered page says so, and its pager keeps the filter.
+        let mut overview = overview_of(&[("Waits.Pkg", 3, 2, 0)]);
+        overview.total = 60;
+        overview.pending = 45;
+        let html = admin_dashboard_page(&urls, &overview, &dashboard(AdminFilter::Pending, 20, 20));
+        assert!(
+            html.contains("<a href=\"/admin?filter=pending\" aria-current=\"true\">"),
+            "{html}"
+        );
+        assert!(
+            html.contains("<title>Admin: pending, page 2 of 3 \u{2014} YANuget</title>"),
+            "{html}"
+        );
+        assert!(
+            html.contains(
+                "<a class=\"btn\" href=\"/admin?filter=pending\">\
+                 <span aria-hidden=\"true\">\u{2190}</span> Previous</a>"
+            ),
+            "{html}"
+        );
+        assert!(
+            html.contains("href=\"/admin?filter=pending&amp;skip=40\">Next"),
+            "{html}"
+        );
+        assert!(html.contains("21\u{2013}21 of 45"), "{html}");
+        assert!(
+            html.contains(
+                "<form method=\"get\" action=\"/admin\">\
+                 <input type=\"hidden\" name=\"filter\" value=\"pending\">"
+            ),
+            "{html}"
+        );
+        // A page size other than the configured one is carried.
+        let html = admin_dashboard_page(&urls, &overview, &dashboard(AdminFilter::All, 0, 50));
+        assert!(
+            html.contains("href=\"/admin?filter=flagged&amp;take=50\""),
+            "{html}"
+        );
+        // GET forms only: the dashboard changes nothing, so it has no token.
+        assert!(!html.contains("method=\"post\""), "{html}");
+    }
+
+    #[test]
+    fn the_dashboard_says_what_an_empty_filter_or_page_means() {
+        let urls = UrlBuilder::new("https://host");
+        let none = admin_dashboard_page(
+            &urls,
+            &Default::default(),
+            &dashboard(AdminFilter::Pending, 0, 20),
+        );
+        assert!(none.contains("No packages published yet."), "{none}");
+        assert!(!none.contains("aria-label=\"Filter\""), "{none}");
+
+        let mut overview = overview_of(&[]);
+        overview.total = 2;
+        let html = admin_dashboard_page(&urls, &overview, &dashboard(AdminFilter::Flagged, 0, 20));
+        assert!(html.contains("<h2>No version is flagged</h2>"), "{html}");
+        assert!(
+            html.contains("<a href=\"/admin\">Show every package</a>"),
+            "{html}"
+        );
+
+        overview.pending = 1;
+        let html = admin_dashboard_page(&urls, &overview, &dashboard(AdminFilter::Pending, 40, 20));
+        assert!(
+            html.contains("<h2>There is nothing on this page</h2>"),
+            "{html}"
+        );
+        assert!(
+            html.contains("<a href=\"/admin?filter=pending\">Back to the first page</a>"),
+            "{html}"
+        );
+    }
 
     #[test]
     fn the_admin_page_acts_on_the_selected_versions() {
@@ -1034,7 +1293,11 @@ mod tests {
     #[test]
     fn admin_pages_render_actions() {
         let urls = UrlBuilder::new("https://host");
-        let dash = admin_dashboard_page(&urls, &["Contoso.Utils".into()]);
+        let dash = admin_dashboard_page(
+            &urls,
+            &overview_of(&[("Contoso.Utils", 1, 0, 0)]),
+            &dashboard(AdminFilter::All, 0, 20),
+        );
         assert!(dash.contains("/admin/packages/contoso.utils"));
 
         let mut disabled = sample();

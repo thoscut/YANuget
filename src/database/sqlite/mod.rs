@@ -46,8 +46,9 @@ use crate::models::Package;
 use crate::version::NuGetVersion;
 
 use super::{
-    DatabaseStats, FeedVersion, Membership, MembershipChange, PackageDatabase, PackageFile,
-    SearchPage, SearchRequest, SymbolKey, SymbolRef, TagCount, UploadSession, VersionFootprint,
+    AdminFilter, AdminOverview, DatabaseStats, FeedVersion, Membership, MembershipChange,
+    PackageDatabase, PackageFile, SearchPage, SearchRequest, SymbolKey, SymbolRef, TagCount,
+    UploadSession, VersionFootprint,
 };
 
 /// The feed-scoped projection: every `packages` column plus the membership's
@@ -363,6 +364,16 @@ impl PackageDatabase for SqliteDatabase {
 
     async fn all_package_ids(&self, feed: &str) -> Result<Vec<String>> {
         feeds::all_package_ids(self, feed).await
+    }
+
+    async fn admin_overview(
+        &self,
+        feed: &str,
+        filter: AdminFilter,
+        skip: i64,
+        take: i64,
+    ) -> Result<AdminOverview> {
+        feeds::admin_overview(self, feed, filter, skip, take).await
     }
 
     async fn stats(&self, feed: &str) -> Result<DatabaseStats> {

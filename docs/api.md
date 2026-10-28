@@ -490,7 +490,7 @@ username, the admin key as the password). Lets an operator moderate versions
 from the browser.
 
 ```
-GET  /admin                                       # dashboard: all package ids
+GET  /admin[?filter=pending|flagged]               # dashboard, pending first, paged
 GET  /admin/packages/{id}                          # versions + actions
 POST /admin/packages/{id}                          # one action on several versions
 POST /admin/packages/{id}/{version}/disable        # withhold a version

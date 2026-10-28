@@ -1872,6 +1872,33 @@ async fn admin_requires_authentication() {
 }
 
 #[tokio::test]
+async fn the_admin_dashboard_filters_and_reads_its_query_leniently() {
+    let server = spawn_admin().await;
+    push_multipart(&server, API_KEY, build_nupkg("Dash.Pkg", "1.0.0", b"data")).await;
+    let get = |path: &'static str| {
+        let request = server
+            .client
+            .get(server.url(path))
+            .basic_auth("admin", Some(ADMIN_KEY));
+        async move {
+            let resp = request.send().await.unwrap();
+            assert!(resp.status().is_success(), "{path}: {}", resp.status());
+            resp.text().await.unwrap()
+        }
+    };
+    // An unknown filter and a mistyped page size are the defaults, not a 400.
+    let all = get("/admin?filter=bogus&take=&page=x").await;
+    assert!(all.contains("/admin/packages/dash.pkg"), "{all}");
+    assert!(all.contains("aria-current=\"true\">All (1)</a>"), "{all}");
+    let pending = get("/admin?filter=pending").await;
+    assert!(
+        pending.contains("No version waits for approval"),
+        "{pending}"
+    );
+    assert!(!pending.contains("/admin/packages/dash.pkg"), "{pending}");
+}
+
+#[tokio::test]
 async fn admin_area_absent_without_key() {
     let server = spawn().await; // no admin key configured
     let resp = server

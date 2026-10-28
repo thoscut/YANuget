@@ -15,9 +15,10 @@ use axum::routing::post;
 use serde::Deserialize;
 
 use super::forms::{form_field, form_fields, lenient};
+use super::gallery::page_window;
 use super::helpers::{check_id, detached, parse_version};
 use super::{hosted, ui, AppState, FeedCounters, FeedMeta};
-use crate::database::{Membership, MembershipChange};
+use crate::database::{AdminFilter, Membership, MembershipChange};
 use crate::error::{Error, Result};
 use crate::retention::{self, RetentionPolicy};
 use crate::version::NuGetVersion;
@@ -100,13 +101,54 @@ fn require_admin_action(state: &AppState, headers: &HeaderMap, body: &str) -> Re
     }
 }
 
+/// The dashboard's query string: a filter and the pager's values, all taken
+/// leniently, as in the gallery.
+#[derive(Debug, Deserialize)]
+pub(super) struct DashboardParams {
+    /// `all` (the default), `pending` or `flagged`.
+    #[serde(default)]
+    filter: Option<String>,
+    #[serde(default)]
+    skip: Option<String>,
+    #[serde(default)]
+    take: Option<String>,
+    #[serde(default)]
+    page: Option<String>,
+}
+
 pub(super) async fn admin_dashboard(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(params): Query<DashboardParams>,
 ) -> Result<Html<String>> {
-    let ids = state.db.all_package_ids(state.feed()).await?;
+    // An unknown filter is no filter, like an unknown gallery order.
+    let filter = params
+        .filter
+        .as_deref()
+        .and_then(AdminFilter::parse)
+        .unwrap_or_default();
+    let default_take = state.config.gallery_page_size.max(1);
+    let (skip, take) = page_window(
+        params.skip.as_deref(),
+        params.take.as_deref(),
+        params.page.as_deref(),
+        default_take,
+    );
+    let overview = state
+        .db
+        .admin_overview(state.feed(), filter, skip, take)
+        .await?;
     let urls = state.url_builder(&headers);
-    Ok(Html(ui::admin_dashboard_page(&urls, &ids)))
+    Ok(Html(ui::admin_dashboard_page(
+        &urls,
+        &overview,
+        &ui::DashboardView {
+            filter,
+            skip,
+            take,
+            default_take,
+        },
+    )))
 }
 
 /// What the package page reports after a copy, move or promotion (see

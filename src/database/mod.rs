@@ -274,6 +274,72 @@ pub enum MembershipChange {
     Approve,
 }
 
+/// Which packages the admin dashboard lists.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AdminFilter {
+    #[default]
+    All,
+    /// Those with a version awaiting approval.
+    Pending,
+    /// Those with a version a policy check flagged.
+    Flagged,
+}
+
+impl AdminFilter {
+    /// Read a `?filter=` value; `None` for anything else.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "all" => Some(Self::All),
+            "pending" => Some(Self::Pending),
+            "flagged" => Some(Self::Flagged),
+            _ => None,
+        }
+    }
+
+    /// The value [`Self::parse`] reads back.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Pending => "pending",
+            Self::Flagged => "flagged",
+        }
+    }
+}
+
+/// One package on the admin dashboard: how many versions the feed holds,
+/// whatever their state, and how many of them are pending or flagged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdminPackageSummary {
+    /// The id as published.
+    pub id: String,
+    pub versions: i64,
+    pub pending: i64,
+    pub flagged: i64,
+}
+
+/// A page of the admin dashboard, and how many packages each filter has.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AdminOverview {
+    pub packages: Vec<AdminPackageSummary>,
+    /// Every package id the feed holds.
+    pub total: i64,
+    /// Ids with at least one pending version.
+    pub pending: i64,
+    /// Ids with at least one flagged version.
+    pub flagged: i64,
+}
+
+impl AdminOverview {
+    /// How many packages `filter` admits: what its page is one page of.
+    pub fn matching(&self, filter: AdminFilter) -> i64 {
+        match filter {
+            AdminFilter::All => self.total,
+            AdminFilter::Pending => self.pending,
+            AdminFilter::Flagged => self.flagged,
+        }
+    }
+}
+
 /// A package version together with its membership state in one feed. Returned by
 /// admin/retention listings that must see pending, disabled and flagged rows.
 #[derive(Debug, Clone)]
@@ -519,6 +585,18 @@ pub trait PackageDatabase: Send + Sync {
     /// Every distinct package id in `feed` (original casing), ascending. Used by
     /// the retention sweep, which must visit packages search would not return.
     async fn all_package_ids(&self, feed: &str) -> Result<Vec<String>>;
+
+    /// A page of `feed`'s packages for the admin dashboard, counting every
+    /// version (pending, disabled and flagged ones too): those with a pending
+    /// version first, then those with a flagged one, then the rest, each part
+    /// by id. The counts cover the whole feed, not the page.
+    async fn admin_overview(
+        &self,
+        feed: &str,
+        filter: AdminFilter,
+        skip: i64,
+        take: i64,
+    ) -> Result<AdminOverview>;
 
     /// Aggregate counters for `feed`, for the statistics page.
     async fn stats(&self, feed: &str) -> Result<DatabaseStats>;

@@ -315,7 +315,7 @@ pub fn gallery_page(
             ));
         }
         rows.push_str("</ul>");
-        rows.push_str(&pager(
+        rows.push_str(&gallery_pager(
             urls,
             &view,
             page.groups.len() as i64,
@@ -502,16 +502,46 @@ fn page_sizes(take: i64, default_take: i64) -> Vec<i64> {
     sizes
 }
 
-/// Pagination for the gallery: previous/next links around the range shown,
-/// and two small forms, one to go to a page and one to change the page size.
+/// Where a paged list lives, for [`pager`].
+pub(super) struct Paging<'a> {
+    /// The list's address, escaped for an attribute: where the forms go.
+    pub action: String,
+    /// The link to the page starting at a `skip`, escaped for an attribute.
+    pub href: &'a dyn Fn(i64) -> String,
+    /// Hidden inputs carrying what the list shows besides the page.
+    pub hidden: String,
+    pub skip: i64,
+    pub take: i64,
+    /// The configured page size.
+    pub default_take: i64,
+}
+
+/// The gallery's [`Paging`].
+fn gallery_pager(urls: &UrlBuilder, view: &GalleryView, shown: i64, total: i64) -> String {
+    pager(
+        &Paging {
+            action: escape_html(&urls.app("/packages")),
+            href: &|skip| view.href(urls, skip),
+            hidden: view.hidden_fields(),
+            skip: view.skip,
+            take: view.take,
+            default_take: view.default_take,
+        },
+        shown,
+        total,
+    )
+}
+
+/// Pagination for a list: previous/next links around the range shown, and
+/// two small forms, one to go to a page and one to change the page size.
 ///
 /// Both are plain GET forms, so they work without JavaScript and need nothing
 /// the CSP would have to allow. "Go to page" sends `page`. The page-size form
 /// sends the current `skip`, which the handler snaps to the start of the page
 /// holding it at the new size, so the first package on screen stays there.
-fn pager(urls: &UrlBuilder, view: &GalleryView, shown: i64, total: i64) -> String {
-    let (skip, take) = (view.skip, view.take);
-    let sizes = page_sizes(take, view.default_take);
+pub(super) fn pager(paging: &Paging, shown: i64, total: i64) -> String {
+    let (skip, take) = (paging.skip, paging.take);
+    let sizes = page_sizes(take, paging.default_take);
     // Paging needs a second page. A page size is worth offering whenever it
     // would change what is shown: without that, choosing 100 on a feed of 60
     // left no way back to 20 a page.
@@ -520,15 +550,14 @@ fn pager(urls: &UrlBuilder, view: &GalleryView, shown: i64, total: i64) -> Strin
     if !paged && !sizable {
         return String::new();
     }
-    let hidden = view.hidden_fields();
-    let action = escape_html(&urls.app("/packages"));
+    let (hidden, action) = (&paging.hidden, &paging.action);
     let mut out = String::from("<nav class=\"pager\" aria-label=\"Pagination\">");
     if paged {
         let link = |target: i64, enabled: bool, label: &str| {
             if enabled {
                 format!(
                     "<a class=\"btn\" href=\"{}\">{label}</a>",
-                    view.href(urls, target)
+                    (paging.href)(target)
                 )
             } else {
                 // A link without an href, still announced as one, and disabled.
