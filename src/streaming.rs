@@ -6,6 +6,8 @@
 
 use std::path::Path;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use base64::Engine;
@@ -148,6 +150,83 @@ where
     Ok((size, hex::encode(hasher.finalize())))
 }
 
+/// Bytes promised to uploads still coming in to one volume: what each has
+/// declared and not yet written.
+///
+/// A free-space check alone does not reserve anything. N uploads that arrive
+/// together each see the same free space, each pass, and together write N
+/// times what was checked. Admitting an upload adds its size here first, and
+/// the check counts what is promised to the others too.
+#[derive(Debug, Default)]
+pub struct Reservations {
+    promised: AtomicI64,
+}
+
+impl Reservations {
+    /// The bytes promised now, over every [`Reservation`] still held. Below
+    /// zero while [offsets](Self::offset) hold more than is promised here:
+    /// the bytes they took off are still counted where they were promised.
+    pub fn promised(&self) -> i64 {
+        self.promised.load(Ordering::SeqCst)
+    }
+
+    /// Promise `bytes` to an upload. Each byte written through the
+    /// reservation (see [`DiskReserve::counting`]) is taken off again, since
+    /// the volume's free space shows it from then on; what is left goes when
+    /// the reservation is dropped, finished or not.
+    pub fn reserve(self: &Arc<Self>, bytes: u64) -> Reservation {
+        let bytes = bytes.min(i64::MAX as u64) as i64;
+        self.promised.fetch_add(bytes, Ordering::SeqCst);
+        Reservation {
+            pool: Arc::clone(self),
+            held: AtomicI64::new(bytes),
+            bounded: true,
+        }
+    }
+
+    /// A reservation for bytes promised somewhere else — a resumable upload's
+    /// row, which says how much of it is still to come. It starts at nothing,
+    /// and each byte written through it is taken off until it is dropped:
+    /// written, the byte shows in the free space while the row still counts
+    /// it, and would otherwise be counted twice.
+    pub fn offset(self: &Arc<Self>) -> Reservation {
+        Reservation {
+            pool: Arc::clone(self),
+            held: AtomicI64::new(0),
+            bounded: false,
+        }
+    }
+}
+
+/// One upload's share of [`Reservations`], released when dropped.
+#[derive(Debug)]
+pub struct Reservation {
+    pool: Arc<Reservations>,
+    held: AtomicI64,
+    /// Whether the share stops at zero: true for a promise of its own, false
+    /// for an [`offset`](Reservations::offset), which goes below.
+    bounded: bool,
+}
+
+impl Reservation {
+    /// `n` bytes went to disk through this upload.
+    fn consumed(&self, n: u64) {
+        let n = n.min(i64::MAX as u64) as i64;
+        // One writer at a time per reservation, so no other update races this.
+        let held = self.held.load(Ordering::SeqCst);
+        let take = if self.bounded { n.min(held.max(0)) } else { n };
+        self.held.store(held - take, Ordering::SeqCst);
+        self.pool.promised.fetch_sub(take, Ordering::SeqCst);
+    }
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        let held = self.held.load(Ordering::SeqCst);
+        self.pool.promised.fetch_sub(held, Ordering::SeqCst);
+    }
+}
+
 /// How many bytes [`DiskReserve`] lets through between two measurements.
 pub const RESERVE_CHECK_INTERVAL: u64 = 64 * 1024 * 1024;
 
@@ -166,6 +245,7 @@ pub struct DiskReserve<'a, W> {
     dir: &'a Path,
     reserve: u64,
     unchecked: u64,
+    reservation: Option<&'a Reservation>,
 }
 
 impl<'a, W> DiskReserve<'a, W> {
@@ -175,7 +255,14 @@ impl<'a, W> DiskReserve<'a, W> {
             dir,
             reserve,
             unchecked: 0,
+            reservation: None,
         }
+    }
+
+    /// Take what goes through off `reservation`, which promised it.
+    pub fn counting(mut self, reservation: &'a Reservation) -> Self {
+        self.reservation = Some(reservation);
+        self
     }
 
     fn check(&mut self) -> std::io::Result<()> {
@@ -212,6 +299,9 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for DiskReserve<'_, W> {
         let poll = Pin::new(&mut *this.inner).poll_write(cx, buf);
         if let Poll::Ready(Ok(n)) = &poll {
             this.unchecked += *n as u64;
+            if let Some(reservation) = this.reservation {
+                reservation.consumed(*n as u64);
+            }
         }
         poll
     }
@@ -364,6 +454,41 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(summary.size, 3 * RESERVE_CHECK_INTERVAL);
+    }
+
+    #[tokio::test]
+    async fn a_reservation_holds_what_is_still_to_come_until_dropped() {
+        let pool = Arc::new(Reservations::default());
+        let first = pool.reserve(1000);
+        let second = pool.reserve(500);
+        assert_eq!(pool.promised(), 1500);
+
+        // Written bytes leave the promise; more than was promised never takes
+        // off another upload's share.
+        let mut sink = tokio::io::sink();
+        let dir = tempfile::tempdir().unwrap();
+        let mut guarded = DiskReserve::new(&mut sink, dir.path(), 0).counting(&first);
+        guarded.write_all(&[0u8; 400]).await.unwrap();
+        assert_eq!(pool.promised(), 1100);
+        guarded.write_all(&[0u8; 1000]).await.unwrap();
+        assert_eq!(pool.promised(), 500);
+        drop(first);
+        assert_eq!(pool.promised(), 500);
+        // An upload that stops part-way gives back the rest.
+        drop(second);
+        assert_eq!(pool.promised(), 0);
+
+        // An offset takes written bytes off what others promised for it, and
+        // puts them back when it goes.
+        let row = pool.reserve(1000);
+        let offset = pool.offset();
+        let mut guarded = DiskReserve::new(&mut sink, dir.path(), 0).counting(&offset);
+        guarded.write_all(&[0u8; 300]).await.unwrap();
+        assert_eq!(pool.promised(), 700);
+        drop(offset);
+        assert_eq!(pool.promised(), 1000);
+        drop(row);
+        assert_eq!(pool.promised(), 0);
     }
 
     #[tokio::test]

@@ -59,6 +59,34 @@ pub(super) async fn delete_upload(db: &SqliteDatabase, id: &str) -> Result<()> {
     Ok(())
 }
 
+pub(super) async fn outstanding_upload_bytes(
+    db: &SqliteDatabase,
+    now: DateTime<Utc>,
+) -> Result<u64> {
+    // An expired upload is as good as gone: no request may write to it.
+    let left: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(MAX(length - received, 0)), 0) FROM uploads WHERE expires >= ?1",
+    )
+    .bind(now.to_rfc3339())
+    .fetch_one(&db.pool)
+    .await?;
+    Ok(left.max(0) as u64)
+}
+
+pub(super) async fn open_uploads(
+    db: &SqliteDatabase,
+    feed: &str,
+    now: DateTime<Utc>,
+) -> Result<u64> {
+    let open: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM uploads WHERE feed = ?1 AND expires >= ?2")
+            .bind(feed)
+            .bind(now.to_rfc3339())
+            .fetch_one(&db.pool)
+            .await?;
+    Ok(open.max(0) as u64)
+}
+
 pub(super) async fn expired_uploads(
     db: &SqliteDatabase,
     now: DateTime<Utc>,

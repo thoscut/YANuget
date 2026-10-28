@@ -653,6 +653,11 @@ pub trait PackageDatabase: Send + Sync {
     async fn get_upload(&self, id: &str) -> Result<Option<UploadSession>>;
     async fn set_upload_received(&self, id: &str, received: u64) -> Result<()>;
     async fn delete_upload(&self, id: &str) -> Result<()>;
+    /// The bytes the uploads current at `now` have still to receive, over
+    /// every feed: space they were admitted with and have not used yet.
+    async fn outstanding_upload_bytes(&self, now: chrono::DateTime<chrono::Utc>) -> Result<u64>;
+    /// How many uploads of `feed` are current (not expired) at `now`.
+    async fn open_uploads(&self, feed: &str, now: chrono::DateTime<chrono::Utc>) -> Result<u64>;
     /// Uploads whose expiry has passed at `now`.
     async fn expired_uploads(
         &self,

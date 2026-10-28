@@ -478,6 +478,14 @@ impl PackageDatabase for SqliteDatabase {
         uploads::delete_upload(self, id).await
     }
 
+    async fn outstanding_upload_bytes(&self, now: DateTime<Utc>) -> Result<u64> {
+        uploads::outstanding_upload_bytes(self, now).await
+    }
+
+    async fn open_uploads(&self, feed: &str, now: DateTime<Utc>) -> Result<u64> {
+        uploads::open_uploads(self, feed, now).await
+    }
+
     async fn expired_uploads(&self, now: DateTime<Utc>) -> Result<Vec<UploadSession>> {
         uploads::expired_uploads(self, now).await
     }

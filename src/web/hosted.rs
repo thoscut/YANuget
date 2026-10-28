@@ -406,7 +406,7 @@ pub(super) async fn put(
         .transpose()?;
     let declared = content_length(&headers);
     check_size(&state, declared)?;
-    state.ensure_disk_space(declared)?;
+    let reservation = state.reserve_disk_space(declared).await?;
 
     let (temp, mut file) = state.create_temp().await?;
     let stream = Box::pin(
@@ -417,11 +417,12 @@ pub(super) async fn put(
     );
     let streamed = streaming::stream_to_writer_sha256(
         stream,
-        &mut state.reserve_guard(&mut file),
+        &mut state.reserve_guard(&mut file, &reservation),
         state.config.max_file_size_bytes(),
         state.config.upload_idle_timeout(),
     )
     .await;
+    drop(reservation);
     // `temp` removes the file on every way out that does not attach it.
     let (size, sha256) = streamed.map_err(map_upload_err)?;
     file.sync_all().await?;
@@ -610,7 +611,20 @@ pub(super) async fn tus_create(
         )));
     }
     check_size(&state, Some(length))?;
-    state.ensure_disk_space(Some(length))?;
+
+    // One creation at a time, so concurrent ones cannot all pass the count,
+    // or the space check, before any of their rows exist.
+    static CREATING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _creating = CREATING.lock().await;
+    let limit = state.config.files.max_open_uploads;
+    if limit > 0 && state.db.open_uploads(state.feed(), Utc::now()).await? >= limit {
+        return Err(Error::TooManyUploads(format!(
+            "this feed already has {limit} unfinished resumable uploads (max_open_uploads); \
+             finish or delete one, or wait for one to expire"
+        )));
+    }
+    // Held until the row exists, which promises the space from then on.
+    let _reservation = state.reserve_disk_space(Some(length)).await?;
 
     let upload = uuid::Uuid::new_v4().simple().to_string();
     tokio::fs::File::create(part_path(&state, &upload)).await?;
@@ -741,8 +755,9 @@ pub(super) async fn tus_patch(
         return built(tus_response(StatusCode::CONFLICT).header("upload-offset", s.received));
     }
     // Checked at creation for the whole upload, but a resumed one may come
-    // back hours later to a fuller disk.
-    state.ensure_disk_space(Some(s.length - s.received))?;
+    // back hours later to a fuller disk. The row promises what is still to
+    // come; the offset keeps what this request writes from counting twice.
+    let reservation = state.resume_disk_space().await?;
     let part = part_path(&state, &upload);
     resume_hash(&mut hashing, &part, s.received).await?;
     // Out of the slot while bytes go in: if this request is cancelled
@@ -766,7 +781,7 @@ pub(super) async fn tus_patch(
     );
     let (written, streamed) = streaming::append_hashed(
         &mut body,
-        &mut state.reserve_guard(&mut file),
+        &mut state.reserve_guard(&mut file, &reservation),
         &mut h.hasher,
         s.length - s.received,
         state.config.upload_idle_timeout(),
@@ -780,6 +795,9 @@ pub(super) async fn tus_patch(
     // Should the row then not be updated, the two disagree and the next
     // request rebuilds the hash from the file.
     *hashing = Some(h);
+    // Counted twice for a moment rather than not at all: the offset goes
+    // before the row stops promising what was written.
+    drop(reservation);
     state.db.set_upload_received(&upload, received).await?;
     if let Err(e) = streamed {
         return Err(map_upload_err(e));

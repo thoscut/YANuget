@@ -5038,6 +5038,138 @@ async fn an_upload_that_would_fill_the_disk_is_refused() {
     );
 }
 
+/// Start a resumable upload of `length` bytes for `Res.Pkg` 1.0.0, under
+/// `name`: the status and, when created, its location.
+async fn create_tus(
+    server: &TestServer,
+    name: &str,
+    length: u64,
+) -> (reqwest::StatusCode, Option<String>) {
+    let created = tus(no_redirect().post(server.url("/api/v2/uploads")))
+        .header("Upload-Length", length.to_string())
+        .header(
+            "Upload-Metadata",
+            tus_metadata(&[("id", "Res.Pkg"), ("version", "1.0.0"), ("filename", name)]),
+        )
+        .send()
+        .await
+        .unwrap();
+    let location = created
+        .headers()
+        .get("location")
+        .map(|l| l.to_str().unwrap().to_string());
+    (created.status(), location)
+}
+
+/// A server whose free space holds one upload of the returned size, and not
+/// two: each passes the free-space check alone.
+async fn spawn_with_room_for_one() -> (TestServer, u64) {
+    let server = spawn_with(|c| {
+        c.min_free_disk_bytes = 1;
+        c.max_package_size_bytes = None;
+        c.files.max_file_size_bytes = None;
+    })
+    .await;
+    push_multipart(&server, API_KEY, build_nupkg("Res.Pkg", "1.0.0", b"x")).await;
+    let free = fs4::available_space(server._dir.path()).unwrap();
+    (server, free / 10 * 6)
+}
+
+#[tokio::test]
+async fn open_resumable_uploads_reserve_the_space_they_declared() {
+    let (server, length) = spawn_with_room_for_one().await;
+    let (status, first) = create_tus(&server, "a.wim", length).await;
+    assert_eq!(status, reqwest::StatusCode::CREATED);
+    // Nothing is written yet, but the first upload was promised the space.
+    let (status, _) = create_tus(&server, "b.wim", length).await;
+    assert_eq!(status, reqwest::StatusCode::INSUFFICIENT_STORAGE);
+    // Abandoned, it gives the space back.
+    let deleted = tus(server.client.delete(first.unwrap()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(deleted.status(), reqwest::StatusCode::NO_CONTENT);
+    let (status, _) = create_tus(&server, "b.wim", length).await;
+    assert_eq!(status, reqwest::StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn an_upload_in_progress_reserves_its_content_length_until_it_ends() {
+    let (server, length) = spawn_with_room_for_one().await;
+    // A PUT that declares `length` and then sends nothing.
+    let (tx, rx) = futures::channel::mpsc::channel::<std::io::Result<Vec<u8>>>(1);
+    let put = server
+        .client
+        .put(server.url("/api/v2/files/Res.Pkg/1.0.0/big.wim"))
+        .header("X-NuGet-ApiKey", API_KEY)
+        .header("content-length", length.to_string())
+        .body(reqwest::Body::wrap_stream(rx))
+        .send();
+    let put = tokio::spawn(put);
+
+    // Admitted, it has a temp file; from then on an upload of the same size
+    // no longer fits. Without a reservation it always does.
+    let staging = server._dir.path().join("packages/.uploads");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !std::fs::read_dir(&staging)
+        .unwrap()
+        .any(|e| e.unwrap().path().extension().is_some_and(|x| x == "tmp"))
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the PUT never started"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let (status, _) = create_tus(&server, "probe.wim", length).await;
+    assert_eq!(status, reqwest::StatusCode::INSUFFICIENT_STORAGE);
+
+    // The client gives up; the server's end of the upload drops, and with it
+    // the reservation.
+    drop(tx);
+    put.abort();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let (status, _) = create_tus(&server, "after.wim", length).await;
+        if status == reqwest::StatusCode::CREATED {
+            break;
+        }
+        assert_eq!(status, reqwest::StatusCode::INSUFFICIENT_STORAGE);
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the space was never released"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn a_feed_holds_a_bounded_number_of_open_resumable_uploads() {
+    let server = spawn_with(|c| c.files.max_open_uploads = 2).await;
+    push_multipart(&server, API_KEY, build_nupkg("Res.Pkg", "1.0.0", b"x")).await;
+    let (status, first) = create_tus(&server, "a.wim", 10).await;
+    assert_eq!(status, reqwest::StatusCode::CREATED);
+    assert_eq!(
+        create_tus(&server, "b.wim", 10).await.0,
+        reqwest::StatusCode::CREATED
+    );
+    let (status, _) = create_tus(&server, "c.wim", 10).await;
+    assert_eq!(status, reqwest::StatusCode::TOO_MANY_REQUESTS);
+    // One finished makes room for another.
+    let done = tus(server.client.patch(first.unwrap()))
+        .header("Content-Type", "application/offset+octet-stream")
+        .header("Upload-Offset", "0")
+        .body(vec![7u8; 10])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(done.status(), reqwest::StatusCode::NO_CONTENT);
+    assert_eq!(
+        create_tus(&server, "c.wim", 10).await.0,
+        reqwest::StatusCode::CREATED
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Monitoring: /metrics and /health/status
 // ---------------------------------------------------------------------------
