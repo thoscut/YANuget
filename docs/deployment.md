@@ -270,6 +270,13 @@ response buffering, and remove the body size limit. A proxy that buffers a 25 GB
 upload in memory or on its own disk undoes the whole point of streaming, and a
 default `client_max_body_size` will reject the push outright.
 
+The server compresses JSON, HTML and text itself (gzip or brotli, whichever
+the client asks for) and never compresses package, symbol or file downloads,
+which are zips already and answer byte ranges. A proxy in front therefore
+needs no compression of its own; if it has one (nginx's `gzip on`), it leaves
+responses that already carry a `Content-Encoding` alone, and it must not be
+told to compress `application/octet-stream`.
+
 ## Upgrading
 
 1. Read the [changelog](https://github.com/thoscut/yanuget/blob/main/CHANGELOG.md)

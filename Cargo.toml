@@ -37,7 +37,7 @@ axum-server = { version = "0.8", default-features = false, features = ["tls-rust
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
 tower = { version = "0.5", features = ["util"] }
-tower-http = { version = "0.7", features = ["trace", "cors"] }
+tower-http = { version = "0.7", features = ["trace", "cors", "compression-gzip", "compression-br"] }
 hyper = "1"
 hyper-util = { version = "0.1", features = ["tokio"] }
 serde = { version = "1", features = ["derive"] }
