@@ -318,6 +318,12 @@ impl State {
 /// Write `bytes` to `path` through a temporary file in the same directory,
 /// so a reader (node_exporter, the next sync) sees the old file or the new
 /// one, never half of one.
+///
+/// The temporary file has a name nobody can guess ahead and is created with
+/// `create_new` (`O_EXCL`), which refuses anything already there, a link
+/// included: a link planted under the name cannot redirect the write, and
+/// two writers never share a file. The rename replaces a link at `path`
+/// itself rather than writing through it.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let dir = match path.parent() {
         Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
@@ -327,20 +333,51 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let name = path
         .file_name()
         .ok_or_else(|| std::io::Error::other(format!("{} names no file", path.display())))?;
-    let mut tmp_name = std::ffi::OsString::from(".");
-    tmp_name.push(name);
-    tmp_name.push(".tmp");
-    let tmp = dir.join(tmp_name);
+    let (tmp, mut f) = create_temporary(&dir, name)?;
     let result = (|| {
-        let mut f = File::create(&tmp)?;
         f.write_all(bytes)?;
         f.sync_all()?;
+        drop(f);
         std::fs::rename(&tmp, path)
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
     result
+}
+
+/// A new file `.{name}.{random}.tmp` in `dir`, and its path.
+fn create_temporary(dir: &Path, name: &std::ffi::OsStr) -> std::io::Result<(PathBuf, File)> {
+    let mut last = None;
+    for _ in 0..16 {
+        let mut tmp_name = std::ffi::OsString::from(".");
+        tmp_name.push(name);
+        tmp_name.push(format!(".{:016x}.tmp", random()));
+        let tmp = dir.join(tmp_name);
+        match File::options().write(true).create_new(true).open(&tmp) {
+            Ok(f) => return Ok((tmp, f)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => last = Some(e),
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| std::io::Error::other("no temporary file could be created")))
+}
+
+/// 64 bits nobody can guess ahead: `RandomState` is seeded from the
+/// operating system's random source, and each call hashes a new counter
+/// value with the time on top. Uniqueness comes from `create_new`; this only
+/// keeps the name from being known in advance.
+fn random() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u64(COUNTER.fetch_add(1, Ordering::Relaxed));
+    h.write_u32(std::process::id());
+    if let Ok(t) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        h.write_u128(t.as_nanos());
+    }
+    h.finish()
 }
 
 /// Hold the lock next to the state file (`<state>.lock`) for as long as the

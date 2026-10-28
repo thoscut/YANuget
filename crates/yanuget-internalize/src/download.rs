@@ -13,7 +13,8 @@
 //! `downloads.proxy` the proxy resolves the names, so each host is resolved
 //! here first as well, and one that does not resolve here is refused; the
 //! proxy should refuse private destinations too. Transfers that break
-//! off are resumed where the host allows it and restarted where it does not.
+//! off are resumed where the host allows it and restarted where it does not,
+//! and a whole file, resumes included, may take `downloads.file_timeout_secs`.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -93,6 +94,8 @@ pub struct Downloader {
     dir: PathBuf,
     max_bytes: u64,
     resume_attempts: u32,
+    /// For a whole file, resumes included.
+    file_timeout: Duration,
 }
 
 /// Tells partial files of one process apart.
@@ -118,6 +121,7 @@ impl Downloader {
             dir: cache_dir.join("files"),
             max_bytes: config.max_file_bytes,
             resume_attempts: config.resume_attempts,
+            file_timeout: Duration::from_secs(config.file_timeout_secs.max(1)),
         })
     }
 
@@ -142,7 +146,19 @@ impl Downloader {
             std::process::id(),
             PARTIAL.fetch_add(1, Ordering::Relaxed)
         ));
-        let result = self.download(url, declared, &partial).await;
+        // The client's timeout is for silence; a host that sends a byte now
+        // and then would otherwise hold the download for ever.
+        let result =
+            tokio::time::timeout(self.file_timeout, self.download(url, declared, &partial))
+                .await
+                .unwrap_or_else(|_| {
+                    Err(UpstreamError::Http(format!(
+                        "{} took longer than downloads.file_timeout_secs ({} s)",
+                        redact(url),
+                        self.file_timeout.as_secs()
+                    ))
+                    .into())
+                });
         match &result {
             Ok(file) => self.write_names(file).await,
             Err(_) => {

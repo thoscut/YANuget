@@ -72,6 +72,9 @@ allow_private = false
 concurrency = 4
 # Connecting, and any silence while a host sends.
 timeout_secs = 60
+# The longest one file may take in all, resumes included, so a host that
+# trickles a byte at a time cannot hold a run.
+file_timeout_secs = 14400
 # The largest file taken.
 max_file_bytes = 8589934592
 # How often a download cut off midway is resumed (or restarted, where the

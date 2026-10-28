@@ -125,7 +125,10 @@ file that came over plain HTTP with nothing to verify it is a warning. The
 name a download got (its URL after redirects, `Content-Disposition`,
 `Content-Type`) is kept next to it, so a file taken from the cache is
 attached under the same name. A transfer that breaks off is resumed with a `Range` where the host offers
-ranges and a validator, and restarted where it does not.
+ranges and a validator, and restarted where it does not. `downloads.timeout_secs`
+bounds any silence; `downloads.file_timeout_secs` (four hours by default)
+bounds a whole file, resumes included, so a host that trickles bytes cannot
+hold a run.
 
 A file is attached under the URL's own name when that is valid for the feed
 (1 to 128 characters of `A-Z a-z 0-9 . _ -`) and its extension fits the

@@ -48,6 +48,15 @@ fn broken_body(bytes: Vec<u8>) -> Body {
     Body::from_stream(first.chain(cut))
 }
 
+/// One byte every 100 ms, for ever: never silent long enough for the
+/// client's timeout.
+fn trickle() -> impl futures_util::Stream<Item = Result<Bytes, std::io::Error>> {
+    futures_util::stream::unfold((), |()| async {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        Some((Ok(Bytes::from_static(b"x")), ()))
+    })
+}
+
 async fn file(State(s): State<Shared>, headers: HeaderMap, resumable: bool) -> Response {
     let range = headers
         .get("range")
@@ -116,6 +125,7 @@ async fn host() -> (String, Shared) {
             get(|| async { axum::response::Redirect::temporary("/plain/setup.exe") }),
         )
         .route("/missing", get(|| async { StatusCode::NOT_FOUND }))
+        .route("/trickle", get(|| async { Body::from_stream(trickle()) }))
         .with_state(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -269,6 +279,31 @@ async fn a_broken_transfer_resumes_or_restarts() {
         .await
         .unwrap_err();
     assert!(err.to_string().contains("broke off"), "{err}");
+}
+
+#[tokio::test]
+async fn a_file_that_trickles_in_runs_out_of_time() {
+    let (base, _) = host().await;
+    let cache = tempfile::tempdir().unwrap();
+    let d = downloader(
+        &DownloadsConfig {
+            file_timeout_secs: 1,
+            ..config()
+        },
+        cache.path(),
+    );
+    let started = std::time::Instant::now();
+    let err = d
+        .fetch(&format!("{base}/trickle").parse().unwrap(), None)
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("downloads.file_timeout_secs"),
+        "{err}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(4));
+    // The partial file goes with it.
+    assert!(files(cache.path()).is_empty(), "{:?}", files(cache.path()));
 }
 
 #[tokio::test]
