@@ -76,8 +76,8 @@ incompatibly at any version.
    git fetch --tags && git tag --sort=-v:refname | head
    ```
 
-   `git tag` without `--fetch` lists only the tags your clone happens to have,
-   which is not the same question. Getting this wrong once meant preparing an
+   `git tag` without a `git fetch --tags` first lists only the tags your clone
+   happens to have, which is not the same question. Getting this wrong once meant preparing an
    0.1.0 release of a project that had already shipped 0.4.0.
 
 5. **Bump `version` in `Cargo.toml`** past the highest released tag, then
@@ -130,14 +130,23 @@ the same one.
 - Check that the provenance and signature verify, as a user would — the
   commands are in [SECURITY.md](SECURITY.md#verifying-a-release):
   `gh attestation verify` on one archive and on the image, and `cosign verify`
-  on the image.
+  on the image. Use cosign 3 or newer: older versions do not find the
+  signature, which is stored as a Sigstore bundle, and report "no signatures
+  found".
 - Download one binary and confirm `/docs` serves the real documentation rather
   than the "documentation not bundled" placeholder — that placeholder appearing
   means the docs step did not run.
 
 ## A note on `cargo install`
 
-The rendered documentation site is generated, so it is not part of the crates.io
-package. A binary from `cargo install yanuget` therefore serves a placeholder at
-`/docs` that links to the online documentation; everything else is identical. The
-release binaries and the container image both ship the full offline site.
+The rendered documentation site is generated, so it is neither in the repository
+nor part of a crates.io package. A binary from `cargo install` therefore serves a
+placeholder at `/docs` that links to the online documentation; everything else is
+identical. The release binaries and the container image both ship the full
+offline site.
+
+Until the first crates.io publish (see step 4 above), `cargo install yanuget`
+finds nothing; the README and the deployment guide document installing from a
+tag instead:
+`cargo install --git https://github.com/thoscut/yanuget --tag vX.Y.Z --locked yanuget`.
+Switch them to `cargo install yanuget` once the crate is published.

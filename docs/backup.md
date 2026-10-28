@@ -166,6 +166,57 @@ package store, or one containing it, is refused.
 Run it as the service user, so the restored files belong to the server. If you
 restore as root, `chown -R yanuget:yanuget` the data directory afterwards.
 
+## In a container
+
+The image's entrypoint is `yanuget`, and the server is the container's main
+process, so the two commands run differently. The backup directory needs a
+volume of its own, outside `/data`, writable by the image's user (uid 10001).
+Add it to the service from [Docker Compose](deployment.md#docker-compose):
+
+```yaml
+services:
+  yanuget:
+    # ... as before ...
+    volumes:
+      - yanuget-data:/data
+      - /srv/backup/yanuget:/backup   # chown 10001 on the host
+```
+
+**Backup** runs inside the running container, next to the server:
+
+```bash
+docker compose exec yanuget yanuget backup /backup
+```
+
+**Restore** cannot run there: the server would have to stop, and stopping it
+stops the container. Stop the service and run the restore in a one-off
+container of the same service, which gets the same volumes, environment and
+configuration but publishes no ports:
+
+```bash
+docker compose stop yanuget
+docker compose run --rm --no-deps yanuget restore --force /backup
+docker compose start yanuget
+```
+
+Stop the service first even though the restore would refuse a running server:
+it looks for one on its own loopback address, and in a one-off container there
+is none to find. Leave out `--force` when restoring into a new, empty volume.
+
+Without Compose, the same with `docker run`, passing the configuration the
+server uses (its `-e`, `--env-file` and `YANUGET_CONFIG` mount) as well:
+
+```bash
+docker stop yanuget
+docker run --rm -v yanuget-data:/data -v /srv/backup/yanuget:/backup \
+  ghcr.io/thoscut/yanuget:X.Y.Z restore --force /backup
+docker start yanuget
+```
+
+Use the image of the version that should serve the restored data: an older
+release's image to roll back an upgrade (see
+[Upgrading](deployment.md#upgrading)), the current one otherwise.
+
 ## Moving to a new host
 
 With `yanuget backup` the move is short and safe at any size. The old server

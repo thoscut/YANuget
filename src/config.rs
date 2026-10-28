@@ -819,6 +819,39 @@ impl Config {
         self.apply_env_from(|name| std::env::var(name))
     }
 
+    /// The `YANUGET_*` names among `names` that nothing reads (`DEP-09`).
+    ///
+    /// The TOML file rejects a misspelled key; a misspelled variable is
+    /// simply never asked for, so `YANUGET_ADMIN_APIKEY` leaves `/admin` off
+    /// without a word. What [`Self::apply_env_from`] asks for is the list of
+    /// names it knows, feed variables included (for the feeds this
+    /// configuration declares), plus the ones the command line reads.
+    pub fn unknown_env_names<'a>(&self, names: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+        let asked = std::cell::RefCell::new(std::collections::HashSet::new());
+        // Every lookup misses, so no value can fail to parse and every name
+        // the overlay knows is asked for.
+        let _ = self.clone().apply_env_from(|name| {
+            asked.borrow_mut().insert(name.to_string());
+            Err(std::env::VarError::NotPresent)
+        });
+        let asked = asked.into_inner();
+        let mut unknown: Vec<String> = names
+            .into_iter()
+            .filter(|n| n.starts_with("YANUGET_") && !asked.contains(*n) && !CLI_ENV.contains(n))
+            .map(str::to_string)
+            .collect();
+        unknown.sort_unstable();
+        unknown
+    }
+
+    /// [`Self::unknown_env_names`] of the process environment.
+    pub fn unknown_env(&self) -> Vec<String> {
+        let names: Vec<String> = std::env::vars_os()
+            .filter_map(|(k, _)| k.into_string().ok())
+            .collect();
+        self.unknown_env_names(names.iter().map(String::as_str))
+    }
+
     /// Overlay `YANUGET_*` values, read through `var` (the process environment
     /// in production, a map in tests).
     ///
@@ -946,8 +979,9 @@ impl Config {
         if let Some(b) = bool_var("YANUGET_MONITORING_ENABLED")? {
             self.monitoring.enabled = b;
         }
-        if let Some(v) = get("YANUGET_MONITORING_TOKEN")? {
-            self.monitoring.token = (!v.trim().is_empty()).then(|| v.trim().to_string());
+        // A key like the others: a blank value would quietly open /metrics.
+        if let Some(v) = secret("YANUGET_MONITORING_TOKEN")? {
+            self.monitoring.token = Some(env_key("YANUGET_MONITORING_TOKEN", &v)?);
         }
         if let Some(b) = bool_var("YANUGET_RATELIMIT_ENABLED")? {
             self.rate_limit.enabled = b;
@@ -1524,6 +1558,18 @@ pub fn feed_env_name(feed: &str) -> String {
         })
         .collect()
 }
+
+/// `YANUGET_*` variables the command line reads rather than the configuration:
+/// the config path, `migrate`'s source and the admin commands' server and key.
+const CLI_ENV: &[&str] = &[
+    "YANUGET_CONFIG",
+    "YANUGET_SOURCE_USERNAME",
+    "YANUGET_SOURCE_PASSWORD",
+    "YANUGET_SOURCE_TOKEN",
+    "YANUGET_SOURCE_HEADERS",
+    "YANUGET_ADMIN_URL",
+    "YANUGET_ADMIN_KEY",
+];
 
 /// A secret from the environment variable `name`, or from the file named by
 /// `{name}_FILE`; setting both is refused, since only one can win and the
@@ -2160,6 +2206,25 @@ mod tests {
     }
 
     #[test]
+    fn variables_nothing_reads_are_reported() {
+        let c = two_feeds();
+        let unknown = c.unknown_env_names([
+            "YANUGET_ADMIN_API_KEY",
+            "YANUGET_ADMIN_APIKEY",
+            "YANUGET_MONITORING_TOKEN_FILE",
+            "YANUGET_FEED_STAGE_API_KEY",
+            "YANUGET_FEED_STAGING_API_KEY",
+            "YANUGET_CONFIG",
+            "YANUGET_ADMIN_KEY",
+            "PATH",
+        ]);
+        assert_eq!(
+            unknown,
+            ["YANUGET_ADMIN_APIKEY", "YANUGET_FEED_STAGING_API_KEY"]
+        );
+    }
+
+    #[test]
     fn a_blank_key_variable_is_an_error_not_a_removal() {
         // Compose writes `${UNSET}` as an empty string. Read as "no key", that
         // would make a read-gated feed public, or drop its push key.
@@ -2169,6 +2234,7 @@ mod tests {
             "YANUGET_API_KEY",
             "YANUGET_API_KEYS",
             "YANUGET_ADMIN_API_KEY",
+            "YANUGET_MONITORING_TOKEN",
             "YANUGET_FEED_STAGE_API_KEY",
             "YANUGET_FEED_STAGE_API_KEYS",
             "YANUGET_FEED_PRE_PROD_READ_API_KEY",

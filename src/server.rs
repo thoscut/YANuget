@@ -31,6 +31,16 @@ use crate::error::{Error, Result};
 /// path. After it, remaining connections are closed.
 pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 
+/// Request work that must not stop part-way: an indexing, an attach, a move
+/// (see `web::helpers::detached`). It outlives its request when the client
+/// disconnects, so the shutdown waits for it as it does for the background
+/// tasks; dropped with the runtime, it would stop between two of its steps
+/// after all.
+pub fn detached_tasks() -> &'static tokio_util::task::TaskTracker {
+    static TASKS: std::sync::OnceLock<tokio_util::task::TaskTracker> = std::sync::OnceLock::new();
+    TASKS.get_or_init(tokio_util::task::TaskTracker::new)
+}
+
 /// How long a client may take to send a request's headers. Generous for any
 /// real client, short enough that a trickle of bytes cannot hold a socket.
 /// It does not bound the body: a slow upload is governed by

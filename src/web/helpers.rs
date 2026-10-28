@@ -91,11 +91,13 @@ pub(super) fn to_io_err<E: std::fmt::Display>(e: E) -> std::io::Error {
 /// it has reached. Work that is a sequence of store and database steps — an
 /// indexing, an attach, a mirror fetch — must not stop between two of them,
 /// leaving a payload without its row or an overwrite with its old rows gone.
-/// Spawned, it finishes either way; only the answer is lost.
+/// Spawned, it finishes either way; only the answer is lost. The shutdown
+/// waits for it too, through [`crate::server::detached_tasks`].
 pub(super) async fn detached<T: Send + 'static>(
     work: impl std::future::Future<Output = Result<T>> + Send + 'static,
 ) -> Result<T> {
-    tokio::spawn(work)
+    crate::server::detached_tasks()
+        .spawn(work)
         .await
         .map_err(|e| Error::Other(anyhow::anyhow!("background task failed: {e}")))?
 }

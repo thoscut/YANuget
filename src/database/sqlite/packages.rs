@@ -209,7 +209,7 @@ async fn replace_rows(
          package_size = excluded.package_size, package_hash = excluded.package_hash, \
          package_hash_algorithm = excluded.package_hash_algorithm, \
          published = excluded.published, package_types = excluded.package_types, \
-         dependencies = excluded.dependencies"
+         dependencies = excluded.dependencies, is_semver2 = excluded.is_semver2"
         )),
         p,
     )?
@@ -573,6 +573,28 @@ mod tests {
             .unwrap()
             .is_empty());
         assert!(db.tag_counts("other", 10).await.unwrap().is_empty());
+    }
+
+    /// A SemVer 2.0.0 dependency range makes the version SemVer 2.0.0, so a
+    /// replacement build can change the flag without changing the version.
+    #[tokio::test]
+    async fn a_replacement_takes_the_new_builds_semver2_flag() {
+        let db = SqliteDatabase::in_memory().await.unwrap();
+        let first = sample("Swap.Pkg", "1.0.0");
+        assert!(!first.is_semver2);
+        db.add_to_feed(FEED, &first).await.unwrap();
+
+        let mut second = sample("Swap.Pkg", "1.0.0");
+        second.is_semver2 = true;
+        db.replace_version(&second, &Membership::active(FEED, &second))
+            .await
+            .unwrap();
+        let data = db
+            .get_package_data("swap.pkg", &second.version)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(data.is_semver2);
     }
 
     #[tokio::test]

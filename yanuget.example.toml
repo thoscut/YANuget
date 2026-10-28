@@ -226,7 +226,10 @@ inbox_scan_secs = 30                # YANUGET_FILES_INBOX_SCAN_SECS
 # version can belong to several feeds at once; its payload and metadata are
 # stored ONCE and referenced by each feed (no duplication on disk).
 #
-# Feeds are configured in TOML only — there are no YANUGET_* env vars for them.
+# Feeds are declared in TOML only: no env var adds a feed or changes its
+# settings. Their keys and mirror credentials can also come from
+# YANUGET_FEED_{NAME}_* env vars (docs/configuration.md, "Keys from the
+# environment or a file"), which override a feed declared here.
 #
 # NOTE on the sub-tables below: a feed's `mirror`, `license_policy` and
 # `retention` blocks attach to the **most recently declared** [[feeds]] entry

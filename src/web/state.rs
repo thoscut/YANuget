@@ -351,6 +351,28 @@ impl AppState {
             .then_some(Access::Public))
     }
 
+    /// What a download that found nothing servable answers.
+    ///
+    /// On a feed with open reads and a preview key, a pending version is a
+    /// 404 to anyone without the key and a 200 with it, and a 404 does not
+    /// count toward `max_failed_auth`: the key could be guessed at the
+    /// request limiter's pace instead of the failed-authentication one. So a
+    /// request that carries a credential which is neither the feed's read
+    /// key nor its preview key is answered `401` (`SEC-28`).
+    pub(super) fn download_miss(&self, headers: &HeaderMap) -> Error {
+        let credential = headers.contains_key(header::AUTHORIZATION)
+            || headers.contains_key(crate::auth::API_KEY_HEADER);
+        if self.feed.preview_auth.is_enabled()
+            && credential
+            && !self.feed.preview_auth.presented(headers)
+            && !self.feed.read_auth.presented(headers)
+        {
+            Error::Unauthorized
+        } else {
+            Error::PackageNotFound
+        }
+    }
+
     /// Reject the request unless valid read credentials are presented (a no-op
     /// when the feed allows open reads).
     pub(super) fn require_read(&self, headers: &HeaderMap) -> Result<()> {

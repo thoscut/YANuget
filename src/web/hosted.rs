@@ -75,7 +75,7 @@ pub(super) async fn download(
     let access = state
         .download_access(&headers, &id, &v)
         .await?
-        .ok_or(Error::PackageNotFound)?;
+        .ok_or_else(|| state.download_miss(&headers))?;
     if name.eq_ignore_ascii_case("index.json") {
         let mut response = index(&state, &headers, &id, &v).await?;
         if access == Access::Preview {

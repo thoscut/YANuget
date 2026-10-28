@@ -193,6 +193,9 @@ async fn run_server(config_path: Option<&str>) -> anyhow::Result<()> {
     tokio::fs::create_dir_all(&config.data_dir).await?;
     tokio::fs::create_dir_all(config.storage_path()).await?;
 
+    for name in config.unknown_env() {
+        tracing::warn!(variable = %name, "environment variable {name} is not a setting and is ignored");
+    }
     let feeds = config.resolved_feeds()?;
     for feed in &feeds {
         if feed.api_keys.is_empty() {
@@ -422,15 +425,16 @@ async fn run_server(config_path: Option<&str>) -> anyhow::Result<()> {
 
     // The server has stopped; let background work that was mid-way finish,
     // by the deadline the requests had. It has been winding down since the
-    // signal, alongside them.
+    // signal, alongside them. So has the work requests left detached: an
+    // overwrite or a move a restart cut off would leave half its steps done.
     let deadline = deadline
         .get()
         .copied()
         .unwrap_or_else(|| tokio::time::Instant::now() + yanuget::server::SHUTDOWN_GRACE);
-    if tokio::time::timeout_at(deadline, futures::future::join_all(background))
-        .await
-        .is_err()
-    {
+    let detached = yanuget::server::detached_tasks();
+    detached.close();
+    let all = futures::future::join(futures::future::join_all(background), detached.wait());
+    if tokio::time::timeout_at(deadline, all).await.is_err() {
         tracing::warn!("background tasks still running at shutdown; abandoning them");
     }
     Ok(())

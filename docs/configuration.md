@@ -17,6 +17,7 @@ A fully commented template lives in
 | `port` | `YANUGET_PORT` | int | `5000` | TCP port. |
 | `base_url` | `YANUGET_BASE_URL` | string | *(per-request)* | External base URL. Set it whenever you know the public address, and always behind a proxy. If unset, derived from `Host`, and from `X-Forwarded-*` only when the peer is in `trusted_proxies`. When set, requests for any other host get `421` (see [Host validation](#host-validation)). |
 | `allowed_hosts` | `YANUGET_ALLOWED_HOSTS` | string[] | `[]` | Further host names the server answers to (env: comma-separated). `*` accepts any. |
+| `cors_allowed_origins` | *(TOML only)* | string[] | `[]` | Browser origins allowed to read the server cross-origin, e.g. `["https://portal.example.com"]`, or `["*"]` for any. Empty sends no CORS headers at all. Read-only either way (`GET`, `HEAD`, `OPTIONS`); NuGet clients are not affected. `*` lets any page a user visits read the feed, so see the [security policy](https://github.com/thoscut/yanuget/blob/main/SECURITY.md#running-yanuget-safely) first. |
 | `data_dir` | `YANUGET_DATA_DIR` | path | `./data` | Root for all data. |
 | `storage_path` | `YANUGET_STORAGE_PATH` | path | `{data_dir}/packages` | Package store. |
 | `database_path` | `YANUGET_DATABASE_PATH` | path | `{data_dir}/yanuget.db` | SQLite file. |
@@ -65,8 +66,8 @@ Every key can be kept out of the TOML file, so `yanuget.toml` can be
 world-readable, managed by Puppet or committed, while the keys come from a
 secret store:
 
-- **Global keys** are `YANUGET_API_KEY`, `YANUGET_API_KEYS` and
-  `YANUGET_ADMIN_API_KEY` (above).
+- **Global keys** are `YANUGET_API_KEY`, `YANUGET_API_KEYS`,
+  `YANUGET_ADMIN_API_KEY` (above) and `YANUGET_MONITORING_TOKEN`.
 - **A feed's keys** are `YANUGET_FEED_{NAME}_API_KEY`, `..._API_KEYS`,
   `..._READ_API_KEY`, `..._PREVIEW_API_KEY`, `..._ADMIN_API_KEY`, and for its mirror
   `..._MIRROR_PASSWORD` and `..._MIRROR_TOKEN`. `{NAME}` is the feed's name
@@ -150,7 +151,7 @@ ones included) and each mirror's upstream host. The probes `/health`,
 | TOML key | Env var | Type | Default | Description |
 | --- | --- | --- | --- | --- |
 | `monitoring.enabled` | `YANUGET_MONITORING_ENABLED` | bool | `false` | Serve `/metrics` and `/health/status`. |
-| `monitoring.token` | `YANUGET_MONITORING_TOKEN` | string | *(none)* | When set, both endpoints require `Authorization: Bearer <token>`. Unset, anyone who can reach the server can read them. |
+| `monitoring.token` | `YANUGET_MONITORING_TOKEN` | string | *(none)* | When set, both endpoints require `Authorization: Bearer <token>`. Unset, anyone who can reach the server can read them. Like the keys, it can come from `YANUGET_MONITORING_TOKEN_FILE`, and a blank variable is an error. |
 
 Like the health probes, `/metrics` answers whatever the `Host`, so a scraper
 can use the server's address. A Prometheus job:
@@ -408,8 +409,11 @@ store (checked on startup; the inbox is then disabled).
 By default YANuget serves a single feed at the root (the implicit `default`
 feed, using the global settings above). Add `[[feeds]]` blocks to host several
 feeds; each is mounted under `/{name}` (e.g. `/stable/v3/index.json`) and the
-root serves a feed index. **Feeds are configured in TOML only — there are no
-`YANUGET_*` environment variables for them.**
+root serves a feed index. **Feeds are declared in TOML only:** no environment
+variable adds a feed or changes its settings. Their keys and mirror
+credentials can also come from `YANUGET_FEED_{NAME}_*` variables (see
+[Keys from the environment or a file](#keys-from-the-environment-or-a-file)),
+which override a feed the TOML declares.
 
 A package version can belong to **many feeds at once**. The payload and metadata
 are stored **once** (keyed by id/version); each feed holds only a *membership*

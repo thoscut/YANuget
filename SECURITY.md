@@ -9,6 +9,10 @@ YANuget is pre-1.0. Only the latest released version receives security fixes.
 | 0.8.x | ✅ |
 | < 0.8 | ❌ |
 
+The table is for the server, `yanuget`, and the `yanuget-pkg` library it is
+built with, which is fixed in the same releases. The internalizer has no
+release yet; see [The internalizer](#the-internalizer).
+
 ## Reporting a vulnerability
 
 **Please do not open a public issue for a security problem.**
@@ -67,6 +71,40 @@ Out of scope:
   is given; it does not audit package contents.
 - Missing hardening headers on endpoints that serve no HTML.
 
+### The internalizer
+
+The repository also holds `yanuget-internalize` (`crates/yanuget-internalize`),
+a separate command-line tool that copies Chocolatey packages into a YANuget
+feed: it runs each package's install script in an offline Windows sandbox to
+record what the script downloads, fetches those files itself, attaches them to
+the feed, and pushes a copy of the package whose script installs from the feed
+instead of the internet. **It is not released and not usable yet** (version
+0.0.0, not published, not in the release archives or the image), so it has no
+supported version; it is listed here so that reports about it are welcome
+anyway, and so the boundaries are clear before it ships.
+
+It treats everything that comes out of a package as untrusted: the package
+itself, what its scripts do inside the sandbox, the URLs they record, and the
+files behind them. In scope:
+
+- **Requests it is tricked into making**: a recorded URL, a redirect or an
+  upstream feed that makes it reach a private, loopback or link-local address
+  it was not told to allow, send credentials to another origin, or downgrade
+  from https to http.
+- **An internalized package that still reaches the internet**, or installs
+  something other than the file that was downloaded and hashed, when the
+  package's script goes through Chocolatey's download helpers.
+- **Misleading the reviewer**: a report, file name or admin-area page that
+  shows an approver something other than what the package will install.
+- **Writing outside its working directories** through a file name, an archive
+  entry or a path in the capture.
+
+Out of scope for it, as for the server: findings that need the worker's push
+key or access to the worker host, and escapes from the virtualisation itself
+(QEMU, Hyper-V), which belong to those projects. The full threat model, with the
+worker as its own trust zone holding a push key for the intake feed only, comes
+with the tool's documentation (`INT-34` in [ROADMAP.md](ROADMAP.md)).
+
 ## Running YANuget safely
 
 Configuration choices that matter most:
@@ -123,6 +161,10 @@ cosign verify ghcr.io/thoscut/yanuget:X.Y.Z \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   --certificate-identity-regexp '^https://github\.com/thoscut/YANuget/\.github/workflows/release\.yml@refs/tags/v'
 ```
+
+`cosign verify` needs **cosign 3 or newer**: the signature is stored as a
+Sigstore bundle, which older versions do not look for (cosign 2.5 reports "no
+signatures found" for an image that is signed).
 
 Either check failing means the file or image did not come from this
 repository's release workflow run for a tag; do not use it.
