@@ -10,19 +10,18 @@ requests can reference them, and ticked off rather than deleted when they land.
 ## Open items
 
 Everything still open across this file and the project's working threads, as
-of 2026-10-27 (0.8.0 released). The entries further down hold the detail; this
+of 2026-10-28 (0.8.0 released). The entries further down hold the detail; this
 list is the index.
 
 **From the review of 2026-10-19**
 
-- Correctness: `COR-27` to `COR-31`. Operations: `DEP-08`.
-  Hardening: `SEC-29`, `SEC-30`. Performance and UI: `PERF-04` to
-  `PERF-08`, `UI-01`.
+- Correctness: `COR-27`, `COR-29`, `COR-31`. Hardening: `SEC-29`.
+  Performance and UI: `PERF-06`, `PERF-08`, `UI-01`.
 
 **From the review of 2026-10-27** ([detail](#review-of-2026-10-27))
 
-- Correctness: `COR-35` to `COR-37`. Maintainability: `MNT-06`.
-  Internalizer: `INT-35`, `INT-36`. Release: `0.8.1`.
+- Correctness: `COR-35`, `COR-37`. Maintainability: `MNT-06`.
+  Internalizer: `INT-35`. Release: `0.8.1`.
 
 **Server, after 0.8.0** ([Target releases](#target-releases))
 
@@ -138,8 +137,10 @@ security, Rust code, tests and CI, operations and documentation), at
 - [ ] **`COR-35` Approving checks the package hash only**
   (`check_shown_builds`): attached files can still change between the page
   and the approval, the pending side of `COR-31`.
-- [ ] **`COR-36` A move removes the membership and writes the tombstone in
+- [x] **`COR-36` A move removes the membership and writes the tombstone in
   two steps**; a failure between them lets the mirror fetch the version back.
+  *Done:* one transaction (`remove_membership_for_good`), used by moves and
+  by retention's purge.
 - [ ] **`COR-37` Blobs a detach leaves are never collected.**
 - [ ] **`MNT-06` Two NuGet v3 readers.** The mirror takes `@type` only as a
   string and does not resolve a relative `@id` (`src/mirror.rs`), the
@@ -148,12 +149,17 @@ security, Rust code, tests and CI, operations and documentation), at
 - [ ] **`INT-35` Overrides apply only `skip`.** `Override::apply` and
   `with_script` have no caller outside tests and `package_parameters` is
   always `None`, while `INT-25` and the README describe all of them.
-- [ ] **`INT-36` Prelude and downloader hardening.** The prelude passes on any
+- [x] **`INT-36` Prelude and downloader hardening.** The prelude passes on any
   value that does not match `^(https?|ftps?)://` exactly (a leading space,
   `https:\\`, a UNC path); it wraps only the first `chocolateyInstall.ps1`;
   the downloader has no overall timeout per file; `write_atomic` in `sync.rs`
   uses a fixed temporary name and follows links. None of it is reachable
   before `run` and `sync` are wired.
+  *Done:* the prelude refuses what it cannot redirect (UNC paths,
+  `file://host`, other schemes) and wraps every install, upgrade and
+  uninstall script; `downloads.file_timeout_secs` bounds a file (4 h
+  default); `write_atomic` creates an unguessable temporary file with
+  `create_new`.
 
 ## Review of 2026-10-19
 
@@ -185,36 +191,46 @@ open. File and line references are from `main` at `a193027`.
   `purge_global_data` never runs for those versions, an overwrite answers
   `409`, and the renamed feed looks empty. *Fix:* warn at startup and in
   `yanuget config check`, and add a command that migrates or removes them.
-- [ ] **`COR-28` `max_age_days` counts from the global `published`**
+- [x] **`COR-28` `max_age_days` counts from the global `published`**
   (`src/retention.rs:178`), not from `feed_packages.added`, so an old version
   promoted into prod is deleted there by the next sweep. Count from `added`,
   or document the behaviour.
+  *Done:* counted from the membership's `added`, which every way into a feed
+  sets; an overwriting push restarts it.
 - [ ] **`COR-29` A mirror takes the upstream's listing state only once**
   (`src/mirror.rs:1581, 1649, 1675`), on the first mirror. A version unlisted
   upstream later stays listed here. *Fix:* reconcile on refresh while no
   admin has set the state.
-- [ ] **`COR-30` Backup verification compares sizes only** (`verify` in
+- [x] **`COR-30` Backup verification compares sizes only** (`verify` in
   `src/backup.rs`). Under `allow_overwrite`, new bytes of the same size leave
   a copy whose hash no longer matches its row. *Fix:* compare `package_hash`
   for the files copied in the last pass.
+  *Done:* every file a backup run copied is hashed against its row (SHA-512
+  for packages, SHA-256 for attached files); a mismatch is retried and then
+  reported as missing.
 
 ### Operations and documentation
 
-- [ ] **`DEP-08` `sudo -u yanuget yanuget …` does not see the unit's
+- [x] **`DEP-08` `sudo -u yanuget yanuget …` does not see the unit's
   environment** (`contrib/systemd/yanuget.service`, `docs/backup.md`,
   `docs/deployment.md:153`). `data_dir` then falls back to `./data` in the
   current directory, and `restore` writes there and reports success. *Fix:*
   the install steps put an absolute `data_dir` into the TOML file, and
   `restore` prints its target and refuses a relative `data_dir`.
+  *Done:* `restore` refuses a relative `data_dir`, `storage_path` or
+  `database_path` and names its target; the install steps write an absolute
+  `data_dir` into the TOML file.
 - [x] **`DEP-09` No warning for unknown `YANUGET_*` variables** in the
   server, as the internalizer has (`check_env_names`). `YANUGET_ADMIN_KEY`
   instead of `YANUGET_ADMIN_API_KEY` silently turns `/admin` off.
   *Done:* the server warns at startup about every `YANUGET_*` variable
   nothing reads, and `config check` reports it. (`YANUGET_ADMIN_KEY` itself
   is the admin commands' key, so it is a known name.)
-- [ ] **`PERF-04` `/metrics` and `/health/status` without a token** run three
+- [x] **`PERF-04` `/metrics` and `/health/status` without a token** run three
   aggregate scans per feed on every request. *Fix:* cache `gather()` for a
   few seconds.
+  *Done:* the scans are cached for 5 s, one scan at a time; writes on this
+  server refresh them at once.
 
 ### Hardening
 
@@ -228,21 +244,28 @@ open. File and line references are from `main` at `a193027`.
   of open tus sessions per feed is not capped. PR #63 re-checks
   `min_free_disk_bytes` while an upload streams; the reservation and the cap
   remain.
-- [ ] **`SEC-30` `rewrite` and `[Content_Types].xml`.** New types are inserted
+- [x] **`SEC-30` `rewrite` and `[Content_Types].xml`.** New types are inserted
   at `rfind("</Types>")` (`crates/yanuget-pkg/src/rewrite.rs:421`), which a
   comment can contain, and control characters in part names are not refused.
   Matters once the internalizer rewrites packages (`INT-20`).
+  *Done:* the XML is parsed and new types go before the root's own end tag;
+  part names with control characters are refused.
 
 ### Performance and UI
 
-- [ ] **`PERF-05` No response compression** (tower-http's `compression-*`
+- [x] **`PERF-05` No response compression** (tower-http's `compression-*`
   features are off): large registration and search JSON goes out
   uncompressed when no proxy compresses it.
+  *Done:* gzip and brotli for JSON, HTML and text; downloads
+  (`Accept-Ranges`), ranges and `application/octet-stream` stay
+  uncompressed.
 - [ ] **`PERF-06` Mirror JSON is decompressed on the async thread and parsed
   into `serde_json::Value`** (`src/mirror.rs:510-570`; `:745` clones the
   items). *Fix:* `spawn_blocking` and typed structs.
-- [ ] **`PERF-07` The bundled docs have no `Cache-Control` or `ETag`**, and
+- [x] **`PERF-07` The bundled docs have no `Cache-Control` or `ETag`**, and
   each request copies the file (`into_owned()`, `src/web/docs.rs:57-75`).
+  *Done:* a weak `ETag` from the embedded hash, `304` on a match,
+  `Cache-Control: public, max-age=300`, no copy.
 - [ ] **`PERF-08` Gallery header queries.** The header needs the headline
   and a `COUNT(*)` per id, not more. (The cap on `take` is in PR #63.)
 - [ ] **`UI-01` The admin dashboard is a flat list** without paging and
