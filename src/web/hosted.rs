@@ -41,6 +41,7 @@ use super::helpers::{
 };
 use super::state::Access;
 use super::{files, AppState};
+use crate::config::OverwriteMode;
 use crate::database::{PackageFile, UploadSession};
 use crate::error::{Error, Result};
 use crate::storage::{PackageContent, TempPath};
@@ -194,6 +195,41 @@ async fn version_in_feed(state: &AppState, id: &str, v: &NuGetVersion) -> Result
     }
 }
 
+/// Whether this request's attaches and detaches are held to
+/// [`check_not_approved`]: under `allow_overwrite = "pending-only"`, unless
+/// the request also presents the feed's admin key.
+fn keeps_approved(state: &AppState, headers: &HeaderMap) -> bool {
+    state.feed.allow_overwrite == OverwriteMode::PendingOnly
+        && !state.feed.admin.check_headers(headers)
+}
+
+/// With `keep_approved`, refuse to change the files of a version some feed
+/// has approved. The package hash does not cover them, and a source feed
+/// keeps its membership after a promotion: without this its push key could
+/// replace `setup.exe` of a version approved in production, while
+/// `pending-only` promises that a version approved anywhere stays as it is.
+async fn check_not_approved(
+    db: &dyn crate::database::PackageDatabase,
+    id: &str,
+    v: &NuGetVersion,
+    keep_approved: bool,
+) -> Result<()> {
+    if !keep_approved {
+        return Ok(());
+    }
+    let approved = db.approved_in(id, v).await?;
+    if approved.is_empty() {
+        return Ok(());
+    }
+    Err(Error::Forbidden(format!(
+        "{id} {} is approved in {}, and allow_overwrite = \"pending-only\" keeps a \
+         version approved anywhere as it is, its files included; changing them takes \
+         the feed's admin key",
+        v.normalized(),
+        approved.join(", ")
+    )))
+}
+
 /// How an attach went.
 pub(crate) enum Attached {
     /// A new file.
@@ -227,6 +263,7 @@ pub(crate) async fn attach(
     v: &NuGetVersion,
     name: &str,
     file: Finished,
+    keep_approved: bool,
 ) -> Result<Attached> {
     let state = state.clone();
     let (id, v, name) = (id.to_string(), v.clone(), name.to_string());
@@ -235,6 +272,7 @@ pub(crate) async fn attach(
             storage: state.storage.as_ref(),
             db: state.db.as_ref(),
             feed: state.feed(),
+            keep_approved,
         };
         let Finished { temp, sha256, size } = file;
         attach_to(
@@ -256,6 +294,9 @@ pub(crate) struct Target<'a> {
     pub storage: &'a dyn crate::storage::PackageStorage,
     pub db: &'a dyn crate::database::PackageDatabase,
     pub feed: &'a str,
+    /// Leave the files of an approved version alone (see
+    /// [`check_not_approved`]).
+    pub keep_approved: bool,
 }
 
 /// [`attach`] without the web layer, for the inbox importer. `temp` is
@@ -285,7 +326,13 @@ async fn attach_locked(
     sha256: &str,
     size: u64,
 ) -> Result<Attached> {
-    let Target { storage, db, feed } = *target;
+    let Target {
+        storage,
+        db,
+        feed,
+        keep_approved,
+    } = *target;
+    // Under the lock an approval takes too, so the two cannot cross.
     let _guard = crate::locks::lock_version(id, &v.normalized()).await;
     if !db.exists(feed, id, v).await? || !db.package_data_exists(id, v).await? {
         return Err(Error::PackageNotFound);
@@ -300,6 +347,7 @@ async fn attach_locked(
             )))
         };
     }
+    check_not_approved(db, id, v, keep_approved).await?;
     // The blob may be shared with other versions, whose locks are not ours:
     // from finding it stored to the row that references it, no detach or
     // purge elsewhere may count it unused and delete it.
@@ -331,9 +379,17 @@ async fn attach_locked(
 }
 
 /// Detach a file from a version, deleting its blob when nothing else uses it.
-pub(crate) async fn detach(state: &AppState, id: &str, v: &NuGetVersion, name: &str) -> Result<()> {
+/// With `keep_approved`, not from a version some feed has approved.
+pub(crate) async fn detach(
+    state: &AppState,
+    id: &str,
+    v: &NuGetVersion,
+    name: &str,
+    keep_approved: bool,
+) -> Result<()> {
     let _guard = crate::locks::lock_version(id, &v.normalized()).await;
     version_in_feed(state, id, v).await?;
+    check_not_approved(state.db.as_ref(), id, v, keep_approved).await?;
     let file = state
         .db
         .delete_file(id, v, name)
@@ -399,6 +455,9 @@ pub(super) async fn put(
     let v = parse_version(&version)?;
     crate::validation::validate_file_name(&name, &state.feed.allowed_extensions)?;
     version_in_feed(&state, &id, &v).await?;
+    // Before the body, not to take gigabytes in vain; again when attaching.
+    let keep_approved = keeps_approved(&state, &headers);
+    check_not_approved(state.db.as_ref(), &id, &v, keep_approved).await?;
     let expected = headers
         .get("x-checksum-sha256")
         .and_then(|h| h.to_str().ok())
@@ -433,7 +492,7 @@ pub(super) async fn put(
         )));
     }
     let finished = Finished { temp, sha256, size };
-    let (status, file) = match attach(&state, &id, &v, &name, finished).await? {
+    let (status, file) = match attach(&state, &id, &v, &name, finished, keep_approved).await? {
         Attached::New(f) => (StatusCode::CREATED, f),
         Attached::Same(f) => (StatusCode::OK, f),
     };
@@ -448,7 +507,7 @@ pub(super) async fn delete(
     check_id(&id)?;
     authorize_upload(&state, &headers)?;
     let v = parse_version(&version)?;
-    detach(&state, &id, &v, &name).await?;
+    detach(&state, &id, &v, &name, keeps_approved(&state, &headers)).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -604,6 +663,7 @@ pub(super) async fn tus_create(
     crate::validation::validate_file_name(name, &state.feed.allowed_extensions)?;
     let expected = meta.get("sha256").map(|s| parse_sha256(s)).transpose()?;
     version_in_feed(&state, id, &v).await?;
+    check_not_approved(state.db.as_ref(), id, &v, keeps_approved(&state, &headers)).await?;
     if state.db.get_file(id, &v, name).await?.is_some() {
         return Err(Error::Conflict(format!(
             "{id} {} already has a file named {name}",
@@ -814,7 +874,16 @@ pub(super) async fn tus_patch(
             _writing: hashing,
         };
         let (task_state, task_session) = (state.clone(), s.clone());
-        detached(finish(task_state, task_session, part, h.hasher, finishing)).await?;
+        let keep_approved = keeps_approved(&state, &headers);
+        detached(finish(
+            task_state,
+            task_session,
+            part,
+            h.hasher,
+            finishing,
+            keep_approved,
+        ))
+        .await?;
     }
     built(
         tus_response(StatusCode::NO_CONTENT)
@@ -831,6 +900,7 @@ async fn finish(
     part: PathBuf,
     hasher: Sha256,
     finishing: Finishing,
+    keep_approved: bool,
 ) -> Result<()> {
     let sha256 = hex::encode(hasher.finalize());
     // The bytes leave the upload's name for one of their own before anything
@@ -857,6 +927,7 @@ async fn finish(
         storage: state.storage.as_ref(),
         db: state.db.as_ref(),
         feed: state.feed(),
+        keep_approved,
     };
     let path = finished.path().to_path_buf();
     attach_to(&target, &s.lower_id, &v, &s.name, path, &sha256, s.length).await?;

@@ -18,7 +18,7 @@ use super::forms::{form_field, form_fields, lenient};
 use super::gallery::page_window;
 use super::helpers::{check_id, detached, parse_version};
 use super::{hosted, ui, AppState, FeedCounters, FeedMeta};
-use crate::database::{AdminFilter, Membership, MembershipChange};
+use crate::database::{files_fingerprint, AdminFilter, Membership, MembershipChange};
 use crate::error::{Error, Result};
 use crate::retention::{self, RetentionPolicy};
 use crate::version::NuGetVersion;
@@ -341,7 +341,8 @@ pub(super) async fn admin_file_delete(
     check_id(&id)?;
     require_admin_action(&state, &headers, &body)?;
     let v = parse_version(&version)?;
-    hosted::detach(&state, &id, &v, &name).await?;
+    // The admin may change the files of an approved version too.
+    hosted::detach(&state, &id, &v, &name, false).await?;
     Ok(Redirect::to(&admin_package_url(&state.feed.prefix, &id)).into_response())
 }
 
@@ -781,10 +782,13 @@ pub(super) async fn admin_approve(
 /// Refuse to approve a version whose build is not the one the page showed.
 ///
 /// The admin page sends `build=<version>:<package hash>` for each pending
-/// version it shows. Under `allow_overwrite = "pending-only"` a push can
-/// replace a pending build while a reviewer reads the page, and approving
-/// would then publish a build nobody looked at. A request without the field,
-/// from a script, approves what is there, as before.
+/// version it shows, and `files=<version>:<digest>` of its attached files
+/// (see [`files_fingerprint`]), which the package hash does not cover. Under
+/// `allow_overwrite = "pending-only"` a push can replace a pending build
+/// while a reviewer reads the page, and the push key can attach and detach
+/// files; approving would then publish a build or files nobody looked at. A
+/// request without the fields, from a script, approves what is there, as
+/// before.
 async fn check_shown_builds(
     state: &AppState,
     body: &str,
@@ -809,6 +813,22 @@ async fn check_shown_builds(
             return Err(Error::Conflict(format!(
                 "{id} {normalized} was replaced by a new build after this page was \
                  loaded; reload the page and review the new build before approving it"
+            )));
+        }
+    }
+    let shown = form_fields(body, "files");
+    for v in versions {
+        let normalized = v.normalized();
+        let Some(digest) = shown.iter().find_map(|f| {
+            let (sv, digest) = f.split_once(':')?;
+            sv.eq_ignore_ascii_case(&normalized).then_some(digest)
+        }) else {
+            continue;
+        };
+        if files_fingerprint(&state.db.files_for(id, v).await?) != digest {
+            return Err(Error::Conflict(format!(
+                "the files attached to {id} {normalized} changed after this page was \
+                 loaded; reload the page and review them before approving it"
             )));
         }
     }

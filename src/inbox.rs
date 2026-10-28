@@ -62,6 +62,9 @@ pub struct Inbox<'a> {
     pub max_file_size: Option<u64>,
     /// The configured feeds; a directory named otherwise is ignored.
     pub feeds: &'a [String],
+    /// The feeds under `allow_overwrite = "pending-only"`: a file dropped for
+    /// one of them is not attached to a version some feed has approved.
+    pub pending_only: &'a [String],
     /// The server's private staging directory (the store's `.uploads`).
     pub staging: &'a Path,
     /// Free space an import must leave on the staging volume
@@ -215,6 +218,7 @@ impl Inbox<'_> {
             storage: self.storage,
             db: self.db,
             feed,
+            keep_approved: self.pending_only.iter().any(|f| f == feed),
         };
         // Already attached with exactly these bytes counts as done too.
         let (Attached::New(_) | Attached::Same(_)) = attach_to(

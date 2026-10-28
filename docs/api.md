@@ -369,6 +369,9 @@ DELETE /api/v2/files/{id}/{version}/{name}
 Both need the feed's push key in `X-NuGet-ApiKey`, **and** a push key must be
 configured: a feed left open for package pushes answers `403` rather than take
 multi-gigabyte files from anyone. The version must be in the feed (`404`).
+Under `allow_overwrite = "pending-only"` the files of a version approved in any
+feed stay as they are (`403`), unless the request also carries the feed's admin
+key as HTTP Basic credentials.
 
 The name is 1–128 characters of `A-Z a-z 0-9 . _ -`, starts with a letter or
 digit, and has one of the feed's allowed extensions (`[feeds.files]`, else

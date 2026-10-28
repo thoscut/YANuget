@@ -469,14 +469,23 @@ pub fn admin_package_page(
         if fv.pending {
             // The build this page shows, so approving it cannot approve one
             // pushed after the page was loaded.
-            let build = format!(
+            let mut build = format!(
                 "<input type=\"hidden\" name=\"build\" value=\"{}\">",
                 escape_html(&format!("{v}:{}", p.package_hash))
             );
-            actions.push_str(&format!(
-                "<input type=\"hidden\" name=\"build\" value=\"{}\" form=\"bulk\">",
-                escape_html(&format!("{v}:{}", p.package_hash))
-            ));
+            // And its files, which the package hash does not cover.
+            if extras.files_enabled {
+                let shown = extras.files.iter().filter(|f| f.normalized_version == v);
+                build.push_str(&format!(
+                    "<input type=\"hidden\" name=\"files\" value=\"{}\">",
+                    escape_html(&format!(
+                        "{v}:{}",
+                        crate::database::files_fingerprint(shown)
+                    ))
+                ));
+            }
+            // The same fields for the selection form; no value holds a quote.
+            actions.push_str(&build.replace("\">", "\" form=\"bulk\">"));
             if problems.is_empty() {
                 actions.push_str(&format!(
                     "<form method=\"post\" action=\"{}\">{csrf}{build}\

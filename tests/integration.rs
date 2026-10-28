@@ -1644,6 +1644,7 @@ async fn files_dropped_in_the_inbox_are_verified_and_attached() {
         feed_extensions: &Default::default(),
         max_file_size: None,
         feeds: &feeds,
+        pending_only: &[],
         staging: &staging,
         min_free_disk_bytes: 0,
     };
@@ -2828,6 +2829,207 @@ async fn approving_from_the_admin_page_approves_the_build_it_showed() {
     let approved = approve(format!("{}&{}", admin_body(ADMIN_KEY), shown_build().await))
         .await
         .unwrap();
+    assert_eq!(approved.status(), reqwest::StatusCode::SEE_OTHER);
+    assert!(server
+        .client
+        .get(&index)
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .is_success());
+}
+
+/// A gated `pending-only` feed `gated` holding `Ring.Pkg` 1.0.0, pending.
+async fn spawn_gated_pending_only() -> TestServer {
+    let server = spawn_feeds(|c| {
+        c.api_key = Some(API_KEY.into());
+        c.admin_api_key = Some(ADMIN_KEY.into());
+        let mut gated = feed("gated");
+        gated.requires_approval = true;
+        gated.allow_overwrite = Some(yanuget::config::OverwriteMode::PendingOnly);
+        c.feeds = vec![gated];
+    })
+    .await;
+    let pushed = push_to(
+        &server,
+        "/gated/api/v2/package",
+        API_KEY,
+        build_nupkg("Ring.Pkg", "1.0.0", b"x"),
+    )
+    .await;
+    assert_eq!(pushed.status(), reqwest::StatusCode::CREATED);
+    server
+}
+
+/// Attach `body` as `name` to `Ring.Pkg` 1.0.0 in `gated`, with the push key
+/// and, if `admin`, the admin key too.
+async fn put_gated_file(
+    server: &TestServer,
+    name: &str,
+    body: Vec<u8>,
+    admin: bool,
+) -> reqwest::StatusCode {
+    let mut req = server
+        .client
+        .put(server.url(&format!("/gated/api/v2/files/Ring.Pkg/1.0.0/{name}")))
+        .header("X-NuGet-ApiKey", API_KEY)
+        .body(body);
+    if admin {
+        req = req.basic_auth("admin", Some(ADMIN_KEY));
+    }
+    req.send().await.unwrap().status()
+}
+
+/// The `build` and `files` fields the admin page of `Ring.Pkg` shows for its
+/// pending version, form-encoded.
+async fn shown_review_fields(server: &TestServer) -> String {
+    let page = server
+        .client
+        .get(server.url("/gated/admin/packages/ring.pkg"))
+        .basic_auth("admin", Some(ADMIN_KEY))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let field = |name: &str| {
+        let marker = format!("name=\"{name}\" value=\"");
+        let start = page.find(&marker).expect("the page shows the field") + marker.len();
+        let value = page[start..].split('"').next().unwrap();
+        assert!(value.starts_with("1.0.0:"), "{value}");
+        format!(
+            "{name}={}",
+            value
+                .replace('+', "%2B")
+                .replace('/', "%2F")
+                .replace('=', "%3D")
+                .replace(':', "%3A")
+        )
+    };
+    format!("{}&{}", field("build"), field("files"))
+}
+
+/// Under `pending-only` a version approved anywhere stays as it is, and the
+/// package hash does not cover its files: the push key can no longer change
+/// them; the admin key still can.
+#[tokio::test]
+async fn the_files_of_an_approved_version_change_only_with_the_admin_key() {
+    let server = spawn_gated_pending_only().await;
+    // While pending, the push key attaches and detaches as it likes.
+    assert_eq!(
+        put_gated_file(&server, "setup.zip", image_bytes(1), false).await,
+        reqwest::StatusCode::CREATED
+    );
+    let approved = no_redirect()
+        .post(server.url("/gated/admin/packages/ring.pkg/1.0.0/approve"))
+        .basic_auth("admin", Some(ADMIN_KEY))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(admin_body(ADMIN_KEY))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(approved.status(), reqwest::StatusCode::SEE_OTHER);
+
+    // Approved: no new file, no detach, no resumable upload with the push key.
+    assert_eq!(
+        put_gated_file(&server, "other.zip", image_bytes(2), false).await,
+        reqwest::StatusCode::FORBIDDEN
+    );
+    let file = server.url("/gated/api/v2/files/Ring.Pkg/1.0.0/setup.zip");
+    let detach = |admin: bool| {
+        let mut req = server
+            .client
+            .delete(&file)
+            .header("X-NuGet-ApiKey", API_KEY);
+        if admin {
+            req = req.basic_auth("admin", Some(ADMIN_KEY));
+        }
+        req.send()
+    };
+    assert_eq!(
+        detach(false).await.unwrap().status(),
+        reqwest::StatusCode::FORBIDDEN
+    );
+    let created = tus(no_redirect().post(server.url("/gated/api/v2/uploads")))
+        .header("Upload-Length", "10")
+        .header(
+            "Upload-Metadata",
+            tus_metadata(&[
+                ("id", "Ring.Pkg"),
+                ("version", "1.0.0"),
+                ("filename", "other.zip"),
+            ]),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), reqwest::StatusCode::FORBIDDEN);
+    let served = server.url("/gated/files/ring.pkg/1.0.0/setup.zip");
+    assert_eq!(
+        server.client.get(&served).send().await.unwrap().status(),
+        reqwest::StatusCode::OK,
+        "the file is still there"
+    );
+
+    // With the admin key as well, both go through.
+    assert_eq!(
+        detach(true).await.unwrap().status(),
+        reqwest::StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        put_gated_file(&server, "setup.zip", image_bytes(3), true).await,
+        reqwest::StatusCode::CREATED
+    );
+}
+
+/// Approving from the admin page approves the files it showed, too: under
+/// `pending-only` the push key can change them while a reviewer reads it.
+#[tokio::test]
+async fn approving_from_the_admin_page_approves_the_files_it_showed() {
+    let server = spawn_gated_pending_only().await;
+    assert_eq!(
+        put_gated_file(&server, "setup.zip", image_bytes(1), false).await,
+        reqwest::StatusCode::CREATED
+    );
+    let shown = shown_review_fields(&server).await;
+
+    // Another file arrives while the page is open; the build is the same.
+    assert_eq!(
+        put_gated_file(&server, "extra.zip", image_bytes(2), false).await,
+        reqwest::StatusCode::CREATED
+    );
+    let approve = |fields: String| {
+        no_redirect()
+            .post(server.url("/gated/admin/packages/ring.pkg/1.0.0/approve"))
+            .basic_auth("admin", Some(ADMIN_KEY))
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(format!("{}&{fields}", admin_body(ADMIN_KEY)))
+            .send()
+    };
+    assert_eq!(
+        approve(shown.clone()).await.unwrap().status(),
+        reqwest::StatusCode::CONFLICT
+    );
+    let bulk = admin_bulk(
+        &server,
+        "/gated",
+        "ring.pkg",
+        ADMIN_KEY,
+        &format!("op=approve&v=1.0.0&{shown}"),
+    )
+    .await;
+    assert_eq!(bulk.status(), reqwest::StatusCode::CONFLICT);
+    let index = server.url("/gated/v3/package/ring.pkg/index.json");
+    assert_eq!(
+        server.client.get(&index).send().await.unwrap().status(),
+        reqwest::StatusCode::NOT_FOUND,
+        "still pending"
+    );
+
+    // The page as it is now shows both files, and approves them.
+    let approved = approve(shown_review_fields(&server).await).await.unwrap();
     assert_eq!(approved.status(), reqwest::StatusCode::SEE_OTHER);
     assert!(server
         .client

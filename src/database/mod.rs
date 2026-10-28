@@ -79,6 +79,26 @@ pub struct PackageFile {
     pub downloads: u64,
 }
 
+/// A digest of a version's attached files, names and contents, in any
+/// order: what the admin page sends back with an approval, so the files can
+/// be checked to be the ones it showed. No files has a digest too.
+pub fn files_fingerprint<'a>(files: impl IntoIterator<Item = &'a PackageFile>) -> String {
+    use sha2::Digest;
+    let mut entries: Vec<(String, &str)> = files
+        .into_iter()
+        .map(|f| (f.name.to_lowercase(), f.sha256.as_str()))
+        .collect();
+    entries.sort_unstable();
+    let mut hasher = sha2::Sha256::new();
+    for (name, sha256) in entries {
+        hasher.update(name.as_bytes());
+        hasher.update([0]);
+        hasher.update(sha256.as_bytes());
+        hasher.update(b"\n");
+    }
+    hex::encode(hasher.finalize())
+}
+
 /// An unfinished resumable (tus) upload of a [`PackageFile`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UploadSession {

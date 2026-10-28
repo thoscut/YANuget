@@ -608,6 +608,13 @@ and re-runs against, can set `allow_overwrite = "pending-only"`:
   transaction as the replacement, so an approval that races a push either
   wins (the push is refused and the approved build stays, files included) or
   waits until the replacement is recorded.
+- Its attached files stay as they are too. Attaching or deleting a file of a
+  version approved anywhere, over HTTP or through the inbox, is `403` with the
+  push key alone; a request that also carries the feed's admin key as HTTP
+  Basic credentials, and the admin page, may still change them.
+- The admin page approves what it showed: a build replaced, or files attached
+  or deleted, after the page was loaded make the approval `409`, and a reload
+  shows what is there now.
 
 `yanuget config check` warns when a feed sets it without
 `requires_approval`, since versions pushed there are approved on arrival.

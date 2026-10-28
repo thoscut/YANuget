@@ -872,6 +872,11 @@ fn spawn_file_tasks(
         return tasks;
     }
     let names: Vec<String> = feeds.iter().map(|f| f.name.clone()).collect();
+    let pending_only: Vec<String> = feeds
+        .iter()
+        .filter(|f| f.allow_overwrite == yanuget::config::OverwriteMode::PendingOnly)
+        .map(|f| f.name.clone())
+        .collect();
     let feed_extensions: std::collections::HashMap<String, Vec<String>> = feeds
         .iter()
         .map(|f| (f.name.clone(), f.allowed_extensions.clone()))
@@ -900,6 +905,7 @@ fn spawn_file_tasks(
                 feed_extensions: &feed_extensions,
                 max_file_size: config.max_file_size_bytes(),
                 feeds: &names,
+                pending_only: &pending_only,
                 staging: &staging,
                 min_free_disk_bytes: config.min_free_disk_bytes,
             };
