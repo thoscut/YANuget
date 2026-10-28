@@ -12,6 +12,12 @@ expected to change incompatibly at any version.
 
 ## [Unreleased]
 
+**Upgrading:** the database is migrated on first start to schema version 9,
+which marks a listing set by hand on a feed. Afterwards 0.8.0 refuses to open
+it, so back the database up first if you may need to go back. Versions that
+are unlisted at migration time count as unlisted by hand, so a mirror does not
+relist them.
+
 ### Security
 
 - `rustls-webpki` 0.103.16 (RUSTSEC-2026-0382, RUSTSEC-2026-0381), used by
@@ -44,6 +50,17 @@ expected to change incompatibly at any version.
 - Moving a version, and retention's purge, remove the membership and record
   the tombstone in one transaction; a failed tombstone no longer lets the
   mirror fetch a moved version back.
+- A mirror follows the upstream's unlisting and relisting on every refresh,
+  not only when it first mirrors a version, except where the listing was set
+  on the feed (`dotnet nuget delete`, a relist).
+- Concurrent uploads reserve the space they declare, so together they cannot
+  pass `min_free_disk_bytes` one by one; the one that does not fit gets `507`.
+- Under `allow_overwrite = "pending-only"`, the push key can no longer attach
+  or detach files of a version some feed has approved (`403`); the feed's
+  admin key, and the admin page, still can. An approval from the admin page
+  answers `409` if the attached files changed since the page was loaded.
+- Detaching a file finishes when the client disconnects, and the daily orphan
+  sweep deletes stored blobs no file references.
 - Adding a content type to `[Content_Types].xml` (the internalizer's
   rewrite) parses the XML instead of looking for the last `</Types>`, and part
   names with control characters are refused.
@@ -69,6 +86,14 @@ expected to change incompatibly at any version.
 
 ### Added
 
+- `yanuget feeds rename <old> <new>` and `yanuget feeds remove <name>` move or
+  clear the versions of a feed the configuration no longer declares; the
+  server and `yanuget config check` warn about such versions.
+- `files.max_open_uploads` (`YANUGET_FILES_MAX_OPEN_UPLOADS`, default 32)
+  caps the open resumable uploads per feed; one more is answered `429`.
+- The admin dashboard lists packages with pending versions first, marks
+  pending and flagged versions with counted badges, filters by
+  All/Pending/Flagged (`?filter=`) and pages like the gallery.
 - The server warns at startup about `YANUGET_*` variables nothing reads, and
   `yanuget config check` reports them along with monitoring enabled without a
   token.
