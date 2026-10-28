@@ -724,6 +724,44 @@ pub trait PackageDatabase: Send + Sync {
 
     /// Forget a tombstone: a push of the version brings it back on purpose.
     async fn clear_tombstone(&self, feed: &str, id: &str, version: &NuGetVersion) -> Result<()>;
+
+    // --- feeds as a whole ---
+
+    /// Every feed name the database holds memberships or tombstones for,
+    /// configured or not, by name.
+    async fn stored_feeds(&self) -> Result<Vec<StoredFeed>>;
+
+    /// How many versions both feeds hold.
+    async fn shared_versions(&self, a: &str, b: &str) -> Result<i64>;
+
+    /// Give everything recorded under the feed name `from` to `to`: its
+    /// memberships, tombstones and unfinished uploads, in one transaction.
+    /// Refused with [`Error::BadRequest`](crate::error::Error::BadRequest)
+    /// when `to` already holds one of `from`'s versions, since the two
+    /// memberships' states cannot both be kept. Returns how many memberships
+    /// moved.
+    async fn rename_feed(&self, from: &str, to: &str) -> Result<u64>;
+
+    /// Every version `feed` holds, in any state, as (lower-cased id,
+    /// version).
+    async fn feed_members(&self, feed: &str) -> Result<Vec<(String, NuGetVersion)>>;
+
+    /// Drop every tombstone of `feed`. Returns how many went.
+    async fn clear_tombstones(&self, feed: &str) -> Result<u64>;
+}
+
+/// What the database holds for one feed name, from
+/// [`PackageDatabase::stored_feeds`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredFeed {
+    pub name: String,
+    /// Versions it holds, in any state.
+    pub versions: i64,
+    /// Of those, the ones no other feed holds: removing the feed's
+    /// memberships frees their payload.
+    pub exclusive: i64,
+    /// Versions deleted from it.
+    pub tombstones: i64,
 }
 
 /// Feed-wide aggregate statistics.

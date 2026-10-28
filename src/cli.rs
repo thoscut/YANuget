@@ -8,6 +8,8 @@ use clap::{Args, Subcommand};
 
 use yanuget::admin_client::{Action, AdminClient, CertPolicy};
 use yanuget::config::{Config, DEFAULT_FEED};
+use yanuget::database::{PackageDatabase, SqliteDatabase};
+use yanuget::storage::FilesystemStorage;
 
 /// Arguments for `yanuget admin`.
 #[derive(Debug, Args)]
@@ -218,14 +220,19 @@ enum ConfigCommand {
     /// Load the configuration as the server would (the file, the environment
     /// and key files) and check what it points at: the TLS certificate and
     /// key belong together and name the configured host, mirror CA bundles
-    /// parse, promotion targets exist. Exits 1 on any error.
+    /// parse, promotion targets exist; and, when the database can be read,
+    /// that it holds no versions for feeds the configuration lacks. Exits 1
+    /// on any error.
     Check,
 }
 
-pub fn run_config(config_path: Option<&str>, args: ConfigArgs) -> anyhow::Result<()> {
+pub async fn run_config(config_path: Option<&str>, args: ConfigArgs) -> anyhow::Result<()> {
     match args.command {
         ConfigCommand::Check => {
-            let report = yanuget::config_check::check(config_path);
+            let mut report = yanuget::config_check::check(config_path);
+            if let Ok(config) = Config::load(config_path) {
+                yanuget::config_check::check_stored_feeds(&config, &mut report).await;
+            }
             for e in &report.errors {
                 println!("error: {e}");
             }
@@ -249,4 +256,128 @@ pub fn run_config(config_path: Option<&str>, args: ConfigArgs) -> anyhow::Result
             Ok(())
         }
     }
+}
+
+/// Arguments for `yanuget feeds`.
+#[derive(Debug, Args)]
+pub struct FeedsArgs {
+    #[command(subcommand)]
+    command: FeedsCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum FeedsCommand {
+    /// Give the versions, deletions and unfinished uploads recorded under a
+    /// feed's old name to its new one, after renaming it in the
+    /// configuration.
+    Rename {
+        /// The name the feed had; no configured feed may have it.
+        from: String,
+        /// The name it has now, as configured.
+        to: String,
+        /// Only say what would move.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Drop what the database holds for a feed that is no longer configured,
+    /// and the packages, attached files and symbols only it held.
+    Remove {
+        /// The feed's name; no configured feed may have it.
+        name: String,
+        /// Only say what would be removed.
+        #[arg(long)]
+        dry_run: bool,
+        /// Confirm the removal; it cannot be undone.
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+pub async fn run_feeds(config_path: Option<&str>, args: FeedsArgs) -> anyhow::Result<()> {
+    crate::init_tracing_quiet();
+    let config = Config::load(config_path).context("cannot load the configuration")?;
+    let feeds = config.resolved_feeds()?;
+    let configured = |name: &str| feeds.iter().any(|f| f.name == name);
+    let (name, dry_run) = match &args.command {
+        FeedsCommand::Rename { from, to, dry_run } => {
+            if configured(from) {
+                bail!("{from:?} is a configured feed; rename it in the configuration first");
+            }
+            if !configured(to) {
+                bail!("{to:?} is not a configured feed (feeds: {})", names(&feeds));
+            }
+            (from.clone(), *dry_run)
+        }
+        FeedsCommand::Remove { name, dry_run, yes } => {
+            if configured(name) {
+                bail!("{name:?} is a configured feed; take it out of the configuration first");
+            }
+            if !dry_run && !yes {
+                bail!(
+                    "removing cannot be undone; add --yes to remove it, or --dry-run to see \
+                     what it would remove"
+                );
+            }
+            (name.clone(), *dry_run)
+        }
+    };
+    let path = config.database_path();
+    if !std::path::Path::new(&path).exists() {
+        bail!("no database at {path}");
+    }
+    // A dry run only reads, so it may look at a database a server is using.
+    if !dry_run {
+        crate::refuse_while_serving(&config, "changing what it stores").await?;
+    }
+    let db = SqliteDatabase::connect(&path).await?;
+    let Some(stored) = db
+        .stored_feeds()
+        .await?
+        .into_iter()
+        .find(|f| f.name == name)
+    else {
+        bail!("the database holds nothing for a feed {name:?}");
+    };
+
+    match args.command {
+        FeedsCommand::Rename { from, to, .. } => {
+            let shared = db.shared_versions(&from, &to).await?;
+            if shared > 0 {
+                bail!(
+                    "{shared} version(s) are in both {from:?} and {to:?}; delete them from \
+                     {to:?} first, or remove {from:?} instead"
+                );
+            }
+            if dry_run {
+                println!(
+                    "Would move {} version(s) and {} deletion(s) from {from:?} to {to:?}.",
+                    stored.versions, stored.tombstones
+                );
+            } else {
+                let moved = db.rename_feed(&from, &to).await?;
+                println!(
+                    "Moved {moved} version(s) and {} deletion(s) from {from:?} to {to:?}.",
+                    stored.tombstones
+                );
+            }
+        }
+        FeedsCommand::Remove { name, .. } => {
+            if dry_run {
+                println!(
+                    "Would remove {} version(s) from {name:?}, {} of them with their packages \
+                     (no other feed holds them), and {} deletion(s).",
+                    stored.versions, stored.exclusive, stored.tombstones
+                );
+            } else {
+                let storage = FilesystemStorage::new(config.storage_path()).await?;
+                let removed = yanuget::feed_data::remove(&storage, &db, &name).await?;
+                println!(
+                    "Removed {} version(s) from {name:?}, {} of them with their packages, and \
+                     {} deletion(s).",
+                    removed.versions, removed.purged, removed.tombstones
+                );
+            }
+        }
+    }
+    Ok(())
 }

@@ -73,6 +73,11 @@ included) and then opens what the server would only open later:
 - each mirror's `ca_cert_path` holds at least one certificate;
 - feeds without a push key, and keys shorter than 32 characters, are
   reported as warnings.
+- when the database can be read, versions it holds for a feed the
+  configuration does not have (one renamed or taken out) are reported as a
+  warning, with the [`yanuget feeds`](cli.md#yanuget-feeds) command that deals
+  with them. The database is only read; when there is none yet, or it cannot be
+  opened, a note says so.
 
 It prints `error:`, `warning:` and `note:` lines, then `configuration ok`, and
 exits `1` if there was any error — so it can run as `ExecStartPre=` in a

@@ -88,6 +88,42 @@ pub fn check_loaded(config: &Config, report: &mut Report) {
     }
 }
 
+/// Report the feeds the database holds versions for that the configuration
+/// does not have (see [`crate::feed_data`]). The database is only read, and
+/// when it cannot be, that is a note: the configuration may well be checked
+/// on a machine without the data.
+pub async fn check_stored_feeds(config: &Config, report: &mut Report) {
+    let Ok(feeds) = config.resolved_feeds() else {
+        // Already an error of `check_loaded`.
+        return;
+    };
+    let path = config.database_path();
+    if !std::path::Path::new(&path).exists() {
+        report.notes.push(format!(
+            "no database at {path} yet, so stored feeds were not compared with the configured ones"
+        ));
+        return;
+    }
+    let stored = match crate::database::SqliteDatabase::open_read_only(&path).await {
+        Ok(db) => {
+            use crate::database::PackageDatabase;
+            db.stored_feeds().await
+        }
+        Err(e) => Err(e),
+    };
+    match stored {
+        Ok(stored) => {
+            for feed in crate::feed_data::unconfigured(&stored, &feeds) {
+                report.warnings.push(crate::feed_data::warning(feed));
+            }
+        }
+        Err(e) => report.notes.push(format!(
+            "could not read the database at {path}, so stored feeds were not compared with \
+             the configured ones: {e}"
+        )),
+    }
+}
+
 /// A file type no file name can have is a typo, and an empty list refuses
 /// every file: both are legal, and both are worth a warning.
 fn check_file_types(feed: &ResolvedFeed, report: &mut Report) {
@@ -407,5 +443,35 @@ mod tests {
             certificate_hosts(&config),
             vec!["10.0.0.5", "::1", "nuget", "nuget.example.com"]
         );
+    }
+
+    #[tokio::test]
+    async fn versions_of_a_feed_no_longer_configured_are_warned_about() {
+        use crate::database::{PackageDatabase, SqliteDatabase};
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            data_dir: dir.path().to_path_buf(),
+            feeds: vec![FeedConfig {
+                name: "live".into(),
+                ..FeedConfig::default()
+            }],
+            ..Config::default()
+        };
+        let mut report = Report::default();
+        check_stored_feeds(&config, &mut report).await;
+        assert!(report.warnings.is_empty());
+        assert!(report.notes[0].contains("no database"), "{report:?}");
+
+        let db = SqliteDatabase::connect(&config.database_path())
+            .await
+            .unwrap();
+        let p = crate::database::sqlite::test_support::sample("Left.Behind", "1.0.0");
+        db.add_to_feed("old", &p).await.unwrap();
+        db.add_to_feed("live", &p).await.unwrap();
+        let mut report = Report::default();
+        check_stored_feeds(&config, &mut report).await;
+        assert_eq!(report.warnings.len(), 1, "{report:?}");
+        assert!(report.warnings[0].contains("\"old\""), "{report:?}");
+        assert!(report.notes.is_empty(), "{report:?}");
     }
 }
