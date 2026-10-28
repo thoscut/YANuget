@@ -13,13 +13,9 @@ Everything still open across this file and the project's working threads, as
 of 2026-10-28 (0.8.0 released). The entries further down hold the detail; this
 list is the index.
 
-**From the review of 2026-10-19**
-
-- Performance: `PERF-06` (with `MNT-06` below).
-
 **From the review of 2026-10-27** ([detail](#review-of-2026-10-27))
 
-- Maintainability: `MNT-06`. Release: `0.8.1`.
+- Release: `0.8.1`.
 
 **Server, after 0.8.0** ([Target releases](#target-releases))
 
@@ -144,10 +140,13 @@ security, Rust code, tests and CI, operations and documentation), at
 - [x] **`COR-37` Blobs a detach leaves are never collected.**
   *Done:* detach runs in `detached()`, and the daily orphan sweep deletes
   blobs no file references.
-- [ ] **`MNT-06` Two NuGet v3 readers.** The mirror takes `@type` only as a
+- [x] **`MNT-06` Two NuGet v3 readers.** The mirror takes `@type` only as a
   string and does not resolve a relative `@id` (`src/mirror.rs`), the
   internalizer does both (`upstream/v3.rs`). Typed structs in `yanuget-pkg`
   would serve both and settle `PERF-06`.
+  *Done:* `yanuget_pkg::v3` reads the service index, registration, version
+  list, search and catalog leniently; the mirror and the internalizer both
+  use it.
 - [x] **`INT-35` Overrides apply only `skip`.** `Override::apply` and
   `with_script` have no caller outside tests and `package_parameters` is
   always `None`, while `INT-25` and the README describe all of them.
@@ -276,9 +275,11 @@ open. File and line references are from `main` at `a193027`.
   *Done:* gzip and brotli for JSON, HTML and text; downloads
   (`Accept-Ranges`), ranges and `application/octet-stream` stay
   uncompressed.
-- [ ] **`PERF-06` Mirror JSON is decompressed on the async thread and parsed
+- [x] **`PERF-06` Mirror JSON is decompressed on the async thread and parsed
   into `serde_json::Value`** (`src/mirror.rs:510-570`; `:745` clones the
   items). *Fix:* `spawn_blocking` and typed structs.
+  *Done:* both run in `spawn_blocking`, into the `yanuget_pkg::v3` types;
+  the pages are taken, not cloned.
 - [x] **`PERF-07` The bundled docs have no `Cache-Control` or `ETag`**, and
   each request copies the file (`into_owned()`, `src/web/docs.rs:57-75`).
   *Done:* a weak `ETag` from the embedded hash, `304` on a match,

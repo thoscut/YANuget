@@ -2,8 +2,8 @@
 //!
 //! Nothing here depends on a web framework or a database: versions and
 //! version ranges, the `.nuspec` parser, `.nupkg` reading and rewriting, the address
-//! policy for upstream fetches, the rule for attached file names, and the
-//! internalizer report schema. Errors
+//! policy for upstream fetches, the rule for attached file names, the NuGet v3
+//! documents an upstream serves, and the internalizer report schema. Errors
 //! are this crate's own [`Error`].
 
 pub mod address;
@@ -15,6 +15,7 @@ pub mod nuspec;
 pub mod range;
 pub mod report;
 pub mod rewrite;
+pub mod v3;
 pub mod version;
 
 pub use error::{Error, Result};

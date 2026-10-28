@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use tokio::sync::{watch, OnceCell};
+use yanuget_pkg::v3::{Catalog, PackageVersions, RegistrationIndex, SearchPage, ServiceIndex};
 
 use crate::config::{LicensePolicyConfig, MirrorAuthConfig, MirrorConfig};
 use crate::database::PackageDatabase;
@@ -511,7 +512,13 @@ impl MirrorClient {
     /// metadata request takes, so each is vetted ([`Self::send`]), carries the
     /// credentials only where they belong, is bounded in time by
     /// `timeout_secs` and in size by [`MAX_JSON_BYTES`]. `None` is a 404.
-    async fn get_json(&self, url: &str, what: &str) -> Result<Option<serde_json::Value>> {
+    ///
+    /// The body is read here; decompressing and parsing it, which take a
+    /// while for a large registration, run on the blocking pool.
+    async fn get_json<T>(&self, url: &str, what: &str) -> Result<Option<T>>
+    where
+        T: serde::de::DeserializeOwned + Send + 'static,
+    {
         let resp = self.send(url, what, Some(self.timeout)).await?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
@@ -544,29 +551,35 @@ impl MirrorClient {
             }
             body.extend_from_slice(&chunk);
         }
-        if gzipped {
-            use std::io::Read;
-            let mut decoded = Vec::new();
-            flate2::read::GzDecoder::new(body.as_slice())
-                .take(MAX_JSON_BYTES + 1)
-                .read_to_end(&mut decoded)
-                .map_err(|e| {
-                    Error::Other(anyhow::anyhow!(
-                        "upstream {what} {} is not valid gzip: {e}",
-                        redact_url(url)
-                    ))
-                })?;
-            if decoded.len() as u64 > MAX_JSON_BYTES {
-                return Err(too_large());
+        let label = what.to_string();
+        let shown = redact_url(url);
+        tokio::task::spawn_blocking(move || {
+            if gzipped {
+                use std::io::Read;
+                let mut decoded = Vec::new();
+                flate2::read::GzDecoder::new(body.as_slice())
+                    .take(MAX_JSON_BYTES + 1)
+                    .read_to_end(&mut decoded)
+                    .map_err(|e| {
+                        Error::Other(anyhow::anyhow!(
+                            "upstream {label} {shown} is not valid gzip: {e}"
+                        ))
+                    })?;
+                if decoded.len() as u64 > MAX_JSON_BYTES {
+                    return Err(Error::Other(anyhow::anyhow!(
+                        "upstream {label} {shown} is larger than {MAX_JSON_BYTES} bytes"
+                    )));
+                }
+                body = decoded;
             }
-            body = decoded;
-        }
-        serde_json::from_slice(&body).map(Some).map_err(|e| {
-            Error::Other(anyhow::anyhow!(
-                "upstream {what} {} is not valid JSON: {e}",
-                redact_url(url)
-            ))
+            serde_json::from_slice(&body).map(Some).map_err(|e| {
+                Error::Other(anyhow::anyhow!(
+                    "upstream {label} {shown} is not valid JSON: {e}"
+                ))
+            })
         })
+        .await
+        .map_err(|e| Error::Other(anyhow::anyhow!("parsing the upstream {what}: {e}")))?
     }
 
     /// Name the feed this client fills, so its log lines say which one.
@@ -588,7 +601,9 @@ impl MirrorClient {
     /// The cached resources are left alone: this only asks whether the
     /// upstream answers.
     pub async fn probe(&self) -> Result<()> {
-        match self.get_json(&self.upstream, "service index").await {
+        // Any JSON will do; the index is read when the resources are.
+        let index = self.get_json::<serde::de::IgnoredAny>(&self.upstream, "service index");
+        match index.await {
             Ok(Some(_)) => Ok(()),
             Ok(None) => {
                 let e = not_found("service index", &self.upstream);
@@ -657,12 +672,19 @@ impl MirrorClient {
     async fn resources(&self) -> Result<&MirrorResources> {
         self.resources
             .get_or_try_init(|| async {
-                let index = self
+                let index: ServiceIndex = self
                     .get_json(&self.upstream, "service index")
                     .await?
                     .ok_or_else(|| not_found("service index", &self.upstream))?;
-                let package_base =
-                    find_resource(&index, "PackageBaseAddress/3.0.0").ok_or_else(|| {
+                // A resource's `@id` may be relative to the index.
+                let base = reqwest::Url::parse(&self.upstream).map_err(|e| {
+                    Error::Other(anyhow::anyhow!(
+                        "upstream {} is not a URL: {e}",
+                        redact_url(&self.upstream)
+                    ))
+                })?;
+                let package_base = find_resource(&index, &base, &["PackageBaseAddress/3.0.0"])
+                    .ok_or_else(|| {
                         Error::Other(anyhow::anyhow!(
                             "upstream {} has no PackageBaseAddress resource",
                             redact_url(&self.upstream)
@@ -670,8 +692,9 @@ impl MirrorClient {
                     })?;
                 // Search service type names are versioned; accept whichever the
                 // upstream advertises, newest first.
-                let search = find_first_resource(
+                let search = find_resource(
                     &index,
+                    &base,
                     &[
                         "SearchQueryService/3.5.0",
                         "SearchQueryService/3.0.0-rc",
@@ -679,9 +702,10 @@ impl MirrorClient {
                         "SearchQueryService",
                     ],
                 );
-                let catalog = find_resource(&index, "Catalog/3.0.0");
-                let registration = find_first_resource(
+                let catalog = find_resource(&index, &base, &["Catalog/3.0.0"]);
+                let registration = find_resource(
                     &index,
+                    &base,
                     &[
                         "RegistrationsBaseUrl/3.6.0",
                         "RegistrationsBaseUrl/3.4.0",
@@ -711,18 +735,13 @@ impl MirrorClient {
     pub async fn upstream_versions(&self, lower_id: &str) -> Result<Vec<String>> {
         let base = &self.resources().await?.package_base;
         let url = format!("{base}{lower_id}/index.json");
-        let Some(doc) = self.get_json(&url, "version list").await? else {
+        let Some(doc) = self
+            .get_json::<PackageVersions>(&url, "version list")
+            .await?
+        else {
             return Ok(Vec::new());
         };
-        Ok(doc
-            .get("versions")
-            .and_then(|v| v.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default())
+        Ok(doc.versions.unwrap_or_default())
     }
 
     /// The versions of `lower_id` the upstream has unlisted, normalized and
@@ -756,47 +775,39 @@ impl MirrorClient {
             return Ok(listing);
         };
         let url = format!("{base}{lower_id}/index.json");
-        let Some(index) = self.get_json(&url, "registration").await? else {
+        let Some(index) = self
+            .get_json::<RegistrationIndex>(&url, "registration")
+            .await?
+        else {
             return Ok(listing);
         };
-        let pages = index
-            .get("items")
-            .and_then(|i| i.as_array())
-            .cloned()
-            .unwrap_or_default();
-        for page in pages {
+        // Page `@id`s may be relative to the registration index.
+        let index_url = reqwest::Url::parse(&url).ok();
+        for page in index.items.into_iter().flatten() {
             // Small packages inline their leaves; large ones page them out.
-            let page = match page.get("items") {
-                Some(_) => page,
-                None => {
-                    let Some(page_url) = page.get("@id").and_then(|u| u.as_str()) else {
-                        continue;
-                    };
-                    self.get_json(page_url, "registration page")
-                        .await?
-                        .ok_or_else(|| not_found("registration page", page_url))?
-                }
+            let page = if page.items.is_some() {
+                page
+            } else {
+                let Some(page_url) = page.id.as_deref().map(|id| {
+                    index_url
+                        .as_ref()
+                        .and_then(|base| base.join(id).ok())
+                        .map_or_else(|| id.to_string(), String::from)
+                }) else {
+                    continue;
+                };
+                self.get_json(&page_url, "registration page")
+                    .await?
+                    .ok_or_else(|| not_found("registration page", &page_url))?
             };
-            for leaf in page
-                .get("items")
-                .and_then(|i| i.as_array())
-                .into_iter()
-                .flatten()
-            {
-                let entry = leaf.get("catalogEntry").unwrap_or(leaf);
-                // `listed: false` is the flag; a `published` date in 1900 is
-                // how older servers said the same thing.
-                let hidden = entry.get("listed").and_then(|l| l.as_bool()) == Some(false)
-                    || entry
-                        .get("published")
-                        .and_then(|p| p.as_str())
-                        .is_some_and(|p| p.starts_with("1900-"));
+            for leaf in page.items.iter().flatten() {
+                let entry = leaf.entry();
                 let version = entry
-                    .get("version")
-                    .and_then(|v| v.as_str())
+                    .version
+                    .as_deref()
                     .and_then(|v| NuGetVersion::parse(v).ok());
                 if let Some(version) = version {
-                    listing.insert(version.normalized().to_lowercase(), !hidden);
+                    listing.insert(version.normalized().to_lowercase(), entry.is_listed());
                 }
             }
         }
@@ -936,16 +947,12 @@ impl MirrorClient {
             let url = format!(
                 "{search}{sep}q=&skip={skip}&take={PAGE}&prerelease=true&semVerLevel=2.0.0"
             );
-            let doc = self
+            let doc: SearchPage = self
                 .get_json(&url, "search page")
                 .await?
                 .ok_or_else(|| not_found("search page", &url))?;
 
-            let page_len = doc
-                .get("data")
-                .and_then(|d| d.as_array())
-                .map(|a| a.len())
-                .unwrap_or(0);
+            let page_len = doc.data.as_ref().map_or(0, Vec::len);
             if page_len == 0 {
                 return Ok(ids.into_vec());
             }
@@ -981,26 +988,23 @@ impl MirrorClient {
         catalog: &str,
         failures: &mut Vec<(String, String)>,
     ) -> Result<Vec<String>> {
-        let index = self
+        let index: Catalog = self
             .get_json(catalog, "catalog index")
             .await?
             .ok_or_else(|| not_found("catalog index", catalog))?;
 
         let pages: Vec<String> = index
-            .get("items")
-            .and_then(|i| i.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|p| p.get("@id").and_then(|u| u.as_str()).map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default();
+            .items
+            .into_iter()
+            .flatten()
+            .filter_map(|p| p.id)
+            .collect();
 
         let mut ids = DedupIds::new();
         for page_url in pages {
             // Page URLs come from the catalog index, so `get_json` vets each
             // one like any other upstream-chosen URL.
-            let page = match self.get_json(&page_url, "catalog page").await {
+            let page = match self.get_json::<Catalog>(&page_url, "catalog page").await {
                 Ok(Some(page)) => page,
                 Ok(None) => {
                     let e = not_found("catalog page", &page_url);
@@ -1018,12 +1022,13 @@ impl MirrorClient {
                     continue;
                 }
             };
-            if let Some(items) = page.get("items").and_then(|i| i.as_array()) {
-                for item in items {
-                    if let Some(id) = item.get("nuget:id").and_then(|i| i.as_str()) {
-                        ids.push(id);
-                    }
-                }
+            for id in page
+                .items
+                .iter()
+                .flatten()
+                .filter_map(|i| i.package_id.as_deref())
+            {
+                ids.push(id);
             }
         }
         Ok(ids.into_vec())
@@ -1039,15 +1044,12 @@ fn not_found(what: &str, url: &str) -> Error {
 }
 
 /// Extract the package ids from one `SearchQueryService` response page.
-fn page_ids(doc: &serde_json::Value) -> Vec<String> {
-    doc.get("data")
-        .and_then(|d| d.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|i| i.get("id").and_then(|v| v.as_str()).map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default()
+fn page_ids(doc: &SearchPage) -> Vec<String> {
+    doc.data
+        .iter()
+        .flatten()
+        .filter_map(|i| i.id.clone())
+        .collect()
 }
 
 /// Accumulates package ids in first-seen order, dropping case-insensitive
@@ -1882,21 +1884,11 @@ enum Fetched {
     DownloadFailed(Error),
 }
 
-fn find_resource(index: &serde_json::Value, ty: &str) -> Option<String> {
-    index
-        .get("resources")?
-        .as_array()?
-        .iter()
-        .find(|r| r.get("@type").and_then(|t| t.as_str()) == Some(ty))
-        .and_then(|r| r.get("@id"))
-        .and_then(|i| i.as_str())
-        .map(str::to_string)
-}
-
 /// Return the first resource matching any of `types`, in the given priority
-/// order (used for the versioned `SearchQueryService` type names).
-fn find_first_resource(index: &serde_json::Value, types: &[&str]) -> Option<String> {
-    types.iter().find_map(|ty| find_resource(index, ty))
+/// order (used for the versioned type names), resolved against the index's
+/// URL `base`. `@type` may be a string or a list.
+fn find_resource(index: &ServiceIndex, base: &reqwest::Url, types: &[&str]) -> Option<String> {
+    index.resolve(types, base).map(String::from)
 }
 
 fn ensure_trailing_slash(s: &str) -> String {
@@ -2131,14 +2123,15 @@ mod tests {
 
     #[test]
     fn page_ids_extracts_and_dedup_collects() {
-        let page = serde_json::json!({
+        let page: SearchPage = serde_json::from_value(serde_json::json!({
             "totalHits": 3,
             "data": [
                 {"id": "Alpha", "version": "1.0.0"},
                 {"id": "Beta", "version": "2.0.0"},
                 {"version": "9.9.9"} // no id — skipped
             ]
-        });
+        }))
+        .unwrap();
         assert_eq!(
             page_ids(&page),
             vec!["Alpha".to_string(), "Beta".to_string()]
@@ -2157,16 +2150,17 @@ mod tests {
 
     #[test]
     fn finds_first_resource_in_priority_order() {
-        let index = serde_json::json!({
+        let index = service_index(serde_json::json!({
             "resources": [
                 {"@id": "https://up/search-rc", "@type": "SearchQueryService/3.0.0-rc"},
                 {"@id": "https://up/search", "@type": "SearchQueryService"}
             ]
-        });
+        }));
         // 3.5.0 is absent, so the next candidate (3.0.0-rc) wins.
         assert_eq!(
-            find_first_resource(
+            find_resource(
                 &index,
+                &url("https://up/v3/index.json"),
                 &[
                     "SearchQueryService/3.5.0",
                     "SearchQueryService/3.0.0-rc",
@@ -2176,22 +2170,103 @@ mod tests {
             .as_deref(),
             Some("https://up/search-rc")
         );
-        assert!(find_first_resource(&index, &["Catalog/3.0.0"]).is_none());
+        let base = url("https://up/v3/index.json");
+        assert!(find_resource(&index, &base, &["Catalog/3.0.0"]).is_none());
+    }
+
+    fn service_index(v: serde_json::Value) -> ServiceIndex {
+        serde_json::from_value(v).unwrap()
     }
 
     #[test]
     fn finds_resource_by_type() {
-        let index = serde_json::json!({
+        let index = service_index(serde_json::json!({
             "resources": [
                 {"@id": "https://up/flat/", "@type": "PackageBaseAddress/3.0.0"},
                 {"@id": "https://up/query", "@type": "SearchQueryService"}
             ]
-        });
+        }));
+        let base = url("https://up/v3/index.json");
         assert_eq!(
-            find_resource(&index, "PackageBaseAddress/3.0.0").as_deref(),
+            find_resource(&index, &base, &["PackageBaseAddress/3.0.0"]).as_deref(),
             Some("https://up/flat/")
         );
-        assert!(find_resource(&index, "Nope").is_none());
+        assert!(find_resource(&index, &base, &["Nope"]).is_none());
+    }
+
+    #[test]
+    fn finds_resources_typed_by_a_list_and_relative_to_the_index() {
+        let index = service_index(serde_json::json!({
+            "resources": [
+                {"@id": "flat/", "@type": ["PackageBaseAddress/3.0.0", "Other"]},
+                {"@id": "/query", "@type": ["SearchQueryService/3.5.0"]}
+            ]
+        }));
+        let base = url("https://up/v3/index.json");
+        assert_eq!(
+            find_resource(&index, &base, &["PackageBaseAddress/3.0.0"]).as_deref(),
+            Some("https://up/v3/flat/")
+        );
+        assert_eq!(
+            find_resource(&index, &base, &["SearchQueryService/3.5.0"]).as_deref(),
+            Some("https://up/query")
+        );
+    }
+
+    #[tokio::test]
+    async fn the_mirror_reads_a_list_typed_index_with_relative_ids() {
+        use axum::routing::get;
+
+        // `@type` as a list and every `@id` relative: the service index, to
+        // the flat container and the registration, and the registration to
+        // its page.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let app = axum::Router::new()
+            .route(
+                "/v3/index.json",
+                get(|| async {
+                    axum::Json(serde_json::json!({"resources": [
+                        {"@id": "flat", "@type": ["PackageBaseAddress/3.0.0"]},
+                        {"@id": "/v3/registration/", "@type": ["RegistrationsBaseUrl/3.6.0", "RegistrationsBaseUrl"]}
+                    ]}))
+                }),
+            )
+            .route(
+                "/v3/flat/pkg/index.json",
+                get(|| async { axum::Json(serde_json::json!({"versions": ["1.0.0", "2.0.0"]})) }),
+            )
+            .route(
+                "/v3/registration/pkg/index.json",
+                get(|| async { axum::Json(serde_json::json!({"items": [{"@id": "page/0.json"}]})) }),
+            )
+            .route(
+                "/v3/registration/pkg/page/0.json",
+                get(|| async {
+                    axum::Json(serde_json::json!({"items": [
+                        {"catalogEntry": {"id": "Pkg", "version": "1.0.0"}},
+                        {"catalogEntry": {"id": "Pkg", "version": "2.0.0", "listed": false}}
+                    ]}))
+                }),
+            );
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let client = MirrorClient::from_config(&MirrorConfig {
+            enabled: true,
+            upstream: format!("{base}/v3/index.json"),
+            // The fake upstream is on loopback.
+            allow_private_upstream: true,
+            timeout_secs: 5,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            client.upstream_versions("pkg").await.unwrap(),
+            ["1.0.0", "2.0.0"]
+        );
+        let listing = client.upstream_listing("pkg").await.unwrap();
+        assert_eq!(listing.get("1.0.0"), Some(&true));
+        assert_eq!(listing.get("2.0.0"), Some(&false));
     }
 
     #[test]

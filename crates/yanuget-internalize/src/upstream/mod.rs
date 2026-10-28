@@ -282,7 +282,7 @@ impl Upstream {
         let Some(index) = self.json(&url, "registration").await? else {
             return Ok(Vec::new());
         };
-        let pages = v3::pages(&index, &url)?;
+        let pages = v3::pages(index, &url)?;
         if pages.len() > MAX_PAGES {
             return Err(UpstreamError::Invalid(format!(
                 "upstream lists {id} over more than {MAX_PAGES} pages"
@@ -302,7 +302,7 @@ impl Upstream {
                                 redact(&page_url)
                             ))
                         })?;
-                    (v3::page_leaves(&doc)?, page_url)
+                    (v3::page_leaves(doc)?, page_url)
                 }
             };
             for l in &leaves {
@@ -577,11 +577,11 @@ impl Upstream {
         Ok(Some(body))
     }
 
-    async fn json(
+    async fn json<T: serde::de::DeserializeOwned>(
         &self,
         url: &Url,
         what: &str,
-    ) -> Result<Option<serde_json::Value>, UpstreamError> {
+    ) -> Result<Option<T>, UpstreamError> {
         match self.document(url, what).await? {
             Some(body) => serde_json::from_slice(&body).map(Some).map_err(|e| {
                 UpstreamError::Invalid(format!("upstream {what} {} is not JSON: {e}", redact(url)))
