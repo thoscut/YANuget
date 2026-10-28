@@ -183,7 +183,9 @@ enabled = false               # YANUGET_MONITORING_ENABLED
 # Retention HARD-deletes versions (payload, sidecars and symbols), so it is
 # off by default. A version is pruned when it is beyond the newest-N of its
 # release channel OR older than max_age_days; the newest stable version (or
-# newest pre-release, if there is no stable) is always kept.
+# newest pre-release, if there is no stable) is always kept. Age counts from
+# when the version entered the feed (push, mirror, promotion, copy or move),
+# not from when it was first published.
 # ---------------------------------------------------------------------------
 [retention]
 enabled = false               # YANUGET_RETENTION_ENABLED — master switch
@@ -194,7 +196,7 @@ interval_hours = 24           # YANUGET_RETENTION_INTERVAL_HOURS — background 
 # sweep to do anything.
 # keep_latest_stable = 10       # YANUGET_RETENTION_KEEP_LATEST_STABLE
 # keep_latest_prerelease = 5    # YANUGET_RETENTION_KEEP_LATEST_PRERELEASE
-# max_age_days = 180            # YANUGET_RETENTION_MAX_AGE_DAYS
+# max_age_days = 180            # YANUGET_RETENTION_MAX_AGE_DAYS — days in this feed
 
 # ---------------------------------------------------------------------------
 # Attached files — disk images and archives a package's install script fetches

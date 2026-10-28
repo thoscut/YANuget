@@ -596,7 +596,7 @@ pub struct RetentionConfig {
     pub keep_latest_stable: Option<usize>,
     /// Keep at most this many of the newest pre-release versions per id.
     pub keep_latest_prerelease: Option<usize>,
-    /// Delete versions published more than this many days ago.
+    /// Delete versions added to the feed more than this many days ago.
     pub max_age_days: Option<u64>,
 }
 

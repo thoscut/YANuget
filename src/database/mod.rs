@@ -268,6 +268,10 @@ pub struct FeedVersion {
     pub flag_reason: Option<String>,
     /// Exempt from retention (see [`Membership::pinned`]).
     pub pinned: bool,
+    /// When the version entered this feed: pushed, promoted, copied, moved or
+    /// mirrored in, or last overwritten. Not `package.published`, which is
+    /// global and older for a version promoted later.
+    pub added: chrono::DateTime<chrono::Utc>,
 }
 
 /// Metadata store for indexed packages.

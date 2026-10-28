@@ -287,6 +287,12 @@ version is pruned when it is beyond the newest *N* of its release channel
 version — or newest pre-release when no stable exists — is always kept, so a
 package can never be pruned out of existence.
 
+A version's age is how long it has been **in that feed**: since it was pushed,
+mirrored, promoted, copied or moved there, or last overwritten. A version
+published to `dev` a year ago and promoted into `prod` today is a day old in
+`prod`, so `max_age_days` there counts from the promotion, not from the first
+push. (Databases from before feeds existed start with the publish date.)
+
 The rules count only what clients can download. **Pending** and **disabled**
 versions are outside them: they are never deleted by retention, never use up
 one of the "newest *N*", and are never the newest version that is kept — so
@@ -302,7 +308,7 @@ it.
 | `retention.interval_hours` | `YANUGET_RETENTION_INTERVAL_HOURS` | int | `24` | Background sweep interval; `0` disables the sweep. |
 | `retention.keep_latest_stable` | `YANUGET_RETENTION_KEEP_LATEST_STABLE` | int | *(unset)* | Keep newest N stable versions per id. |
 | `retention.keep_latest_prerelease` | `YANUGET_RETENTION_KEEP_LATEST_PRERELEASE` | int | *(unset)* | Keep newest N pre-release versions per id. |
-| `retention.max_age_days` | `YANUGET_RETENTION_MAX_AGE_DAYS` | int | *(unset)* | Prune versions published more than N days ago. |
+| `retention.max_age_days` | `YANUGET_RETENTION_MAX_AGE_DAYS` | int | *(unset)* | Prune versions added to the feed more than N days ago. |
 
 With no limit set, the sweep does nothing even when `enabled`.
 
