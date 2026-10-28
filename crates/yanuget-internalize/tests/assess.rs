@@ -8,6 +8,7 @@ use sha2::{Digest, Sha256};
 use yanuget_internalize::assess::{assess, fetch};
 use yanuget_internalize::config::DownloadsConfig;
 use yanuget_internalize::download::Downloader;
+use yanuget_internalize::overrides::Overrides;
 use yanuget_internalize::report::{self, Draft};
 use yanuget_internalize::sandbox::fake::FakeSandbox;
 use yanuget_internalize::sandbox::{CaptureJob, RawCapture, Sandbox};
@@ -104,7 +105,7 @@ async fn a_capture_becomes_reports_and_files() {
         draft("broken", "1.0.0"),
         draft("meta", "1.0.0"),
     ];
-    let wanted = assess(capture, &closure, &mut drafts, 60);
+    let wanted = assess(capture, &closure, &mut drafts, 60, &Overrides::none());
     assert_eq!(
         wanted.iter().map(Vec::len).collect::<Vec<_>>(),
         [2, 1, 1, 0]

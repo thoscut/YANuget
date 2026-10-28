@@ -11,13 +11,15 @@ pub mod fake;
 pub mod kvm;
 pub mod windows_container;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use yanuget_pkg::report::{Environment, PackageRef};
+use yanuget_pkg::NuGetVersion;
 
 use crate::config::{Backend, SandboxConfig};
+use crate::overrides::Overrides;
 
 /// One capture: install `package` from a local source holding its closure,
 /// with every download recorded instead of made.
@@ -94,13 +96,51 @@ pub fn from_config(config: &SandboxConfig) -> Result<Box<dyn Sandbox>, SandboxEr
     })
 }
 
-/// The job for `package` under `config`'s limits.
-pub fn job(config: &SandboxConfig, package: PackageRef, sources: Vec<PathBuf>) -> CaptureJob {
-    CaptureJob {
-        package,
+/// The job for a closure, the root first and each package with its
+/// `.nupkg`, under `config`'s limits, with what the overrides (`INT-25`)
+/// change before the capture: a package whose override has a script is
+/// copied into `work_dir` with it in place of its `chocolateyInstall.ps1`,
+/// and the root's package parameters become `--params`. The job's `sources`
+/// are in the order of `packages`, and are what a run publishes, so the
+/// feed gets the script the capture ran.
+pub async fn job(
+    config: &SandboxConfig,
+    overrides: &Overrides,
+    packages: &[(&str, &NuGetVersion, &Path)],
+    work_dir: &Path,
+) -> Result<CaptureJob, yanuget_pkg::Error> {
+    let Some((root_id, root_version, _)) = packages.first() else {
+        return Err(yanuget_pkg::Error::InvalidRewrite(
+            "a capture needs the root package".into(),
+        ));
+    };
+    let mut sources = Vec::with_capacity(packages.len());
+    for (id, version, nupkg) in packages {
+        let Some((_, script)) = overrides.get(id, version).and_then(|o| o.script.as_ref()) else {
+            sources.push(nupkg.to_path_buf());
+            continue;
+        };
+        // Apart from where the publish writes its own rewrite.
+        let dir = work_dir.join("override");
+        tokio::fs::create_dir_all(&dir).await?;
+        let out = dir.join(format!(
+            "{}.{}.nupkg",
+            id.to_ascii_lowercase(),
+            version.normalized().to_ascii_lowercase()
+        ));
+        crate::overrides::with_script(nupkg, &out, script.clone()).await?;
+        sources.push(out);
+    }
+    Ok(CaptureJob {
+        package: PackageRef {
+            id: root_id.to_string(),
+            version: root_version.normalized(),
+        },
         sources,
         timeout: Duration::from_secs(config.timeout_secs),
         max_capture_bytes: config.max_capture_bytes,
-        package_parameters: None,
-    }
+        package_parameters: overrides
+            .get(root_id, root_version)
+            .and_then(|o| o.package_parameters.clone()),
+    })
 }

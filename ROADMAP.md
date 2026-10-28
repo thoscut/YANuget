@@ -19,7 +19,7 @@ list is the index.
 
 **From the review of 2026-10-27** ([detail](#review-of-2026-10-27))
 
-- Maintainability: `MNT-06`. Internalizer: `INT-35`. Release: `0.8.1`.
+- Maintainability: `MNT-06`. Release: `0.8.1`.
 
 **Server, after 0.8.0** ([Target releases](#target-releases))
 
@@ -148,9 +148,13 @@ security, Rust code, tests and CI, operations and documentation), at
   string and does not resolve a relative `@id` (`src/mirror.rs`), the
   internalizer does both (`upstream/v3.rs`). Typed structs in `yanuget-pkg`
   would serve both and settle `PERF-06`.
-- [ ] **`INT-35` Overrides apply only `skip`.** `Override::apply` and
+- [x] **`INT-35` Overrides apply only `skip`.** `Override::apply` and
   `with_script` have no caller outside tests and `package_parameters` is
   always `None`, while `INT-25` and the README describe all of them.
+  *Done:* `sandbox::job` puts the script into a copy of the package and the
+  root's parameters into the job, and `assess` applies the downloads and
+  rewrites; a dependency's parameters are a warning. `run` and `sync` reach
+  these stages once a runner captures (`INT-15`), which the README says.
 - [x] **`INT-36` Prelude and downloader hardening.** The prelude passes on any
   value that does not match `^(https?|ftps?)://` exactly (a leading space,
   `https:\\`, a UNC path); it wraps only the first `chocolateyInstall.ps1`;

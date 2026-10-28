@@ -18,9 +18,11 @@
 //! ```
 //!
 //! or, instead of all that, `skip = "why"`: the package is left out of runs.
-//! Every override used goes into the package's report, and one that no
-//! longer matches what the capture saw is a warning, so stale overrides
-//! surface.
+//! [`crate::sandbox::job`] puts the script and the root's parameters into
+//! the capture, and [`crate::assess::assess`] adds the downloads and
+//! rewrites to what it asked for. Every override used goes into the
+//! package's report, and one that no longer matches what the capture saw is
+//! a warning, so stale overrides surface.
 
 use std::collections::BTreeMap;
 use std::path::{Component, Path};
@@ -368,12 +370,19 @@ pub async fn with_script(
 impl Override {
     /// Apply the downloads and rewrites to what the capture asked for, and
     /// note in the report what was used and what no longer matches.
-    pub fn apply(&self, draft: &mut Draft, wanted: &mut Vec<Wanted>) {
+    /// `root` says whether the package was the capture's root, the only one
+    /// whose install got the package parameters.
+    pub fn apply(&self, draft: &mut Draft, wanted: &mut Vec<Wanted>, root: bool) {
         if let Some((name, _)) = &self.script {
             draft.overridden(format!("chocolateyInstall.ps1 replaced by {name}"));
         }
-        if let Some(p) = &self.package_parameters {
-            draft.overridden(format!("package parameters {p:?}"));
+        match &self.package_parameters {
+            Some(p) if root => draft.overridden(format!("package parameters {p:?}")),
+            Some(p) => draft.warn(format!(
+                "the override's package parameters {p:?} were not passed: \
+                 the package was installed as a dependency, and only the root gets --params"
+            )),
+            None => {}
         }
         for r in &self.rewrites {
             let mut hit = false;
@@ -577,7 +586,7 @@ sha256 = "AA"
             },
         );
         let mut ws = vec![wanted("https://example.com/setup.exe")];
-        o.apply(&mut draft, &mut ws);
+        o.apply(&mut draft, &mut ws, true);
 
         assert_eq!(ws.len(), 2);
         assert_eq!(
