@@ -1173,13 +1173,44 @@ async fn a_client_that_trickles_its_headers_is_cut_off() {
     served.handle.shutdown();
 }
 
+/// Send `/health/live` on `conn` and return what came back before the server
+/// closed it or five seconds passed: the start of a response, or nothing when
+/// the connection was turned away.
+async fn probe_live(conn: &mut tokio::net::TcpStream, close: bool) -> Vec<u8> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let connection = if close { "close" } else { "keep-alive" };
+    let request =
+        format!("GET /health/live HTTP/1.1\r\nHost: x\r\nConnection: {connection}\r\n\r\n");
+    // A turned-away connection may already be closed; that shows up below as
+    // an empty answer, so a failed write is not an error here.
+    let _ = conn.write_all(request.as_bytes()).await;
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 1024];
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    // Enough to see the status line; the rest of the answer does not matter.
+    while buf.len() < b"HTTP/1.1 200".len() {
+        match tokio::time::timeout_at(deadline, conn.read(&mut chunk)).await {
+            Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+            Ok(Ok(n)) => buf.extend_from_slice(&chunk[..n]),
+        }
+    }
+    buf
+}
+
 #[tokio::test]
 async fn connections_over_the_cap_are_turned_away() {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncReadExt;
     let served = serve_real(|_| {}, |l| l.max_connections = 1).await;
-    let first = tokio::net::TcpStream::connect(served.addr).await.unwrap();
-    // Give the server a moment to accept the first and take its slot.
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // An answer on the first connection shows it holds the one slot, without
+    // guessing how long the server takes to accept it. Kept alive, it keeps
+    // holding it.
+    let mut first = tokio::net::TcpStream::connect(served.addr).await.unwrap();
+    let reply = probe_live(&mut first, false).await;
+    assert!(
+        reply.starts_with(b"HTTP/1.1 200"),
+        "the first connection was not served: {}",
+        String::from_utf8_lossy(&reply)
+    );
     let mut second = tokio::net::TcpStream::connect(served.addr).await.unwrap();
     let mut buf = Vec::new();
     let closed = tokio::time::timeout(Duration::from_secs(5), second.read_to_end(&mut buf)).await;
@@ -1188,20 +1219,27 @@ async fn connections_over_the_cap_are_turned_away() {
         "the second connection was served: {closed:?}"
     );
 
-    // Closing the first frees its slot.
+    // Closing the first frees its slot. The server notices the close on its
+    // own schedule, so try again until a connection is served or time is up.
     drop(first);
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    let mut third = tokio::net::TcpStream::connect(served.addr).await.unwrap();
-    third
-        .write_all(b"GET /health/live HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
-        .await
-        .unwrap();
-    let mut reply = String::new();
-    tokio::time::timeout(Duration::from_secs(5), third.read_to_string(&mut reply))
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let mut third = tokio::net::TcpStream::connect(served.addr).await.unwrap();
+        let reply = probe_live(&mut third, true).await;
+        if reply.starts_with(b"HTTP/1.1 200") {
+            break;
+        }
+        assert!(
+            reply.is_empty(),
+            "an unexpected answer: {}",
+            String::from_utf8_lossy(&reply)
+        );
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the slot was not freed within 5 s of the first connection closing"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     served.handle.shutdown();
 }
 

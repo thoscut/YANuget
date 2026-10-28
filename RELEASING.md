@@ -57,7 +57,10 @@ incompatibly at any version.
 1. **CI is green on `main`** — including the `Packaging` and
    `NuGet client compatibility` jobs. The first proves the crate still packages
    and the container image still builds and comes up healthy; the second proves
-   the real `dotnet` client can still push and restore.
+   the real `dotnet` client can still push and restore. The release workflow
+   runs the whole CI workflow again against the tagged commit and publishes
+   nothing unless it passes, so a red tag fails before anything goes out; this
+   check is so it does not fail there.
 
 2. **Run the client check locally** if the release touches anything a NuGet
    client observes:

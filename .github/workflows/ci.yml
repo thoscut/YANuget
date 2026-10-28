@@ -11,6 +11,16 @@ on:
   schedule:
     - cron: "23 5 * * 1"
   workflow_dispatch:
+  # The release workflow runs this whole workflow against the commit it is
+  # about to publish, and publishes nothing unless every job here passes. It
+  # passes that commit as `ref`; every other trigger leaves it empty and each
+  # checkout takes the event's own commit.
+  workflow_call:
+    inputs:
+      ref:
+        description: "Commit SHA to check out and test"
+        required: true
+        type: string
 
 # Nothing here writes to the repository. Every job runs code from the pull
 # request (build scripts, proc macros, the docs toolchain), so the token it
@@ -19,9 +29,12 @@ permissions:
   contents: read
 
 # A newer push to the same pull request makes the older run moot. Pushes to
-# `main` are left to finish, so every commit there keeps a result.
+# `main` are left to finish, so every commit there keeps a result. The group
+# is named literally rather than after `github.workflow`: called from the
+# release workflow, that is the caller's name, and sharing the caller's group
+# would leave this run waiting on the run that is waiting on it.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ci-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
@@ -33,6 +46,13 @@ env:
 # (github-actions ecosystem) proposes the updates. `dtolnay/rust-toolchain` is
 # pinned to a commit of its master branch, which has no release tags, and names
 # the toolchain explicitly with `toolchain:`.
+#
+# Caches are keyed per job and per compiler (`cachekey` is a hash of the rustc
+# version), so a new stable release starts a fresh `target/` instead of
+# restoring one full of artifacts it cannot use, and no job's restore prefix
+# matches another job's cache. When the release workflow calls this one
+# (`inputs.ref` is set) nothing is restored: a release is checked from a clean
+# state, as it is built.
 jobs:
   test:
     name: Build, test & lint
@@ -41,23 +61,26 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.ref }}
           persist-credentials: false
 
       - name: Install Rust toolchain
+        id: toolchain
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: stable
           components: rustfmt, clippy
 
       - name: Cache cargo
+        if: ${{ !inputs.ref }}
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
+          key: ${{ runner.os }}-cargo-test-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-test-${{ steps.toolchain.outputs.cachekey }}-
 
       - name: Set up Python
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
@@ -90,13 +113,13 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        run: cargo clippy --workspace --all-targets --all-features
+        run: cargo clippy --workspace --all-targets --all-features --locked
 
       - name: Test
-        run: cargo test --workspace --all-features
+        run: cargo test --workspace --all-features --locked
 
       - name: Build release
-        run: cargo build --release
+        run: cargo build --release --locked
 
   msrv:
     name: Minimum supported Rust (1.89)
@@ -105,31 +128,75 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.ref }}
           persist-credentials: false
 
       # rust-toolchain.toml pins `stable`; an explicit `+1.89.0` on the command
       # line overrides it so this job really exercises the declared MSRV.
       # (1.89 is the floor required by transitive deps, e.g. uuid 1.27.)
       - name: Install Rust 1.89.0
+        id: toolchain
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: 1.89.0
 
       - name: Cache cargo
+        if: ${{ !inputs.ref }}
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-msrv-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-msrv-
+          key: ${{ runner.os }}-cargo-msrv-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-msrv-${{ steps.toolchain.outputs.cachekey }}-
 
       # The tests run here, not just a `check`: the container image is built
       # with 1.89, so this is the compiler the image ships, and a behaviour
       # difference between it and stable would otherwise go unnoticed.
       - name: Test against MSRV
-        run: cargo +1.89.0 test --workspace --all-targets --all-features
+        run: cargo +1.89.0 test --workspace --all-targets --all-features --locked
+
+  # The release binaries are also built for Windows and macOS, and the code
+  # has `cfg(not(unix))` branches (file permissions, the inbox, storage) that
+  # the Linux jobs never compile. A check here finds a break in them on the
+  # pull request instead of at tag time. `check` rather than `test`: it covers
+  # every target, tests included, at a fraction of the runner minutes.
+  portability:
+    name: Check on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        id: toolchain
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+
+      - name: Cache cargo
+        if: ${{ !inputs.ref }}
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-check-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-check-${{ steps.toolchain.outputs.cachekey }}-
+
+      # No docs site: the build script embeds its placeholder, which is all a
+      # check needs.
+      - name: Check
+        run: cargo check --workspace --all-targets --all-features --locked
 
   audit:
     name: Dependency audit
@@ -138,25 +205,34 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.ref }}
           persist-credentials: false
 
       - name: Install Rust toolchain
+        id: toolchain
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: stable
 
+      # Exact versions: the action is pinned, but without one it installs
+      # whatever was released last, and a new release that reads the config
+      # differently would turn CI red with no change here. Dependabot does not
+      # see these; bump them by hand.
       - name: Install cargo-audit and cargo-deny
         uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
         with:
-          tool: cargo-audit,cargo-deny
+          tool: cargo-audit@0.22.2,cargo-deny@0.20.2
 
       # RUSTSEC-2023-0071 (rsa, Marvin attack) has no fixed release and reaches
       # the lockfile only via sqlx-mysql, an optional driver this sqlite-only
       # build never compiles. Verified rather than assumed: `cargo tree -i rsa
       # -e normal` finds nothing, so the crate is in `Cargo.lock` and not in the
       # binary. Ignored deliberately; revisit if a fix ships.
+      # `--deny yanked`: cargo-audit only warns about a yanked crate in the
+      # lockfile, and a yank is often how a broken or compromised release is
+      # withdrawn, so it fails the job like an advisory does.
       - name: Audit dependencies for known vulnerabilities
-        run: cargo audit --ignore RUSTSEC-2023-0071
+        run: cargo audit --deny yanked --ignore RUSTSEC-2023-0071
 
       # Licenses, sources and duplicate crates, as set out in deny.toml. A
       # dependency under a license nobody has looked at, or from a git
@@ -176,22 +252,25 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.ref }}
           persist-credentials: false
 
       - name: Install Rust toolchain
+        id: toolchain
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: stable
 
       - name: Cache cargo
+        if: ${{ !inputs.ref }}
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-package-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-package-
+          key: ${{ runner.os }}-cargo-package-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-package-${{ steps.toolchain.outputs.cachekey }}-
 
       # Deliberately without a docs site present: this is how crates.io builds
       # it, and it is what caught `build.rs` writing outside `OUT_DIR`.
@@ -251,22 +330,25 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.ref }}
           persist-credentials: false
 
       - name: Install Rust toolchain
+        id: toolchain
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: stable
 
       - name: Cache cargo
+        if: ${{ !inputs.ref }}
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-compat-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-compat-
+          key: ${{ runner.os }}-cargo-compat-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-compat-${{ steps.toolchain.outputs.cachekey }}-
 
       - name: Set up .NET
         uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
@@ -274,7 +356,7 @@ jobs:
           dotnet-version: "8.0.x"
 
       - name: Build the server
-        run: cargo build --release
+        run: cargo build --release --locked
 
       - name: Push, restore, build and run with the real client
         env:

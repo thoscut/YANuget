@@ -117,6 +117,19 @@ security, Rust code, tests and CI, operations and documentation), at
   (#77), and Dependabot groups their majors now. The server stays on sha2
   0.10: digest 0.11 drops the `io::Write` impl `src/symbols.rs` hashes with.
 
+- [x] **`CI-11` A release did not wait for CI.** `guard` checked the tag,
+  the version and the CHANGELOG; nothing ran the tests or the audit on the
+  tagged commit. `release.yml` now runs `ci.yml` (made callable) on that
+  commit, and the image, the GitHub Release and crates.io wait for it.
+- [x] **`CI-12` The `cfg(not(unix))` code was compiled only at tag time.** A
+  `cargo check` on Windows and macOS runs on every pull request.
+- [x] **`CI-13` Loose ends in CI.** `--locked` on every build, test and clippy
+  step; cargo-audit and cargo-deny pinned; a yanked crate fails the audit;
+  cache keys per job and per compiler.
+- [x] **`TEST-08` Sleeps and a test that could not fail.** The connection-cap
+  test polls instead of sleeping, `a_stalled_upload_is_cut_off` checks the
+  cut-off, and the unused `tokio-test` is gone.
+
 ### Open
 
 - [ ] **`0.8.1`** 0.8.0 shipped `rustls-webpki` 0.103.15 (RUSTSEC-2026-0382,
