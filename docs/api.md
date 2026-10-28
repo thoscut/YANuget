@@ -612,6 +612,12 @@ GET /health/status  → 200 JSON, "status": "ok" | "degraded"; 503 "unavailable"
 GET /metrics        → 200 Prometheus text format
 ```
 
+The database's numbers (the package, version, size and download totals, and
+whether the database answers) are read at most once every 5 seconds and
+shared by all callers in between; a push, promotion or mirrored version on
+this server refreshes them at once. The counters since startup and the mirror
+states are always current.
+
 ```json
 {
   "status": "degraded",
