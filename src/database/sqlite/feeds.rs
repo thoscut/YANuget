@@ -3,7 +3,10 @@
 
 use sqlx::Row;
 
-use crate::database::{canonical_id, DatabaseStats, FeedVersion, VersionFootprint};
+use crate::database::{
+    canonical_id, AdminFilter, AdminOverview, AdminPackageSummary, DatabaseStats, FeedVersion,
+    VersionFootprint,
+};
 use crate::error::Result;
 use crate::models::Package;
 use crate::version::NuGetVersion;
@@ -138,6 +141,69 @@ pub(super) async fn all_package_ids(db: &SqliteDatabase, feed: &str) -> Result<V
     .fetch_all(&db.pool)
     .await?;
     Ok(rows.iter().map(|r| r.get::<String, _>("id")).collect())
+}
+
+pub(super) async fn admin_overview(
+    db: &SqliteDatabase,
+    feed: &str,
+    filter: AdminFilter,
+    skip: i64,
+    take: i64,
+) -> Result<AdminOverview> {
+    // Every membership counts, as in `all_package_ids`: the dashboard is
+    // where an operator finds what clients cannot see yet.
+    macro_rules! per_id {
+        () => {
+            "SELECT MAX(p.id) AS id, p.lower_id AS lower_id, COUNT(*) AS versions, \
+                    COALESCE(SUM(fp.pending), 0) AS pending, \
+                    COALESCE(SUM(fp.flagged), 0) AS flagged \
+             FROM packages p JOIN feed_packages fp \
+               ON fp.lower_id = p.lower_id AND fp.normalized_version = p.normalized_version \
+             WHERE fp.feed = ?1 \
+             GROUP BY p.lower_id"
+        };
+    }
+    let rows = sqlx::query(concat!(
+        "SELECT id, versions, pending, flagged FROM (",
+        per_id!(),
+        ") WHERE ?2 = 'all' OR (?2 = 'pending' AND pending > 0) \
+              OR (?2 = 'flagged' AND flagged > 0) \
+         ORDER BY pending > 0 DESC, flagged > 0 DESC, lower_id ASC LIMIT ?3 OFFSET ?4"
+    ))
+    .bind(feed)
+    .bind(filter.as_str())
+    .bind(take.max(0))
+    .bind(skip.max(0))
+    .fetch_all(&db.pool)
+    .await?;
+    let packages = rows
+        .iter()
+        .map(|r| -> Result<AdminPackageSummary> {
+            Ok(AdminPackageSummary {
+                id: r.try_get("id")?,
+                versions: r.try_get("versions")?,
+                pending: r.try_get("pending")?,
+                flagged: r.try_get("flagged")?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let counts = sqlx::query(concat!(
+        "SELECT COUNT(*) AS total, \
+                COALESCE(SUM(pending > 0), 0) AS pending, \
+                COALESCE(SUM(flagged > 0), 0) AS flagged FROM (",
+        per_id!(),
+        ")"
+    ))
+    .bind(feed)
+    .fetch_one(&db.pool)
+    .await?;
+    Ok(AdminOverview {
+        packages,
+        total: counts.try_get("total")?,
+        pending: counts.try_get("pending")?,
+        flagged: counts.try_get("flagged")?,
+    })
 }
 
 pub(super) async fn stats(db: &SqliteDatabase, feed: &str) -> Result<DatabaseStats> {
@@ -309,6 +375,93 @@ mod tests {
         assert_eq!(stats.total_downloads, 1);
         assert!(stats.total_size > 0);
         assert_eq!(stats.symbol_count, 0);
+    }
+
+    #[tokio::test]
+    async fn the_admin_overview_puts_pending_first_and_counts_every_version() {
+        let db = SqliteDatabase::in_memory().await.unwrap();
+        for (id, version) in [
+            ("Alpha", "1.0.0"),
+            ("Alpha", "1.1.0"),
+            ("Beta", "1.0.0"),
+            ("Zed", "1.0.0"),
+        ] {
+            db.add_to_feed(FEED, &sample(id, version)).await.unwrap();
+        }
+        let gated = |id: &str, version: &str, pending: bool, flagged: bool| {
+            let p = sample(id, version);
+            let m = Membership {
+                pending,
+                flagged,
+                ..Membership::active(FEED, &p)
+            };
+            (p, m)
+        };
+        for (p, m) in [
+            gated("Zed", "2.0.0", true, false),
+            gated("Beta", "2.0.0", false, true),
+            gated("Gamma", "1.0.0", true, true),
+        ] {
+            db.upsert_package_data(&p).await.unwrap();
+            db.add_membership(&m).await.unwrap();
+        }
+        // A disabled version is still one of the package's.
+        let v = NuGetVersion::parse("1.1.0").unwrap();
+        assert!(db.set_enabled(FEED, "alpha", &v, false).await.unwrap());
+        // Another feed's pending versions are not this one's.
+        let (p, mut m) = gated("Alpha", "9.0.0", true, true);
+        m.feed = "elsewhere".into();
+        db.upsert_package_data(&p).await.unwrap();
+        db.add_membership(&m).await.unwrap();
+
+        let all = db
+            .admin_overview(FEED, AdminFilter::All, 0, 10)
+            .await
+            .unwrap();
+        let row = |id: &str, versions, pending, flagged| AdminPackageSummary {
+            id: id.into(),
+            versions,
+            pending,
+            flagged,
+        };
+        assert_eq!(
+            all.packages,
+            vec![
+                row("Gamma", 1, 1, 1),
+                row("Zed", 2, 1, 0),
+                row("Beta", 2, 0, 1),
+                row("Alpha", 2, 0, 0),
+            ]
+        );
+        assert_eq!((all.total, all.pending, all.flagged), (4, 2, 2));
+
+        let ids = |o: &AdminOverview| o.packages.iter().map(|p| p.id.clone()).collect::<Vec<_>>();
+        let pending = db
+            .admin_overview(FEED, AdminFilter::Pending, 0, 10)
+            .await
+            .unwrap();
+        assert_eq!(ids(&pending), ["Gamma", "Zed"]);
+        assert_eq!(pending.matching(AdminFilter::Pending), 2);
+        let flagged = db
+            .admin_overview(FEED, AdminFilter::Flagged, 0, 10)
+            .await
+            .unwrap();
+        assert_eq!(ids(&flagged), ["Gamma", "Beta"]);
+        // The counts are the feed's, whatever the filter and the page.
+        assert_eq!((flagged.total, flagged.pending, flagged.flagged), (4, 2, 2));
+
+        let page = db
+            .admin_overview(FEED, AdminFilter::All, 1, 2)
+            .await
+            .unwrap();
+        assert_eq!(ids(&page), ["Zed", "Beta"]);
+        assert_eq!(page.total, 4);
+
+        let empty = db
+            .admin_overview("nothing", AdminFilter::All, 0, 10)
+            .await
+            .unwrap();
+        assert_eq!(empty, AdminOverview::default());
     }
 
     #[tokio::test]

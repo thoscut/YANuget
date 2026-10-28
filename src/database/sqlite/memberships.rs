@@ -3,7 +3,7 @@
 use chrono::Utc;
 use sqlx::{Row, SqliteConnection};
 
-use crate::database::{canonical_id, Membership, MembershipChange};
+use crate::database::{canonical_id, Membership, MembershipChange, StoredFeed};
 use crate::error::{Error, Result};
 use crate::version::NuGetVersion;
 
@@ -127,7 +127,29 @@ pub(super) async fn set_listed(
     listed: bool,
 ) -> Result<bool> {
     let result = sqlx::query(
-        "UPDATE feed_packages SET listed = ?4 WHERE feed = ?1 AND lower_id = ?2 AND normalized_version = ?3",
+        "UPDATE feed_packages SET listed = ?4, listing_set = 1 \
+         WHERE feed = ?1 AND lower_id = ?2 AND normalized_version = ?3",
+    )
+    .bind(feed)
+    .bind(canonical_id(id))
+    .bind(version.normalized())
+    .bind(i64::from(listed))
+    .execute(&db.pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+pub(super) async fn follow_upstream_listing(
+    db: &SqliteDatabase,
+    feed: &str,
+    id: &str,
+    version: &NuGetVersion,
+    listed: bool,
+) -> Result<bool> {
+    let result = sqlx::query(
+        "UPDATE feed_packages SET listed = ?4 \
+         WHERE feed = ?1 AND lower_id = ?2 AND normalized_version = ?3 \
+           AND listing_set = 0 AND listed <> ?4",
     )
     .bind(feed)
     .bind(canonical_id(id))
@@ -281,6 +303,113 @@ pub(super) async fn insert_membership(conn: &mut SqliteConnection, m: &Membershi
         Err(e) if is_unique_violation(&e) => Err(Error::PackageAlreadyExists),
         Err(e) => Err(Error::Database(e)),
     }
+}
+
+pub(super) async fn stored_feeds(db: &SqliteDatabase) -> Result<Vec<StoredFeed>> {
+    let rows = sqlx::query(
+        "SELECT name, SUM(versions) AS versions, SUM(exclusive) AS exclusive, \
+                SUM(tombstones) AS tombstones \
+         FROM ( \
+             SELECT fp.feed AS name, COUNT(*) AS versions, \
+                    SUM(NOT EXISTS (SELECT 1 FROM feed_packages o \
+                        WHERE o.lower_id = fp.lower_id \
+                          AND o.normalized_version = fp.normalized_version \
+                          AND o.feed <> fp.feed)) AS exclusive, \
+                    0 AS tombstones \
+             FROM feed_packages fp GROUP BY fp.feed \
+             UNION ALL \
+             SELECT feed, 0, 0, COUNT(*) FROM tombstones GROUP BY feed \
+         ) GROUP BY name ORDER BY name",
+    )
+    .fetch_all(&db.pool)
+    .await?;
+    rows.iter()
+        .map(|r| {
+            Ok(StoredFeed {
+                name: r.try_get("name")?,
+                versions: r.try_get("versions")?,
+                exclusive: r.try_get("exclusive")?,
+                tombstones: r.try_get("tombstones")?,
+            })
+        })
+        .collect()
+}
+
+pub(super) async fn shared_versions(conn: &mut SqliteConnection, a: &str, b: &str) -> Result<i64> {
+    Ok(sqlx::query_scalar(
+        "SELECT COUNT(*) FROM feed_packages x JOIN feed_packages y \
+           ON y.lower_id = x.lower_id AND y.normalized_version = x.normalized_version \
+         WHERE x.feed = ?1 AND y.feed = ?2",
+    )
+    .bind(a)
+    .bind(b)
+    .fetch_one(&mut *conn)
+    .await?)
+}
+
+pub(super) async fn rename_feed(db: &SqliteDatabase, from: &str, to: &str) -> Result<u64> {
+    let mut tx = db.write_tx().await?;
+    // Checked inside the transaction, so nothing lands in between.
+    let shared = shared_versions(&mut tx, from, to).await?;
+    if shared > 0 {
+        return Err(Error::BadRequest(format!(
+            "{shared} version(s) are in both {from:?} and {to:?}; remove them from one first"
+        )));
+    }
+    let moved = sqlx::query("UPDATE feed_packages SET feed = ?2 WHERE feed = ?1")
+        .bind(from)
+        .bind(to)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    // A version deleted from both keeps one tombstone. One deleted only from
+    // the new name but held under the old is held now, which a membership
+    // and a tombstone together never say.
+    sqlx::query("UPDATE OR IGNORE tombstones SET feed = ?2 WHERE feed = ?1")
+        .bind(from)
+        .bind(to)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM tombstones WHERE feed = ?1")
+        .bind(from)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "DELETE FROM tombstones WHERE feed = ?1 AND EXISTS (SELECT 1 FROM feed_packages fp \
+           WHERE fp.feed = ?1 AND fp.lower_id = tombstones.lower_id \
+             AND fp.normalized_version = tombstones.normalized_version)",
+    )
+    .bind(to)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("UPDATE uploads SET feed = ?2 WHERE feed = ?1")
+        .bind(from)
+        .bind(to)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(moved)
+}
+
+pub(super) async fn feed_members(
+    db: &SqliteDatabase,
+    feed: &str,
+) -> Result<Vec<(String, NuGetVersion)>> {
+    let rows = sqlx::query(
+        "SELECT lower_id, normalized_version FROM feed_packages WHERE feed = ?1 \
+         ORDER BY lower_id, normalized_version",
+    )
+    .bind(feed)
+    .fetch_all(&db.pool)
+    .await?;
+    rows.iter()
+        .map(|r| {
+            let version: String = r.try_get("normalized_version")?;
+            let version = NuGetVersion::parse_stored(&version)
+                .map_err(|e| Error::InvalidVersion(e.to_string()))?;
+            Ok((r.try_get("lower_id")?, version))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -456,5 +585,74 @@ mod tests {
         assert!(db.set_enabled(FEED, "pkg", &v1, true).await.unwrap());
         assert!(db.is_servable(FEED, "pkg", &v1).await.unwrap());
         assert_eq!(db.find_versions(FEED, "pkg", true).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_rename_moves_memberships_tombstones_and_uploads() {
+        let db = SqliteDatabase::in_memory().await.unwrap();
+        let (a, b) = (sample("Moved.Pkg", "1.0.0"), sample("Moved.Pkg", "2.0.0"));
+        db.add_to_feed("old", &a).await.unwrap();
+        db.set_enabled("old", "moved.pkg", &a.version, false)
+            .await
+            .unwrap();
+        db.add_tombstone("old", "moved.pkg", &b.version)
+            .await
+            .unwrap();
+        // Deleted from the new name, but still held under the old one.
+        db.add_tombstone("new", "moved.pkg", &a.version)
+            .await
+            .unwrap();
+        db.create_upload(&UploadSession {
+            id: "up".into(),
+            feed: "old".into(),
+            lower_id: "moved.pkg".into(),
+            normalized_version: "1.0.0".into(),
+            name: "f.iso".into(),
+            length: 1,
+            received: 0,
+            expected_sha256: None,
+            expires: Utc::now(),
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(db.rename_feed("old", "new").await.unwrap(), 1);
+        // The state comes along.
+        let moved = db.get_membership("new", "moved.pkg", &a.version).await;
+        assert!(!moved.unwrap().unwrap().enabled);
+        assert!(!db.exists("old", "moved.pkg", &a.version).await.unwrap());
+        assert!(db
+            .is_tombstoned("new", "moved.pkg", &b.version)
+            .await
+            .unwrap());
+        assert!(!db
+            .is_tombstoned("new", "moved.pkg", &a.version)
+            .await
+            .unwrap());
+        assert!(!db
+            .is_tombstoned("old", "moved.pkg", &b.version)
+            .await
+            .unwrap());
+        assert_eq!(db.get_upload("up").await.unwrap().unwrap().feed, "new");
+        assert!(db
+            .stored_feeds()
+            .await
+            .unwrap()
+            .iter()
+            .all(|f| f.name == "new"));
+    }
+
+    #[tokio::test]
+    async fn a_rename_onto_a_feed_holding_the_same_version_is_refused() {
+        let db = SqliteDatabase::in_memory().await.unwrap();
+        let p = sample("Both.Pkg", "1.0.0");
+        db.add_to_feed("old", &p).await.unwrap();
+        db.add_to_feed("new", &p).await.unwrap();
+        assert_eq!(db.shared_versions("old", "new").await.unwrap(), 1);
+        assert!(matches!(
+            db.rename_feed("old", "new").await,
+            Err(Error::BadRequest(_))
+        ));
+        assert!(db.exists("old", "both.pkg", &p.version).await.unwrap());
     }
 }

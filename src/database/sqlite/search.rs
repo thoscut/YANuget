@@ -1,11 +1,14 @@
 //! Search, autocomplete and the tag cloud: the FTS5 index (`search_text`,
 //! `search_keys`) and `package_tags`, scoped to a feed.
 
+use std::collections::hash_map::Entry;
+
 use sqlx::Row;
 
 use crate::database::{canonical_id, SearchGroup, SearchPage, SearchRequest, SearchSort, TagCount};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::models::Package;
+use crate::version::NuGetVersion;
 
 use super::packages::row_to_feed_package;
 use super::{placeholders, SqliteDatabase, ID_CHUNK};
@@ -147,16 +150,28 @@ pub(super) async fn search(
         .fetch_one(&db.pool)
         .await?;
 
-    // Phase 2: load every visible version for the chosen ids.
-    let groups = load_groups(
-        db,
-        feed,
-        &ids,
-        request.include_prerelease,
-        request.include_semver2,
-        true,
-    )
-    .await?;
+    // Phase 2: load every visible version for the chosen ids, or only what a
+    // gallery row shows of them.
+    let groups = if request.headlines_only {
+        load_headlines(
+            db,
+            feed,
+            &ids,
+            request.include_prerelease,
+            request.include_semver2,
+        )
+        .await?
+    } else {
+        load_groups(
+            db,
+            feed,
+            &ids,
+            request.include_prerelease,
+            request.include_semver2,
+            true,
+        )
+        .await?
+    };
 
     Ok(SearchPage { total_hits, groups })
 }
@@ -301,26 +316,7 @@ pub(super) async fn load_groups(
             let package = row_to_feed_package(&row)?.package;
             by_id.entry(package.lower_id()).or_default().push(package);
         }
-
-        // A package's total counts every version the feed serves, not
-        // only those this search's filters admitted: `totalDownloads` is
-        // the package's figure, and it used to shrink when a client left
-        // out pre-releases.
-        let id_params = super::placeholders(2, chunk.len());
-        let sql = format!(
-            "SELECT lower_id, COALESCE(SUM(downloads), 0) AS total FROM feed_packages \
-             WHERE feed = ?1 AND enabled = 1 AND pending = 0 \
-               AND lower_id IN ({id_params}) \
-             GROUP BY lower_id"
-        );
-        let mut query = sqlx::query(&sql).bind(feed);
-        for id in chunk {
-            query = query.bind(id);
-        }
-        for row in query.fetch_all(&db.pool).await? {
-            let total: i64 = row.try_get("total")?;
-            totals.insert(row.try_get("lower_id")?, total.max(0) as u64);
-        }
+        download_totals(db, feed, chunk, &mut totals).await?;
     }
 
     // Emit in the order the caller asked for — that order is the search
@@ -330,12 +326,166 @@ pub(super) async fn load_groups(
         if let Some(mut packages) = by_id.remove(id) {
             packages.sort_by(|a, b| a.version.cmp(&b.version));
             groups.push(SearchGroup {
+                version_count: packages.len() as u64,
                 packages,
                 total_downloads: totals.get(id).copied().unwrap_or(0),
             });
         }
     }
     Ok(groups)
+}
+
+/// [`load_groups`] for a page that shows one version per id: each id's
+/// [headline](SearchGroup::headline), how many versions are visible, and the
+/// download total. Always listed versions only, as search shows.
+///
+/// The versions are read as bare keys, and only the headlines in full: a
+/// package with hundreds of versions no longer sends hundreds of rows of
+/// descriptions, release notes and dependency lists to show one of them.
+pub(super) async fn load_headlines(
+    db: &SqliteDatabase,
+    feed: &str,
+    ids: &[String],
+    include_prerelease: bool,
+    include_semver2: bool,
+) -> Result<Vec<SearchGroup>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Per id: the headline so far (parsed and as stored) and how many
+    // versions are visible.
+    let mut heads: std::collections::HashMap<String, (NuGetVersion, String, u64)> =
+        std::collections::HashMap::with_capacity(ids.len());
+    let mut by_id: std::collections::HashMap<String, Package> =
+        std::collections::HashMap::with_capacity(ids.len());
+    let mut totals: std::collections::HashMap<String, u64> =
+        std::collections::HashMap::with_capacity(ids.len());
+
+    for chunk in ids.chunks(ID_CHUNK) {
+        // The same visibility as `load_groups` with `listed_only`. Versions
+        // cannot be ordered in SQL, so the headline is picked here, by the
+        // rule `SearchGroup::headline` applies.
+        let sql = format!(
+            "SELECT p.lower_id AS lower_id, p.normalized_version AS normalized_version, \
+                    p.original_version AS original_version \
+             FROM packages p JOIN feed_packages fp \
+               ON fp.lower_id = p.lower_id AND fp.normalized_version = p.normalized_version \
+             WHERE fp.feed = ?1 AND fp.listed = 1 AND fp.enabled = 1 AND fp.pending = 0 \
+               AND (?2 = 1 OR p.is_prerelease = 0) \
+               AND (?3 = 1 OR p.is_semver2 = 0) \
+               AND fp.lower_id IN ({})",
+            placeholders(4, chunk.len())
+        );
+        let mut query = sqlx::query(&sql)
+            .bind(feed)
+            .bind(i64::from(include_prerelease))
+            .bind(i64::from(include_semver2));
+        for id in chunk {
+            query = query.bind(id);
+        }
+        for row in query.fetch_all(&db.pool).await? {
+            let original: String = row.try_get("original_version")?;
+            let version = NuGetVersion::parse_stored(&original)
+                .map_err(|e| Error::InvalidVersion(e.to_string()))?;
+            let normalized: String = row.try_get("normalized_version")?;
+            match heads.entry(row.try_get("lower_id")?) {
+                Entry::Vacant(e) => {
+                    e.insert((version, normalized, 1));
+                }
+                Entry::Occupied(mut e) => {
+                    let (head, head_normalized, count) = e.get_mut();
+                    *count += 1;
+                    // A stable version beats any pre-release; otherwise the
+                    // higher one wins.
+                    let better = match (version.is_prerelease(), head.is_prerelease()) {
+                        (false, true) => true,
+                        (true, false) => false,
+                        _ => version > *head,
+                    };
+                    if better {
+                        *head = version;
+                        *head_normalized = normalized;
+                    }
+                }
+            }
+        }
+
+        // The headlines in full, by key. Two parameters each, so a full
+        // chunk still stays under the 999 of old SQLite builds.
+        let keys: Vec<(&String, &String)> = chunk
+            .iter()
+            .filter_map(|id| heads.get(id).map(|(_, v, _)| (id, v)))
+            .collect();
+        if !keys.is_empty() {
+            let pairs = (0..keys.len())
+                .map(|i| format!("(?{},?{})", 2 + 2 * i, 3 + 2 * i))
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                concat!(
+                    feed_select!(),
+                    " WHERE fp.feed = ?1 \
+                       AND (fp.lower_id, fp.normalized_version) IN (VALUES {pairs})"
+                ),
+                pairs = pairs
+            );
+            // As in `load_groups`, only generated placeholders are formatted
+            // in; the keys are bound.
+            let mut query = sqlx::query(&sql).bind(feed);
+            for (id, version) in &keys {
+                query = query.bind(*id).bind(*version);
+            }
+            for row in query.fetch_all(&db.pool).await? {
+                let package = row_to_feed_package(&row)?.package;
+                by_id.insert(package.lower_id(), package);
+            }
+        }
+
+        download_totals(db, feed, chunk, &mut totals).await?;
+    }
+
+    // In the caller's order, which is the ranking.
+    let mut groups = Vec::with_capacity(ids.len());
+    for id in ids {
+        if let (Some(package), Some((_, _, count))) = (by_id.remove(id), heads.get(id)) {
+            groups.push(SearchGroup {
+                packages: vec![package],
+                version_count: *count,
+                total_downloads: totals.get(id).copied().unwrap_or(0),
+            });
+        }
+    }
+    Ok(groups)
+}
+
+/// Add the download totals of a chunk of ids to `totals`.
+///
+/// A package's total counts every version the feed serves, not only those a
+/// search's filters admitted: `totalDownloads` is the package's figure, and it
+/// used to shrink when a client left out pre-releases.
+async fn download_totals(
+    db: &SqliteDatabase,
+    feed: &str,
+    chunk: &[String],
+    totals: &mut std::collections::HashMap<String, u64>,
+) -> Result<()> {
+    let id_params = placeholders(2, chunk.len());
+    let sql = format!(
+        "SELECT lower_id, COALESCE(SUM(downloads), 0) AS total FROM feed_packages \
+         WHERE feed = ?1 AND enabled = 1 AND pending = 0 \
+           AND lower_id IN ({id_params}) \
+         GROUP BY lower_id"
+    );
+    let mut query = sqlx::query(&sql).bind(feed);
+    for id in chunk {
+        query = query.bind(id);
+    }
+    for row in query.fetch_all(&db.pool).await? {
+        let total: i64 = row.try_get("total")?;
+        totals.insert(row.try_get("lower_id")?, total.max(0) as u64);
+    }
+    Ok(())
 }
 
 /// The longest search query acted on, in characters. Longer ones are cut:
@@ -371,7 +521,7 @@ fn like_pattern(query: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::super::test_support::*;
-    use super::load_groups;
+    use super::{load_groups, load_headlines};
 
     #[tokio::test]
     async fn the_tag_filter_and_counts_see_packages_not_versions() {
@@ -650,6 +800,103 @@ mod tests {
         assert_eq!(groups[0].latest().lower_id(), "beta.pkg");
 
         assert!(load_groups(&db, FEED, &[], true, true, false)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    /// A headlines-only search shows what a full one does: the same ids in the
+    /// same order, the same headline, and the same version and download
+    /// counts — only without loading every version.
+    #[tokio::test]
+    async fn headlines_match_the_full_groups() {
+        let db = SqliteDatabase::in_memory().await.unwrap();
+        for (id, version) in [
+            ("Stable.Pkg", "1.0.0"),
+            ("Stable.Pkg", "1.10.0"),
+            ("Stable.Pkg", "1.9.0"),
+            ("Stable.Pkg", "2.0.0-beta"),
+            ("Pre.Pkg", "0.1.0-alpha"),
+            ("Pre.Pkg", "0.1.0-beta"),
+            ("Hidden.Pkg", "3.0.0"),
+            ("Hidden.Pkg", "3.1.0"),
+        ] {
+            db.add_to_feed(FEED, &sample(id, version)).await.unwrap();
+        }
+        let v = |s: &str| NuGetVersion::parse(s).unwrap();
+        // An unlisted version is neither the headline nor counted, but its
+        // downloads are the package's.
+        assert!(db
+            .set_listed(FEED, "hidden.pkg", &v("3.1.0"), false)
+            .await
+            .unwrap());
+        for _ in 0..3 {
+            db.increment_downloads(FEED, "hidden.pkg", &v("3.1.0"))
+                .await
+                .unwrap();
+        }
+        db.increment_downloads(FEED, "stable.pkg", &v("2.0.0-beta"))
+            .await
+            .unwrap();
+
+        let ids: Vec<String> = ["pre.pkg", "stable.pkg", "nope.pkg", "hidden.pkg"]
+            .map(String::from)
+            .to_vec();
+        let shown = |groups: &[SearchGroup]| {
+            groups
+                .iter()
+                .map(|g| {
+                    (
+                        g.headline().lower_id(),
+                        g.headline().normalized_version(),
+                        g.version_count(),
+                        g.total_downloads(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        for prerelease in [true, false] {
+            let full = load_groups(&db, FEED, &ids, prerelease, true, true)
+                .await
+                .unwrap();
+            let heads = load_headlines(&db, FEED, &ids, prerelease, true)
+                .await
+                .unwrap();
+            assert_eq!(shown(&heads), shown(&full), "prerelease: {prerelease}");
+            assert!(heads.iter().all(|g| g.packages.len() == 1));
+        }
+
+        // The figures themselves, so the two cannot agree on a wrong answer.
+        let heads = load_headlines(&db, FEED, &ids, true, true).await.unwrap();
+        assert_eq!(
+            shown(&heads),
+            [
+                ("pre.pkg".to_string(), "0.1.0-beta".to_string(), 2, 0),
+                ("stable.pkg".to_string(), "1.10.0".to_string(), 4, 1),
+                ("hidden.pkg".to_string(), "3.0.0".to_string(), 1, 3),
+            ]
+        );
+
+        // Through search, the page and its count are the full search's.
+        let request = SearchRequest {
+            sort: SearchSort::Name,
+            ..Default::default()
+        };
+        let full = db.search(FEED, &request).await.unwrap();
+        let heads = db
+            .search(
+                FEED,
+                &SearchRequest {
+                    headlines_only: true,
+                    ..request
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(heads.total_hits, full.total_hits);
+        assert_eq!(shown(&heads.groups), shown(&full.groups));
+
+        assert!(load_headlines(&db, FEED, &[], true, true)
             .await
             .unwrap()
             .is_empty());

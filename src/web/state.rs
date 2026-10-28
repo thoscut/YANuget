@@ -2,9 +2,10 @@
 //! with, the cross-feed [`FeedMeta`] registry, and the cloneable [`AppState`]
 //! every handler receives.
 
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use axum::http::{header, HeaderMap};
 
@@ -18,6 +19,7 @@ use crate::mirror::{self, MirrorClient, MirrorOptions};
 use crate::nuget::UrlBuilder;
 use crate::retention;
 use crate::storage::{PackageStorage, TempPath};
+use crate::streaming::{Reservation, Reservations};
 use crate::version::NuGetVersion;
 
 /// The resolved, ready-to-serve context for a single feed: its identity, its
@@ -197,6 +199,9 @@ pub struct AppState {
     pub feed: Arc<FeedContext>,
     pub(super) feeds: Arc<Vec<FeedMeta>>,
     pub(super) temp_dir: PathBuf,
+    /// The space promised to uploads in progress into `temp_dir`, shared by
+    /// every feed that writes there.
+    pub(super) reservations: Arc<Reservations>,
 }
 
 impl AppState {
@@ -230,6 +235,7 @@ impl AppState {
         tokio::fs::create_dir_all(&temp_dir).await?;
         sweep_stale_uploads(&temp_dir).await;
         let feed = Arc::new(FeedContext::from_resolved(resolved, &config)?);
+        let reservations = reservations_for(&temp_dir);
         Ok(Self {
             storage,
             db,
@@ -237,6 +243,7 @@ impl AppState {
             feed,
             feeds,
             temp_dir,
+            reservations,
         })
     }
 
@@ -272,17 +279,38 @@ impl AppState {
         UrlBuilder::with_prefix(root, &self.feed.prefix).with_icons(self.config.enable_web_ui)
     }
 
-    /// Refuse an upload of `incoming` bytes (when the client declared a size)
-    /// that would leave the storage volume with less than
-    /// `min_free_disk_bytes` free.
+    /// Admit an upload of `incoming` bytes (when the client declared a size),
+    /// or refuse it when it would leave the storage volume with less than
+    /// `min_free_disk_bytes` free. The returned reservation holds the bytes
+    /// until they are written or it is dropped (see [`Reservations`]).
     ///
     /// A full disk does not fail cleanly: the database, the temp file and every
     /// other writer on the volume run out together, mid-write. Saying no up
-    /// front costs one `statvfs`. With no declared size (a chunked body) only
-    /// the reserve itself is checked; the size limit and the idle timeout bound
-    /// the rest. When free space cannot be measured the upload is let through,
-    /// since a guard that fails closed would take the feed down with it.
-    pub(super) fn ensure_disk_space(&self, incoming: Option<u64>) -> Result<()> {
+    /// front costs one `statvfs`. What is promised counts as used: the bytes
+    /// other uploads in progress declared and have not written, and what the
+    /// resumable uploads still open have yet to receive. With no declared size
+    /// (a chunked body) only the rest is checked; the size limit, the idle
+    /// timeout and [`Self::reserve_guard`] bound the body. When free space
+    /// cannot be measured the upload is let through, since a guard that fails
+    /// closed would take the feed down with it.
+    pub(super) async fn reserve_disk_space(&self, incoming: Option<u64>) -> Result<Reservation> {
+        let reservation = self.reservations.reserve(incoming.unwrap_or(0));
+        self.check_disk_space(incoming.unwrap_or(0)).await?;
+        Ok(reservation)
+    }
+
+    /// The check of [`Self::reserve_disk_space`] for more bytes of a resumable
+    /// upload, which its row already promises: an [offset](Reservations::offset)
+    /// for the request that writes them.
+    pub(super) async fn resume_disk_space(&self) -> Result<Reservation> {
+        let reservation = self.reservations.offset();
+        self.check_disk_space(0).await?;
+        Ok(reservation)
+    }
+
+    /// Whether the volume has room for everything promised, `incoming` (part
+    /// of it) included, and the reserve.
+    async fn check_disk_space(&self, incoming: u64) -> Result<()> {
         let reserve = self.config.min_free_disk_bytes;
         if reserve == 0 {
             return Ok(());
@@ -294,11 +322,15 @@ impl AppState {
                 return Ok(());
             }
         };
-        let needed = incoming.unwrap_or(0).saturating_add(reserve);
+        let resumable = self.db.outstanding_upload_bytes(chrono::Utc::now()).await?;
+        let promised = (self.reservations.promised() as i128 + resumable as i128).max(0) as u64;
+        let others = promised.saturating_sub(incoming);
+        let needed = promised.max(incoming).saturating_add(reserve);
         if available < needed {
             return Err(Error::InsufficientStorage(format!(
                 "{available} bytes free on the storage volume, {needed} needed \
-                 (the upload plus the configured reserve)"
+                 (the upload, {others} promised to other uploads in progress, \
+                 and the configured reserve)"
             )));
         }
         Ok(())
@@ -306,15 +338,17 @@ impl AppState {
 
     /// `writer`, made to fail part-way once the storage volume drops below
     /// `min_free_disk_bytes` (see [`streaming::DiskReserve`]): the check
-    /// [`Self::ensure_disk_space`] makes up front cannot see a body that
-    /// declared no size.
+    /// [`Self::reserve_disk_space`] makes up front cannot see a body that
+    /// declared no size. What goes through is taken off `reservation`.
     ///
     /// [`streaming::DiskReserve`]: crate::streaming::DiskReserve
     pub(super) fn reserve_guard<'a, W>(
         &'a self,
         writer: &'a mut W,
+        reservation: &'a Reservation,
     ) -> crate::streaming::DiskReserve<'a, W> {
         crate::streaming::DiskReserve::new(writer, &self.temp_dir, self.config.min_free_disk_bytes)
+            .counting(reservation)
     }
 
     /// Create a fresh temp file for an incoming upload, removed again when the
@@ -469,6 +503,18 @@ impl AppState {
             tracing::warn!(feed = %self.feed(), id, version = %version.normalized(), error = %e, "mirror fetch failed");
         }
     }
+}
+
+/// The [`Reservations`] of the uploads directory `temp_dir`: one for every
+/// feed state built on it, since the feeds share the volume.
+fn reservations_for(temp_dir: &Path) -> Arc<Reservations> {
+    static ALL: LazyLock<std::sync::Mutex<HashMap<PathBuf, Arc<Reservations>>>> =
+        LazyLock::new(Default::default);
+    ALL.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(temp_dir.to_path_buf())
+        .or_default()
+        .clone()
 }
 
 /// Delete upload temp files left over from a previous run.

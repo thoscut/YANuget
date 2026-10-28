@@ -213,6 +213,7 @@ enabled = true                      # YANUGET_FILES_ENABLED
 # max_file_size_bytes = 107374182400  # YANUGET_FILES_MAX_FILE_SIZE_BYTES (100 GiB)
 allowed_extensions = ["wim", "swm", "esd", "iso", "vhd", "vhdx", "zip", "7z", "cab"]  # YANUGET_FILES_ALLOWED_EXTENSIONS
 upload_expiry_hours = 72            # YANUGET_FILES_UPLOAD_EXPIRY_HOURS — unfinished resumable uploads
+max_open_uploads = 32               # YANUGET_FILES_MAX_OPEN_UPLOADS — unfinished resumable uploads per feed (0 = no limit)
 # An inbox the host's sshd writes to: {inbox}/{feed}/{id}/{version}/{name}
 # plus {name}.sha256 (sha256sum format) once the file is complete. Must not be
 # inside the package store.

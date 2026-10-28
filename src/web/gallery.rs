@@ -54,6 +54,29 @@ fn gallery_tag(raw: Option<&str>) -> Option<String> {
     plausible.then_some(tag)
 }
 
+/// The page of a paged list that `skip`, `take` and `page` ask for, as
+/// `(skip, take)`: what the gallery and the admin dashboard read.
+pub(super) fn page_window(
+    skip: Option<&str>,
+    take: Option<&str>,
+    page: Option<&str>,
+    default_take: i64,
+) -> (i64, i64) {
+    // No larger than the pager offers: every package on a page is rows to
+    // load, and an anonymous `?take=1000` asked for a thousand of them.
+    let max_take = ui::MAX_PAGE_SIZE.max(default_take).min(MAX_SEARCH_TAKE);
+    let take = lenient(take).unwrap_or(default_take).clamp(1, max_take);
+    // `page` wins over `skip`, and either way the offset snaps to the start of
+    // a page. That makes "page N" one exact page, and it is what lets the
+    // page-size form send the current `skip`: at the new size, the page shown
+    // is the one holding the package that was first on screen.
+    let skip = match lenient::<i64>(page) {
+        Some(page) => (page.max(1) - 1).saturating_mul(take),
+        None => lenient(skip).unwrap_or(0).max(0),
+    };
+    (skip - skip % take, take)
+}
+
 pub(super) async fn gallery(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -62,20 +85,12 @@ pub(super) async fn gallery(
     state.require_read(&headers)?;
     let query = params.q.unwrap_or_default();
     let default_take = state.config.gallery_page_size.max(1);
-    // No larger than the pager offers: every package on a page loads all of
-    // its versions.
-    let max_take = ui::MAX_PAGE_SIZE.max(default_take).min(MAX_SEARCH_TAKE);
-    let take = lenient(params.take.as_deref())
-        .unwrap_or(default_take)
-        .clamp(1, max_take);
-    // `page` wins over `skip`, and either way the offset snaps to the start of
-    // a page. That makes "page N" one exact page, and it is what lets the
-    // page-size form send the current `skip`: at the new size, the page shown
-    // is the one holding the package that was first on screen.
-    let skip = match lenient::<i64>(params.page.as_deref()) {
-        Some(page) => (page.max(1) - 1).saturating_mul(take),
-        None => lenient(params.skip.as_deref()).unwrap_or(0).max(0),
-    };
+    let (skip, take) = page_window(
+        params.skip.as_deref(),
+        params.take.as_deref(),
+        params.page.as_deref(),
+        default_take,
+    );
     let prerelease = lenient::<bool>(params.prerelease.as_deref());
     let package_type = params.package_type.filter(|s| !s.is_empty());
     // An unknown order is the default one, like every other gallery value.
@@ -87,13 +102,15 @@ pub(super) async fn gallery(
     let tag = gallery_tag(params.tag.as_deref());
     let request = SearchRequest {
         query: query.clone(),
-        skip: skip - skip % take,
+        skip,
         take,
         include_prerelease: prerelease.unwrap_or(true),
         include_semver2: true,
         package_type: package_type.clone(),
         sort,
         tag: tag.clone(),
+        // A row shows the headline and how many versions there are.
+        headlines_only: true,
     };
     let page = state.db.search(state.feed(), &request).await?;
     // The landing page (no search, no filter, first page) offers a way in by
@@ -169,6 +186,7 @@ pub(super) async fn stats_page(
             state.feed(),
             &SearchRequest {
                 take: 10,
+                headlines_only: true,
                 ..Default::default()
             },
         )

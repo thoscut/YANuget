@@ -102,6 +102,11 @@ const MIGRATIONS: &[Migration] = &[
         description: "mark versions with a SemVer 2.0.0 dependency range as SemVer 2.0.0",
         step: Step::SemVer2Dependencies,
     },
+    Migration {
+        version: 9,
+        description: "record which memberships had their listing set by hand",
+        step: Step::ListingSet,
+    },
 ];
 
 /// What a [`Migration`] runs. An enum rather than a function pointer in the
@@ -117,6 +122,7 @@ enum Step {
     DropDeadColumns,
     AddForeignKeys,
     SemVer2Dependencies,
+    ListingSet,
 }
 
 async fn apply(step: Step, c: &mut SqliteConnection) -> Result<()> {
@@ -129,6 +135,7 @@ async fn apply(step: Step, c: &mut SqliteConnection) -> Result<()> {
         Step::DropDeadColumns => drop_dead_columns(c).await,
         Step::AddForeignKeys => add_foreign_keys(c).await,
         Step::SemVer2Dependencies => semver2_dependencies(c).await,
+        Step::ListingSet => listing_set(c).await,
     }
 }
 
@@ -937,6 +944,37 @@ async fn semver2_dependencies(c: &mut SqliteConnection) -> Result<()> {
             "marked versions with a SemVer 2.0.0 dependency range as SemVer 2.0.0"
         );
     }
+    Ok(())
+}
+
+/// Step 9: `feed_packages.listing_set`, whether the membership's `listed`
+/// was set by hand (an unlist or relist through the API) rather than taken
+/// from a mirror's upstream. A mirror follows the upstream's listing on
+/// every refresh, but only while it is unset.
+///
+/// A column added in place rather than a rebuild: every database reaches
+/// this step with the definition step 7 wrote, so the text it leaves is the
+/// same everywhere. Versions unlisted now are marked as set by hand, since
+/// nothing tells an unlist by a person from one a mirror copied, and
+/// relisting what a person hid is the worse mistake; one only the upstream
+/// unlisted then stays unlisted here if the upstream relists it, as before.
+async fn listing_set(c: &mut SqliteConnection) -> Result<()> {
+    // Only a database whose number was turned back by hand (as the tests of
+    // step 8 do) has the column already; its marks stand.
+    let present: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('feed_packages') WHERE name = 'listing_set'",
+    )
+    .fetch_one(&mut *c)
+    .await?;
+    if present > 0 {
+        return Ok(());
+    }
+    sqlx::raw_sql(
+        "ALTER TABLE feed_packages ADD COLUMN listing_set INTEGER NOT NULL DEFAULT 0;
+         UPDATE feed_packages SET listing_set = 1 WHERE listed = 0;",
+    )
+    .execute(&mut *c)
+    .await?;
     Ok(())
 }
 

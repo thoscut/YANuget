@@ -1644,6 +1644,7 @@ async fn files_dropped_in_the_inbox_are_verified_and_attached() {
         feed_extensions: &Default::default(),
         max_file_size: None,
         feeds: &feeds,
+        pending_only: &[],
         staging: &staging,
         min_free_disk_bytes: 0,
     };
@@ -1869,6 +1870,33 @@ async fn admin_requires_authentication() {
         .await
         .unwrap();
     assert!(ok.status().is_success());
+}
+
+#[tokio::test]
+async fn the_admin_dashboard_filters_and_reads_its_query_leniently() {
+    let server = spawn_admin().await;
+    push_multipart(&server, API_KEY, build_nupkg("Dash.Pkg", "1.0.0", b"data")).await;
+    let get = |path: &'static str| {
+        let request = server
+            .client
+            .get(server.url(path))
+            .basic_auth("admin", Some(ADMIN_KEY));
+        async move {
+            let resp = request.send().await.unwrap();
+            assert!(resp.status().is_success(), "{path}: {}", resp.status());
+            resp.text().await.unwrap()
+        }
+    };
+    // An unknown filter and a mistyped page size are the defaults, not a 400.
+    let all = get("/admin?filter=bogus&take=&page=x").await;
+    assert!(all.contains("/admin/packages/dash.pkg"), "{all}");
+    assert!(all.contains("aria-current=\"true\">All (1)</a>"), "{all}");
+    let pending = get("/admin?filter=pending").await;
+    assert!(
+        pending.contains("No version waits for approval"),
+        "{pending}"
+    );
+    assert!(!pending.contains("/admin/packages/dash.pkg"), "{pending}");
 }
 
 #[tokio::test]
@@ -2801,6 +2829,207 @@ async fn approving_from_the_admin_page_approves_the_build_it_showed() {
     let approved = approve(format!("{}&{}", admin_body(ADMIN_KEY), shown_build().await))
         .await
         .unwrap();
+    assert_eq!(approved.status(), reqwest::StatusCode::SEE_OTHER);
+    assert!(server
+        .client
+        .get(&index)
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .is_success());
+}
+
+/// A gated `pending-only` feed `gated` holding `Ring.Pkg` 1.0.0, pending.
+async fn spawn_gated_pending_only() -> TestServer {
+    let server = spawn_feeds(|c| {
+        c.api_key = Some(API_KEY.into());
+        c.admin_api_key = Some(ADMIN_KEY.into());
+        let mut gated = feed("gated");
+        gated.requires_approval = true;
+        gated.allow_overwrite = Some(yanuget::config::OverwriteMode::PendingOnly);
+        c.feeds = vec![gated];
+    })
+    .await;
+    let pushed = push_to(
+        &server,
+        "/gated/api/v2/package",
+        API_KEY,
+        build_nupkg("Ring.Pkg", "1.0.0", b"x"),
+    )
+    .await;
+    assert_eq!(pushed.status(), reqwest::StatusCode::CREATED);
+    server
+}
+
+/// Attach `body` as `name` to `Ring.Pkg` 1.0.0 in `gated`, with the push key
+/// and, if `admin`, the admin key too.
+async fn put_gated_file(
+    server: &TestServer,
+    name: &str,
+    body: Vec<u8>,
+    admin: bool,
+) -> reqwest::StatusCode {
+    let mut req = server
+        .client
+        .put(server.url(&format!("/gated/api/v2/files/Ring.Pkg/1.0.0/{name}")))
+        .header("X-NuGet-ApiKey", API_KEY)
+        .body(body);
+    if admin {
+        req = req.basic_auth("admin", Some(ADMIN_KEY));
+    }
+    req.send().await.unwrap().status()
+}
+
+/// The `build` and `files` fields the admin page of `Ring.Pkg` shows for its
+/// pending version, form-encoded.
+async fn shown_review_fields(server: &TestServer) -> String {
+    let page = server
+        .client
+        .get(server.url("/gated/admin/packages/ring.pkg"))
+        .basic_auth("admin", Some(ADMIN_KEY))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let field = |name: &str| {
+        let marker = format!("name=\"{name}\" value=\"");
+        let start = page.find(&marker).expect("the page shows the field") + marker.len();
+        let value = page[start..].split('"').next().unwrap();
+        assert!(value.starts_with("1.0.0:"), "{value}");
+        format!(
+            "{name}={}",
+            value
+                .replace('+', "%2B")
+                .replace('/', "%2F")
+                .replace('=', "%3D")
+                .replace(':', "%3A")
+        )
+    };
+    format!("{}&{}", field("build"), field("files"))
+}
+
+/// Under `pending-only` a version approved anywhere stays as it is, and the
+/// package hash does not cover its files: the push key can no longer change
+/// them; the admin key still can.
+#[tokio::test]
+async fn the_files_of_an_approved_version_change_only_with_the_admin_key() {
+    let server = spawn_gated_pending_only().await;
+    // While pending, the push key attaches and detaches as it likes.
+    assert_eq!(
+        put_gated_file(&server, "setup.zip", image_bytes(1), false).await,
+        reqwest::StatusCode::CREATED
+    );
+    let approved = no_redirect()
+        .post(server.url("/gated/admin/packages/ring.pkg/1.0.0/approve"))
+        .basic_auth("admin", Some(ADMIN_KEY))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(admin_body(ADMIN_KEY))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(approved.status(), reqwest::StatusCode::SEE_OTHER);
+
+    // Approved: no new file, no detach, no resumable upload with the push key.
+    assert_eq!(
+        put_gated_file(&server, "other.zip", image_bytes(2), false).await,
+        reqwest::StatusCode::FORBIDDEN
+    );
+    let file = server.url("/gated/api/v2/files/Ring.Pkg/1.0.0/setup.zip");
+    let detach = |admin: bool| {
+        let mut req = server
+            .client
+            .delete(&file)
+            .header("X-NuGet-ApiKey", API_KEY);
+        if admin {
+            req = req.basic_auth("admin", Some(ADMIN_KEY));
+        }
+        req.send()
+    };
+    assert_eq!(
+        detach(false).await.unwrap().status(),
+        reqwest::StatusCode::FORBIDDEN
+    );
+    let created = tus(no_redirect().post(server.url("/gated/api/v2/uploads")))
+        .header("Upload-Length", "10")
+        .header(
+            "Upload-Metadata",
+            tus_metadata(&[
+                ("id", "Ring.Pkg"),
+                ("version", "1.0.0"),
+                ("filename", "other.zip"),
+            ]),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), reqwest::StatusCode::FORBIDDEN);
+    let served = server.url("/gated/files/ring.pkg/1.0.0/setup.zip");
+    assert_eq!(
+        server.client.get(&served).send().await.unwrap().status(),
+        reqwest::StatusCode::OK,
+        "the file is still there"
+    );
+
+    // With the admin key as well, both go through.
+    assert_eq!(
+        detach(true).await.unwrap().status(),
+        reqwest::StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        put_gated_file(&server, "setup.zip", image_bytes(3), true).await,
+        reqwest::StatusCode::CREATED
+    );
+}
+
+/// Approving from the admin page approves the files it showed, too: under
+/// `pending-only` the push key can change them while a reviewer reads it.
+#[tokio::test]
+async fn approving_from_the_admin_page_approves_the_files_it_showed() {
+    let server = spawn_gated_pending_only().await;
+    assert_eq!(
+        put_gated_file(&server, "setup.zip", image_bytes(1), false).await,
+        reqwest::StatusCode::CREATED
+    );
+    let shown = shown_review_fields(&server).await;
+
+    // Another file arrives while the page is open; the build is the same.
+    assert_eq!(
+        put_gated_file(&server, "extra.zip", image_bytes(2), false).await,
+        reqwest::StatusCode::CREATED
+    );
+    let approve = |fields: String| {
+        no_redirect()
+            .post(server.url("/gated/admin/packages/ring.pkg/1.0.0/approve"))
+            .basic_auth("admin", Some(ADMIN_KEY))
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(format!("{}&{fields}", admin_body(ADMIN_KEY)))
+            .send()
+    };
+    assert_eq!(
+        approve(shown.clone()).await.unwrap().status(),
+        reqwest::StatusCode::CONFLICT
+    );
+    let bulk = admin_bulk(
+        &server,
+        "/gated",
+        "ring.pkg",
+        ADMIN_KEY,
+        &format!("op=approve&v=1.0.0&{shown}"),
+    )
+    .await;
+    assert_eq!(bulk.status(), reqwest::StatusCode::CONFLICT);
+    let index = server.url("/gated/v3/package/ring.pkg/index.json");
+    assert_eq!(
+        server.client.get(&index).send().await.unwrap().status(),
+        reqwest::StatusCode::NOT_FOUND,
+        "still pending"
+    );
+
+    // The page as it is now shows both files, and approves them.
+    let approved = approve(shown_review_fields(&server).await).await.unwrap();
     assert_eq!(approved.status(), reqwest::StatusCode::SEE_OTHER);
     assert!(server
         .client
@@ -5008,6 +5237,138 @@ async fn an_upload_that_would_fill_the_disk_is_refused() {
     assert_eq!(
         status_of(&server, "/v3/package/full.disk/index.json").await,
         reqwest::StatusCode::NOT_FOUND
+    );
+}
+
+/// Start a resumable upload of `length` bytes for `Res.Pkg` 1.0.0, under
+/// `name`: the status and, when created, its location.
+async fn create_tus(
+    server: &TestServer,
+    name: &str,
+    length: u64,
+) -> (reqwest::StatusCode, Option<String>) {
+    let created = tus(no_redirect().post(server.url("/api/v2/uploads")))
+        .header("Upload-Length", length.to_string())
+        .header(
+            "Upload-Metadata",
+            tus_metadata(&[("id", "Res.Pkg"), ("version", "1.0.0"), ("filename", name)]),
+        )
+        .send()
+        .await
+        .unwrap();
+    let location = created
+        .headers()
+        .get("location")
+        .map(|l| l.to_str().unwrap().to_string());
+    (created.status(), location)
+}
+
+/// A server whose free space holds one upload of the returned size, and not
+/// two: each passes the free-space check alone.
+async fn spawn_with_room_for_one() -> (TestServer, u64) {
+    let server = spawn_with(|c| {
+        c.min_free_disk_bytes = 1;
+        c.max_package_size_bytes = None;
+        c.files.max_file_size_bytes = None;
+    })
+    .await;
+    push_multipart(&server, API_KEY, build_nupkg("Res.Pkg", "1.0.0", b"x")).await;
+    let free = fs4::available_space(server._dir.path()).unwrap();
+    (server, free / 10 * 6)
+}
+
+#[tokio::test]
+async fn open_resumable_uploads_reserve_the_space_they_declared() {
+    let (server, length) = spawn_with_room_for_one().await;
+    let (status, first) = create_tus(&server, "a.wim", length).await;
+    assert_eq!(status, reqwest::StatusCode::CREATED);
+    // Nothing is written yet, but the first upload was promised the space.
+    let (status, _) = create_tus(&server, "b.wim", length).await;
+    assert_eq!(status, reqwest::StatusCode::INSUFFICIENT_STORAGE);
+    // Abandoned, it gives the space back.
+    let deleted = tus(server.client.delete(first.unwrap()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(deleted.status(), reqwest::StatusCode::NO_CONTENT);
+    let (status, _) = create_tus(&server, "b.wim", length).await;
+    assert_eq!(status, reqwest::StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn an_upload_in_progress_reserves_its_content_length_until_it_ends() {
+    let (server, length) = spawn_with_room_for_one().await;
+    // A PUT that declares `length` and then sends nothing.
+    let (tx, rx) = futures::channel::mpsc::channel::<std::io::Result<Vec<u8>>>(1);
+    let put = server
+        .client
+        .put(server.url("/api/v2/files/Res.Pkg/1.0.0/big.wim"))
+        .header("X-NuGet-ApiKey", API_KEY)
+        .header("content-length", length.to_string())
+        .body(reqwest::Body::wrap_stream(rx))
+        .send();
+    let put = tokio::spawn(put);
+
+    // Admitted, it has a temp file; from then on an upload of the same size
+    // no longer fits. Without a reservation it always does.
+    let staging = server._dir.path().join("packages/.uploads");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !std::fs::read_dir(&staging)
+        .unwrap()
+        .any(|e| e.unwrap().path().extension().is_some_and(|x| x == "tmp"))
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the PUT never started"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let (status, _) = create_tus(&server, "probe.wim", length).await;
+    assert_eq!(status, reqwest::StatusCode::INSUFFICIENT_STORAGE);
+
+    // The client gives up; the server's end of the upload drops, and with it
+    // the reservation.
+    drop(tx);
+    put.abort();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let (status, _) = create_tus(&server, "after.wim", length).await;
+        if status == reqwest::StatusCode::CREATED {
+            break;
+        }
+        assert_eq!(status, reqwest::StatusCode::INSUFFICIENT_STORAGE);
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the space was never released"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn a_feed_holds_a_bounded_number_of_open_resumable_uploads() {
+    let server = spawn_with(|c| c.files.max_open_uploads = 2).await;
+    push_multipart(&server, API_KEY, build_nupkg("Res.Pkg", "1.0.0", b"x")).await;
+    let (status, first) = create_tus(&server, "a.wim", 10).await;
+    assert_eq!(status, reqwest::StatusCode::CREATED);
+    assert_eq!(
+        create_tus(&server, "b.wim", 10).await.0,
+        reqwest::StatusCode::CREATED
+    );
+    let (status, _) = create_tus(&server, "c.wim", 10).await;
+    assert_eq!(status, reqwest::StatusCode::TOO_MANY_REQUESTS);
+    // One finished makes room for another.
+    let done = tus(server.client.patch(first.unwrap()))
+        .header("Content-Type", "application/offset+octet-stream")
+        .header("Upload-Offset", "0")
+        .body(vec![7u8; 10])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(done.status(), reqwest::StatusCode::NO_CONTENT);
+    assert_eq!(
+        create_tus(&server, "c.wim", 10).await.0,
+        reqwest::StatusCode::CREATED
     );
 }
 

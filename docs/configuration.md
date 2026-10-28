@@ -27,7 +27,7 @@ A fully commented template lives in
 | `gallery_page_size` | `YANUGET_GALLERY_PAGE_SIZE` | int | `20` | Packages per gallery page (`?take=` overrides, up to 100 or this size, whichever is larger). |
 | `max_package_size_bytes` | `YANUGET_MAX_PACKAGE_SIZE_BYTES` | int | *(unlimited)* | Upload cap; streamed either way. |
 | `upload_idle_timeout_secs` | `YANUGET_UPLOAD_IDLE_TIMEOUT_SECS` | int | `300` | Abort an upload after this long without a byte arriving (`408`). Only silence counts; a slow transfer is never cut off. `0` waits forever. |
-| `min_free_disk_bytes` | `YANUGET_MIN_FREE_DISK_BYTES` | int | `2147483648` (2 GiB) | Refuse an upload (`507`) that would leave less than this free on the storage volume. Checked against the declared size when there is one, and again every 64 MiB while a body streams in, so an upload without a `Content-Length` is held to it too; a resumable upload is checked again on every `PATCH`. Mirror fetches and `yanuget migrate` downloads are held to it too, against the upstream's `Content-Length`. `0` turns the check off. |
+| `min_free_disk_bytes` | `YANUGET_MIN_FREE_DISK_BYTES` | int | `2147483648` (2 GiB) | Refuse an upload (`507`) that would leave less than this free on the storage volume. Checked against the declared size when there is one, counting the space promised to the uploads still in progress (what they declared and have not written yet, resumable ones included) as used, and again every 64 MiB while a body streams in, so an upload without a `Content-Length` is held to it too; a resumable upload is checked again on every `PATCH`. Mirror fetches and `yanuget migrate` downloads are held to it too, against the upstream's `Content-Length`. `0` turns the check off. |
 | `max_connections` | `YANUGET_MAX_CONNECTIONS` | int | `4096` | Concurrent connections accepted; one over the cap is closed at once. `0` is unlimited. |
 | `allow_overwrite` | `YANUGET_ALLOW_OVERWRITE` | bool \| string | `false` | Re-push an existing version: `false`, `true`, `"prerelease-only"` (overwrite pre-releases only), or `"pending-only"` (replace a version only while it is pending in every feed that holds it; see below). |
 | `hard_delete_enabled` | `YANUGET_HARD_DELETE_ENABLED` | bool | `false` | DELETE removes vs. unlists. |
@@ -336,6 +336,7 @@ wherever their version goes, retention included.
 | `files.max_file_size_bytes` | `YANUGET_FILES_MAX_FILE_SIZE_BYTES` | int | *(`max_package_size_bytes`)* | Largest file accepted; unset falls back to the package limit, and both unset is unlimited. |
 | `files.allowed_extensions` | `YANUGET_FILES_ALLOWED_EXTENSIONS` | string[] | `wim, swm, esd, iso, vhd, vhdx, zip, 7z, cab` | Accepted file types (env: comma-separated). |
 | `files.upload_expiry_hours` | `YANUGET_FILES_UPLOAD_EXPIRY_HOURS` | int | `72` | How long an unfinished resumable upload is kept. |
+| `files.max_open_uploads` | `YANUGET_FILES_MAX_OPEN_UPLOADS` | int | `32` | How many unfinished resumable uploads one feed may hold at once; another is refused with `429` until one finishes, is deleted or expires. `0` is no limit. |
 | `files.inbox_dir` | `YANUGET_FILES_INBOX_DIR` | path | *(off)* | The SSH inbox (below). |
 | `files.inbox_scan_secs` | `YANUGET_FILES_INBOX_SCAN_SECS` | int | `30` | How often the inbox is scanned (at least 5). |
 
@@ -506,6 +507,12 @@ How the mirror keeps up, and what it does not repeat:
 * **New upstream releases appear.** A package's version list is fetched again
   once it is older than `refresh_secs` — in the background when the feed
   already has versions of it, so the read that noticed is not held up.
+* **The upstream's listing is followed.** Each time the list is fetched, the
+  upstream's registration says which versions it lists, and a version unlisted
+  there (or listed again) is unlisted (or listed) here too. Not one whose
+  listing was set on this feed by hand, with `dotnet nuget delete` or a
+  relist: that stays as set. Versions already unlisted when the database is
+  migrated to schema version 9 count as set by hand.
 * **The version a client asks for is fetched first**, even when it is older
   than the newest `max_versions_per_package`, so a project pinned to an old
   version restores.
@@ -607,6 +614,13 @@ and re-runs against, can set `allow_overwrite = "pending-only"`:
   transaction as the replacement, so an approval that races a push either
   wins (the push is refused and the approved build stays, files included) or
   waits until the replacement is recorded.
+- Its attached files stay as they are too. Attaching or deleting a file of a
+  version approved anywhere, over HTTP or through the inbox, is `403` with the
+  push key alone; a request that also carries the feed's admin key as HTTP
+  Basic credentials, and the admin page, may still change them.
+- The admin page approves what it showed: a build replaced, or files attached
+  or deleted, after the page was loaded make the approval `409`, and a reload
+  shows what is there now.
 
 `yanuget config check` warns when a feed sets it without
 `requires_approval`, since versions pushed there are approved on arrival.

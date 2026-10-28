@@ -714,6 +714,9 @@ pub struct FilesConfig {
     pub allowed_extensions: Vec<String>,
     /// How long an unfinished resumable upload may sit before it is dropped.
     pub upload_expiry_hours: u64,
+    /// How many unfinished resumable uploads one feed may hold at once; 0
+    /// is no limit. Each holds a partial file and the space it declared.
+    pub max_open_uploads: u64,
     /// A directory scanned for files dropped over SSH (`scp`, `sftp`,
     /// `rsync`). Unset turns the inbox off.
     pub inbox_dir: Option<PathBuf>,
@@ -732,6 +735,7 @@ impl Default for FilesConfig {
             .map(String::from)
             .to_vec(),
             upload_expiry_hours: 72,
+            max_open_uploads: 32,
             inbox_dir: None,
             inbox_scan_secs: 30,
         }
@@ -1013,6 +1017,9 @@ impl Config {
         if let Some(v) = get("YANUGET_FILES_UPLOAD_EXPIRY_HOURS")? {
             self.files.upload_expiry_hours =
                 parse_env_int("YANUGET_FILES_UPLOAD_EXPIRY_HOURS", &v)?;
+        }
+        if let Some(v) = get("YANUGET_FILES_MAX_OPEN_UPLOADS")? {
+            self.files.max_open_uploads = parse_env_int("YANUGET_FILES_MAX_OPEN_UPLOADS", &v)?;
         }
         if let Some(v) = get("YANUGET_FILES_INBOX_DIR")? {
             self.files.inbox_dir = (!v.trim().is_empty()).then(|| PathBuf::from(v.trim()));

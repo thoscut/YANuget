@@ -340,6 +340,44 @@ pub async fn sweep_orphans(storage: &dyn PackageStorage, db: &dyn PackageDatabas
     removed
 }
 
+/// Delete stored blobs no attached file references any more: what a detach,
+/// or a replacement that dropped files, leaves when it stops between the row
+/// and the bytes. Nothing else would ever find them again. Returns how many
+/// were removed.
+///
+/// Each is counted and deleted under its blob lock, which an attach holds
+/// from storing a blob to writing the row that references it, so bytes being
+/// attached right now are never taken.
+pub async fn sweep_unreferenced_blobs(
+    storage: &dyn PackageStorage,
+    db: &dyn PackageDatabase,
+) -> usize {
+    let blobs = match storage.list_blobs().await {
+        Ok(blobs) => blobs,
+        Err(e) => {
+            tracing::error!(error = %e, "blob sweep could not list the stored blobs");
+            return 0;
+        }
+    };
+    let mut removed = 0;
+    for sha in blobs {
+        let _blob = crate::locks::lock_blob(&sha).await;
+        if !matches!(db.blob_references(&sha).await, Ok(0)) {
+            continue;
+        }
+        match storage.delete_blob(&sha).await {
+            Ok(()) => {
+                removed += 1;
+                tracing::info!(sha256 = %sha, "removed a blob no file references");
+            }
+            Err(e) => {
+                tracing::error!(sha256 = %sha, error = %e, "blob sweep failed to remove a blob");
+            }
+        }
+    }
+    removed
+}
+
 /// Hard-delete the data shared by every feed: symbol files and rows, the stored
 /// payload and sidecars, and the `packages` row.
 ///
@@ -1422,5 +1460,40 @@ mod tests {
         assert!(!storage.package_exists("pkg", "1.0.0").await);
         assert!(storage.package_exists("pkg", "2.0.0").await);
         assert_eq!(sweep_orphans(&storage, &db).await, 0);
+    }
+
+    #[tokio::test]
+    async fn the_blob_sweep_removes_what_no_file_references() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FilesystemStorage::new(dir.path()).await.unwrap();
+        let db = SqliteDatabase::in_memory().await.unwrap();
+        db.add_to_feed(FEED, &pkg("1.0.0", 0)).await.unwrap();
+        let (kept, left) = ("a".repeat(64), "b".repeat(64));
+        for sha in [&kept, &left] {
+            let tmp = dir.path().join("blob.tmp");
+            tokio::fs::write(&tmp, sha.as_bytes()).await.unwrap();
+            storage.store_blob(sha, tmp).await.unwrap();
+        }
+        db.add_file(&crate::database::PackageFile {
+            lower_id: "pkg".into(),
+            normalized_version: "1.0.0".into(),
+            name: "kept.wim".into(),
+            sha256: kept.clone(),
+            size: 64,
+            uploaded: Utc::now(),
+            downloads: 0,
+        })
+        .await
+        .unwrap();
+        // `left` is what a detach that stopped after its row leaves behind.
+        assert_eq!(
+            storage.list_blobs().await.unwrap(),
+            vec![kept.clone(), left.clone()]
+        );
+
+        assert_eq!(sweep_unreferenced_blobs(&storage, &db).await, 1);
+        assert!(storage.get_blob(&left).await.is_err());
+        assert!(storage.get_blob(&kept).await.is_ok());
+        assert_eq!(sweep_unreferenced_blobs(&storage, &db).await, 0);
     }
 }

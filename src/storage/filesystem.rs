@@ -257,6 +257,34 @@ impl PackageStorage for FilesystemStorage {
         }
     }
 
+    async fn list_blobs(&self) -> Result<Vec<String>> {
+        let root = self.root.join(".blobs").join("sha256");
+        let mut blobs = Vec::new();
+        let mut shards = match tokio::fs::read_dir(&root).await {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(blobs),
+            Err(e) => return Err(e.into()),
+        };
+        while let Some(shard) = shards.next_entry().await? {
+            if !shard.file_type().await?.is_dir() {
+                continue;
+            }
+            let mut entries = tokio::fs::read_dir(shard.path()).await?;
+            while let Some(entry) = entries.next_entry().await? {
+                // Only what `blob_path` names: anything else here is not a
+                // blob, and not for a sweep to delete.
+                let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                    continue;
+                };
+                if self.blob_path(&name).is_ok_and(|p| p == entry.path()) {
+                    blobs.push(name);
+                }
+            }
+        }
+        blobs.sort_unstable();
+        Ok(blobs)
+    }
+
     async fn get_package(&self, id: &str, version: &str) -> Result<PackageContent> {
         let path = self.package_path(id, version)?;
         if tokio::fs::try_exists(&path).await.unwrap_or(false) {

@@ -18,6 +18,7 @@ pub mod config;
 pub mod config_check;
 pub mod database;
 pub mod error;
+pub mod feed_data;
 pub mod inbox;
 pub mod indexing;
 pub mod locks;

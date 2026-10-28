@@ -34,6 +34,7 @@ pub(super) fn page_of(ids: &[&str]) -> crate::database::SearchPage {
                 p
             }],
             total_downloads: 0,
+            version_count: 0,
         })
         .collect::<Vec<_>>();
     crate::database::SearchPage {
@@ -50,6 +51,41 @@ pub(super) fn view(query: &str, skip: i64, take: i64) -> GalleryView<'_> {
         take,
         default_take: 20,
         ..Default::default()
+    }
+}
+
+/// A dashboard of `(id, versions, pending, flagged)` rows, in that order, each
+/// counted once in the totals.
+pub(super) fn overview_of(rows: &[(&str, i64, i64, i64)]) -> crate::database::AdminOverview {
+    crate::database::AdminOverview {
+        packages: rows
+            .iter()
+            .map(
+                |&(id, versions, pending, flagged)| crate::database::AdminPackageSummary {
+                    id: id.into(),
+                    versions,
+                    pending,
+                    flagged,
+                },
+            )
+            .collect(),
+        total: rows.len() as i64,
+        pending: rows.iter().filter(|r| r.2 > 0).count() as i64,
+        flagged: rows.iter().filter(|r| r.3 > 0).count() as i64,
+    }
+}
+
+/// A dashboard request on a server whose configured page size is 20.
+pub(super) fn dashboard(
+    filter: crate::database::AdminFilter,
+    skip: i64,
+    take: i64,
+) -> super::admin::DashboardView {
+    super::admin::DashboardView {
+        filter,
+        skip,
+        take,
+        default_take: 20,
     }
 }
 

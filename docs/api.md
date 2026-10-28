@@ -369,6 +369,9 @@ DELETE /api/v2/files/{id}/{version}/{name}
 Both need the feed's push key in `X-NuGet-ApiKey`, **and** a push key must be
 configured: a feed left open for package pushes answers `403` rather than take
 multi-gigabyte files from anyone. The version must be in the feed (`404`).
+Under `allow_overwrite = "pending-only"` the files of a version approved in any
+feed stay as they are (`403`), unless the request also carries the feed's admin
+key as HTTP Basic credentials.
 
 The name is 1–128 characters of `A-Z a-z 0-9 . _ -`, starts with a letter or
 digit, and has one of the feed's allowed extensions (`[feeds.files]`, else
@@ -408,7 +411,9 @@ The request that brings the last byte verifies the SHA-256 (discarding the
 upload on a mismatch, `400`) and attaches the file.
 
 Unfinished uploads expire after `[files].upload_expiry_hours` (`Upload-Expires`
-says when) and are swept. [`scripts/Send-YanugetFile.ps1`](https://github.com/thoscut/yanuget/blob/main/scripts/Send-YanugetFile.ps1)
+says when) and are swept. Until then each counts against `min_free_disk_bytes`
+with what it has still to receive, and a feed holds at most
+`[files].max_open_uploads` of them (`429` for another). [`scripts/Send-YanugetFile.ps1`](https://github.com/thoscut/yanuget/blob/main/scripts/Send-YanugetFile.ps1)
 is a PowerShell 7 function that uploads resumably:
 
 ```powershell
@@ -490,7 +495,7 @@ username, the admin key as the password). Lets an operator moderate versions
 from the browser.
 
 ```
-GET  /admin                                       # dashboard: all package ids
+GET  /admin[?filter=pending|flagged]               # dashboard, pending first, paged
 GET  /admin/packages/{id}                          # versions + actions
 POST /admin/packages/{id}                          # one action on several versions
 POST /admin/packages/{id}/{version}/disable        # withhold a version

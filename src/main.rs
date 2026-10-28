@@ -51,6 +51,9 @@ enum Command {
     Admin(Box<cli::AdminArgs>),
     /// Work with the configuration without starting the server.
     Config(cli::ConfigArgs),
+    /// Deal with what the database still holds for a feed that was renamed
+    /// or taken out of the configuration. The server must be stopped.
+    Feeds(cli::FeedsArgs),
 }
 
 /// Arguments for `yanuget backup`.
@@ -179,7 +182,8 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Backup(args)) => run_backup(cli.config.as_deref(), args).await,
         Some(Command::Restore(args)) => run_restore(cli.config.as_deref(), args).await,
         Some(Command::Admin(args)) => cli::run_admin(cli.config.as_deref(), *args).await,
-        Some(Command::Config(args)) => cli::run_config(cli.config.as_deref(), args),
+        Some(Command::Config(args)) => cli::run_config(cli.config.as_deref(), args).await,
+        Some(Command::Feeds(args)) => cli::run_feeds(cli.config.as_deref(), args).await,
         None => {
             init_tracing();
             run_server(cli.config.as_deref()).await
@@ -217,6 +221,7 @@ async fn run_server(config_path: Option<&str>) -> anyhow::Result<()> {
 
     let storage = Arc::new(FilesystemStorage::new(config.storage_path()).await?);
     let db = Arc::new(SqliteDatabase::connect(&config.database_path()).await?);
+    yanuget::feed_data::warn_unconfigured(db.as_ref(), &feeds).await;
     let config = Arc::new(config);
 
     let feeds_meta = Arc::new(
@@ -365,6 +370,7 @@ async fn run_server(config_path: Option<&str>) -> anyhow::Result<()> {
                 }
                 // Like the retention sweep: a pass that started finishes.
                 yanuget::retention::sweep_orphans(storage.as_ref(), db.as_ref()).await;
+                yanuget::retention::sweep_unreferenced_blobs(storage.as_ref(), db.as_ref()).await;
                 if *shutdown.borrow() {
                     break;
                 }
@@ -594,16 +600,7 @@ async fn run_backup(config_path: Option<&str>, args: BackupArgs) -> anyhow::Resu
 async fn run_restore(config_path: Option<&str>, args: RestoreArgs) -> anyhow::Result<()> {
     init_tracing_quiet();
     let config = Config::load(config_path)?;
-    let url = healthcheck_url(&config);
-    let probe = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .timeout(Duration::from_secs(4))
-        .no_proxy()
-        .build()?;
-    // Any answer at all means a server holds the database open.
-    if probe.get(&url).send().await.is_ok() {
-        anyhow::bail!("a server answers at {url}; stop it before restoring");
-    }
+    refuse_while_serving(&config, "restoring").await?;
     let s = yanuget::backup::restore(
         &config,
         &args.src,
@@ -620,6 +617,23 @@ async fn run_restore(config_path: Option<&str>, args: RestoreArgs) -> anyhow::Re
         s.copied,
         s.removed,
     );
+    Ok(())
+}
+
+/// Refuse to go on while a server answers on the configured port: what
+/// follows writes to the database and store behind its back, outside the
+/// locks it takes in-process.
+async fn refuse_while_serving(config: &Config, doing: &str) -> anyhow::Result<()> {
+    let url = healthcheck_url(config);
+    let probe = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .timeout(Duration::from_secs(4))
+        .no_proxy()
+        .build()?;
+    // Any answer at all means a server holds the database open.
+    if probe.get(&url).send().await.is_ok() {
+        anyhow::bail!("a server answers at {url}; stop it before {doing}");
+    }
     Ok(())
 }
 
@@ -872,6 +886,11 @@ fn spawn_file_tasks(
         return tasks;
     }
     let names: Vec<String> = feeds.iter().map(|f| f.name.clone()).collect();
+    let pending_only: Vec<String> = feeds
+        .iter()
+        .filter(|f| f.allow_overwrite == yanuget::config::OverwriteMode::PendingOnly)
+        .map(|f| f.name.clone())
+        .collect();
     let feed_extensions: std::collections::HashMap<String, Vec<String>> = feeds
         .iter()
         .map(|f| (f.name.clone(), f.allowed_extensions.clone()))
@@ -900,6 +919,7 @@ fn spawn_file_tasks(
                 feed_extensions: &feed_extensions,
                 max_file_size: config.max_file_size_bytes(),
                 feeds: &names,
+                pending_only: &pending_only,
                 staging: &staging,
                 min_free_disk_bytes: config.min_free_disk_bytes,
             };

@@ -15,7 +15,7 @@ use crate::error::{Error, Result};
 use crate::indexing::{self, IndexOptions};
 use crate::retention::{self, RetentionPolicy};
 use crate::storage::TempPath;
-use crate::streaming::{self, StreamSummary};
+use crate::streaming::{self, Reservation, StreamSummary};
 use crate::symbols;
 
 pub(super) async fn push_package(
@@ -97,11 +97,13 @@ async fn receive_push(state: &AppState, request: Request) -> Result<(TempPath, S
         .and_then(|v| v.to_str().ok())
         .is_some_and(|s| s.starts_with("multipart/"));
 
-    state.ensure_disk_space(content_length(headers))?;
+    let reservation = state.reserve_disk_space(content_length(headers)).await?;
     let (temp, mut file) = state.create_temp().await?;
     let limit = state.config.max_package_size_bytes;
 
-    let summary = write_upload(request, &mut file, is_multipart, limit, state).await?;
+    let summary =
+        write_upload(request, &mut file, is_multipart, limit, state, &reservation).await?;
+    drop(reservation);
     // Flush the OS page cache to stable storage before the payload is renamed
     // into the store. The database row that follows says the package exists; if
     // a crash lands between the rename and the kernel's own writeback, that row
@@ -118,6 +120,7 @@ async fn write_upload(
     is_multipart: bool,
     limit: Option<u64>,
     state: &AppState,
+    reservation: &Reservation,
 ) -> Result<StreamSummary> {
     if is_multipart {
         let mut multipart = Multipart::from_request(request, state)
@@ -130,7 +133,7 @@ async fn write_upload(
             .map_err(|e| Error::BadRequest(format!("invalid multipart field: {e}")))?
             .ok_or_else(|| Error::BadRequest("multipart body contained no file".into()))?;
         let stream = Box::pin(field.map(|r| r.map_err(to_io_err)));
-        let mut file = state.reserve_guard(file);
+        let mut file = state.reserve_guard(file, reservation);
         streaming::stream_to_writer_limited(
             stream,
             &mut file,
@@ -146,7 +149,7 @@ async fn write_upload(
                 .into_data_stream()
                 .map(|r| r.map_err(to_io_err)),
         );
-        let mut file = state.reserve_guard(file);
+        let mut file = state.reserve_guard(file, reservation);
         streaming::stream_to_writer_limited(
             stream,
             &mut file,

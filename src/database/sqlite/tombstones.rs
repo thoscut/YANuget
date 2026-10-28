@@ -74,6 +74,14 @@ pub(super) async fn clear_tombstone(
     Ok(())
 }
 
+pub(super) async fn clear_tombstones(db: &SqliteDatabase, feed: &str) -> Result<u64> {
+    let result = sqlx::query("DELETE FROM tombstones WHERE feed = ?1")
+        .bind(feed)
+        .execute(&db.pool)
+        .await?;
+    Ok(result.rows_affected())
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::test_support::*;

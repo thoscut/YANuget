@@ -149,4 +149,8 @@ pub trait PackageStorage: Send + Sync {
 
     /// Delete a stored blob. Succeeds even if it is already gone.
     async fn delete_blob(&self, sha256_hex: &str) -> Result<()>;
+
+    /// The SHA-256 of every stored blob, for the sweep that removes the ones
+    /// nothing references.
+    async fn list_blobs(&self) -> Result<Vec<String>>;
 }

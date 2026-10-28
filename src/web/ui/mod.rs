@@ -32,8 +32,9 @@ mod settings;
 mod stats;
 
 pub use admin::{
-    admin_dashboard_page, admin_package_page, admin_retention_page, AdminPackageExtras, ReportView,
-    RetentionNotice, RetentionView, TransferNotice, TransferOp, VersionReport, CSRF_FIELD,
+    admin_dashboard_page, admin_package_page, admin_retention_page, AdminPackageExtras,
+    DashboardView, ReportView, RetentionNotice, RetentionView, TransferNotice, TransferOp,
+    VersionReport, CSRF_FIELD,
 };
 pub use escape::escape_html;
 pub use gallery::{
@@ -50,7 +51,7 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::nuget::UrlBuilder;
-    use crate::web::ui::fixtures::{feed_ctx, page_of, sample, view};
+    use crate::web::ui::fixtures::{dashboard, feed_ctx, overview_of, page_of, sample, view};
     use crate::web::ui::layout::STYLE;
 
     /// The level of every heading in `html`, in document order.
@@ -118,6 +119,25 @@ mod tests {
             (
                 "gallery",
                 gallery_page(&urls, &page_of(&["A", "B"]), &view("", 0, 20)),
+            ),
+            (
+                "admin",
+                admin_dashboard_page(
+                    &urls,
+                    &overview_of(&[("A", 2, 1, 0)]),
+                    &dashboard(Default::default(), 0, 20),
+                ),
+            ),
+            (
+                "admin, empty filter",
+                admin_dashboard_page(
+                    &urls,
+                    &crate::database::AdminOverview {
+                        total: 1,
+                        ..Default::default()
+                    },
+                    &dashboard(crate::database::AdminFilter::Pending, 0, 20),
+                ),
             ),
         ];
         for (name, html) in pages {

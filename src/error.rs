@@ -75,6 +75,10 @@ pub enum Error {
     #[error("forbidden: {0}")]
     Forbidden(String),
 
+    /// A feed holds as many unfinished resumable uploads as it may.
+    #[error("too many uploads: {0}")]
+    TooManyUploads(String),
+
     /// Underlying storage failure.
     #[error("storage error: {0}")]
     Storage(String),
@@ -121,6 +125,7 @@ impl Error {
             Error::InsufficientStorage(_) => StatusCode::INSUFFICIENT_STORAGE,
             Error::Conflict(_) => StatusCode::CONFLICT,
             Error::Forbidden(_) => StatusCode::FORBIDDEN,
+            Error::TooManyUploads(_) => StatusCode::TOO_MANY_REQUESTS,
             Error::Database(sqlx::Error::RowNotFound) => StatusCode::NOT_FOUND,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         }

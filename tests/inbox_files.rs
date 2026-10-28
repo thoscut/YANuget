@@ -180,6 +180,7 @@ impl Inbox {
             feed_extensions: &self.feed_extensions,
             max_file_size: None,
             feeds: &self.feeds,
+            pending_only: &[],
             staging: &self.staging,
             min_free_disk_bytes: self.reserve,
         }

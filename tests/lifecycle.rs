@@ -303,3 +303,164 @@ async fn pending_builds_do_not_prune_the_approved_version() {
     );
     assert_eq!(offered(&server, "/gated", "ring.pkg").await, ["3.0.0"]);
 }
+
+/// Run the real binary against a configuration with the feeds `feeds`, the
+/// data directory `data` and the port `port`.
+async fn yanuget(
+    data: &std::path::Path,
+    feeds: &[&str],
+    port: u16,
+    args: &[&str],
+) -> std::process::Output {
+    let config = data.join("cli.toml");
+    // A TOML literal string takes a Windows path's backslashes as they are.
+    let mut toml = format!(
+        "data_dir = '{}'\ntls_enabled = false\nhost = '127.0.0.1'\nport = {port}\n",
+        data.display()
+    );
+    for name in feeds {
+        toml.push_str(&format!("[[feeds]]\nname = '{name}'\n"));
+    }
+    std::fs::write(&config, toml).unwrap();
+    tokio::process::Command::new(env!("CARGO_BIN_EXE_yanuget"))
+        .arg("--config")
+        .arg(&config)
+        .args(args)
+        .output()
+        .await
+        .unwrap()
+}
+
+/// A port nothing listens on.
+fn free_port() -> u16 {
+    std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+fn text(out: &std::process::Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
+}
+
+#[tokio::test]
+async fn a_renamed_feed_gets_its_versions_back() {
+    let data = tempfile::tempdir().unwrap();
+    let path = data.path().to_path_buf();
+    let before = spawn_feeds(|c| {
+        c.data_dir = path.clone();
+        c.feeds = vec![feed("old")];
+    })
+    .await;
+    assert_eq!(
+        push(&before, "/old", build_nupkg("Renamed.Pkg", "1.0.0", b"x")).await,
+        reqwest::StatusCode::CREATED
+    );
+    let port: u16 = before.base.rsplit(':').next().unwrap().parse().unwrap();
+
+    // Renamed in the configuration: the check says what was left behind.
+    let free = free_port();
+    let check = yanuget(&path, &["new"], free, &["config", "check"]).await;
+    assert!(check.status.success(), "{}", text(&check));
+    assert!(
+        text(&check).contains("warning: feed \"old\" is not configured"),
+        "{}",
+        text(&check)
+    );
+
+    // Not while a server answers on the configured port.
+    let refused = yanuget(&path, &["new"], port, &["feeds", "rename", "old", "new"]).await;
+    assert!(!refused.status.success());
+    assert!(
+        text(&refused).contains("a server answers"),
+        "{}",
+        text(&refused)
+    );
+    // Nor onto a name the configuration lacks, or away from one it has.
+    let unknown = yanuget(&path, &["new"], free, &["feeds", "rename", "old", "newer"]).await;
+    assert!(!unknown.status.success());
+    let live = yanuget(&path, &["new"], free, &["feeds", "rename", "new", "old"]).await;
+    assert!(!live.status.success());
+
+    let args = ["feeds", "rename", "old", "new", "--dry-run"];
+    let dry = yanuget(&path, &["new"], free, &args).await;
+    assert!(dry.status.success(), "{}", text(&dry));
+    assert!(
+        text(&dry).contains("Would move 1 version(s)"),
+        "{}",
+        text(&dry)
+    );
+    let moved = yanuget(&path, &["new"], free, &["feeds", "rename", "old", "new"]).await;
+    assert!(moved.status.success(), "{}", text(&moved));
+
+    let after = spawn_feeds(|c| {
+        c.data_dir = path.clone();
+        c.feeds = vec![feed("new")];
+    })
+    .await;
+    assert_eq!(offered(&after, "/new", "renamed.pkg").await, ["1.0.0"]);
+    let check = yanuget(&path, &["new"], free, &["config", "check"]).await;
+    assert!(
+        !text(&check).contains("is not configured"),
+        "{}",
+        text(&check)
+    );
+}
+
+#[tokio::test]
+async fn removing_a_gone_feed_frees_what_only_it_held() {
+    use yanuget::database::PackageDatabase;
+    use yanuget::storage::PackageStorage;
+
+    let data = tempfile::tempdir().unwrap();
+    let path = data.path().to_path_buf();
+    let server = spawn_feeds(|c| {
+        c.data_dir = path.clone();
+        c.feeds = vec![feed("gone"), feed("kept")];
+    })
+    .await;
+    for prefix in ["/gone", "/kept"] {
+        let status = push(&server, prefix, build_nupkg("Shared.Pkg", "1.0.0", b"s")).await;
+        assert_eq!(status, reqwest::StatusCode::CREATED);
+    }
+    assert_eq!(
+        push(&server, "/gone", build_nupkg("Only.Pkg", "1.0.0", b"o")).await,
+        reqwest::StatusCode::CREATED
+    );
+
+    let free = free_port();
+    let unconfirmed = yanuget(&path, &["kept"], free, &["feeds", "remove", "gone"]).await;
+    assert!(!unconfirmed.status.success());
+    assert!(
+        text(&unconfirmed).contains("--yes"),
+        "{}",
+        text(&unconfirmed)
+    );
+    let args = ["feeds", "remove", "gone", "--dry-run"];
+    let dry = yanuget(&path, &["kept"], free, &args).await;
+    assert!(
+        text(&dry).contains("Would remove 2 version(s) from \"gone\", 1 of them"),
+        "{}",
+        text(&dry)
+    );
+    let args = ["feeds", "remove", "gone", "--yes"];
+    let removed = yanuget(&path, &["kept"], free, &args).await;
+    assert!(removed.status.success(), "{}", text(&removed));
+
+    let db = SqliteDatabase::connect(&path.join("yanuget.db").to_string_lossy())
+        .await
+        .unwrap();
+    let v = yanuget::version::NuGetVersion::parse("1.0.0").unwrap();
+    assert!(!db.package_data_exists("only.pkg", &v).await.unwrap());
+    assert!(db.exists("kept", "shared.pkg", &v).await.unwrap());
+    let stored = db.stored_feeds().await.unwrap();
+    assert!(stored.iter().all(|f| f.name == "kept"), "{stored:?}");
+    let storage = FilesystemStorage::new(path.join("packages")).await.unwrap();
+    assert!(!storage.package_exists("only.pkg", "1.0.0").await);
+    assert!(storage.package_exists("shared.pkg", "1.0.0").await);
+}

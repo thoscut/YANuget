@@ -15,13 +15,11 @@ list is the index.
 
 **From the review of 2026-10-19**
 
-- Correctness: `COR-27`, `COR-29`, `COR-31`. Hardening: `SEC-29`.
-  Performance and UI: `PERF-06`, `PERF-08`, `UI-01`.
+- Performance: `PERF-06` (with `MNT-06` below).
 
 **From the review of 2026-10-27** ([detail](#review-of-2026-10-27))
 
-- Correctness: `COR-35`, `COR-37`. Maintainability: `MNT-06`.
-  Internalizer: `INT-35`. Release: `0.8.1`.
+- Maintainability: `MNT-06`. Internalizer: `INT-35`. Release: `0.8.1`.
 
 **Server, after 0.8.0** ([Target releases](#target-releases))
 
@@ -134,14 +132,18 @@ security, Rust code, tests and CI, operations and documentation), at
 - [ ] **`0.8.1`** 0.8.0 shipped `rustls-webpki` 0.103.15 (RUSTSEC-2026-0382,
   RUSTSEC-2026-0381); `main` has 0.103.16. A patch release carries it with the
   fixes above.
-- [ ] **`COR-35` Approving checks the package hash only**
+- [x] **`COR-35` Approving checks the package hash only**
   (`check_shown_builds`): attached files can still change between the page
   and the approval, the pending side of `COR-31`.
+  *Done:* the admin page sends a digest of the attached files with the
+  build, and an approval answers `409` if they changed.
 - [x] **`COR-36` A move removes the membership and writes the tombstone in
   two steps**; a failure between them lets the mirror fetch the version back.
   *Done:* one transaction (`remove_membership_for_good`), used by moves and
   by retention's purge.
-- [ ] **`COR-37` Blobs a detach leaves are never collected.**
+- [x] **`COR-37` Blobs a detach leaves are never collected.**
+  *Done:* detach runs in `detached()`, and the daily orphan sweep deletes
+  blobs no file references.
 - [ ] **`MNT-06` Two NuGet v3 readers.** The mirror takes `@type` only as a
   string and does not resolve a relative `@id` (`src/mirror.rs`), the
   internalizer does both (`upstream/v3.rs`). Typed structs in `yanuget-pkg`
@@ -178,7 +180,7 @@ open. File and line references are from `main` at `a193027`.
   transaction, check the policy of every feed that holds the version, or
   re-flag it there. *Done:* both, in the swap's transaction: a feed whose
   policy blocks the new build refuses the push, the others re-flag it.
-- [ ] **`COR-31` Attached files of an approved version can still change.**
+- [x] **`COR-31` Attached files of an approved version can still change.**
   `src/web/hosted.rs` (`delete` → `detach`, then `attach_locked`) checks only
   that the version is in the push key's feed. After a promotion the source
   feed keeps its membership, so its push key can replace `setup.exe` of a
@@ -187,20 +189,28 @@ open. File and line references are from `main` at `a193027`.
   "approved anywhere stays immutable". *Fix:* refuse attach and detach while
   `approved_in` is not empty, except with the admin key, at least under
   `pending-only`.
-- [ ] **`COR-27` Memberships of removed or renamed feeds stay behind.** Then
+  *Done:* under `pending-only`, the push key cannot attach or detach files
+  of an approved version; the admin key can.
+- [x] **`COR-27` Memberships of removed or renamed feeds stay behind.** Then
   `purge_global_data` never runs for those versions, an overwrite answers
   `409`, and the renamed feed looks empty. *Fix:* warn at startup and in
   `yanuget config check`, and add a command that migrates or removes them.
+  *Done:* the server and `config check` warn about versions of feeds the
+  configuration no longer declares; `yanuget feeds rename` and `yanuget
+  feeds remove` move or clear them.
 - [x] **`COR-28` `max_age_days` counts from the global `published`**
   (`src/retention.rs:178`), not from `feed_packages.added`, so an old version
   promoted into prod is deleted there by the next sweep. Count from `added`,
   or document the behaviour.
   *Done:* counted from the membership's `added`, which every way into a feed
   sets; an overwriting push restarts it.
-- [ ] **`COR-29` A mirror takes the upstream's listing state only once**
+- [x] **`COR-29` A mirror takes the upstream's listing state only once**
   (`src/mirror.rs:1581, 1649, 1675`), on the first mirror. A version unlisted
   upstream later stays listed here. *Fix:* reconcile on refresh while no
   admin has set the state.
+  *Done:* every refresh follows the upstream's listing for the versions the
+  feed holds, except a listing set on the feed by hand
+  (`feed_packages.listing_set`, schema 9).
 - [x] **`COR-30` Backup verification compares sizes only** (`verify` in
   `src/backup.rs`). Under `allow_overwrite`, new bytes of the same size leave
   a copy whose hash no longer matches its row. *Fix:* compare `package_hash`
@@ -239,11 +249,14 @@ open. File and line references are from `main` at `a193027`.
   `max_failed_auth`.
   *Done:* on a feed with a preview key, a download miss that carries a
   credential which is neither the read key nor the preview key is a `401`.
-- [ ] **`SEC-29` Free-space checks do not reserve.** Without a running
+- [x] **`SEC-29` Free-space checks do not reserve.** Without a running
   reservation, N concurrent uploads each pass the check alone, and the number
   of open tus sessions per feed is not capped. PR #63 re-checks
   `min_free_disk_bytes` while an upload streams; the reservation and the cap
   remain.
+  *Done:* uploads reserve the length they declare on a counter shared by
+  every feed on the volume; `files.max_open_uploads` (default 32) caps open
+  tus uploads.
 - [x] **`SEC-30` `rewrite` and `[Content_Types].xml`.** New types are inserted
   at `rfind("</Types>")` (`crates/yanuget-pkg/src/rewrite.rs:421`), which a
   comment can contain, and control characters in part names are not refused.
@@ -266,11 +279,15 @@ open. File and line references are from `main` at `a193027`.
   each request copies the file (`into_owned()`, `src/web/docs.rs:57-75`).
   *Done:* a weak `ETag` from the embedded hash, `304` on a match,
   `Cache-Control: public, max-age=300`, no copy.
-- [ ] **`PERF-08` Gallery header queries.** The header needs the headline
+- [x] **`PERF-08` Gallery header queries.** The header needs the headline
   and a `COUNT(*)` per id, not more. (The cap on `take` is in PR #63.)
-- [ ] **`UI-01` The admin dashboard is a flat list** without paging and
+  *Done:* the gallery and statistics pages load each package's headline and
+  a version count, not every version.
+- [x] **`UI-01` The admin dashboard is a flat list** without paging and
   without marking pending or flagged versions (`src/web/admin.rs:103-110`).
   *Fix:* badges with counts, pending first, filters.
+  *Done:* pending first, counted badges, All/Pending/Flagged filters and the
+  gallery's pager.
 
 ---
 

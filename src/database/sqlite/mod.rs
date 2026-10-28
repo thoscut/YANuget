@@ -46,8 +46,9 @@ use crate::models::Package;
 use crate::version::NuGetVersion;
 
 use super::{
-    DatabaseStats, FeedVersion, Membership, MembershipChange, PackageDatabase, PackageFile,
-    SearchPage, SearchRequest, SymbolKey, SymbolRef, TagCount, UploadSession, VersionFootprint,
+    AdminFilter, AdminOverview, DatabaseStats, FeedVersion, Membership, MembershipChange,
+    PackageDatabase, PackageFile, SearchPage, SearchRequest, StoredFeed, SymbolKey, SymbolRef,
+    TagCount, UploadSession, VersionFootprint,
 };
 
 /// The feed-scoped projection: every `packages` column plus the membership's
@@ -141,6 +142,22 @@ impl SqliteDatabase {
         conn.close().await?;
         let pool = SqlitePoolOptions::new()
             .max_connections(16)
+            .connect_with(options)
+            .await?;
+        Ok(Self { pool })
+    }
+
+    /// Open an existing database at `path` for reading only: nothing is
+    /// created or migrated, so a check can look at the database a server is
+    /// running on, or one an older build left, without changing it. Reads
+    /// that need a column a later step adds fail on an older schema.
+    pub async fn open_read_only(path: &str) -> Result<Self> {
+        let options = SqliteConnectOptions::new()
+            .filename(path)
+            .read_only(true)
+            .busy_timeout(Duration::from_secs(5));
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
             .connect_with(options)
             .await?;
         Ok(Self { pool })
@@ -291,6 +308,16 @@ impl PackageDatabase for SqliteDatabase {
         memberships::set_listed(self, feed, id, version, listed).await
     }
 
+    async fn follow_upstream_listing(
+        &self,
+        feed: &str,
+        id: &str,
+        version: &NuGetVersion,
+        listed: bool,
+    ) -> Result<bool> {
+        memberships::follow_upstream_listing(self, feed, id, version, listed).await
+    }
+
     async fn set_enabled(
         &self,
         feed: &str,
@@ -363,6 +390,16 @@ impl PackageDatabase for SqliteDatabase {
 
     async fn all_package_ids(&self, feed: &str) -> Result<Vec<String>> {
         feeds::all_package_ids(self, feed).await
+    }
+
+    async fn admin_overview(
+        &self,
+        feed: &str,
+        filter: AdminFilter,
+        skip: i64,
+        take: i64,
+    ) -> Result<AdminOverview> {
+        feeds::admin_overview(self, feed, filter, skip, take).await
     }
 
     async fn stats(&self, feed: &str) -> Result<DatabaseStats> {
@@ -467,6 +504,14 @@ impl PackageDatabase for SqliteDatabase {
         uploads::delete_upload(self, id).await
     }
 
+    async fn outstanding_upload_bytes(&self, now: DateTime<Utc>) -> Result<u64> {
+        uploads::outstanding_upload_bytes(self, now).await
+    }
+
+    async fn open_uploads(&self, feed: &str, now: DateTime<Utc>) -> Result<u64> {
+        uploads::open_uploads(self, feed, now).await
+    }
+
     async fn expired_uploads(&self, now: DateTime<Utc>) -> Result<Vec<UploadSession>> {
         uploads::expired_uploads(self, now).await
     }
@@ -512,6 +557,28 @@ impl PackageDatabase for SqliteDatabase {
     async fn clear_tombstone(&self, feed: &str, id: &str, version: &NuGetVersion) -> Result<()> {
         tombstones::clear_tombstone(self, feed, id, version).await
     }
+
+    // --- feeds as a whole: `feed_packages`, `tombstones`, `uploads` ---
+
+    async fn stored_feeds(&self) -> Result<Vec<StoredFeed>> {
+        memberships::stored_feeds(self).await
+    }
+
+    async fn shared_versions(&self, a: &str, b: &str) -> Result<i64> {
+        memberships::shared_versions(&mut *self.pool.acquire().await?, a, b).await
+    }
+
+    async fn rename_feed(&self, from: &str, to: &str) -> Result<u64> {
+        memberships::rename_feed(self, from, to).await
+    }
+
+    async fn feed_members(&self, feed: &str) -> Result<Vec<(String, NuGetVersion)>> {
+        memberships::feed_members(self, feed).await
+    }
+
+    async fn clear_tombstones(&self, feed: &str) -> Result<u64> {
+        tombstones::clear_tombstones(self, feed).await
+    }
 }
 
 /// How many ids one `IN (…)` list binds. Each is a parameter, and SQLite
@@ -548,9 +615,9 @@ fn parse_time(raw: &str, what: &str) -> Result<DateTime<Utc>> {
         .map_err(|e| Error::Other(anyhow::anyhow!("bad {what} timestamp: {e}")))
 }
 
-/// What the tests of every module share.
+/// What the tests of every module share, and of the crate's other modules.
 #[cfg(test)]
-pub(super) mod test_support {
+pub(crate) mod test_support {
     pub use super::SqliteDatabase;
     pub use crate::database::*;
     pub use crate::error::Error;

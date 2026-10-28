@@ -14,6 +14,7 @@ Commands:
   restore      Restore a backup into the data directory (server stopped)
   admin        Promote, approve, enable, disable, pin, unpin or delete a version
   config       Work with the configuration (config check)
+  feeds        Rename or remove what a feed no longer configured left behind
   help         Print help for the server or a command
 
 Options:
@@ -33,6 +34,7 @@ and the same `YANUGET_*` overrides, as the server.
 | `backup`, `restore` | [Backup, restore and moving hosts](backup.md) |
 | `admin` | [Admin command line](admin-cli.md#acting-on-a-version) |
 | `config check` | [Admin command line](admin-cli.md#checking-a-configuration) |
+| `feeds rename`, `feeds remove` | [below](#yanuget-feeds), and [Renaming or removing a feed](feeds.md#renaming-or-removing-a-feed) |
 
 ## Running the server
 
@@ -126,6 +128,39 @@ See [Admin command line](admin-cli.md).
 
 Loads the configuration as the server would and checks what it points at (the
 TLS certificate and key belong together and carry the configured host, mirror CA
-bundles parse, promotion targets exist), then exits `1` on any error. Run it
-before restarting with a changed configuration; see
+bundles parse, promotion targets exist, the database holds no versions for a
+feed the configuration lacks), then exits `1` on any error. Run it before
+restarting with a changed configuration; see
 [Checking a configuration](admin-cli.md#checking-a-configuration).
+
+## `yanuget feeds`
+
+Memberships are stored under the feed's name. A feed renamed or taken out of
+the configuration leaves its versions behind under the old name, where nothing
+serves them; the server warns about them at startup, and so does
+`config check`. These commands deal with them:
+
+```text
+yanuget feeds rename <old> <new> [--dry-run]
+yanuget feeds remove <name> [--dry-run] [--yes]
+```
+
+- `rename` gives the versions recorded under `<old>` to `<new>`, with their
+  state (listed, enabled, pending, pinned, downloads), the record of versions
+  deleted from it, and resumable uploads in progress. `<new>` must be a
+  configured feed and `<old>` must not be. It refuses when both hold the same
+  version; delete it from one of them first.
+- `remove` drops everything recorded under `<name>`, which must not be
+  configured, and, as retention does, deletes the packages, attached files and
+  symbols of versions no other feed holds. It cannot be undone and needs
+  `--yes`.
+
+With `--dry-run`, either command only prints what it would do. Otherwise both
+refuse while a server answers on the configured port: stop it first, run the
+command, then start it again.
+
+```bash
+systemctl stop yanuget
+sudo -u yanuget yanuget --config /etc/yanuget/yanuget.toml feeds rename prod production
+systemctl start yanuget
+```

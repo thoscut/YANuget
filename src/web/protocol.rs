@@ -446,6 +446,7 @@ pub(super) async fn search(
         package_type: params.package_type.filter(|s| !s.is_empty()),
         sort: Default::default(),
         tag: None,
+        headlines_only: false,
     };
     let page = state.db.search(state.feed(), &request).await?;
     // Link results into the hive matching the caller's semVerLevel, so a client

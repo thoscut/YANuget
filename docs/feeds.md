@@ -132,6 +132,32 @@ own cannot without both.
 Feeds without `promotes_to` are simply independent sets of packages between
 which versions can be copied or moved.
 
+### Renaming or removing a feed
+
+A feed's memberships are stored under its name, so renaming a feed in the
+configuration, or taking it out, leaves its versions behind under the old name.
+Nothing serves them, and they still count as a feed holding each version: its
+payload is never deleted, a push of different content under that version is
+refused with `409` even where `allow_overwrite` is on, and a renamed feed starts
+out empty. The server logs a warning for each such name at startup, and
+`yanuget config check` reports it.
+
+With the server stopped, give the versions to the feed's new name:
+
+```bash
+yanuget feeds rename prod production
+```
+
+or, for a feed that is gone for good, remove them, and the packages no other
+feed holds:
+
+```bash
+yanuget feeds remove old-team --dry-run   # what it would remove
+yanuget feeds remove old-team --yes
+```
+
+See [`yanuget feeds`](cli.md#yanuget-feeds).
+
 ### Scripting promotion and approval
 
 The simplest way is [`yanuget admin`](admin-cli.md), which handles the

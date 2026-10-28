@@ -146,6 +146,13 @@ pub fn settings_page(urls: &UrlBuilder, config: &Config, feed: &crate::web::Feed
             "Unfinished uploads kept",
             &format!("{} h", fc.upload_expiry_hours),
         ));
+        files.push_str(&kv(
+            "Unfinished uploads per feed",
+            &match fc.max_open_uploads {
+                0 => "Unlimited".to_string(),
+                n => n.to_string(),
+            },
+        ));
         // Whether there is an inbox, not where: the path is infrastructure.
         files.push_str(&kv(
             "SSH inbox",
