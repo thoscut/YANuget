@@ -352,9 +352,23 @@ fn write_source(
     Ok(())
 }
 
+/// Where new types go: before the root's end tag, or, for an empty root
+/// (`<Types/>`), in place of the empty element.
+enum Insert {
+    Before(usize),
+    Expand { start: usize, end: usize },
+}
+
 /// Add a content type for every part in `names` (normalized) that the types
 /// do not cover: a `Default` for an extension, an `Override` for a part with
 /// none. The document is otherwise left as it is, byte for byte.
+///
+/// The document is parsed, not searched: the types are those of the root
+/// `Types`' own children, and new ones go before the end tag the parser
+/// reports for the root, so a `</Types>` in a comment, a CDATA section or
+/// after the root cannot move them. A part name with a control character
+/// (or a character XML cannot hold) is refused, since it could be written
+/// into an attribute neither intact nor escaped.
 fn complete_content_types(xml: &str, names: &[String]) -> Result<String, Error> {
     let bad = |e: &dyn std::fmt::Display| {
         Error::InvalidPackage(format!("[Content_Types].xml is malformed: {e}"))
@@ -362,34 +376,86 @@ fn complete_content_types(xml: &str, names: &[String]) -> Result<String, Error> 
     let mut extensions = HashSet::new();
     let mut overrides = HashSet::new();
     let mut reader = quick_xml::Reader::from_str(xml);
+    let position = |reader: &quick_xml::Reader<&[u8]>| {
+        usize::try_from(reader.buffer_position()).unwrap_or(usize::MAX)
+    };
+    let mut depth = 0usize;
+    let mut has_root = false;
+    let mut insert = None;
     loop {
-        match reader.read_event().map_err(|e| bad(&e))? {
+        let start = position(&reader);
+        let event = reader.read_event().map_err(|e| bad(&e))?;
+        match &event {
             Event::Start(e) | Event::Empty(e) => {
                 let local = e.local_name();
-                let (wanted, set) = match local.as_ref() {
-                    "Default" => ("Extension", &mut extensions),
-                    "Override" => ("PartName", &mut overrides),
-                    _ => continue,
-                };
-                for attribute in e.attributes() {
-                    let attribute = attribute.map_err(|e| bad(&e))?;
-                    if attribute.key.as_ref() == wanted {
-                        let value = attribute
-                            .normalized_value(XmlVersion::Implicit1_0)
-                            .map_err(|e| bad(&e))?;
-                        set.insert(value.to_ascii_lowercase());
+                if depth == 0 {
+                    if has_root {
+                        return Err(bad(&"it has more than one root element"));
                     }
+                    if local.as_ref() != "Types" {
+                        return Err(bad(&"its root element is not Types"));
+                    }
+                    has_root = true;
+                    if matches!(event, Event::Empty(_)) {
+                        let end = position(&reader);
+                        insert = Some(Insert::Expand { start, end });
+                    }
+                } else if depth == 1 {
+                    let collect = match local.as_ref() {
+                        "Default" => Some(("Extension", &mut extensions)),
+                        "Override" => Some(("PartName", &mut overrides)),
+                        _ => None,
+                    };
+                    if let Some((wanted, set)) = collect {
+                        for attribute in e.attributes() {
+                            let attribute = attribute.map_err(|e| bad(&e))?;
+                            if attribute.key.as_ref() == wanted {
+                                let value = attribute
+                                    .normalized_value(XmlVersion::Implicit1_0)
+                                    .map_err(|e| bad(&e))?;
+                                set.insert(value.to_ascii_lowercase());
+                            }
+                        }
+                    }
+                }
+                if matches!(event, Event::Start(_)) {
+                    depth += 1;
+                }
+            }
+            Event::End(_) => {
+                depth = depth
+                    .checked_sub(1)
+                    .ok_or_else(|| bad(&"it closes an element it never opened"))?;
+                if depth == 0 {
+                    insert = Some(Insert::Before(start));
                 }
             }
             Event::DocType(_) => return Err(bad(&"it has a DOCTYPE")),
             Event::Eof => break,
+            // Outside the root, only the declaration, comments, processing
+            // instructions and whitespace.
+            Event::Text(text) if depth == 0 => {
+                if !text.bytes().all(|b| b.is_ascii_whitespace()) {
+                    return Err(bad(&"it has text outside the root element"));
+                }
+            }
+            Event::Decl(_) | Event::PI(_) | Event::Comment(_) => {}
+            _ if depth == 0 => return Err(bad(&"it has content outside the root element")),
             _ => {}
         }
+    }
+    if depth != 0 {
+        return Err(bad(&"it ends inside an element"));
     }
 
     let mut missing = String::new();
     let mut added = HashSet::new();
     for name in names {
+        if let Some(c) = name.chars().find(|c| !is_part_name_char(*c)) {
+            return Err(Error::InvalidPackage(format!(
+                "the entry name {name:?} holds {c:?}, which a part name cannot"
+            )));
+        }
         if name == CONTENT_TYPES || name.ends_with('/') {
             continue;
         }
@@ -417,10 +483,34 @@ fn complete_content_types(xml: &str, names: &[String]) -> Result<String, Error> 
     if missing.is_empty() {
         return Ok(xml.to_string());
     }
-    let at = xml
-        .rfind("</Types>")
-        .ok_or_else(|| bad(&"it has no closing </Types>"))?;
-    Ok(format!("{}{missing}{}", &xml[..at], &xml[at..]))
+    match insert {
+        Some(Insert::Before(at)) if xml.get(at..).is_some_and(|s| s.starts_with("</")) => {
+            Ok(format!("{}{missing}{}", &xml[..at], &xml[at..]))
+        }
+        Some(Insert::Expand { start, end })
+            if xml.get(start..end).is_some_and(|s| s.ends_with("/>")) =>
+        {
+            // `<Types .../>` becomes `<Types ...>{missing}</Types>`, under the
+            // name (and prefix) the document gives it.
+            let open = &xml[start..end - 2];
+            let qname = open[1..]
+                .split(|c: char| c.is_ascii_whitespace())
+                .next()
+                .unwrap_or_default();
+            Ok(format!(
+                "{}{open}>{missing}</{qname}>{}",
+                &xml[..start],
+                &xml[end..]
+            ))
+        }
+        _ => Err(bad(&"it has no closing </Types>")),
+    }
+}
+
+/// Whether `c` may stand in a part name written into the types: no control
+/// characters (C0, DEL, C1) and none of the noncharacters XML 1.0 excludes.
+fn is_part_name_char(c: char) -> bool {
+    !c.is_control() && !matches!(c, '\u{FFFE}' | '\u{FFFF}')
 }
 
 /// The core properties NuGet writes for a manifest.
@@ -703,6 +793,76 @@ mod tests {
         assert_eq!(complete_content_types(xml, &names).unwrap(), xml);
         assert!(complete_content_types("<Types><!DOCTYPE x></Types>", &names).is_err());
         assert!(complete_content_types("<Types>", &["c.txt".to_string()]).is_err());
+    }
+
+    #[test]
+    fn content_types_go_before_the_real_end_tag() {
+        let names = ["tools/c.txt".to_string()];
+        let added = "<Default Extension=\"txt\" ContentType=\"application/octet\" />";
+        // A `</Types>` in a comment after the root, or in a comment or CDATA
+        // inside it, does not move the insertion.
+        let xml = "<Types><!-- </Types> --><Default Extension=\"ps1\" ContentType=\"x\"/>\
+                   <![CDATA[</Types>]]></Types   >\n<!-- </Types> -->";
+        assert_eq!(
+            complete_content_types(xml, &names).unwrap(),
+            xml.replacen("</Types   >", &format!("{added}</Types   >"), 1)
+        );
+        // A Default that is not a child of the root covers nothing.
+        let nested = "<Types><x><Default Extension=\"txt\" ContentType=\"x\"/></x></Types>";
+        assert!(complete_content_types(nested, &names)
+            .unwrap()
+            .ends_with(&format!("</x>{added}</Types>")));
+        // An empty root is opened up under its own name.
+        assert_eq!(
+            complete_content_types("<?xml version=\"1.0\"?><Types xmlns=\"u\" />", &names).unwrap(),
+            format!("<?xml version=\"1.0\"?><Types xmlns=\"u\" >{added}</Types>")
+        );
+        for broken in [
+            "<Types></Types><Types></Types>",
+            "<Other></Other>",
+            "<Types></Types>text",
+            "<Types><Default></Types>",
+            "<!-- </Types> --><Types>",
+        ] {
+            assert!(complete_content_types(broken, &names).is_err(), "{broken}");
+        }
+    }
+
+    #[test]
+    fn part_names_with_control_characters_are_refused() {
+        let xml = "<Types><Default Extension=\"txt\" ContentType=\"x\"/></Types>";
+        for name in [
+            "tools/a\u{1}b",
+            "tools/a\nb",
+            "tools/a\tb.txt",
+            "tools/a\u{7f}",
+            "tools/a\u{85}",
+            "tools/\u{fffe}",
+        ] {
+            let err = complete_content_types(xml, &[name.to_string()]).unwrap_err();
+            assert!(err.to_string().contains("part name"), "{name:?}: {err}");
+        }
+        assert!(complete_content_types(xml, &["tools/caf\u{e9}".to_string()]).is_ok());
+
+        // And a package that carries one is not rewritten.
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.nupkg");
+        let mut zip = ZipWriter::new(File::create(&input).unwrap());
+        let deflated = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+        for (name, bytes) in [
+            ("Tool.nuspec", NUSPEC),
+            ("[Content_Types].xml", TYPES),
+            ("tools/evil\u{1}\"/><x", "x"),
+        ] {
+            zip.start_file(name, deflated).unwrap();
+            zip.write_all(bytes.as_bytes()).unwrap();
+        }
+        zip.finish().unwrap();
+        let output = dir.path().join("out.nupkg");
+        let plan = Rewrite::new().put("tools/a.ps1", Source::Bytes(vec![]));
+        let err = rewrite_blocking(&input, &output, &plan).unwrap_err();
+        assert!(err.to_string().contains("part name"), "{err}");
+        assert!(!output.exists());
     }
 
     /// Done when a 5 GB entry passes in constant memory. Takes a while and
