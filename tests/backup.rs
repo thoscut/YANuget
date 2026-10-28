@@ -216,6 +216,59 @@ async fn a_file_missing_from_the_live_store_is_reported_not_hidden() {
     assert_eq!(summary.attempts, 3, "it retried before settling");
 }
 
+/// Same size, other bytes: what an overwrite during the copy can leave. The
+/// size check passes it; the hash of a file the run copied does not.
+#[tokio::test]
+async fn a_copied_file_with_the_right_size_but_other_bytes_fails_verification() {
+    let live = tempfile::tempdir().unwrap();
+    let base = serve(config_for(live.path())).await;
+    push(&base, "Alpha", "1.0.0").await;
+    let backups = tempfile::tempdir().unwrap();
+    yanuget::backup::backup(&config_for(live.path()), backups.path(), hidden())
+        .await
+        .unwrap();
+
+    let rel = "alpha/1.0.0/alpha.1.0.0.nupkg";
+    let copy = backups.path().join("packages").join(rel);
+    let len = std::fs::metadata(&copy).unwrap().len() as usize;
+    std::fs::write(&copy, vec![b'x'; len]).unwrap();
+
+    let (db, store) = (
+        backups.path().join("yanuget.db"),
+        backups.path().join("packages"),
+    );
+    let skipped = std::collections::HashSet::new();
+    assert!(yanuget::backup::verify(&db, &store, &skipped)
+        .await
+        .unwrap()
+        .is_empty());
+    let copied = [std::path::PathBuf::from(rel)].into();
+    assert_eq!(
+        yanuget::backup::verify(&db, &store, &copied).await.unwrap(),
+        [rel]
+    );
+}
+
+/// A live file whose bytes no longer match its row is copied, hashed, and
+/// reported like a missing one.
+#[tokio::test]
+async fn a_live_file_that_does_not_match_its_row_is_reported() {
+    let live = tempfile::tempdir().unwrap();
+    let base = serve(config_for(live.path())).await;
+    push(&base, "Alpha", "1.0.0").await;
+    push(&base, "Beta", "1.0.0").await;
+    let file = live.path().join("packages/beta/1.0.0/beta.1.0.0.nupkg");
+    let len = std::fs::metadata(&file).unwrap().len() as usize;
+    std::fs::write(&file, vec![b'x'; len]).unwrap();
+
+    let backups = tempfile::tempdir().unwrap();
+    let summary = yanuget::backup::backup(&config_for(live.path()), backups.path(), hidden())
+        .await
+        .unwrap();
+    assert_eq!(summary.manifest.missing, ["beta/1.0.0/beta.1.0.0.nupkg"]);
+    assert_eq!(summary.attempts, 3, "it retried before settling");
+}
+
 /// The package store can live outside the data directory. A backup inside it
 /// — or one that contains it — used to be refused only relative to the data
 /// directory, and the copy then recursed into itself.

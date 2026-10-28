@@ -17,8 +17,10 @@
 //! file the snapshot still lists. So once the copy is done, every file the
 //! snapshot references is checked in the backup, and if one is missing or has
 //! the wrong size the whole pass runs again: a fresh snapshot, and a copy that
-//! only moves what changed, which takes seconds. A file still missing after
-//! that is missing from the live store too, and is reported, not hidden.
+//! only moves what changed, which takes seconds. The files this run copied
+//! are hashed too, since an overwrite can keep the size; the ones it skipped
+//! were already there before the snapshot. A file still wrong after that is
+//! wrong in the live store too, and is reported, not hidden.
 //!
 //! Re-running into the same directory is incremental, like `rsync`: a stored
 //! file is never rewritten in place (the store renames new content over the
@@ -75,7 +77,8 @@ pub struct Manifest {
     pub files: u64,
     /// Their total size in bytes.
     pub bytes: u64,
-    /// Files the snapshot references that the live store did not have.
+    /// Files the snapshot references that the live store did not have, or
+    /// held with other bytes than it recorded.
     pub missing: Vec<String>,
     /// Whether the self-signed TLS pair is included.
     pub tls: bool,
@@ -139,6 +142,8 @@ pub async fn backup(
     let packages = dest.join(PACKAGES);
     let snapshot = dest.join(format!("{DATABASE}{TEMP_SUFFIX}"));
     let (mut copied, mut copied_bytes) = (0, 0);
+    // Every file any pass copied: the ones whose content is new to the backup.
+    let mut fresh = HashSet::new();
     let mut attempts = 0;
     let (tree, missing, created) = loop {
         attempts += 1;
@@ -156,8 +161,10 @@ pub async fn backup(
         };
         copied += tree.copied;
         copied_bytes += tree.copied_bytes;
+        fresh.extend(tree.fresh.iter().cloned());
 
-        let missing = verify(&snapshot, &packages).await?;
+        progress.set_message(format!("pass {attempts}: checking the copy"));
+        let missing = verify(&snapshot, &packages, &fresh).await?;
         if missing.is_empty() || attempts == ATTEMPTS {
             break (tree, missing, created);
         }
@@ -425,22 +432,57 @@ async fn finish_snapshot(path: &Path) -> anyhow::Result<u64> {
     Ok(packages as u64)
 }
 
+/// The content a database row records for a file.
+#[derive(Debug, Clone)]
+enum Digest {
+    /// A package's `package_hash` under `SHA512`: base64, as NuGet has it.
+    Sha512Base64(String),
+    /// An attached file's blob: lowercase hex, also its name.
+    Sha256Hex(String),
+}
+
+/// One file the snapshot references.
+struct Expected {
+    /// Relative to the store.
+    rel: String,
+    size: Option<u64>,
+    digest: Option<Digest>,
+}
+
 /// Every file the snapshot at `db` references that `store` lacks, or holds
 /// with a size other than the one recorded, as a path relative to `store`.
-pub async fn verify(db: &Path, store: &Path) -> anyhow::Result<Vec<String>> {
+/// The files in `hash` (relative to `store`) must also have the recorded
+/// hash, where the row has one this can compute.
+///
+/// Sizes catch a delete, and nearly every overwrite. Hashing every file would
+/// read the whole store on each run and make an incremental backup as slow as
+/// the first, so only the files the caller just copied are hashed: their bytes
+/// are the ones that may come from a different build than the snapshot's.
+pub async fn verify(
+    db: &Path,
+    store: &Path,
+    hash: &HashSet<PathBuf>,
+) -> anyhow::Result<Vec<String>> {
     let mut conn = open_snapshot(db).await?;
-    let mut expected: Vec<(String, Option<u64>)> = Vec::new();
-    for row in sqlx::query("SELECT lower_id, normalized_version, package_size FROM packages")
-        .fetch_all(&mut conn)
-        .await?
+    let mut expected: Vec<Expected> = Vec::new();
+    for row in sqlx::query(
+        "SELECT lower_id, normalized_version, package_size, package_hash, \
+                package_hash_algorithm FROM packages",
+    )
+    .fetch_all(&mut conn)
+    .await?
     {
         let id = row.get::<String, _>(0).to_ascii_lowercase();
         let version = row.get::<String, _>(1).to_ascii_lowercase();
         let size: i64 = row.get(2);
-        expected.push((
-            format!("{id}/{version}/{id}.{version}.nupkg"),
-            Some(size as u64),
-        ));
+        let algorithm: String = row.get(4);
+        expected.push(Expected {
+            rel: format!("{id}/{version}/{id}.{version}.nupkg"),
+            size: Some(size as u64),
+            digest: algorithm
+                .eq_ignore_ascii_case("SHA512")
+                .then(|| Digest::Sha512Base64(row.get(3))),
+        });
     }
     for row in sqlx::query("SELECT DISTINCT sha256, size FROM package_files")
         .fetch_all(&mut conn)
@@ -449,10 +491,11 @@ pub async fn verify(db: &Path, store: &Path) -> anyhow::Result<Vec<String>> {
         let sha: String = row.get(0);
         let size: i64 = row.get(1);
         if sha.len() > 2 {
-            expected.push((
-                format!(".blobs/sha256/{}/{sha}", &sha[..2]),
-                Some(size as u64),
-            ));
+            expected.push(Expected {
+                rel: format!(".blobs/sha256/{}/{sha}", &sha[..2]),
+                size: Some(size as u64),
+                digest: Some(Digest::Sha256Hex(sha.to_ascii_lowercase())),
+            });
         }
     }
     for row in sqlx::query("SELECT ssqp_key, filename FROM symbols")
@@ -461,22 +504,53 @@ pub async fn verify(db: &Path, store: &Path) -> anyhow::Result<Vec<String>> {
     {
         let key = row.get::<String, _>(0).to_ascii_lowercase();
         let file = row.get::<String, _>(1).to_ascii_lowercase();
-        expected.push((format!(".symbols/{key}/{file}"), None));
+        expected.push(Expected {
+            rel: format!(".symbols/{key}/{file}"),
+            size: None,
+            digest: None,
+        });
     }
     conn.close().await?;
 
-    let store = store.to_path_buf();
+    let (store, hash) = (store.to_path_buf(), hash.clone());
     Ok(tokio::task::spawn_blocking(move || {
         expected
             .into_iter()
-            .filter(|(rel, size)| match std::fs::metadata(store.join(rel)) {
-                Ok(m) => !m.is_file() || size.is_some_and(|s| s != m.len()),
-                Err(_) => true,
+            .filter(|e| {
+                let path = store.join(&e.rel);
+                let sized = std::fs::metadata(&path)
+                    .is_ok_and(|m| m.is_file() && e.size.is_none_or(|s| s == m.len()));
+                // A file of the wrong size is not read at all.
+                !sized
+                    || match &e.digest {
+                        Some(digest) if hash.contains(Path::new(&e.rel)) => {
+                            !has_digest(&path, digest)
+                        }
+                        _ => false,
+                    }
             })
-            .map(|(rel, _)| rel)
+            .map(|e| e.rel)
             .collect()
     })
     .await?)
+}
+
+/// Whether the file at `path` hashes to `digest`. A file that cannot be read
+/// does not.
+fn has_digest(path: &Path, digest: &Digest) -> bool {
+    use base64::Engine;
+    fn hash<D: sha2::Digest + std::io::Write>(path: &Path) -> Option<Vec<u8>> {
+        let mut hasher = D::new();
+        std::io::copy(&mut std::fs::File::open(path).ok()?, &mut hasher).ok()?;
+        Some(hasher.finalize().to_vec())
+    }
+    match digest {
+        Digest::Sha512Base64(want) => hash::<sha2::Sha512>(path)
+            .is_some_and(|got| base64::engine::general_purpose::STANDARD.encode(got) == *want),
+        Digest::Sha256Hex(want) => {
+            hash::<sha2::Sha256>(path).is_some_and(|got| hex::encode(got) == *want)
+        }
+    }
 }
 
 // --- the files ---
@@ -485,6 +559,8 @@ pub async fn verify(db: &Path, store: &Path) -> anyhow::Result<Vec<String>> {
 struct TreeCopy {
     /// Every file copied or already in place, relative to the root.
     seen: HashSet<PathBuf>,
+    /// The ones copied, relative to the root.
+    fresh: HashSet<PathBuf>,
     files: u64,
     bytes: u64,
     copied: u64,
@@ -516,6 +592,7 @@ fn copy_tree(
 ) -> anyhow::Result<TreeCopy> {
     let mut out = TreeCopy {
         seen: HashSet::new(),
+        fresh: HashSet::new(),
         files: 0,
         bytes: 0,
         copied: 0,
@@ -559,6 +636,7 @@ fn copy_tree(
                 }
                 out.copied += 1;
                 out.copied_bytes += meta.len();
+                out.fresh.insert(child.clone());
                 wrote_here = true;
             }
             out.files += 1;

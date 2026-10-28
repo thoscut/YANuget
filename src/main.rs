@@ -575,7 +575,7 @@ async fn run_backup(config_path: Option<&str>, args: BackupArgs) -> anyhow::Resu
     );
     if !m.missing.is_empty() {
         eprintln!(
-            "warning: {} file(s) the database references are missing from the live store too:",
+            "warning: {} file(s) the database references are missing from the live store too, or differ from what it recorded:",
             m.missing.len()
         );
         for path in m.missing.iter().take(20) {

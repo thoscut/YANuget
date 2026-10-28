@@ -48,19 +48,22 @@ at a different moment from the database can miss a package either way.
    uploads (`.uploads/`) and a running migration's downloads (`.migrate/`) are
    skipped.
 3. **Check every file the snapshot references** is in the backup with the size
-   the database recorded. A push between steps 1 and 2 only leaves an extra
-   file, which is harmless. A delete, an overwrite or a retention run in that
-   window can take away a file the snapshot still lists, and then the pass
-   runs again: a fresh snapshot and an incremental copy, which takes seconds.
-   (The check compares sizes, not hashes, to stay cheap on a large store: an
-   overwrite with exactly the same size during the copy goes unnoticed.)
+   the database recorded, and every file this run copied with the hash it
+   recorded. A push between steps 1 and 2 only leaves an extra file, which is
+   harmless. A delete, an overwrite or a retention run in that window can take
+   away or replace a file the snapshot still lists, and then the pass runs
+   again: a fresh snapshot and an incremental copy, which takes seconds.
+   (Only the copied files are hashed, so the next run stays incremental: a
+   skipped file was already in the backup before the snapshot was taken. The
+   first backup hashes everything it copies, which reads the store a second
+   time.)
 4. **Put the snapshot in place**, remove files the server no longer has, copy
    the TLS pair, and write `backup.json`.
 
-A file still missing after three passes is missing from the live store too.
-The backup completes, lists it under `missing` in `backup.json`, and prints a
-warning: it is a faithful copy of a server that has a problem, not a backup
-that hides one.
+A file still missing after three passes is missing from the live store too,
+or its bytes there do not match the database. The backup completes, lists it
+under `missing` in `backup.json`, and prints a warning: it is a faithful copy
+of a server that has a problem, not a backup that hides one.
 
 Resumable uploads that were unfinished at backup time are not included; a
 client resuming one after a restore starts it over.
