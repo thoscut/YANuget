@@ -16,7 +16,10 @@ port = 5000                # YANUGET_PORT
 # base_url = "https://nuget.example.com"   # YANUGET_BASE_URL
 
 # Where all server data lives. The package store and SQLite database default to
-# subpaths of this directory unless overridden below.
+# subpaths of this directory unless overridden below. A relative path is
+# resolved against the directory the command runs in; for a service, and for
+# `yanuget backup` / `restore` run by hand, set an absolute one
+# (e.g. "/var/lib/yanuget").
 data_dir = "./data"        # YANUGET_DATA_DIR
 # storage_path = "./data/packages"        # YANUGET_STORAGE_PATH
 # database_path = "./data/yanuget.db"     # YANUGET_DATABASE_PATH

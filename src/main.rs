@@ -564,10 +564,11 @@ async fn run_backup(config_path: Option<&str>, args: BackupArgs) -> anyhow::Resu
         .await?;
     let m = &s.manifest;
     println!(
-        "Backed up {} package versions, {} files ({}) to {}: {} copied ({}), {} removed.",
+        "Backed up {} package versions, {} files ({}) from {} to {}: {} copied ({}), {} removed.",
         m.packages,
         m.files,
         indicatif::HumanBytes(m.bytes),
+        yanuget::backup::target(&config),
         args.dest.display(),
         s.copied,
         indicatif::HumanBytes(s.copied_bytes),
@@ -611,10 +612,11 @@ async fn run_restore(config_path: Option<&str>, args: RestoreArgs) -> anyhow::Re
     )
     .await?;
     println!(
-        "Restored the backup of {} ({} package versions, {} files): {} copied, {} removed.",
+        "Restored the backup of {} ({} package versions, {} files) into {}: {} copied, {} removed.",
         s.manifest.created.format("%Y-%m-%d %H:%M:%S UTC"),
         s.manifest.packages,
         s.manifest.files,
+        yanuget::backup::target(&config),
         s.copied,
         s.removed,
     );

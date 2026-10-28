@@ -116,7 +116,21 @@ pub async fn backup(
 ) -> anyhow::Result<BackupSummary> {
     let live_db = PathBuf::from(config.database_path());
     if !live_db.is_file() {
-        bail!("no database at {}: nothing to back up", live_db.display());
+        // A relative path is fine for a server run from its own directory,
+        // and a backup only reads; but run from anywhere else it finds
+        // nothing, and the reason should be on screen.
+        let hint = if live_db.is_relative() {
+            format!(
+                " (relative to the current directory {}; {ABSOLUTE_HINT})",
+                cwd()
+            )
+        } else {
+            String::new()
+        };
+        bail!(
+            "no database at {}{hint}: nothing to back up",
+            live_db.display()
+        );
     }
     std::fs::create_dir_all(dest).with_context(|| format!("creating {}", dest.display()))?;
     // A backup inside the store would copy itself, and one inside the data
@@ -235,6 +249,7 @@ pub async fn restore(
     if !backup_db.is_file() {
         bail!("{} is missing from the backup", backup_db.display());
     }
+    check_absolute(config, manifest.tls)?;
 
     let live_db = PathBuf::from(config.database_path());
     let storage = config.storage_path();
@@ -305,6 +320,69 @@ pub async fn restore(
         copied: tree.copied,
         removed,
     })
+}
+
+/// How to set the data directory so a command run by hand finds it: the end
+/// of a sentence that names the problem.
+const ABSOLUTE_HINT: &str = "set an absolute `data_dir` in the configuration file, e.g. \
+    `data_dir = \"/var/lib/yanuget\"`, and pass that file with `--config`, or set \
+    YANUGET_DATA_DIR";
+
+fn cwd() -> String {
+    std::env::current_dir()
+        .map(|d| d.display().to_string())
+        .unwrap_or_else(|_| "unknown".into())
+}
+
+/// Refuse to restore into a relative path. It resolves against the current
+/// directory, which for `sudo -u yanuget yanuget restore` is wherever the
+/// operator stands, not the service's working directory, and the restore
+/// would write there and report success.
+fn check_absolute(config: &Config, tls: bool) -> anyhow::Result<()> {
+    let (store, db) = (config.storage_path(), PathBuf::from(config.database_path()));
+    let mut targets = vec![
+        (config.storage_path.is_some(), "storage_path", store),
+        (config.database_path.is_some(), "database_path", db),
+    ];
+    if tls {
+        targets.push((false, "data_dir", config.data_dir.join(TLS)));
+    }
+    for (overridden, key, path) in targets {
+        if path.is_absolute() {
+            continue;
+        }
+        if overridden {
+            bail!(
+                "{key} is the relative path {}, which would restore into the current \
+                 directory ({}); set an absolute `{key}` in the configuration file and \
+                 pass that file with `--config`, or set YANUGET_{}",
+                path.display(),
+                cwd(),
+                key.to_ascii_uppercase()
+            );
+        }
+        bail!(
+            "data_dir is the relative path {}, which would restore into the current \
+             directory ({}); {ABSOLUTE_HINT}",
+            config.data_dir.display(),
+            cwd()
+        );
+    }
+    Ok(())
+}
+
+/// Where the data `config` describes lives, for the operator to read: the
+/// data directory, or the store and the database when either is set apart.
+pub fn target(config: &Config) -> String {
+    if config.storage_path.is_none() && config.database_path.is_none() {
+        config.data_dir.display().to_string()
+    } else {
+        format!(
+            "{} and {}",
+            config.storage_path().display(),
+            config.database_path()
+        )
+    }
 }
 
 /// Refuse a backup directory and a package store that contain each other.

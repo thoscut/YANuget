@@ -269,6 +269,50 @@ async fn a_live_file_that_does_not_match_its_row_is_reported() {
     assert_eq!(summary.attempts, 3, "it retried before settling");
 }
 
+/// `sudo -u yanuget yanuget restore` runs wherever the operator stands, not in
+/// the service's working directory, so a relative `data_dir` would restore
+/// there and report success. It is refused before anything is written.
+#[tokio::test]
+async fn a_restore_into_a_relative_path_is_refused() {
+    let live = tempfile::tempdir().unwrap();
+    let base = serve(config_for(live.path())).await;
+    push(&base, "Alpha", "1.0.0").await;
+    let backups = tempfile::tempdir().unwrap();
+    yanuget::backup::backup(&config_for(live.path()), backups.path(), hidden())
+        .await
+        .unwrap();
+
+    let relative = std::path::PathBuf::from(format!("restore-target-{}", std::process::id()));
+    let config = Config {
+        data_dir: relative.clone(),
+        ..config_for(live.path())
+    };
+    let err = yanuget::backup::restore(&config, backups.path(), true, hidden())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("data_dir is the relative path"), "{err}");
+    assert!(err.contains("--config"), "{err}");
+    assert!(!relative.exists(), "it wrote into the current directory");
+
+    // An override of its own is named as such.
+    let restored = tempfile::tempdir().unwrap();
+    let config = Config {
+        storage_path: Some(relative.join("packages")),
+        ..config_for(restored.path())
+    };
+    let err = yanuget::backup::restore(&config, backups.path(), true, hidden())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("storage_path is the relative path"), "{err}");
+    assert!(!relative.exists());
+    assert_eq!(
+        yanuget::backup::target(&config_for(restored.path())),
+        restored.path().display().to_string()
+    );
+}
+
 /// The package store can live outside the data directory. A backup inside it
 /// — or one that contains it — used to be refused only relative to the data
 /// directory, and the copy then recursed into itself.
