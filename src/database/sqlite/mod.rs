@@ -250,6 +250,15 @@ impl PackageDatabase for SqliteDatabase {
         memberships::remove_membership(self, feed, id, version).await
     }
 
+    async fn remove_membership_for_good(
+        &self,
+        feed: &str,
+        id: &str,
+        version: &NuGetVersion,
+    ) -> Result<bool> {
+        memberships::remove_membership_for_good(self, feed, id, version).await
+    }
+
     async fn get_membership(
         &self,
         feed: &str,

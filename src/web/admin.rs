@@ -418,11 +418,13 @@ async fn transfer_version(
         Err(e) => return Err(e),
     };
     if mode == Transfer::Move {
-        state.db.remove_membership(state.feed(), id, v).await?;
-        // Moved out on purpose: this feed's mirror must not fetch it back.
-        if let Err(e) = state.db.add_tombstone(state.feed(), id, v).await {
-            tracing::error!(feed = %state.feed(), %id, error = %e, "could not record the move");
-        }
+        // Moved out on purpose: this feed's mirror must not fetch it back, so
+        // the membership goes only together with its tombstone. Should that
+        // fail, the version is in both feeds: a copy, not a move.
+        state
+            .db
+            .remove_membership_for_good(state.feed(), id, v)
+            .await?;
     }
     Ok(arrival)
 }
@@ -627,8 +629,9 @@ pub(super) async fn admin_bulk(
             } else {
                 Transfer::Copy
             };
-            // Detached: a move that a disconnect stops between removing the
-            // membership and writing the tombstone leaves no tombstone.
+            // Detached: a disconnect must not stop a move between versions,
+            // or between adding the target's membership and removing this
+            // feed's (which goes together with its tombstone).
             let moving = state.clone();
             let task_target = target.clone();
             let (task_id, task_versions) = (id.clone(), versions.clone());

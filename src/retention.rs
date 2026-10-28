@@ -291,13 +291,9 @@ async fn purge_locked(
     id: &str,
     version: &NuGetVersion,
 ) -> Result<bool> {
-    let removed = db.remove_membership(feed, id, version).await?;
-    // Deleted on purpose: a read-through mirror must not fetch it back.
-    if removed {
-        if let Err(e) = db.add_tombstone(feed, id, version).await {
-            tracing::error!(%feed, %id, version = %version.normalized(), error = %e, "could not record the deletion; a mirror may fetch this version again");
-        }
-    }
+    // Deleted on purpose: a read-through mirror must not fetch it back, so
+    // the membership goes only together with its tombstone.
+    let removed = db.remove_membership_for_good(feed, id, version).await?;
     if db.feed_count(id, version).await? == 0 {
         purge_global_data(storage, db, id, version).await?;
     }
