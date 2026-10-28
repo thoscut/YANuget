@@ -634,6 +634,7 @@ mod tests {
         let group = SearchGroup {
             packages: vec![pkg("Contoso.Utils", "1.0.0"), pkg("Contoso.Utils", "1.1.0")],
             total_downloads: 0,
+            version_count: 0,
         };
         let page = SearchPage {
             total_hits: 1,
@@ -659,6 +660,7 @@ mod tests {
             groups: vec![SearchGroup {
                 packages: vec![pkg("Contoso.Utils", "1.0.0")],
                 total_downloads: 1_000,
+                version_count: 0,
             }],
         };
         let resp = search_response(&urls(), &page);
@@ -685,6 +687,7 @@ mod tests {
             groups: vec![SearchGroup {
                 packages: vec![p],
                 total_downloads: 0,
+                version_count: 0,
             }],
         };
         let item = &search_response(&urls(), &page)["data"][0];
@@ -763,6 +766,7 @@ mod tests {
             groups: vec![SearchGroup {
                 packages: vec![p],
                 total_downloads: 0,
+                version_count: 0,
             }],
         };
         assert_eq!(

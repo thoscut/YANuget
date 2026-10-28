@@ -307,8 +307,8 @@ pub fn gallery_page(
                  <div class=\"figs\"><div>{nv} version{vs}, {dl} download{ds}</div>{authors}</div>\
                  {tags}</li>",
                 ver = escape_html(&p.normalized_version()),
-                nv = group.packages.len(),
-                vs = plural(group.packages.len() as i64),
+                nv = group.version_count(),
+                vs = plural(group.version_count() as i64),
                 dl = group_digits(group.total_downloads() as i64),
                 ds = plural(group.total_downloads() as i64),
                 tags = render_tags(urls, &p.tags),
@@ -698,6 +698,7 @@ mod tests {
         let mut group = crate::database::SearchGroup {
             packages: vec![versioned("1.9.0"), versioned("2.0.0-beta")],
             total_downloads: 0,
+            version_count: 0,
         };
         assert_eq!(group.latest().normalized_version(), "2.0.0-beta");
         assert_eq!(group.headline().normalized_version(), "1.9.0");
@@ -710,6 +711,7 @@ mod tests {
             groups: vec![crate::database::SearchGroup {
                 packages: vec![versioned("1.9.0"), versioned("2.0.0-beta")],
                 total_downloads: 0,
+                version_count: 0,
             }],
             total_hits: 1,
         };

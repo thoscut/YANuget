@@ -34,6 +34,7 @@ pub(super) fn page_of(ids: &[&str]) -> crate::database::SearchPage {
                 p
             }],
             total_downloads: 0,
+            version_count: 0,
         })
         .collect::<Vec<_>>();
     crate::database::SearchPage {

@@ -94,6 +94,8 @@ pub(super) async fn gallery(
         package_type: package_type.clone(),
         sort,
         tag: tag.clone(),
+        // A row shows the headline and how many versions there are.
+        headlines_only: true,
     };
     let page = state.db.search(state.feed(), &request).await?;
     // The landing page (no search, no filter, first page) offers a way in by
@@ -169,6 +171,7 @@ pub(super) async fn stats_page(
             state.feed(),
             &SearchRequest {
                 take: 10,
+                headlines_only: true,
                 ..Default::default()
             },
         )

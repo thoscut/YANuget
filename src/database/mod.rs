@@ -55,6 +55,10 @@ pub struct SearchRequest {
     pub sort: SearchSort,
     /// Only packages carrying this tag (case-insensitive, exact).
     pub tag: Option<String>,
+    /// Load only each id's [headline](SearchGroup::headline) version and a
+    /// count of the others, not every version. Enough for the gallery and the
+    /// statistics page; `/v3/search` lists every version and needs them all.
+    pub headlines_only: bool,
 }
 
 /// A file attached to a package version (a disk image, an archive).
@@ -114,6 +118,7 @@ impl Default for SearchRequest {
             package_type: None,
             sort: SearchSort::default(),
             tag: None,
+            headlines_only: false,
         }
     }
 }
@@ -156,10 +161,14 @@ impl SearchSort {
 }
 
 /// One search hit: every (matching) version of a single package id, already
-/// sorted ascending by version.
+/// sorted ascending by version — or, for a
+/// [`headlines_only`](SearchRequest::headlines_only) search, just the headline.
 #[derive(Debug, Clone)]
 pub struct SearchGroup {
     pub packages: Vec<Package>,
+    /// How many versions the search admitted. `packages.len()` unless only
+    /// the headline was loaded.
+    pub version_count: u64,
     /// Downloads of every version of the id this feed serves, whether or not
     /// the search's filters (pre-release, SemVer2, listed) admitted it: the
     /// package's total, as `totalDownloads` means on nuget.org.
@@ -187,6 +196,13 @@ impl SearchGroup {
             .rev()
             .find(|p| !p.is_prerelease())
             .unwrap_or_else(|| self.latest())
+    }
+
+    /// How many versions the search admitted (the `version_count` field);
+    /// never less than the versions loaded, so a group built without it still
+    /// counts.
+    pub fn version_count(&self) -> u64 {
+        self.version_count.max(self.packages.len() as u64)
     }
 
     /// Total downloads of the package, across all its versions in the feed
