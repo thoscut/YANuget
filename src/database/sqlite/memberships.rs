@@ -31,6 +31,33 @@ pub(super) async fn remove_membership(
     Ok(result.rows_affected() > 0)
 }
 
+/// [`remove_membership`] and, when a row was removed, its tombstone, in one
+/// transaction: a failure leaves the membership in place rather than gone
+/// without the tombstone that keeps a mirror from fetching it back.
+pub(super) async fn remove_membership_for_good(
+    db: &SqliteDatabase,
+    feed: &str,
+    id: &str,
+    version: &NuGetVersion,
+) -> Result<bool> {
+    let mut tx = db.write_tx().await?;
+    let removed = sqlx::query(
+        "DELETE FROM feed_packages WHERE feed = ?1 AND lower_id = ?2 AND normalized_version = ?3",
+    )
+    .bind(feed)
+    .bind(canonical_id(id))
+    .bind(version.normalized())
+    .execute(&mut *tx)
+    .await?
+    .rows_affected()
+        > 0;
+    if removed {
+        super::tombstones::insert_tombstone(&mut tx, feed, id, version).await?;
+    }
+    tx.commit().await?;
+    Ok(removed)
+}
+
 pub(super) async fn get_membership(
     db: &SqliteDatabase,
     feed: &str,
@@ -259,6 +286,56 @@ pub(super) async fn insert_membership(conn: &mut SqliteConnection, m: &Membershi
 #[cfg(test)]
 mod tests {
     use super::super::test_support::*;
+
+    #[tokio::test]
+    async fn a_removal_for_good_takes_the_membership_and_writes_the_tombstone_together() {
+        let db = SqliteDatabase::in_memory().await.unwrap();
+        let (a, b) = (sample("Gone.Pkg", "1.0.0"), sample("Gone.Pkg", "2.0.0"));
+        db.add_to_feed(FEED, &a).await.unwrap();
+        db.add_to_feed(FEED, &b).await.unwrap();
+
+        assert!(db
+            .remove_membership_for_good(FEED, "gone.pkg", &a.version)
+            .await
+            .unwrap());
+        assert!(db
+            .get_membership(FEED, "gone.pkg", &a.version)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(db
+            .is_tombstoned(FEED, "gone.pkg", &a.version)
+            .await
+            .unwrap());
+        // Nothing to remove: no tombstone either.
+        let absent = NuGetVersion::parse("3.0.0").unwrap();
+        assert!(!db
+            .remove_membership_for_good(FEED, "gone.pkg", &absent)
+            .await
+            .unwrap());
+        assert!(!db.is_tombstoned(FEED, "gone.pkg", &absent).await.unwrap());
+
+        // The tombstone cannot be written: the membership stays.
+        sqlx::query(
+            "CREATE TRIGGER refuse_tombstones BEFORE INSERT ON tombstones \
+             BEGIN SELECT RAISE(ABORT, 'refused'); END",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        db.remove_membership_for_good(FEED, "gone.pkg", &b.version)
+            .await
+            .unwrap_err();
+        assert!(db
+            .get_membership(FEED, "gone.pkg", &b.version)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(!db
+            .is_tombstoned(FEED, "gone.pkg", &b.version)
+            .await
+            .unwrap());
+    }
 
     #[tokio::test]
     async fn a_batch_membership_update_is_all_or_nothing() {

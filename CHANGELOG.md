@@ -33,6 +33,39 @@ expected to change incompatibly at any version.
   blocked build past it.
 - The shutdown waits, within its grace period, for a push, overwrite, move or
   attach that a disconnected client left running.
+- `max_age_days` counts from when a version entered the feed, not from when
+  it was first published: an old version promoted into a feed today is not
+  deleted there by the next sweep. An overwriting push restarts the count.
+  Sweeps can delete less than before.
+- A backup hashes every file it copied against the database (SHA-512 for
+  packages, SHA-256 for attached files), not only its size. The first full
+  backup reads the store a second time; `missing` in `backup.json` also lists
+  files whose bytes do not match their row.
+- Moving a version, and retention's purge, remove the membership and record
+  the tombstone in one transaction; a failed tombstone no longer lets the
+  mirror fetch a moved version back.
+- Adding a content type to `[Content_Types].xml` (the internalizer's
+  rewrite) parses the XML instead of looking for the last `</Types>`, and part
+  names with control characters are refused.
+
+### Changed
+
+- **`yanuget restore` refuses a relative `data_dir`**, `storage_path` or
+  `database_path`, and both `backup` and `restore` name the directory they
+  read or write; their summary lines changed. Run by hand or by the
+  documented backup timer, they do not see the unit's `YANUGET_DATA_DIR`:
+  put an absolute `data_dir` into the TOML file you pass with `--config`.
+- Responses are compressed (gzip or brotli) when the client asks for it:
+  JSON, HTML and text. Downloads, ranges and `application/octet-stream` are
+  not. A compressed response carries a weak `ETag` and
+  `Vary: Accept-Encoding`. A client that refuses every encoding
+  (`identity;q=0`) gets `406`.
+- `/metrics` and `/health/status` cache their database scans for 5 seconds;
+  a push, promotion or mirrored version on this server refreshes them, while
+  a delete, relist or retention sweep shows up within the 5 seconds.
+- The bundled docs under `/docs` carry an `ETag` and
+  `Cache-Control: public, max-age=300`, and answer `304` to a matching
+  `If-None-Match`.
 
 ### Added
 

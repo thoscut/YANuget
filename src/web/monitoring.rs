@@ -7,11 +7,15 @@
 //! (`/health`, `/health/live`, `/health/ready`) stay as they are: an upstream
 //! outage must not make an orchestrator restart a server that still serves
 //! everything it holds.
+//!
+//! The database's share (the per-feed aggregate scans) is cached for a few
+//! seconds, so a scraper or an anonymous caller hammering the endpoints costs
+//! one scan per interval, not one per request.
 
 use std::fmt::Write as _;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::extract::State;
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
@@ -28,10 +32,58 @@ use crate::mirror::{redact_url, UpstreamStatus};
 /// The Prometheus text exposition format.
 const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 
+/// How long one round of aggregate scans answers for.
+const SCAN_TTL: Duration = Duration::from_secs(5);
+
 struct Monitor {
     states: Vec<AppState>,
     token: Option<String>,
     started: Instant,
+    scans: Recent<Scan>,
+}
+
+/// What the database said: whether it answered, and each feed's statistics
+/// (in `states` order).
+#[derive(Clone)]
+struct Scan {
+    db_up: bool,
+    stats: Vec<Option<DatabaseStats>>,
+}
+
+/// A value computed at most once per `ttl`, single-flight: a caller that
+/// arrives while another refreshes waits for that refresh and takes its
+/// result rather than starting its own.
+///
+/// The value is also refreshed when `writes` changed since it was computed,
+/// so what this process itself changed shows up at once.
+struct Recent<T> {
+    slot: tokio::sync::Mutex<Option<(Instant, u64, T)>>,
+}
+
+impl<T: Clone> Recent<T> {
+    fn new() -> Self {
+        Self {
+            slot: tokio::sync::Mutex::new(None),
+        }
+    }
+
+    async fn get(
+        &self,
+        ttl: Duration,
+        writes: u64,
+        refresh: impl std::future::Future<Output = T>,
+    ) -> T {
+        // Held across the refresh: that is what makes it single-flight.
+        let mut slot = self.slot.lock().await;
+        if let Some((taken, w, value)) = slot.as_ref() {
+            if *w == writes && taken.elapsed() < ttl {
+                return value.clone();
+            }
+        }
+        let value = refresh.await;
+        *slot = Some((Instant::now(), writes, value.clone()));
+        value
+    }
 }
 
 /// One feed's numbers, gathered once per request.
@@ -60,6 +112,7 @@ pub(super) fn routes(states: &[AppState]) -> Router {
             .filter(|t| !t.is_empty())
             .map(str::to_string),
         started: Instant::now(),
+        scans: Recent::new(),
     });
     Router::new()
         .route("/metrics", get(metrics))
@@ -75,7 +128,28 @@ impl Monitor {
             .is_none_or(|token| crate::auth::bearer_matches(headers, token))
     }
 
-    async fn gather(&self) -> (bool, Vec<FeedReport<'_>>) {
+    /// The changes this process made that the scans would show: pushes,
+    /// promotions and mirrored versions, over every feed. Each only grows, so
+    /// an unchanged sum means none of them moved. Downloads are left out on
+    /// purpose: anyone can make them, and they would defeat the cache.
+    fn writes(&self) -> u64 {
+        self.states
+            .iter()
+            .map(|state| {
+                let counters = &state.feed.counters;
+                counters.pushes.load(Ordering::Relaxed)
+                    + counters.promotions.load(Ordering::Relaxed)
+                    + state
+                        .feed
+                        .mirror
+                        .as_ref()
+                        .map_or(0, |m| m.upstream_status().mirrored)
+            })
+            .sum()
+    }
+
+    /// The database probe and the per-feed aggregate scans, uncached.
+    async fn scan(&self) -> Scan {
         let db_up = match self.states.first() {
             Some(state) => match state.db.ping().await {
                 Ok(()) => true,
@@ -86,9 +160,9 @@ impl Monitor {
             },
             None => false,
         };
-        let mut feeds = Vec::with_capacity(self.states.len());
+        let mut stats = Vec::with_capacity(self.states.len());
         for state in &self.states {
-            let stats = if db_up {
+            stats.push(if db_up {
                 match state.db.stats(state.feed()).await {
                     Ok(stats) => Some(stats),
                     Err(e) => {
@@ -98,19 +172,30 @@ impl Monitor {
                 }
             } else {
                 None
-            };
-            let mirror = state
-                .feed
-                .mirror
-                .as_ref()
-                .map(|m| (redact_url(m.upstream()), m.upstream_status()));
-            feeds.push(FeedReport {
-                state,
-                stats,
-                mirror,
             });
         }
-        (db_up, feeds)
+        Scan { db_up, stats }
+    }
+
+    /// Everything both endpoints report: the database's share from the last
+    /// [`SCAN_TTL`], the in-memory counters and mirror states as they are now.
+    async fn gather(&self) -> (bool, Vec<FeedReport<'_>>) {
+        let scan = self.scans.get(SCAN_TTL, self.writes(), self.scan()).await;
+        let feeds = self
+            .states
+            .iter()
+            .zip(scan.stats)
+            .map(|(state, stats)| FeedReport {
+                state,
+                stats,
+                mirror: state
+                    .feed
+                    .mirror
+                    .as_ref()
+                    .map(|m| (redact_url(m.upstream()), m.upstream_status())),
+            })
+            .collect();
+        (scan.db_up, feeds)
     }
 }
 
@@ -413,11 +498,47 @@ fn escape_label(v: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::escape_label;
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
 
     #[test]
     fn label_values_are_escaped() {
         assert_eq!(escape_label(r#"a"b\c"#), r#"a\"b\\c"#);
         assert_eq!(escape_label("a\nb"), "a\\nb");
+    }
+
+    async fn counted(calls: &AtomicUsize) -> usize {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        calls.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    #[tokio::test]
+    async fn concurrent_callers_share_one_refresh() {
+        let recent = Recent::new();
+        let calls = AtomicUsize::new(0);
+        let results = futures::future::join_all(
+            (0..8).map(|_| recent.get(Duration::from_secs(60), 0, counted(&calls))),
+        )
+        .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(results.iter().all(|&r| r == 1));
+        // Still fresh: answered from the cache.
+        assert_eq!(
+            recent
+                .get(Duration::from_secs(60), 0, counted(&calls))
+                .await,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn a_write_or_an_expired_value_refreshes() {
+        let recent = Recent::new();
+        let calls = AtomicUsize::new(0);
+        let ttl = Duration::from_secs(60);
+        assert_eq!(recent.get(ttl, 0, counted(&calls)).await, 1);
+        assert_eq!(recent.get(ttl, 1, counted(&calls)).await, 2);
+        assert_eq!(recent.get(ttl, 1, counted(&calls)).await, 2);
+        assert_eq!(recent.get(Duration::ZERO, 1, counted(&calls)).await, 3);
     }
 }

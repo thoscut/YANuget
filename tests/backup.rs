@@ -216,6 +216,103 @@ async fn a_file_missing_from_the_live_store_is_reported_not_hidden() {
     assert_eq!(summary.attempts, 3, "it retried before settling");
 }
 
+/// Same size, other bytes: what an overwrite during the copy can leave. The
+/// size check passes it; the hash of a file the run copied does not.
+#[tokio::test]
+async fn a_copied_file_with_the_right_size_but_other_bytes_fails_verification() {
+    let live = tempfile::tempdir().unwrap();
+    let base = serve(config_for(live.path())).await;
+    push(&base, "Alpha", "1.0.0").await;
+    let backups = tempfile::tempdir().unwrap();
+    yanuget::backup::backup(&config_for(live.path()), backups.path(), hidden())
+        .await
+        .unwrap();
+
+    let rel = "alpha/1.0.0/alpha.1.0.0.nupkg";
+    let copy = backups.path().join("packages").join(rel);
+    let len = std::fs::metadata(&copy).unwrap().len() as usize;
+    std::fs::write(&copy, vec![b'x'; len]).unwrap();
+
+    let (db, store) = (
+        backups.path().join("yanuget.db"),
+        backups.path().join("packages"),
+    );
+    let skipped = std::collections::HashSet::new();
+    assert!(yanuget::backup::verify(&db, &store, &skipped)
+        .await
+        .unwrap()
+        .is_empty());
+    let copied = [std::path::PathBuf::from(rel)].into();
+    assert_eq!(
+        yanuget::backup::verify(&db, &store, &copied).await.unwrap(),
+        [rel]
+    );
+}
+
+/// A live file whose bytes no longer match its row is copied, hashed, and
+/// reported like a missing one.
+#[tokio::test]
+async fn a_live_file_that_does_not_match_its_row_is_reported() {
+    let live = tempfile::tempdir().unwrap();
+    let base = serve(config_for(live.path())).await;
+    push(&base, "Alpha", "1.0.0").await;
+    push(&base, "Beta", "1.0.0").await;
+    let file = live.path().join("packages/beta/1.0.0/beta.1.0.0.nupkg");
+    let len = std::fs::metadata(&file).unwrap().len() as usize;
+    std::fs::write(&file, vec![b'x'; len]).unwrap();
+
+    let backups = tempfile::tempdir().unwrap();
+    let summary = yanuget::backup::backup(&config_for(live.path()), backups.path(), hidden())
+        .await
+        .unwrap();
+    assert_eq!(summary.manifest.missing, ["beta/1.0.0/beta.1.0.0.nupkg"]);
+    assert_eq!(summary.attempts, 3, "it retried before settling");
+}
+
+/// `sudo -u yanuget yanuget restore` runs wherever the operator stands, not in
+/// the service's working directory, so a relative `data_dir` would restore
+/// there and report success. It is refused before anything is written.
+#[tokio::test]
+async fn a_restore_into_a_relative_path_is_refused() {
+    let live = tempfile::tempdir().unwrap();
+    let base = serve(config_for(live.path())).await;
+    push(&base, "Alpha", "1.0.0").await;
+    let backups = tempfile::tempdir().unwrap();
+    yanuget::backup::backup(&config_for(live.path()), backups.path(), hidden())
+        .await
+        .unwrap();
+
+    let relative = std::path::PathBuf::from(format!("restore-target-{}", std::process::id()));
+    let config = Config {
+        data_dir: relative.clone(),
+        ..config_for(live.path())
+    };
+    let err = yanuget::backup::restore(&config, backups.path(), true, hidden())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("data_dir is the relative path"), "{err}");
+    assert!(err.contains("--config"), "{err}");
+    assert!(!relative.exists(), "it wrote into the current directory");
+
+    // An override of its own is named as such.
+    let restored = tempfile::tempdir().unwrap();
+    let config = Config {
+        storage_path: Some(relative.join("packages")),
+        ..config_for(restored.path())
+    };
+    let err = yanuget::backup::restore(&config, backups.path(), true, hidden())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("storage_path is the relative path"), "{err}");
+    assert!(!relative.exists());
+    assert_eq!(
+        yanuget::backup::target(&config_for(restored.path())),
+        restored.path().display().to_string()
+    );
+}
+
 /// The package store can live outside the data directory. A backup inside it
 /// — or one that contains it — used to be refused only relative to the data
 /// directory, and the copy then recursed into itself.

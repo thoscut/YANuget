@@ -1,5 +1,5 @@
 //! Middleware: the process-wide layers every served app gets (body limit,
-//! CORS, tracing, rate limiting, the host and cross-site request guard,
+//! response compression, CORS, tracing, rate limiting, the host and cross-site request guard,
 //! security headers, forwarded-header filtering), and the per-feed layers for
 //! read-gated feeds and the gallery's HTML error pages.
 
@@ -11,6 +11,8 @@ use axum::extract::{ConnectInfo, DefaultBodyLimit, Request, State};
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Json, Response};
 use axum::Router;
+use tower_http::compression::predicate::{DefaultPredicate, NotForContentType, Predicate};
+use tower_http::compression::{CompressionLayer, CompressionLevel};
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
@@ -102,10 +104,57 @@ impl GlobalLayers {
     }
 }
 
+/// Compress JSON, HTML and text for clients that ask for it (gzip or brotli).
+///
+/// Registration pages and search results are large and repetitive, and
+/// without a proxy that compresses them they went out as they were. Package,
+/// symbol and attached-file downloads are left alone: a `.nupkg` is a zip
+/// already, and they answer ranges, which need the real `Content-Length` and
+/// byte offsets. Every one of them is served by `files::serve_open_file`, which
+/// marks it `Accept-Ranges: bytes`; that and `application/octet-stream` keep
+/// them out. Images (but SVG), tiny bodies and anything already encoded are
+/// excluded by the default predicate.
+///
+/// The default brotli quality (11) is meant for static assets and far too slow
+/// per request; 4 compresses about as well as gzip's default, faster.
+fn compression_layer() -> CompressionLayer<impl Predicate> {
+    let predicate = DefaultPredicate::new()
+        .and(NotForContentType::const_new("application/octet-stream"))
+        .and(|_, _, headers: &axum::http::HeaderMap, _: &_| {
+            !headers.contains_key(header::ACCEPT_RANGES)
+                && !headers.contains_key(header::CONTENT_RANGE)
+        });
+    CompressionLayer::new()
+        .quality(CompressionLevel::Precise(4))
+        .compress_when(predicate)
+}
+
+/// Weaken the `ETag` of a compressed response.
+///
+/// A strong tag names exact bytes, and the compressed bytes are not the ones
+/// the handler tagged; a cache could otherwise splice ranges of one encoding
+/// into another. A weak tag still revalidates: `If-None-Match` compares
+/// weakly.
+async fn weaken_encoded_etag(req: Request, next: axum::middleware::Next) -> Response {
+    let mut resp = next.run(req).await;
+    let headers = resp.headers_mut();
+    if headers.contains_key(header::CONTENT_ENCODING) {
+        let weak = headers
+            .get(header::ETAG)
+            .and_then(|v| v.to_str().ok())
+            .filter(|tag| tag.starts_with('"'))
+            .and_then(|tag| HeaderValue::from_str(&format!("W/{tag}")).ok());
+        if let Some(weak) = weak {
+            headers.insert(header::ETAG, weak);
+        }
+    }
+    resp
+}
+
 /// Apply the process-wide middleware shared by every served app: an unbounded
 /// body limit (uploads stream straight to disk, so axum's small default cap is
 /// removed; the configured size limit is still enforced while streaming),
-/// CORS for the configured `cors_allowed_origins` (none by default, read-only
+/// response compression (see [`compression_layer`]), CORS for the configured `cors_allowed_origins` (none by default, read-only
 /// methods only), request tracing, per-IP rate limiting (when enabled),
 /// baseline security response headers and — when TLS is on — HSTS.
 ///
@@ -116,6 +165,8 @@ impl GlobalLayers {
 pub(super) fn apply_global_layers(router: Router, layers: GlobalLayers) -> Router {
     let mut router = router
         .layer(DefaultBodyLimit::disable())
+        .layer(compression_layer())
+        .layer(axum::middleware::from_fn(weaken_encoded_etag))
         .layer(cors_layer(&layers.cors_allowed_origins))
         .layer(TraceLayer::new_for_http());
     // Added before HSTS so it stays inner: short-circuits abusive callers, and

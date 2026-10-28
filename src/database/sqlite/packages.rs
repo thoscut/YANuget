@@ -222,7 +222,9 @@ async fn replace_rows(
         .await?;
     insert_tags(tx, p).await?;
     // The membership's own state is the caller's to decide; its download
-    // counter is history and survives the replacement.
+    // counter is history and survives the replacement. `added` restarts:
+    // retention's age limit counts from it, and new bytes are a new arrival,
+    // as they were when the limit counted from `published`.
     sqlx::query(
         r#"INSERT INTO feed_packages
                (feed, lower_id, normalized_version, listed, enabled, pending,
@@ -231,7 +233,8 @@ async fn replace_rows(
            ON CONFLICT(feed, lower_id, normalized_version) DO UPDATE SET
                listed = excluded.listed, enabled = excluded.enabled,
                pending = excluded.pending, flagged = excluded.flagged,
-               flag_reason = excluded.flag_reason, pinned = excluded.pinned"#,
+               flag_reason = excluded.flag_reason, pinned = excluded.pinned,
+               added = excluded.added"#,
     )
     .bind(&m.feed)
     .bind(canonical_id(&m.lower_id))
@@ -454,12 +457,19 @@ pub(super) fn row_to_feed_package(row: &SqliteRow) -> Result<FeedVersion> {
     let enabled = row.try_get::<i64, _>("m_enabled")? != 0;
     let downloads = row.try_get::<i64, _>("m_downloads")? as u64;
     let package = build_package(row, listed, enabled, downloads)?;
+    // Every writer stores RFC 3339 (the oldest rows copied `published`). A
+    // row that is not falls back to `published`, which is what retention
+    // counted from before; it is no reason to make the feed unreadable.
+    let added = DateTime::parse_from_rfc3339(&row.try_get::<String, _>("m_added")?)
+        .map(|t| t.with_timezone(&Utc))
+        .unwrap_or(package.published);
     Ok(FeedVersion {
         package,
         pending: row.try_get::<i64, _>("m_pending")? != 0,
         flagged: row.try_get::<i64, _>("m_flagged")? != 0,
         flag_reason: row.try_get("m_flag_reason")?,
         pinned: row.try_get::<i64, _>("m_pinned")? != 0,
+        added,
     })
 }
 
@@ -595,6 +605,27 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(data.is_semver2);
+    }
+
+    /// Retention's age limit counts from `added`, so new bytes start it over,
+    /// as they did when it counted from `published`.
+    #[tokio::test]
+    async fn a_replacement_restarts_the_time_in_the_feed() {
+        let db = SqliteDatabase::in_memory().await.unwrap();
+        let first = sample("Swap.Pkg", "1.0.0");
+        db.add_to_feed(FEED, &first).await.unwrap();
+        sqlx::query("UPDATE feed_packages SET added = '2020-01-01T00:00:00+00:00'")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let before = db.find_all_versions(FEED, "swap.pkg").await.unwrap();
+        assert_eq!(before[0].added.format("%Y").to_string(), "2020");
+
+        db.replace_version(&first, &Membership::active(FEED, &first))
+            .await
+            .unwrap();
+        let after = db.find_all_versions(FEED, "swap.pkg").await.unwrap();
+        assert!(after[0].added > Utc::now() - chrono::Duration::minutes(1));
     }
 
     #[tokio::test]

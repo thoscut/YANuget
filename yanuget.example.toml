@@ -16,7 +16,10 @@ port = 5000                # YANUGET_PORT
 # base_url = "https://nuget.example.com"   # YANUGET_BASE_URL
 
 # Where all server data lives. The package store and SQLite database default to
-# subpaths of this directory unless overridden below.
+# subpaths of this directory unless overridden below. A relative path is
+# resolved against the directory the command runs in; for a service, and for
+# `yanuget backup` / `restore` run by hand, set an absolute one
+# (e.g. "/var/lib/yanuget").
 data_dir = "./data"        # YANUGET_DATA_DIR
 # storage_path = "./data/packages"        # YANUGET_STORAGE_PATH
 # database_path = "./data/yanuget.db"     # YANUGET_DATABASE_PATH
@@ -183,7 +186,9 @@ enabled = false               # YANUGET_MONITORING_ENABLED
 # Retention HARD-deletes versions (payload, sidecars and symbols), so it is
 # off by default. A version is pruned when it is beyond the newest-N of its
 # release channel OR older than max_age_days; the newest stable version (or
-# newest pre-release, if there is no stable) is always kept.
+# newest pre-release, if there is no stable) is always kept. Age counts from
+# when the version entered the feed (push, mirror, promotion, copy or move),
+# not from when it was first published.
 # ---------------------------------------------------------------------------
 [retention]
 enabled = false               # YANUGET_RETENTION_ENABLED — master switch
@@ -194,7 +199,7 @@ interval_hours = 24           # YANUGET_RETENTION_INTERVAL_HOURS — background 
 # sweep to do anything.
 # keep_latest_stable = 10       # YANUGET_RETENTION_KEEP_LATEST_STABLE
 # keep_latest_prerelease = 5    # YANUGET_RETENTION_KEEP_LATEST_PRERELEASE
-# max_age_days = 180            # YANUGET_RETENTION_MAX_AGE_DAYS
+# max_age_days = 180            # YANUGET_RETENTION_MAX_AGE_DAYS — days in this feed
 
 # ---------------------------------------------------------------------------
 # Attached files — disk images and archives a package's install script fetches

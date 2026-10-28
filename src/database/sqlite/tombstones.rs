@@ -1,6 +1,7 @@
 //! Versions deliberately removed from a feed: `tombstones`.
 
 use chrono::Utc;
+use sqlx::SqliteConnection;
 
 use crate::database::canonical_id;
 use crate::error::Result;
@@ -14,6 +15,17 @@ pub(super) async fn add_tombstone(
     id: &str,
     version: &NuGetVersion,
 ) -> Result<()> {
+    let mut conn = db.pool.acquire().await?;
+    insert_tombstone(&mut conn, feed, id, version).await
+}
+
+/// The tombstone insert, on a connection or inside a transaction.
+pub(super) async fn insert_tombstone(
+    conn: &mut SqliteConnection,
+    feed: &str,
+    id: &str,
+    version: &NuGetVersion,
+) -> Result<()> {
     sqlx::query(
         "INSERT OR IGNORE INTO tombstones (feed, lower_id, normalized_version, created) \
          VALUES (?1, ?2, ?3, ?4)",
@@ -22,7 +34,7 @@ pub(super) async fn add_tombstone(
     .bind(canonical_id(id))
     .bind(version.normalized())
     .bind(Utc::now().to_rfc3339())
-    .execute(&db.pool)
+    .execute(conn)
     .await?;
     Ok(())
 }

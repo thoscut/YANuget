@@ -180,6 +180,10 @@ pub struct DownloadsConfig {
     pub concurrency: usize,
     /// For connecting and for any silence while a host sends.
     pub timeout_secs: u64,
+    /// The longest one file may take in all, resumes and restarts included.
+    /// `timeout_secs` never fires on a host that trickles a byte at a time;
+    /// this does.
+    pub file_timeout_secs: u64,
     /// The largest file taken.
     pub max_file_bytes: u64,
     /// How often a download cut off midway is resumed (or restarted, where
@@ -200,6 +204,8 @@ impl Default for DownloadsConfig {
         DownloadsConfig {
             concurrency: 4,
             timeout_secs: 60,
+            // Four hours: the largest file at about 600 KiB/s.
+            file_timeout_secs: 4 * 60 * 60,
             max_file_bytes: 8 * 1024 * 1024 * 1024,
             resume_attempts: 5,
             allow_private_hosts: Vec::new(),
@@ -349,6 +355,7 @@ pub const KNOWN_ENV: &[&str] = &[
     "YANUGET_INTERNALIZE_UPSTREAM_TOKEN_FILE",
     "YANUGET_INTERNALIZE_DOWNLOADS_CONCURRENCY",
     "YANUGET_INTERNALIZE_DOWNLOADS_TIMEOUT_SECS",
+    "YANUGET_INTERNALIZE_DOWNLOADS_FILE_TIMEOUT_SECS",
     "YANUGET_INTERNALIZE_DOWNLOADS_MAX_FILE_BYTES",
     "YANUGET_INTERNALIZE_DOWNLOADS_RESUME_ATTEMPTS",
     "YANUGET_INTERNALIZE_DOWNLOADS_ALLOW_PRIVATE_HOSTS",
@@ -482,6 +489,9 @@ impl Config {
         }
         if let Some(v) = get("YANUGET_INTERNALIZE_DOWNLOADS_TIMEOUT_SECS")? {
             d.timeout_secs = parse_int("YANUGET_INTERNALIZE_DOWNLOADS_TIMEOUT_SECS", &v)?;
+        }
+        if let Some(v) = get("YANUGET_INTERNALIZE_DOWNLOADS_FILE_TIMEOUT_SECS")? {
+            d.file_timeout_secs = parse_int("YANUGET_INTERNALIZE_DOWNLOADS_FILE_TIMEOUT_SECS", &v)?;
         }
         if let Some(v) = get("YANUGET_INTERNALIZE_DOWNLOADS_MAX_FILE_BYTES")? {
             d.max_file_bytes = parse_int("YANUGET_INTERNALIZE_DOWNLOADS_MAX_FILE_BYTES", &v)?;
@@ -629,6 +639,10 @@ impl Config {
             ),
             ("downloads.concurrency", self.downloads.concurrency as u64),
             ("downloads.timeout_secs", self.downloads.timeout_secs),
+            (
+                "downloads.file_timeout_secs",
+                self.downloads.file_timeout_secs,
+            ),
             ("downloads.max_file_bytes", self.downloads.max_file_bytes),
             ("sandbox.timeout_secs", self.sandbox.timeout_secs),
             ("sandbox.max_parallel", self.sandbox.max_parallel as u64),
@@ -992,6 +1006,13 @@ mod tests {
             assert!(load(Some(&toml), &[]).is_err(), "{host:?}");
         }
         assert!(load(Some("[downloads]\nmax_file_bytes = 0\n"), &[]).is_err());
+        assert!(load(Some("[downloads]\nfile_timeout_secs = 0\n"), &[]).is_err());
+        let c = load(
+            Some("[downloads]\nfile_timeout_secs = 600\n"),
+            &[("YANUGET_INTERNALIZE_DOWNLOADS_FILE_TIMEOUT_SECS", "900")],
+        )
+        .unwrap();
+        assert_eq!(c.downloads.file_timeout_secs, 900);
     }
 
     #[test]

@@ -125,7 +125,10 @@ file that came over plain HTTP with nothing to verify it is a warning. The
 name a download got (its URL after redirects, `Content-Disposition`,
 `Content-Type`) is kept next to it, so a file taken from the cache is
 attached under the same name. A transfer that breaks off is resumed with a `Range` where the host offers
-ranges and a validator, and restarted where it does not.
+ranges and a validator, and restarted where it does not. `downloads.timeout_secs`
+bounds any silence; `downloads.file_timeout_secs` (four hours by default)
+bounds a whole file, resumes included, so a host that trickles bytes cannot
+hold a run.
 
 A file is attached under the URL's own name when that is valid for the feed
 (1 to 128 characters of `A-Z a-z 0-9 . _ -`) and its extension fits the
@@ -204,12 +207,20 @@ its file.
 
 ## Prelude
 
-A package with attached files gets three entries. `internalizer/prelude.ps1`
-is the prelude. The package's own `chocolateyInstall.ps1` moves to
+A package with attached files gets `internalizer/prelude.ps1`, the prelude.
+The package's own `chocolateyInstall.ps1` moves to
 `chocolateyInstall.upstream.ps1` in the same folder, so `$toolsDir` and
 `$MyInvocation` still lead there. In its place goes a loader that
-dot-sources the prelude and then the package's own script. A package that
-already has entries under those names is refused.
+dot-sources the prelude and then the package's own script.
+`chocolateyBeforeModify.ps1` and `chocolateyUninstall.ps1` get the same
+treatment (`chocolateyUninstall.upstream.ps1`, ...): Chocolatey runs them with
+the same helpers, so they can download too. The capture ran neither, so a
+download there that the install did not make stops the upgrade or uninstall
+rather than reaching the internet; the static cross-check warns about such
+URLs beforehand, and `choco uninstall --skip-powershell` gets past one. Every
+copy of these scripts in the package is wrapped, in whatever folder, since
+which one Chocolatey runs depends on how it walks the extracted package. A
+package that already has entries under the new names is refused.
 
 The prelude wraps `Get-ChocolateyWebFile`, `Get-WebFile`, `Get-FtpFile`,
 `Install-ChocolateyPackage`, `Install-ChocolateyZipPackage`,
@@ -225,9 +236,16 @@ wrapper:
 - for `Get-WebFile`, which takes no checksum, checks the file it wrote.
 
 A URL that is not in the map stops the install with a message naming the
-package; it never falls back to the internet. A local path is left alone.
-Calls the helpers make among themselves are not wrapped, so they keep the
-URL they were given.
+package; it never falls back to the internet. Whatever starts with `http` or
+`ftp` once the blanks around it are trimmed counts as a URL, as it does for
+the helpers, so ` https://...` or `https:\\host\file` cannot slip past. A
+file on this machine (a drive path, a relative path, a `file:` URI without
+a host) is left alone. A UNC path (`\\host\share`), a `file:` URI with a
+host or any other scheme stops the install as well: the helpers would copy
+it over the network. Normalizing such a value and copying it anyway was
+the alternative; refusing is the one that cannot reach another machine by
+a spelling the prelude did not foresee. Calls the helpers make among
+themselves are not wrapped, so they keep the URL they were given.
 
 The map is keyed by the SHA-256 of the URL as the report records it. The
 wrapper looks up the URL as the package spelled it, then in the canonical

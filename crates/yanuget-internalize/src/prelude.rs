@@ -4,6 +4,16 @@
 //! `chocolateyInstall.upstream.ps1` beside it, so `$toolsDir` and
 //! `$MyInvocation` lead to the same folder as before.
 //!
+//! `chocolateyBeforeModify.ps1` and `chocolateyUninstall.ps1` get the same
+//! loader: Chocolatey runs them with the same helpers imported, so they can
+//! download as well. The capture ran neither, so the map holds only what the
+//! install fetched; a download of anything else stops the upgrade or
+//! uninstall instead of reaching the internet, as one in the install does
+//! (`choco uninstall --skip-powershell` gets past it). Every copy of these
+//! scripts in the package is wrapped, not only the first: which one
+//! Chocolatey runs depends on how it walks the extracted folder, not on the
+//! entry order.
+//!
 //! The prelude wraps Chocolatey's download helpers in proxy commands, made on
 //! the client from the helpers it has, so a call binds exactly as it does
 //! against them. A wrapper replaces each URL with the attached file's and
@@ -29,6 +39,20 @@ pub const PRELUDE_PATH: &str = "internalizer/prelude.ps1";
 
 /// What the package's own `chocolateyInstall.ps1` is renamed to.
 pub const UPSTREAM_SCRIPT: &str = "chocolateyInstall.upstream.ps1";
+
+/// The scripts Chocolatey runs from a package, each with the name the
+/// package's own is renamed to when a loader takes its place.
+pub const SCRIPTS: [(&str, &str); 3] = [
+    ("chocolateyInstall.ps1", UPSTREAM_SCRIPT),
+    (
+        "chocolateyBeforeModify.ps1",
+        "chocolateyBeforeModify.upstream.ps1",
+    ),
+    (
+        "chocolateyUninstall.ps1",
+        "chocolateyUninstall.upstream.ps1",
+    ),
+];
 
 /// The script the placeholders are filled into.
 const TEMPLATE: &str = include_str!("prelude.ps1");
@@ -67,28 +91,30 @@ pub async fn build(
         return Ok(None);
     };
     let nupkg: PathBuf = nupkg.to_path_buf();
-    let (name, script) = tokio::task::spawn_blocking(move || install_script(&nupkg))
+    let scripts = tokio::task::spawn_blocking(move || package_scripts(&nupkg))
         .await
         .map_err(|e| {
-            yanuget_pkg::Error::Task(format!("reading the install script panicked: {e}"))
+            yanuget_pkg::Error::Task(format!("reading the package scripts panicked: {e}"))
         })??;
-    let (dir, _) = split(&name);
-    let depth = dir.split(['/', '\\']).filter(|c| !c.is_empty()).count();
-    let upstream = if dir.is_empty() {
-        UPSTREAM_SCRIPT.to_string()
-    } else {
-        format!("{dir}/{UPSTREAM_SCRIPT}")
-    };
-    Ok(Some(Prelude {
-        entries: vec![
-            (
-                PRELUDE_PATH.to_string(),
-                Source::Bytes(prelude.into_bytes()),
-            ),
-            (upstream, Source::Bytes(script)),
-            (name, Source::Bytes(loader(depth).into_bytes())),
-        ],
-    }))
+    let mut entries = vec![(
+        PRELUDE_PATH.to_string(),
+        Source::Bytes(prelude.into_bytes()),
+    )];
+    for script in scripts {
+        let (dir, _) = split(&script.name);
+        let depth = dir.split(['/', '\\']).filter(|c| !c.is_empty()).count();
+        let upstream = if dir.is_empty() {
+            script.upstream.to_string()
+        } else {
+            format!("{dir}/{}", script.upstream)
+        };
+        entries.push((upstream, Source::Bytes(script.content)));
+        entries.push((
+            script.name,
+            Source::Bytes(loader(depth, script.upstream).into_bytes()),
+        ));
+    }
+    Ok(Some(Prelude { entries }))
 }
 
 /// The prelude's text, or `None` when there is nothing to redirect.
@@ -147,9 +173,10 @@ pub fn render(
     Ok(Some(crlf(&text)))
 }
 
-/// The `chocolateyInstall.ps1` of an internalized package, `depth` folders
-/// below the package root.
-pub fn loader(depth: usize) -> String {
+/// The script of an internalized package that takes the place of one of
+/// [`SCRIPTS`], `depth` folders below the package root, the package's own
+/// renamed to `upstream` beside it.
+pub fn loader(depth: usize, upstream: &str) -> String {
     let prelude = format!(
         "{}{}",
         "..\\".repeat(depth),
@@ -158,9 +185,9 @@ pub fn loader(depth: usize) -> String {
     crlf(&format!(
         "# Internalized by yanuget-internalize: this package's downloads come from\n\
          # the feed it was installed from (see {PRELUDE_PATH}). The package's own\n\
-         # install script is {UPSTREAM_SCRIPT}, beside this one.\n\
+         # script is {upstream}, beside this one.\n\
          . (Join-Path $PSScriptRoot '{prelude}')\n\
-         . (Join-Path $PSScriptRoot '{UPSTREAM_SCRIPT}')\n"
+         . (Join-Path $PSScriptRoot '{upstream}')\n"
     ))
 }
 
@@ -194,47 +221,75 @@ fn split(name: &str) -> (&str, &str) {
     }
 }
 
-/// The package's `chocolateyInstall.ps1`, the first in entry order as
-/// Chocolatey finds it, and its content.
-fn install_script(nupkg: &Path) -> Result<(String, Vec<u8>), PreludeError> {
+/// One of [`SCRIPTS`] in the package.
+struct Script {
+    /// The entry, as the package names it.
+    name: String,
+    /// What the package's own is renamed to.
+    upstream: &'static str,
+    content: Vec<u8>,
+}
+
+/// Every one of [`SCRIPTS`] the package carries, in any folder, with its
+/// content. At least one must be a `chocolateyInstall.ps1`, for the prelude
+/// to be loaded from.
+fn package_scripts(nupkg: &Path) -> Result<Vec<Script>, PreludeError> {
     let mut archive = open_archive(nupkg)?;
-    let mut found = None;
+    let mut found = Vec::new();
     for i in 0..archive.len() {
         let Some(name) = entry_name(&archive, i)? else {
             continue;
         };
         let lower = name.to_ascii_lowercase().replace('\\', "/");
         let (_, file) = split(&lower);
-        if lower.starts_with("internalizer/") || file == UPSTREAM_SCRIPT.to_ascii_lowercase() {
+        if lower.starts_with("internalizer/")
+            || SCRIPTS
+                .iter()
+                .any(|(_, upstream)| file == upstream.to_ascii_lowercase())
+        {
             return Err(PreludeError::Package(format!(
                 "the package has an entry {name}, which the prelude would replace"
             )));
         }
-        if found.is_none() && file == "chocolateyinstall.ps1" {
-            found = Some((i, name));
+        if let Some((_, upstream)) = SCRIPTS
+            .iter()
+            .find(|(script, _)| file == script.to_ascii_lowercase())
+        {
+            found.push((i, name, *upstream));
         }
     }
-    let Some((i, name)) = found else {
+    if !found
+        .iter()
+        .any(|(_, _, upstream)| *upstream == UPSTREAM_SCRIPT)
+    {
         return Err(PreludeError::Package(
             "files were attached, but the package has no chocolateyInstall.ps1 to load the \
              prelude from"
                 .into(),
         ));
-    };
-    let file = archive
-        .by_index(i)
-        .map_err(|e| yanuget_pkg::Error::InvalidPackage(format!("{name}: {e}")))?;
-    let mut script = Vec::new();
-    file.take(MAX_SCRIPT_BYTES + 1)
-        .read_to_end(&mut script)
-        .map_err(|e| yanuget_pkg::Error::InvalidPackage(format!("{name}: {e}")))?;
-    if script.len() as u64 > MAX_SCRIPT_BYTES {
-        return Err(PreludeError::Package(format!(
-            "{name} is larger than {} KiB",
-            MAX_SCRIPT_BYTES / 1024
-        )));
     }
-    Ok((name, script))
+    let mut scripts = Vec::with_capacity(found.len());
+    for (i, name, upstream) in found {
+        let file = archive
+            .by_index(i)
+            .map_err(|e| yanuget_pkg::Error::InvalidPackage(format!("{name}: {e}")))?;
+        let mut content = Vec::new();
+        file.take(MAX_SCRIPT_BYTES + 1)
+            .read_to_end(&mut content)
+            .map_err(|e| yanuget_pkg::Error::InvalidPackage(format!("{name}: {e}")))?;
+        if content.len() as u64 > MAX_SCRIPT_BYTES {
+            return Err(PreludeError::Package(format!(
+                "{name} is larger than {} KiB",
+                MAX_SCRIPT_BYTES / 1024
+            )));
+        }
+        scripts.push(Script {
+            name,
+            upstream,
+            content,
+        });
+    }
+    Ok(scripts)
 }
 
 #[cfg(test)]
@@ -323,11 +378,34 @@ mod tests {
         }
     }
 
+    /// The capture records a URL as `Url` parses it, which is the form the
+    /// prelude looks a sloppy spelling up in, after .NET has parsed it alike.
+    #[test]
+    fn a_sloppy_spelling_is_recorded_in_canonical_form() {
+        for sloppy in [
+            " https://example.com/setup.exe",
+            "https:\\\\example.com\\setup.exe",
+            "HTTPS://EXAMPLE.COM:443/setup.exe",
+        ] {
+            assert_eq!(
+                Url::parse(sloppy).unwrap().as_str(),
+                "https://example.com/setup.exe",
+                "{sloppy:?}"
+            );
+        }
+        // The prelude takes apart what is not a download.
+        assert!(TEMPLATE.contains("function __Yanuget-IsLocal"));
+        assert!(!TEMPLATE.contains("(https?|ftps?)://"));
+    }
+
     #[test]
     fn the_loader_finds_the_prelude_from_its_folder() {
-        assert!(loader(1).contains(". (Join-Path $PSScriptRoot '..\\internalizer\\prelude.ps1')"));
-        assert!(loader(0).contains(". (Join-Path $PSScriptRoot 'internalizer\\prelude.ps1')"));
-        assert!(loader(2).contains("'..\\..\\internalizer\\prelude.ps1'"));
-        assert!(loader(1).contains(". (Join-Path $PSScriptRoot 'chocolateyInstall.upstream.ps1')"));
+        let install = |depth| loader(depth, UPSTREAM_SCRIPT);
+        assert!(install(1).contains(". (Join-Path $PSScriptRoot '..\\internalizer\\prelude.ps1')"));
+        assert!(install(0).contains(". (Join-Path $PSScriptRoot 'internalizer\\prelude.ps1')"));
+        assert!(install(2).contains("'..\\..\\internalizer\\prelude.ps1'"));
+        assert!(install(1).contains(". (Join-Path $PSScriptRoot 'chocolateyInstall.upstream.ps1')"));
+        assert!(loader(1, "chocolateyUninstall.upstream.ps1")
+            .contains(". (Join-Path $PSScriptRoot 'chocolateyUninstall.upstream.ps1')"));
     }
 }

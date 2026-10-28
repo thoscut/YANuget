@@ -4,8 +4,10 @@
 # internet. internalizer/report.json in the package lists the original URLs.
 #
 # A URL that is not in the map below stops the install; nothing falls back
-# to the internet. Files are checked against their SHA-256, whatever checksum
-# the package declares.
+# to the internet, and a path to another machine (\\host\share) is refused
+# as well. Files are checked against their SHA-256, whatever checksum the
+# package declares. The package's uninstall and before-modify scripts load
+# this prelude too.
 #
 # The feed the files come from. Set YANUGET_INTERNALIZED_FEED_URL on the
 # client to fetch them from another address, after the feed moved hosts.
@@ -36,18 +38,37 @@ function __Yanuget-Key([string] $Text) {
     }
 }
 
-# The attached file for a URL: as the package spelled it, else in the
-# canonical form the capture recorded it in (lower-case scheme and host, no
-# default port, escaped).
+# The attached file for a URL: as the package spelled it, without the blanks
+# around it, else in the canonical form the capture recorded it in
+# (lower-case scheme and host, no default port, '/' for '\', escaped), which
+# is also what .NET makes of it when it downloads.
 function __Yanuget-Find([string] $Url) {
     $files = __Yanuget-Files
-    $file = $files[(__Yanuget-Key $Url)]
-    if ($null -ne $file) { return , $file }
+    foreach ($spelling in @($Url, $Url.Trim())) {
+        $file = $files[(__Yanuget-Key $spelling)]
+        if ($null -ne $file) { return , $file }
+    }
     $uri = $null
-    if ([System.Uri]::TryCreate($Url, [System.UriKind]::Absolute, [ref] $uri)) {
+    if ([System.Uri]::TryCreate($Url.Trim(), [System.UriKind]::Absolute, [ref] $uri)) {
         $file = $files[(__Yanuget-Key $uri.AbsoluteUri)]
     }
     , $file
+}
+
+# Whether a URL parameter's value names a file on this machine, which the
+# helpers copy rather than download: a drive path, a path relative to the
+# current folder or drive, or a file: URI without a host. A UNC path
+# (\\host\share, //host/share, \\?\ and \\.\ alike), a file: URI with a host
+# and any other scheme would reach the network another way, and are not.
+function __Yanuget-IsLocal([string] $Path) {
+    if ($Path -match '^[\\/]{2}') { return $false }
+    if ($Path -match '^[a-z]:') { return $true }
+    if ($Path -match '^file:') {
+        $uri = $null
+        return ([System.Uri]::TryCreate($Path, [System.UriKind]::Absolute, [ref] $uri) -and
+            $uri.IsFile -and -not $uri.IsUnc -and $uri.LocalPath -notmatch '^[\\/]{2}')
+    }
+    $Path -notmatch '^[a-z][a-z0-9+.-]*:'
 }
 
 # For each helper: its URL parameters, each with the checksum parameters that
@@ -74,8 +95,19 @@ function __Yanuget-Redirect($Bound, [string] $Helper) {
     foreach ($s in (__Yanuget-Spec $Helper)) {
         if (-not $Bound.ContainsKey($s[0])) { continue }
         $url = [string] $Bound[$s[0]]
-        # A local path is no download.
-        if ($url -notmatch '^(?i)(https?|ftps?)://') { continue }
+        $probe = $url.Trim()
+        if (-not $probe) { continue }
+        # The helpers download what starts with http or ftp, and .NET forgives
+        # the blanks, case and backslashes the package may have written
+        # (' https:\\host\x'): all of it is looked up in the map. Anything
+        # else is copied, which is fine for a file on this machine only.
+        if ($probe -notmatch '^(http|ftp)') {
+            if (__Yanuget-IsLocal $probe) { continue }
+            throw ("yanuget: the internalized package $env:ChocolateyPackageName " +
+                "$env:ChocolateyPackageVersion asks $Helper for $url, which is neither a " +
+                'download it carries nor a file on this machine. ' +
+                'Internalize it again, or add the download to its override.')
+        }
         $file = __Yanuget-Find $url
         if ($null -eq $file) {
             throw ("yanuget: the internalized package $env:ChocolateyPackageName " +

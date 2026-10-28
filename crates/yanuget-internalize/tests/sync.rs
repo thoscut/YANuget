@@ -550,6 +550,40 @@ fn only_one_sync_holds_the_lock() {
 }
 
 #[test]
+fn an_atomic_write_leaves_no_temporary_file_and_follows_no_link() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.json");
+    sync::write_atomic(&path, b"one").unwrap();
+    sync::write_atomic(&path, b"two").unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), b"two");
+    let names: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(names, ["state.json"]);
+
+    // A link where the old fixed temporary name was, and one at the path
+    // itself: neither is written through, and the file they point at stays.
+    #[cfg(unix)]
+    {
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, b"untouched").unwrap();
+        std::os::unix::fs::symlink(&victim, dir.path().join(".state.json.tmp")).unwrap();
+        let linked = dir.path().join("linked.json");
+        std::os::unix::fs::symlink(&victim, &linked).unwrap();
+        sync::write_atomic(&path, b"three").unwrap();
+        sync::write_atomic(&linked, b"four").unwrap();
+        assert_eq!(std::fs::read(&victim).unwrap(), b"untouched");
+        assert_eq!(std::fs::read(&path).unwrap(), b"three");
+        assert!(!std::fs::symlink_metadata(&linked)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read(&linked).unwrap(), b"four");
+    }
+}
+
+#[test]
 fn metrics_are_written_whole() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("textfile").join("internalize.prom");

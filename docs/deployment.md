@@ -109,6 +109,9 @@ systemd-sysusers                       # creates the yanuget user and group
 
 install -d -m 0750 -g yanuget /etc/yanuget
 install -m 0640 -g yanuget yanuget.example.toml /etc/yanuget/yanuget.toml
+# The data directory the unit uses, as an absolute path in the file too:
+# `sudo -u yanuget yanuget backup` and `restore` read only the file.
+sed -i 's|^data_dir = .*|data_dir = "/var/lib/yanuget"|' /etc/yanuget/yanuget.toml
 install -m 0644 yanuget.service /etc/systemd/system/yanuget.service
 
 systemctl daemon-reload
@@ -119,8 +122,13 @@ What the unit sets up:
 
 - **Unprivileged user.** The server runs as `yanuget`, never as root.
 - **Data in `/var/lib/yanuget`.** systemd creates it (`StateDirectory=`) owned
-  by the service user, and the unit sets `YANUGET_DATA_DIR` to it, so the
-  `data_dir` in the TOML file is ignored.
+  by the service user, and the unit sets `YANUGET_DATA_DIR` to it, which wins
+  over the TOML file for the service. A command you run yourself, such as
+  `sudo -u yanuget yanuget --config /etc/yanuget/yanuget.toml backup …`, does
+  not run inside the unit and sees only the file: that is why the install step
+  puts the same absolute `data_dir` there. With the example's `./data` it
+  would look in the directory you run it from; `restore` refuses a relative
+  path for that reason.
 - **Configuration in `/etc/yanuget/yanuget.toml`**, read-only to the service.
   Keys can stay out of that file: put `YANUGET_API_KEY=…` and
   `YANUGET_ADMIN_API_KEY=…` in `/etc/yanuget/secrets.env`, owned by root and
@@ -139,7 +147,8 @@ upgrade can replace the unit. The usual changes:
 
 ```ini
 [Service]
-# Data on another volume: both lines together.
+# Data on another volume: both lines together, and data_dir = "/srv/yanuget"
+# in /etc/yanuget/yanuget.toml as well.
 Environment=YANUGET_DATA_DIR=/srv/yanuget
 ReadWritePaths=/srv/yanuget
 # files.inbox_dir must be writable too, since imported files leave it.
@@ -269,6 +278,13 @@ Two settings there are not optional for a package server: disable request and
 response buffering, and remove the body size limit. A proxy that buffers a 25 GB
 upload in memory or on its own disk undoes the whole point of streaming, and a
 default `client_max_body_size` will reject the push outright.
+
+The server compresses JSON, HTML and text itself (gzip or brotli, whichever
+the client asks for) and never compresses package, symbol or file downloads,
+which are zips already and answer byte ranges. A proxy in front therefore
+needs no compression of its own; if it has one (nginx's `gzip on`), it leaves
+responses that already carry a `Content-Encoding` alone, and it must not be
+told to compress `application/octet-stream`.
 
 ## Upgrading
 

@@ -8,6 +8,7 @@
 #   install -m 0644 yanuget.service /etc/systemd/system/yanuget.service
 #   install -d -m 0750 -g yanuget /etc/yanuget
 #   install -m 0640 -g yanuget yanuget.example.toml /etc/yanuget/yanuget.toml
+#   sed -i 's|^data_dir = .*|data_dir = "/var/lib/yanuget"|' /etc/yanuget/yanuget.toml
 #   systemctl daemon-reload && systemctl enable --now yanuget
 #
 # Adjust paths with `systemctl edit yanuget` rather than editing this file, so
@@ -31,9 +32,11 @@ User=yanuget
 Group=yanuget
 UMask=0027
 
-# /var/lib/yanuget is created and owned by the service user. The data_dir in
-# the TOML file is overridden here so the two cannot disagree; if you move the
-# data elsewhere, change this and ReadWritePaths together.
+# /var/lib/yanuget is created and owned by the service user. YANUGET_DATA_DIR
+# wins over the TOML file for the service, but `sudo -u yanuget yanuget backup`
+# and `restore` do not run in this unit and read only the file: keep the same
+# absolute data_dir there. If you move the data elsewhere, change this,
+# ReadWritePaths and the file together.
 StateDirectory=yanuget
 StateDirectoryMode=0750
 WorkingDirectory=/var/lib/yanuget

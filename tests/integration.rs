@@ -5737,3 +5737,89 @@ async fn an_unreadable_report_is_shown_as_such() {
     assert!(html.contains("schema version 2"), "{html}");
     assert!(html.contains("Approve it anyway?"));
 }
+
+// ---------------------------------------------------------------------------
+// Response compression
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn json_is_compressed_and_package_downloads_are_not() {
+    use std::io::Read;
+    let server = spawn().await;
+    let nupkg = build_nupkg("Compress.Pkg", "1.0.0", &[b'x'; 4096]);
+    let resp = push_multipart(&server, API_KEY, nupkg).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+
+    let resp = server
+        .client
+        .get(server.url("/v3/registration/compress.pkg/index.json"))
+        .header("accept-encoding", "gzip")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(resp.headers()["content-encoding"], "gzip");
+    let vary: Vec<_> = resp.headers().get_all("vary").iter().collect();
+    assert!(
+        vary.iter().any(|v| v
+            .to_str()
+            .unwrap()
+            .to_ascii_lowercase()
+            .contains("accept-encoding")),
+        "{vary:?}"
+    );
+    let gz = resp.bytes().await.unwrap();
+    let mut json = String::new();
+    flate2::read::GzDecoder::new(&gz[..])
+        .read_to_string(&mut json)
+        .unwrap();
+    let doc: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(doc["count"], 1);
+
+    // Brotli is offered too; a client that asks for nothing gets plain JSON.
+    let resp = server
+        .client
+        .get(server.url("/v3/registration/compress.pkg/index.json"))
+        .header("accept-encoding", "br")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.headers()["content-encoding"], "br");
+    let resp = server
+        .client
+        .get(server.url("/v3/registration/compress.pkg/index.json"))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.headers().get("content-encoding").is_none());
+
+    let url = server.url("/v3/package/compress.pkg/1.0.0/compress.pkg.1.0.0.nupkg");
+    let resp = server
+        .client
+        .get(&url)
+        .header("accept-encoding", "gzip, br")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert!(resp.headers().get("content-encoding").is_none());
+    assert_eq!(resp.headers()["accept-ranges"], "bytes");
+    let length: usize = resp.headers()["content-length"]
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(resp.bytes().await.unwrap().len(), length);
+
+    let resp = server
+        .client
+        .get(&url)
+        .header("accept-encoding", "gzip")
+        .header("range", "bytes=0-9")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+    assert!(resp.headers().get("content-encoding").is_none());
+    assert_eq!(resp.bytes().await.unwrap().len(), 10);
+}

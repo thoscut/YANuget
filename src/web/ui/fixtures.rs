@@ -81,6 +81,7 @@ pub(super) fn feed_version(
     flagged: bool,
 ) -> crate::database::FeedVersion {
     crate::database::FeedVersion {
+        added: p.published,
         package: p,
         pending,
         flagged,

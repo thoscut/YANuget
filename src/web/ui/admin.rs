@@ -852,7 +852,7 @@ pub fn admin_retention_page(urls: &UrlBuilder, view: &RetentionView) -> String {
         Some(plan) => {
             let mut table = String::from(
                 "<div class=\"scroll\"><table class=\"atbl plan\"><thead><tr><th>Package</th>\
-                 <th>Version</th><th>Published</th><th>Why</th><th>Frees</th></tr></thead><tbody>",
+                 <th>Version</th><th>Added</th><th>Why</th><th>Frees</th></tr></thead><tbody>",
             );
             for p in plan.planned.iter().take(MAX_PREVIEW_ROWS) {
                 table.push_str(&format!(
@@ -865,7 +865,7 @@ pub fn admin_retention_page(urls: &UrlBuilder, view: &RetentionView) -> String {
                     ))),
                     id = escape_html(&p.id),
                     v = escape_html(&p.version.normalized()),
-                    when = escape_html(&p.published.format("%Y-%m-%d").to_string()),
+                    when = escape_html(&p.added.format("%Y-%m-%d").to_string()),
                     why = escape_html(&p.reason.describe()),
                     frees = if p.frees > 0 {
                         human_size(p.frees)
@@ -1190,7 +1190,7 @@ mod tests {
             planned: vec![Planned {
                 id: "Old.Pkg".into(),
                 version: crate::version::NuGetVersion::parse("1.0.0").unwrap(),
-                published: chrono::Utc::now(),
+                added: chrono::Utc::now(),
                 reason: PruneReason {
                     beyond_newest: Some((2, false)),
                     older_than_days: None,

@@ -12,6 +12,13 @@ server to a new host is a backup on the old one and a restore on the new one.
 sudo -u yanuget yanuget --config /etc/yanuget/yanuget.toml backup /srv/backup/yanuget
 ```
 
+The command reads its data directory from that file, not from the service's
+environment, so the file needs the absolute `data_dir` the server uses
+(`data_dir = "/var/lib/yanuget"` under the systemd unit, see
+[systemd](deployment.md#systemd)). A relative one is resolved against the
+directory you run the command from; when no database is there, the backup
+stops and says so. The summary names the directory it backed up.
+
 The directory is created if needed, and must not be inside the data directory
 (a backup on the same disk goes with it), nor inside the package store or
 contain it when `storage_path` points elsewhere (the copy would recurse into
@@ -48,19 +55,22 @@ at a different moment from the database can miss a package either way.
    uploads (`.uploads/`) and a running migration's downloads (`.migrate/`) are
    skipped.
 3. **Check every file the snapshot references** is in the backup with the size
-   the database recorded. A push between steps 1 and 2 only leaves an extra
-   file, which is harmless. A delete, an overwrite or a retention run in that
-   window can take away a file the snapshot still lists, and then the pass
-   runs again: a fresh snapshot and an incremental copy, which takes seconds.
-   (The check compares sizes, not hashes, to stay cheap on a large store: an
-   overwrite with exactly the same size during the copy goes unnoticed.)
+   the database recorded, and every file this run copied with the hash it
+   recorded. A push between steps 1 and 2 only leaves an extra file, which is
+   harmless. A delete, an overwrite or a retention run in that window can take
+   away or replace a file the snapshot still lists, and then the pass runs
+   again: a fresh snapshot and an incremental copy, which takes seconds.
+   (Only the copied files are hashed, so the next run stays incremental: a
+   skipped file was already in the backup before the snapshot was taken. The
+   first backup hashes everything it copies, which reads the store a second
+   time.)
 4. **Put the snapshot in place**, remove files the server no longer has, copy
    the TLS pair, and write `backup.json`.
 
-A file still missing after three passes is missing from the live store too.
-The backup completes, lists it under `missing` in `backup.json`, and prints a
-warning: it is a faithful copy of a server that has a problem, not a backup
-that hides one.
+A file still missing after three passes is missing from the live store too,
+or its bytes there do not match the database. The backup completes, lists it
+under `missing` in `backup.json`, and prints a warning: it is a faithful copy
+of a server that has a problem, not a backup that hides one.
 
 Resumable uploads that were unfinished at backup time are not included; a
 client resuming one after a restore starts it over.
@@ -150,7 +160,10 @@ systemctl start yanuget
 
 It restores into the locations the configuration names (`data_dir`, or
 `storage_path` and `database_path` if set), so a backup taken from one layout
-restores into another. The package store is copied first and the database last,
+restores into another, and prints them when it is done. They must be absolute
+paths: a relative `data_dir` would be resolved against the directory the
+command runs in, so `restore` refuses it and asks for an absolute `data_dir`
+in the file it is given with `--config`. The package store is copied first and the database last,
 and any `-wal`/`-shm` files left by the previous database are removed so they
 cannot be replayed into the restored one. The database is then opened the way
 the server opens it, which brings a backup taken by an older version up to the
@@ -224,7 +237,7 @@ keeps serving until the last minute:
 
 ```bash
 # 1. Old host, server running: take a full backup. This is the long part.
-yanuget --config /etc/yanuget/yanuget.toml backup /srv/backup/move
+sudo -u yanuget yanuget --config /etc/yanuget/yanuget.toml backup /srv/backup/move
 
 # 2. Copy it to the new host. Repeat 1 and 2 as often as you like; each
 #    round only moves what changed.
@@ -233,11 +246,12 @@ rsync -a --delete /srv/backup/move/ newhost:/srv/backup/move/
 # 3. Old host: stop the server, take a final backup (seconds, since only the
 #    last changes are copied) and copy it over.
 systemctl stop yanuget
-yanuget --config /etc/yanuget/yanuget.toml backup /srv/backup/move
+sudo -u yanuget yanuget --config /etc/yanuget/yanuget.toml backup /srv/backup/move
 rsync -a --delete /srv/backup/move/ newhost:/srv/backup/move/
 
-# 4. New host: install the binary and configuration, restore and start.
-yanuget --config /etc/yanuget/yanuget.toml restore /srv/backup/move
+# 4. New host: install the binary and configuration (with an absolute
+#    data_dir), restore and start.
+sudo -u yanuget yanuget --config /etc/yanuget/yanuget.toml restore /srv/backup/move
 systemctl start yanuget
 ```
 

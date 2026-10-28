@@ -94,6 +94,8 @@ async fn the_install_script_loads_the_prelude_and_then_the_package_s_own() {
         &[
             ("tools/ChocolateyInstall.ps1", UPSTREAM),
             ("tools/chocolateyUninstall.ps1", "# uninstall"),
+            ("chocolateyBeforeModify.ps1", "# before modify"),
+            ("tools/legacy/chocolateyInstall.ps1", "# another install"),
         ],
     );
     let built = prelude::build(&input, ID, VERSION, &downloads(), &feed())
@@ -118,16 +120,46 @@ async fn the_install_script_loads_the_prelude_and_then_the_package_s_own() {
     assert!(loader.contains(". (Join-Path $PSScriptRoot '..\\internalizer\\prelude.ps1')"));
     assert!(loader.contains(". (Join-Path $PSScriptRoot 'chocolateyInstall.upstream.ps1')"));
     assert_eq!(get("tools/chocolateyInstall.upstream.ps1"), UPSTREAM);
-    assert_eq!(get("tools/chocolateyUninstall.ps1"), "# uninstall");
+    // The uninstall and before-modify scripts, and every other copy of the
+    // install script, load the prelude as well.
+    for (script, upstream, own, prelude) in [
+        (
+            "tools/chocolateyUninstall.ps1",
+            "tools/chocolateyUninstall.upstream.ps1",
+            "# uninstall",
+            "'..\\internalizer\\prelude.ps1'",
+        ),
+        (
+            "chocolateyBeforeModify.ps1",
+            "chocolateyBeforeModify.upstream.ps1",
+            "# before modify",
+            "'internalizer\\prelude.ps1'",
+        ),
+        (
+            "tools/legacy/chocolateyInstall.ps1",
+            "tools/legacy/chocolateyInstall.upstream.ps1",
+            "# another install",
+            "'..\\..\\internalizer\\prelude.ps1'",
+        ),
+    ] {
+        let loader = get(script);
+        assert!(loader.contains(prelude), "{script}: {loader}");
+        let (_, file) = upstream.rsplit_once('/').unwrap_or(("", upstream));
+        assert!(
+            loader.contains(&format!(". (Join-Path $PSScriptRoot '{file}')")),
+            "{script}: {loader}"
+        );
+        assert_eq!(get(upstream), own);
+    }
     let text = get(PRELUDE_PATH);
     assert!(text.contains("files/tool.install/1.0.0/setup.exe"));
     assert!(!text.contains("example.com/setup.exe"));
-    // No second install script for Chocolatey to pick up.
+    // No install script left for Chocolatey to pick up unwrapped.
     let scripts = entries
         .iter()
         .filter(|(n, _)| n.to_ascii_lowercase().ends_with("chocolateyinstall.ps1"))
         .count();
-    assert_eq!(scripts, 1);
+    assert_eq!(scripts, 2);
 }
 
 #[tokio::test]
@@ -147,6 +179,7 @@ async fn a_package_the_prelude_cannot_go_into_is_refused() {
     for taken in [
         "internalizer/prelude.ps1",
         "tools/chocolateyInstall.upstream.ps1",
+        "tools/chocolateyUninstall.upstream.ps1",
     ] {
         write_nupkg(
             &nupkg,
@@ -402,8 +435,79 @@ async fn an_install_fetches_the_attached_file() {
     .unwrap();
     assert!(!out.status.success());
 
-    // A URL the package did not have at capture time stops the install.
+    // Spellings that .NET downloads from but a plain `https://` test misses
+    // are looked up all the same: a captured file is redirected, anything
+    // else stops the install. A path to another machine is refused; a file
+    // on this one is copied as before.
     let script = dir.path().join("pkg/tools/chocolateyInstall.upstream.ps1");
+    for (url, outcome) in [
+        (" https://example.com/setup.exe", Ok(true)),
+        // Redirected where .NET reads '\' as '/', as it does for http;
+        // refused, never fetched, if it does not.
+        ("https:\\\\example.com\\setup.exe", Ok(false)),
+        ("HTTPS://EXAMPLE.COM/setup.exe", Ok(true)),
+        (
+            " https:\\\\example.com\\other.exe",
+            Err("which it does not carry"),
+        ),
+        (
+            "\\\\fileserver\\share\\setup.exe",
+            Err("nor a file on this machine"),
+        ),
+        (
+            "//fileserver/share/setup.exe",
+            Err("nor a file on this machine"),
+        ),
+        (
+            "file://fileserver/share/setup.exe",
+            Err("nor a file on this machine"),
+        ),
+        (
+            "smb://fileserver/share/setup.exe",
+            Err("nor a file on this machine"),
+        ),
+        ("C:\\setup.exe", Err("the stand-in")),
+    ] {
+        std::fs::write(
+            &script,
+            format!(
+                "Install-ChocolateyPackage 'tool' -Url '{url}' -Checksum 'x' -ChecksumType md5\r\n"
+            ),
+        )
+        .unwrap();
+        let out = run(vec![]).await.unwrap();
+        let all = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        match outcome {
+            Ok(false) if !out.status.success() => {
+                assert!(all.contains("which it does not carry"), "{url}: {all}");
+            }
+            Ok(_) => {
+                assert!(out.status.success(), "{url}: {all}");
+                assert!(
+                    all.contains(&format!(
+                        "installed {feed}files/tool.install/1.0.0/setup.exe (sha256)"
+                    )),
+                    "{url}: {all}"
+                );
+            }
+            Err(why) => {
+                assert!(!out.status.success(), "{url}: {all}");
+                assert!(!all.contains("installed"), "{url}: {all}");
+                // A local path reaches the stand-in, which cannot fetch it.
+                if why != "the stand-in" {
+                    assert!(all.contains(why), "{url}: {all}");
+                } else {
+                    assert!(!all.contains("yanuget:"), "{url}: {all}");
+                }
+            }
+        }
+    }
+
+    // A URL the package did not have at capture time stops the install.
     std::fs::write(
         &script,
         "Install-ChocolateyPackage 'tool' -Url 'https://example.com/other.exe'\r\n",

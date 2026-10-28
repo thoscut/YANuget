@@ -61,7 +61,7 @@ macro_rules! feed_select {
     () => {
         "SELECT p.*, fp.listed AS m_listed, fp.enabled AS m_enabled, \
          fp.pending AS m_pending, fp.flagged AS m_flagged, fp.flag_reason AS m_flag_reason, \
-         fp.downloads AS m_downloads, fp.pinned AS m_pinned \
+         fp.downloads AS m_downloads, fp.pinned AS m_pinned, fp.added AS m_added \
          FROM packages p \
          JOIN feed_packages fp \
            ON fp.lower_id = p.lower_id AND fp.normalized_version = p.normalized_version"
@@ -248,6 +248,15 @@ impl PackageDatabase for SqliteDatabase {
         version: &NuGetVersion,
     ) -> Result<bool> {
         memberships::remove_membership(self, feed, id, version).await
+    }
+
+    async fn remove_membership_for_good(
+        &self,
+        feed: &str,
+        id: &str,
+        version: &NuGetVersion,
+    ) -> Result<bool> {
+        memberships::remove_membership_for_good(self, feed, id, version).await
     }
 
     async fn get_membership(

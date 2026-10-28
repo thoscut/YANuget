@@ -268,6 +268,10 @@ pub struct FeedVersion {
     pub flag_reason: Option<String>,
     /// Exempt from retention (see [`Membership::pinned`]).
     pub pinned: bool,
+    /// When the version entered this feed: pushed, promoted, copied, moved or
+    /// mirrored in, or last overwritten. Not `package.published`, which is
+    /// global and older for a version promoted later.
+    pub added: chrono::DateTime<chrono::Utc>,
 }
 
 /// Metadata store for indexed packages.
@@ -356,6 +360,18 @@ pub trait PackageDatabase: Send + Sync {
     /// Remove a membership. Returns `true` if a row was removed.
     async fn remove_membership(&self, feed: &str, id: &str, version: &NuGetVersion)
         -> Result<bool>;
+
+    /// Remove a membership on purpose (moved out, pruned) and, when a row was
+    /// removed, record its tombstone, in one transaction: either both happen
+    /// or neither does, so a read-through mirror never finds the version gone
+    /// without the tombstone that keeps it from fetching it back. Returns
+    /// `true` if a row was removed.
+    async fn remove_membership_for_good(
+        &self,
+        feed: &str,
+        id: &str,
+        version: &NuGetVersion,
+    ) -> Result<bool>;
 
     /// Fetch a membership (any state) for admin/promotion logic.
     async fn get_membership(

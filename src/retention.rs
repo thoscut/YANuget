@@ -6,7 +6,9 @@
 //! is a thin wrapper over the existing storage/database primitives.
 //!
 //! A version is pruned when it is **excess by count** (beyond the newest N of
-//! its release channel) **or** **too old** (published before the age cutoff).
+//! its release channel) **or** **too old** (added to the feed before the age
+//! cutoff). Age is the feed's own: a version promoted into `prod` today is a
+//! day old there, however long ago it was first pushed elsewhere.
 //! As a safety floor the newest stable version is always kept — or, when a
 //! package has no stable version, its newest pre-release — so retention can
 //! never make a package disappear entirely. A **pinned** version is never
@@ -60,7 +62,7 @@ impl From<&RetentionConfig> for RetentionPolicy {
 pub struct PruneReason {
     /// Beyond the newest `keep` of its channel; `prerelease` names the channel.
     pub beyond_newest: Option<(usize, bool)>,
-    /// Published more than this many days ago.
+    /// Added to the feed more than this many days ago.
     pub older_than_days: Option<u64>,
 }
 
@@ -102,15 +104,18 @@ pub struct Candidate<'a> {
     /// count, because a client restoring an exact version still gets them —
     /// they are hidden from search, not withdrawn.
     pub servable: bool,
+    /// When it entered the feed; the age limit counts from here.
+    pub added: DateTime<Utc>,
 }
 
 impl<'a> Candidate<'a> {
-    /// A servable, unpinned version.
+    /// A servable, unpinned version, added when it was published.
     pub fn ranked(package: &'a Package) -> Self {
         Self {
             package,
             pinned: false,
             servable: true,
+            added: package.published,
         }
     }
 }
@@ -143,14 +148,15 @@ pub fn prune_plan(
     let protected: Option<&NuGetVersion> = newest(false).or_else(|| newest(true));
 
     // Newest-first within each channel so "rank" is an index from the top.
-    let ranked = versions
-        .iter()
-        .filter(|c| c.servable && !c.pinned)
-        .map(|c| c.package);
-    let mut stable: Vec<&Package> = ranked.clone().filter(|p| !p.is_prerelease()).collect();
-    let mut prerelease: Vec<&Package> = ranked.filter(|p| p.is_prerelease()).collect();
-    stable.sort_by(|a, b| b.version.cmp(&a.version));
-    prerelease.sort_by(|a, b| b.version.cmp(&a.version));
+    let ranked = versions.iter().filter(|c| c.servable && !c.pinned);
+    let mut stable: Vec<&Candidate<'_>> = ranked
+        .clone()
+        .filter(|c| !c.package.is_prerelease())
+        .collect();
+    let mut prerelease: Vec<&Candidate<'_>> =
+        ranked.filter(|c| c.package.is_prerelease()).collect();
+    stable.sort_by(|a, b| b.package.version.cmp(&a.package.version));
+    prerelease.sort_by(|a, b| b.package.version.cmp(&a.package.version));
 
     // `Duration::days` panics outside its representable range, and a `u64` day
     // count from configuration can easily exceed it — so build the cutoff with
@@ -168,19 +174,19 @@ pub fn prune_plan(
         (&stable, policy.keep_latest_stable, false),
         (&prerelease, policy.keep_latest_prerelease, true),
     ] {
-        for (rank, pkg) in channel.iter().enumerate() {
-            if protected.is_some_and(|v| *v == pkg.version) {
+        for (rank, c) in channel.iter().enumerate() {
+            if protected.is_some_and(|v| *v == c.package.version) {
                 continue;
             }
             let reason = PruneReason {
                 beyond_newest: keep.filter(|n| rank >= *n).map(|n| (n, is_pre)),
                 older_than_days: cutoff
-                    .filter(|c| pkg.published < *c)
+                    .filter(|cutoff| c.added < *cutoff)
                     .and(policy.max_age_days),
             };
             if reason.beyond_newest.is_some() || reason.older_than_days.is_some() {
                 prune.push(Pruned {
-                    version: pkg.version.clone(),
+                    version: c.package.version.clone(),
                     reason,
                 });
             }
@@ -205,8 +211,8 @@ pub fn versions_to_prune(
         .collect()
 }
 
-/// [`prune_plan`] over a feed's versions of one package, with their pins and
-/// their pending and disabled states.
+/// [`prune_plan`] over a feed's versions of one package, with their pins,
+/// their pending and disabled states, and when each was added to the feed.
 pub fn plan_for(
     versions: &[FeedVersion],
     policy: &RetentionPolicy,
@@ -221,6 +227,7 @@ fn candidate(v: &FeedVersion) -> Candidate<'_> {
         package: &v.package,
         pinned: v.pinned,
         servable: is_servable(v),
+        added: v.added,
     }
 }
 
@@ -284,13 +291,9 @@ async fn purge_locked(
     id: &str,
     version: &NuGetVersion,
 ) -> Result<bool> {
-    let removed = db.remove_membership(feed, id, version).await?;
-    // Deleted on purpose: a read-through mirror must not fetch it back.
-    if removed {
-        if let Err(e) = db.add_tombstone(feed, id, version).await {
-            tracing::error!(%feed, %id, version = %version.normalized(), error = %e, "could not record the deletion; a mirror may fetch this version again");
-        }
-    }
+    // Deleted on purpose: a read-through mirror must not fetch it back, so
+    // the membership goes only together with its tombstone.
+    let removed = db.remove_membership_for_good(feed, id, version).await?;
     if db.feed_count(id, version).await? == 0 {
         purge_global_data(storage, db, id, version).await?;
     }
@@ -563,7 +566,8 @@ pub struct Planned {
     /// The package id as published.
     pub id: String,
     pub version: NuGetVersion,
-    pub published: DateTime<Utc>,
+    /// When it was added to the feed.
+    pub added: DateTime<Utc>,
     pub reason: PruneReason,
     /// Bytes deleting it frees: its size when no other feed holds it, else 0.
     pub frees: u64,
@@ -662,7 +666,7 @@ pub async fn preview(
             out.planned.push(Planned {
                 id: fv.package.id.clone(),
                 version: p.version,
-                published: fv.package.published,
+                added: fv.added,
                 reason: p.reason,
                 frees,
             });
@@ -937,7 +941,7 @@ mod tests {
         let planned = |id: &str, v: &str| Planned {
             id: id.into(),
             version: NuGetVersion::parse(v).unwrap(),
-            published: Utc::now(),
+            added: Utc::now(),
             reason: PruneReason {
                 beyond_newest: Some((1, false)),
                 older_than_days: None,
@@ -1064,6 +1068,39 @@ mod tests {
         assert_eq!(
             names(versions_to_prune(&[old, new], &policy, now)),
             vec!["1.0.0"]
+        );
+    }
+
+    #[test]
+    fn age_counts_from_when_the_version_entered_the_feed() {
+        let base = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        let in_feed = |version: &str, published: i64, added: i64| {
+            let mut p = pkg(version, 0);
+            p.published = base + Duration::days(published);
+            FeedVersion {
+                package: p,
+                pending: false,
+                flagged: false,
+                flag_reason: None,
+                pinned: false,
+                added: base + Duration::days(added),
+            }
+        };
+        let policy = RetentionPolicy {
+            max_age_days: Some(30),
+            ..Default::default()
+        };
+        let now = base + Duration::days(110);
+        // 1.0.0 was published 110 days ago but promoted here 10 days ago;
+        // 1.1.0 has been here since day 0. 2.0.0 is the protected newest.
+        let versions = [
+            in_feed("1.0.0", 0, 100),
+            in_feed("1.1.0", 0, 0),
+            in_feed("2.0.0", 50, 50),
+        ];
+        assert_eq!(
+            plan_names(&plan_for(&versions, &policy, now)),
+            vec!["1.1.0"]
         );
     }
 
@@ -1311,6 +1348,38 @@ mod tests {
         assert!(db.exists(FEED, "pkg", &v1).await.unwrap());
         assert!(storage.package_exists("pkg", "1.0.0").await);
         assert!(!storage.package_exists("pkg", "2.0.0").await);
+    }
+
+    #[tokio::test]
+    async fn an_old_version_promoted_today_is_not_too_old_for_its_new_feed() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FilesystemStorage::new(dir.path()).await.unwrap();
+        let db = SqliteDatabase::in_memory().await.unwrap();
+        // Pushed to dev 400 days ago, promoted into prod just now.
+        for v in ["1.0.0", "2.0.0"] {
+            let p = pkg(v, 400);
+            db.add_to_feed("dev", &p).await.unwrap();
+            db.add_membership(&crate::database::Membership::active("prod", &p))
+                .await
+                .unwrap();
+            store_dummy(&storage, "Pkg", v).await;
+        }
+        let policy = RetentionPolicy {
+            max_age_days: Some(30),
+            ..Default::default()
+        };
+        let now = Utc::now() + Duration::days(1);
+        assert!(preview(&db, "prod", &policy, now)
+            .await
+            .unwrap()
+            .planned
+            .is_empty());
+        assert_eq!(prune_all(&storage, &db, "prod", &policy).await.unwrap(), 0);
+        // A month on it is old in prod too.
+        let later = Utc::now() + Duration::days(31);
+        let plan = preview(&db, "prod", &policy, later).await.unwrap();
+        assert_eq!(plan.planned.len(), 1);
+        assert_eq!(plan.planned[0].version.normalized(), "1.0.0");
     }
 
     #[tokio::test]
