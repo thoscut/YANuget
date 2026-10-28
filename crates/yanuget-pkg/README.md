@@ -13,6 +13,8 @@ server and its tools, with no web framework or database underneath:
   content types and core properties follow, and the signature is dropped.
 - `address` (and, with the `net` feature, a guarded reqwest resolver): which
   hosts and addresses an upstream fetch must not reach.
+- `v3`: the NuGet v3 documents an upstream serves (service index,
+  registration, flat container, search, catalog), read leniently.
 - `report`: the internalizer report (`internalizer/report.json`), schema
   version 1, shared by the tool that writes it and the server that shows it.
 

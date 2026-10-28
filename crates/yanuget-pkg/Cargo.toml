@@ -28,6 +28,8 @@ zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
 flate2 = "1"
 uuid = { version = "1", features = ["v4"] }
 quick-xml = { version = "0.42", features = ["serialize"] }
+# The URL type reqwest uses, to resolve the `@id`s of a NuGet v3 document.
+url = "2"
 reqwest = { version = "0.12", default-features = false, optional = true }
 
 [dev-dependencies]

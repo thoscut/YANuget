@@ -19,6 +19,7 @@ use yanuget_pkg::NuGetVersion;
 use crate::capture::{self, Call, Checksum, Helper, Origin};
 use crate::download::Downloader;
 use crate::naming::{Kind, Names, Source};
+use crate::overrides::Overrides;
 use crate::report::Draft;
 use crate::sandbox::{RawCapture, SandboxError};
 
@@ -53,14 +54,17 @@ pub struct Attachment {
 /// Apply a capture to the drafts of the packages it was to tell about, and
 /// return the downloads each of them asked for, in the order of `drafts`.
 ///
-/// `closure` is every package the install saw, `(id, version)`, those the
-/// target holds already included: their calls are attributed, then left
-/// alone. `timeout_secs` is the sandbox's limit, for the report.
+/// `closure` is every package the install saw, `(id, version)`, the root
+/// first, those the target holds already included: their calls are
+/// attributed, then left alone. `timeout_secs` is the sandbox's limit, for
+/// the report. Once the calls are in, each package's override (`INT-25`)
+/// adds its downloads and rewrites, and its draft says what was used.
 pub fn assess(
     capture: Result<RawCapture, SandboxError>,
     closure: &[(&str, &NuGetVersion)],
     drafts: &mut [Draft],
     timeout_secs: u64,
+    overrides: &Overrides,
 ) -> Vec<Vec<Wanted>> {
     let mut wanted = vec![Vec::new(); drafts.len()];
     let raw = match capture {
@@ -110,6 +114,15 @@ pub fn assess(
             continue;
         };
         add_call(&mut drafts[i], &mut wanted[i], call);
+    }
+    for (n, (id, version)) in closure.iter().enumerate() {
+        let Some(o) = overrides.get(id, version) else {
+            continue;
+        };
+        let version = version.normalized();
+        if let Some(i) = drafts.iter().position(|d| d.is(id, &version)) {
+            o.apply(&mut drafts[i], &mut wanted[i], n == 0);
+        }
     }
     wanted
 }
@@ -334,7 +347,7 @@ mod tests {
             // The package the target holds: attributed, then left alone.
             line("held", "1.0.0", "https://example.com/held.exe", ""),
         ]);
-        let wanted = assess(Ok(capture), &closure, &mut drafts, 60);
+        let wanted = assess(Ok(capture), &closure, &mut drafts, 60, &Overrides::none());
         let urls: Vec<Vec<&str>> = wanted
             .iter()
             .map(|ws| ws.iter().map(|w| w.url.as_str()).collect())
@@ -375,7 +388,7 @@ mod tests {
             // No URL: a local file, whoever calls.
             r#"{"schema":1,"package":"git.install","version":"2.51.0","helper":"Get-ChocolateyUnzip","caller":"C:\\Temp\\x.ps1"}"#.to_string(),
         ]);
-        assess(Ok(capture), &closure, &mut drafts, 60);
+        assess(Ok(capture), &closure, &mut drafts, 60, &Overrides::none());
         let r = drafts[0].finish("t");
         assert_eq!(r.status, Status::NeedsOverride);
         assert_eq!(
@@ -394,7 +407,7 @@ mod tests {
         let drafts = || [draft("a", "1.0.0"), draft("b", "2.0.0")];
         let reasons = |capture: Result<RawCapture, SandboxError>| {
             let mut ds = drafts();
-            assess(capture, &closure, &mut ds, 600);
+            assess(capture, &closure, &mut ds, 600, &Overrides::none());
             ds.map(|d| {
                 let r = d.finish("t");
                 (r.status, r.reasons)

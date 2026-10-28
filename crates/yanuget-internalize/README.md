@@ -286,13 +286,21 @@ to = "https://mirror.example.com/setup.exe"
 ```
 
 Or, alone in the file, `skip = "why"`: the package is left out of runs, and
-`plan` says so. The script is a path inside `overrides_dir`; it goes into the
-package before the capture, under the name the package's own has, so the
-capture runs it and the feed gets it. A rewritten URL is still the one the
-package asks for, and the prelude maps it to the attached file. Every
+`plan` says so. The script is a path inside `overrides_dir`; it goes into a
+copy of the package before the capture, under the name the package's own
+has, and that copy is what is published, so the capture runs it and the
+feed gets it. Package parameters go to the root's install only; a
+dependency's are a warning in its report. A rewritten URL is still the one
+the package asks for, and the prelude maps it to the attached file. Every
 override used is listed in the report under `overrides`; a rewrite that
 matches no captured URL, or a download the capture saw anyway, is a warning,
 so stale overrides surface.
+
+Until a sandbox runner captures (`INT-15`), `run` and `sync` stop before a
+capture, so of all this only `skip` shows in them. The rest is wired into
+the stages they are built from: the capture job takes the script and the
+parameters, and the assessment of the capture takes the downloads and the
+rewrites. `tests/overrides.rs` goes through them with the fake sandbox.
 
 ## Keeping feeds current
 

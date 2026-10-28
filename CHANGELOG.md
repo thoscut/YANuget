@@ -64,6 +64,10 @@ relist them.
 - Adding a content type to `[Content_Types].xml` (the internalizer's
   rewrite) parses the XML instead of looking for the last `</Types>`, and part
   names with control characters are refused.
+- The mirror reads a service index whose `@type` is a list, and resolves a
+  relative `@id` (and a registration page's) against the document it is in,
+  as the internalizer does; both now share one NuGet v3 reader. Upstream JSON
+  is decompressed and parsed off the async threads.
 
 ### Changed
 

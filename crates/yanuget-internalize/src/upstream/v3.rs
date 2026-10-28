@@ -3,7 +3,9 @@
 //! download URL), or from the flat container when a feed has no registration.
 
 use reqwest::Url;
-use serde_json::Value;
+use yanuget_pkg::v3::{
+    PackageVersions, RegistrationIndex, RegistrationLeaf, RegistrationPage, ServiceIndex,
+};
 use yanuget_pkg::NuGetVersion;
 
 use super::{DependencyRef, HashAlgorithm, PackageHash, PackageInfo, UpstreamError};
@@ -25,23 +27,13 @@ const REGISTRATION_TYPES: [&str; 4] = [
 ];
 
 /// Read the service index.
-pub fn resources(index: &Value, base: &Url) -> Result<Resources, UpstreamError> {
-    let list = index["resources"].as_array().ok_or_else(|| {
-        UpstreamError::Invalid("upstream service index lists no resources".into())
-    })?;
-    let find = |types: &[&str]| -> Option<Url> {
-        types.iter().find_map(|t| {
-            list.iter()
-                .filter(|r| match &r["@type"] {
-                    Value::String(s) => s == t,
-                    Value::Array(a) => a.iter().any(|s| s.as_str() == Some(t)),
-                    _ => false,
-                })
-                .find_map(|r| r["@id"].as_str())
-                .and_then(|id| base.join(id).ok())
-                .map(with_slash)
-        })
-    };
+pub fn resources(index: &ServiceIndex, base: &Url) -> Result<Resources, UpstreamError> {
+    if index.resources.is_none() {
+        return Err(UpstreamError::Invalid(
+            "upstream service index lists no resources".into(),
+        ));
+    }
+    let find = |types: &[&str]| index.resolve(types, base).map(with_slash);
     let resources = Resources {
         registration: find(&REGISTRATION_TYPES),
         flat_container: find(&["PackageBaseAddress/3.0.0"]),
@@ -90,21 +82,21 @@ fn join(base: &Url, path: &str) -> Result<Url, UpstreamError> {
 /// A registration index's pages: each either inline (`items`) or to be
 /// fetched (`@id`).
 pub enum Page {
-    Inline(Vec<Value>),
+    Inline(Vec<RegistrationLeaf>),
     Remote(Url),
 }
 
-pub fn pages(index: &Value, base: &Url) -> Result<Vec<Page>, UpstreamError> {
-    let items = index["items"]
-        .as_array()
+pub fn pages(index: RegistrationIndex, base: &Url) -> Result<Vec<Page>, UpstreamError> {
+    let items = index
+        .items
         .ok_or_else(|| UpstreamError::Invalid("upstream registration has no items".into()))?;
     items
-        .iter()
-        .map(|page| match page["items"].as_array() {
-            Some(leaves) => Ok(Page::Inline(leaves.clone())),
-            None => page["@id"]
-                .as_str()
-                .and_then(|id| base.join(id).ok())
+        .into_iter()
+        .map(|page| match page.items {
+            Some(leaves) => Ok(Page::Inline(leaves)),
+            None => page
+                .id
+                .and_then(|id| base.join(&id).ok())
                 .map(Page::Remote)
                 .ok_or_else(|| {
                     UpstreamError::Invalid("upstream registration page has no @id".into())
@@ -114,68 +106,68 @@ pub fn pages(index: &Value, base: &Url) -> Result<Vec<Page>, UpstreamError> {
 }
 
 /// A fetched page's leaves.
-pub fn page_leaves(page: &Value) -> Result<Vec<Value>, UpstreamError> {
-    page["items"]
-        .as_array()
-        .cloned()
+pub fn page_leaves(page: RegistrationPage) -> Result<Vec<RegistrationLeaf>, UpstreamError> {
+    page.items
         .ok_or_else(|| UpstreamError::Invalid("upstream registration page has no items".into()))
 }
 
 /// One registration leaf, for `want`. `None` for another id or a version
 /// that does not parse.
 pub fn leaf(
-    leaf: &Value,
+    leaf: &RegistrationLeaf,
     want: &str,
     base: &Url,
     flat: Option<&Url>,
 ) -> Result<Option<PackageInfo>, UpstreamError> {
-    let entry = &leaf["catalogEntry"];
-    let Some(id) = entry["id"].as_str() else {
+    let Some(entry) = &leaf.catalog_entry else {
+        return Ok(None);
+    };
+    let Some(id) = entry.id.as_deref() else {
         return Ok(None);
     };
     if !id.eq_ignore_ascii_case(want) {
         return Ok(None);
     }
-    let Some(version) = entry["version"]
-        .as_str()
+    let Some(version) = entry
+        .version
+        .as_deref()
         .and_then(|v| NuGetVersion::parse(v).ok())
     else {
         return Ok(None);
     };
-    let content = leaf["packageContent"]
-        .as_str()
-        .or(entry["packageContent"].as_str())
+    let content = leaf
+        .package_content
+        .as_deref()
+        .or(entry.package_content.as_deref())
         .and_then(|c| base.join(c).ok());
     let download_url = match (content, flat) {
         (Some(url), _) => url,
         (None, Some(flat)) => flat_package_url(flat, id, &version.normalized())?,
         (None, None) => return Ok(None),
     };
-    let hash = entry["packageHash"].as_str().and_then(|h| {
-        let algorithm = HashAlgorithm::parse(entry["packageHashAlgorithm"].as_str()?)?;
+    let hash = entry.package_hash.as_deref().and_then(|h| {
+        let algorithm = HashAlgorithm::parse(entry.package_hash_algorithm.as_deref()?)?;
         PackageHash::from_base64(algorithm, h)
     });
     let mut dependencies: Vec<DependencyRef> = Vec::new();
-    for group in entry["dependencyGroups"].as_array().into_iter().flatten() {
-        for dep in group["dependencies"].as_array().into_iter().flatten() {
-            let Some(dep_id) = dep["id"].as_str() else {
-                continue;
-            };
-            let dep = DependencyRef {
-                id: dep_id.to_string(),
-                range: dep["range"].as_str().map(str::to_string),
-            };
-            if !dependencies.contains(&dep) {
-                dependencies.push(dep);
-            }
+    for dep in entry.dependencies() {
+        let Some(dep_id) = &dep.id else {
+            continue;
+        };
+        let dep = DependencyRef {
+            id: dep_id.clone(),
+            range: dep.range.clone(),
+        };
+        if !dependencies.contains(&dep) {
+            dependencies.push(dep);
         }
     }
     Ok(Some(PackageInfo {
         id: id.to_string(),
         version,
-        listed: entry["listed"].as_bool().unwrap_or(true),
+        listed: entry.listed.unwrap_or(true),
         hash,
-        size: entry["packageSize"].as_u64(),
+        size: entry.package_size,
         dependencies,
         download_url,
     }))
@@ -183,12 +175,16 @@ pub fn leaf(
 
 /// The flat container's version list, for a feed without a registration.
 /// It cannot tell unlisted versions apart, so every version counts as listed.
-pub fn flat_versions(doc: &Value, id: &str, flat: &Url) -> Result<Vec<PackageInfo>, UpstreamError> {
-    let versions = doc["versions"].as_array().ok_or_else(|| {
+pub fn flat_versions(
+    doc: &PackageVersions,
+    id: &str,
+    flat: &Url,
+) -> Result<Vec<PackageInfo>, UpstreamError> {
+    let versions = doc.versions.as_ref().ok_or_else(|| {
         UpstreamError::Invalid("upstream flat container lists no versions".into())
     })?;
     let mut out = Vec::new();
-    for v in versions.iter().filter_map(Value::as_str) {
+    for v in versions {
         let Ok(version) = NuGetVersion::parse(v) else {
             continue;
         };
@@ -210,14 +206,18 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn read<T: serde::de::DeserializeOwned>(v: serde_json::Value) -> T {
+        serde_json::from_value(v).unwrap()
+    }
+
     #[test]
     fn the_service_index_prefers_semver2_registrations() {
         let base = Url::parse("https://feed.example/v3/index.json").unwrap();
-        let index = json!({"resources": [
+        let index: ServiceIndex = read(json!({"resources": [
             {"@id": "https://feed.example/v3/registration/", "@type": "RegistrationsBaseUrl"},
             {"@id": "https://feed.example/v3/registration-semver2", "@type": ["RegistrationsBaseUrl/3.6.0"]},
             {"@id": "/v3/flat", "@type": "PackageBaseAddress/3.0.0"},
-        ]});
+        ]}));
         let r = resources(&index, &base).unwrap();
         assert_eq!(
             r.registration.unwrap().as_str(),
@@ -227,15 +227,15 @@ mod tests {
             r.flat_container.unwrap().as_str(),
             "https://feed.example/v3/flat/"
         );
-        assert!(resources(&json!({"resources": []}), &base).is_err());
-        assert!(resources(&json!({}), &base).is_err());
+        assert!(resources(&read(json!({"resources": []})), &base).is_err());
+        assert!(resources(&read(json!({})), &base).is_err());
     }
 
     #[test]
     fn leaves_parse() {
         let base = Url::parse("https://feed.example/v3/registration/git/index.json").unwrap();
         let flat = Url::parse("https://feed.example/v3/flat/").unwrap();
-        let l = json!({
+        let l: RegistrationLeaf = read(json!({
             "catalogEntry": {
                 "id": "Git", "version": "2.51.0", "listed": false,
                 "packageHash": "q6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urqw==", "packageHashAlgorithm": "SHA512",
@@ -244,7 +244,7 @@ mod tests {
                     {"targetFramework": "net45", "dependencies": [{"id": "git.install", "range": "[2.51.0, 2.51.0]"}]}
                 ]
             }
-        });
+        }));
         let info = leaf(&l, "git", &base, Some(&flat)).unwrap().unwrap();
         assert!(!info.listed);
         assert_eq!(info.dependencies.len(), 1);
