@@ -10,12 +10,8 @@ requests can reference them, and ticked off rather than deleted when they land.
 ## Open items
 
 Everything still open across this file and the project's working threads, as
-of 2026-10-28 (0.8.0 released). The entries further down hold the detail; this
+of 2026-10-28 (0.9.0 released). The entries further down hold the detail; this
 list is the index.
-
-**From the review of 2026-10-27** ([detail](#review-of-2026-10-27))
-
-- Release: `0.8.1`.
 
 **Server, after 0.8.0** ([Target releases](#target-releases))
 
@@ -125,9 +121,11 @@ security, Rust code, tests and CI, operations and documentation), at
 
 ### Open
 
-- [ ] **`0.8.1`** 0.8.0 shipped `rustls-webpki` 0.103.15 (RUSTSEC-2026-0382,
+- [x] **`0.8.1`** 0.8.0 shipped `rustls-webpki` 0.103.15 (RUSTSEC-2026-0382,
   RUSTSEC-2026-0381); `main` has 0.103.16. A patch release carries it with the
   fixes above.
+  *Done:* released as 0.9.0 instead, since schema 9 and the stricter
+  `restore` make it a minor release.
 - [x] **`COR-35` Approving checks the package hash only**
   (`check_shown_builds`): attached files can still change between the page
   and the approval, the pending side of `COR-31`.

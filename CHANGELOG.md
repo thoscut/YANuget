@@ -12,6 +12,8 @@ expected to change incompatibly at any version.
 
 ## [Unreleased]
 
+## [0.9.0] — 2026-10-28
+
 **Upgrading:** the database is migrated on first start to schema version 9,
 which marks a listing set by hand on a feed. Afterwards 0.8.0 refuses to open
 it, so back the database up first if you may need to go back. Versions that
@@ -946,7 +948,8 @@ Beyond the defaults:
 - Symbol downloads require read authorisation and resolve to a package the
   requester is allowed to see.
 
-[Unreleased]: https://github.com/thoscut/yanuget/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/thoscut/yanuget/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/thoscut/yanuget/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/thoscut/yanuget/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/thoscut/yanuget/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/thoscut/yanuget/compare/v0.5.1...v0.6.0

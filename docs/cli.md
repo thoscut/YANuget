@@ -50,7 +50,7 @@ names the setting.
 Once the port is bound, the server prints where it can be reached:
 
 ```text
-  YANuget 0.8.0
+  YANuget 0.9.0
 
     Gallery        https://localhost:5000/
     Service index  https://localhost:5000/v3/index.json
