@@ -1183,6 +1183,9 @@ mod tests {
         async fn delete_blob(&self, sha256_hex: &str) -> Result<()> {
             self.inner.delete_blob(sha256_hex).await
         }
+        async fn list_blobs(&self) -> Result<Vec<String>> {
+            self.inner.list_blobs().await
+        }
     }
 
     #[tokio::test]

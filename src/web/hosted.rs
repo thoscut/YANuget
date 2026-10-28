@@ -380,6 +380,11 @@ async fn attach_locked(
 
 /// Detach a file from a version, deleting its blob when nothing else uses it.
 /// With `keep_approved`, not from a version some feed has approved.
+///
+/// In a task of its own, like [`attach`]: a client that disconnects must not
+/// stop it between the row and the blob. A blob left behind all the same (a
+/// failed delete, a crash) goes with the next
+/// [`sweep_unreferenced_blobs`](crate::retention::sweep_unreferenced_blobs).
 pub(crate) async fn detach(
     state: &AppState,
     id: &str,
@@ -387,21 +392,30 @@ pub(crate) async fn detach(
     name: &str,
     keep_approved: bool,
 ) -> Result<()> {
-    let _guard = crate::locks::lock_version(id, &v.normalized()).await;
-    version_in_feed(state, id, v).await?;
-    check_not_approved(state.db.as_ref(), id, v, keep_approved).await?;
-    let file = state
-        .db
-        .delete_file(id, v, name)
-        .await?
-        .ok_or(Error::PackageNotFound)?;
-    // Counted and deleted as one step against attaches to other versions.
-    let _blob = crate::locks::lock_blob(&file.sha256).await;
-    if state.db.blob_references(&file.sha256).await? == 0 {
-        state.storage.delete_blob(&file.sha256).await?;
-    }
-    tracing::info!(feed = %state.feed(), %id, version = %v.normalized(), %name, "detached file");
-    Ok(())
+    let state = state.clone();
+    let (id, v, name) = (id.to_string(), v.clone(), name.to_string());
+    detached(async move {
+        let _guard = crate::locks::lock_version(&id, &v.normalized()).await;
+        version_in_feed(&state, &id, &v).await?;
+        check_not_approved(state.db.as_ref(), &id, &v, keep_approved).await?;
+        let file = state
+            .db
+            .delete_file(&id, &v, &name)
+            .await?
+            .ok_or(Error::PackageNotFound)?;
+        tracing::info!(feed = %state.feed(), %id, version = %v.normalized(), %name, "detached file");
+        // Counted and deleted as one step against attaches to other versions.
+        // The file is detached either way; a blob that stays is swept.
+        let _blob = crate::locks::lock_blob(&file.sha256).await;
+        let unused = matches!(state.db.blob_references(&file.sha256).await, Ok(0));
+        if unused {
+            if let Err(e) = state.storage.delete_blob(&file.sha256).await {
+                tracing::warn!(sha256 = %file.sha256, error = %e, "could not delete the blob of a detached file");
+            }
+        }
+        Ok(())
+    })
+    .await
 }
 
 /// The JSON a successful upload answers with.

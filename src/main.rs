@@ -365,6 +365,7 @@ async fn run_server(config_path: Option<&str>) -> anyhow::Result<()> {
                 }
                 // Like the retention sweep: a pass that started finishes.
                 yanuget::retention::sweep_orphans(storage.as_ref(), db.as_ref()).await;
+                yanuget::retention::sweep_unreferenced_blobs(storage.as_ref(), db.as_ref()).await;
                 if *shutdown.borrow() {
                     break;
                 }
