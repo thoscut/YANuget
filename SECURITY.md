@@ -6,8 +6,8 @@ YANuget is pre-1.0. Only the latest released version receives security fixes.
 
 | Version | Supported |
 | --- | --- |
-| 0.8.x | ✅ |
-| < 0.8 | ❌ |
+| 0.9.x | ✅ |
+| < 0.9 | ❌ |
 
 The table is for the server, `yanuget`, and the `yanuget-pkg` library it is
 built with, which is fixed in the same releases. The internalizer has no
