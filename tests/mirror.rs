@@ -1441,3 +1441,115 @@ async fn an_id_reserved_for_another_feed_is_not_downloaded() {
     );
     assert_eq!(upstream.hits(".nupkg"), 0);
 }
+
+impl Upstream {
+    fn set_unlisted(&self, id: &str, version: &str, unlisted: bool) {
+        self.behave(|b| {
+            let key = (id.to_lowercase(), version.to_lowercase());
+            if unlisted {
+                b.unlisted.insert(key);
+            } else {
+                b.unlisted.remove(&key);
+            }
+        });
+    }
+}
+
+impl Local {
+    async fn listed(&self, id: &str, version: &str) -> bool {
+        self.membership(id, version).await.unwrap().listed
+    }
+}
+
+#[tokio::test]
+async fn a_refresh_follows_the_upstreams_listing() {
+    // Each `mirror` call is a new client, so each one re-lists the package.
+    let upstream = Upstream::start().await;
+    upstream.publish("Relisted.Pkg", "1.0.0");
+    upstream.publish("Relisted.Pkg", "2.0.0");
+    upstream.behave(|b| b.registration = true);
+    let local = local_feed().await;
+    let options = MirrorOptions::default();
+    assert_eq!(
+        local
+            .mirror(&upstream, "Relisted.Pkg", options.clone())
+            .await,
+        2
+    );
+    assert!(local.listed("relisted.pkg", "1.0.0").await);
+
+    // Unlisted upstream after it was mirrored: unlisted here on the next
+    // refresh, with nothing new to fetch.
+    upstream.set_unlisted("Relisted.Pkg", "1.0.0", true);
+    assert_eq!(
+        local
+            .mirror(&upstream, "Relisted.Pkg", options.clone())
+            .await,
+        0
+    );
+    assert!(!local.listed("relisted.pkg", "1.0.0").await);
+    assert!(local.listed("relisted.pkg", "2.0.0").await);
+
+    // And relisted there: listed here again.
+    upstream.set_unlisted("Relisted.Pkg", "1.0.0", false);
+    local
+        .mirror(&upstream, "Relisted.Pkg", options.clone())
+        .await;
+    assert!(local.listed("relisted.pkg", "1.0.0").await);
+
+    // An upstream without a registration says nothing, so nothing changes.
+    upstream.set_unlisted("Relisted.Pkg", "2.0.0", true);
+    upstream.behave(|b| b.registration = false);
+    local.mirror(&upstream, "Relisted.Pkg", options).await;
+    assert!(local.listed("relisted.pkg", "2.0.0").await);
+}
+
+#[tokio::test]
+async fn a_listing_set_by_hand_is_not_undone_by_a_refresh() {
+    let upstream = Upstream::start().await;
+    upstream.publish("Curated.Pkg", "1.0.0");
+    upstream.publish("Curated.Pkg", "2.0.0");
+    upstream.behave(|b| {
+        b.registration = true;
+        b.unlisted.insert(("curated.pkg".into(), "1.0.0".into()));
+    });
+    let local = local_feed().await;
+    let options = MirrorOptions::default();
+    local
+        .mirror(&upstream, "Curated.Pkg", options.clone())
+        .await;
+    assert!(!local.listed("curated.pkg", "1.0.0").await);
+
+    // An admin relists what the upstream hid, and unlists what it lists.
+    let (v1, v2) = (
+        NuGetVersion::parse("1.0.0").unwrap(),
+        NuGetVersion::parse("2.0.0").unwrap(),
+    );
+    assert!(local
+        .db
+        .set_listed("mirror", "curated.pkg", &v1, true)
+        .await
+        .unwrap());
+    assert!(local
+        .db
+        .set_listed("mirror", "curated.pkg", &v2, false)
+        .await
+        .unwrap());
+    local
+        .mirror(&upstream, "Curated.Pkg", options.clone())
+        .await;
+    assert!(local.listed("curated.pkg", "1.0.0").await);
+    assert!(!local.listed("curated.pkg", "2.0.0").await);
+
+    // Even once the upstream agrees and then changes its mind again.
+    upstream.set_unlisted("Curated.Pkg", "1.0.0", false);
+    upstream.set_unlisted("Curated.Pkg", "2.0.0", true);
+    local
+        .mirror(&upstream, "Curated.Pkg", options.clone())
+        .await;
+    upstream.set_unlisted("Curated.Pkg", "1.0.0", true);
+    upstream.set_unlisted("Curated.Pkg", "2.0.0", false);
+    local.mirror(&upstream, "Curated.Pkg", options).await;
+    assert!(local.listed("curated.pkg", "1.0.0").await);
+    assert!(!local.listed("curated.pkg", "2.0.0").await);
+}

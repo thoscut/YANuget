@@ -737,13 +737,27 @@ impl MirrorClient {
         &self,
         lower_id: &str,
     ) -> Result<std::collections::HashSet<String>> {
-        let mut unlisted = std::collections::HashSet::new();
+        Ok(self
+            .upstream_listing(lower_id)
+            .await?
+            .into_iter()
+            .filter_map(|(version, listed)| (!listed).then_some(version))
+            .collect())
+    }
+
+    /// Whether the upstream lists each version of `lower_id` its registration
+    /// has, by version normalized and lower-cased. A version missing from it
+    /// is one the upstream says nothing about; the map is empty when the
+    /// upstream has no registration resource or no registration for the
+    /// package.
+    pub async fn upstream_listing(&self, lower_id: &str) -> Result<HashMap<String, bool>> {
+        let mut listing = HashMap::new();
         let Some(base) = &self.resources().await?.registration else {
-            return Ok(unlisted);
+            return Ok(listing);
         };
         let url = format!("{base}{lower_id}/index.json");
         let Some(index) = self.get_json(&url, "registration").await? else {
-            return Ok(unlisted);
+            return Ok(listing);
         };
         let pages = index
             .get("items")
@@ -781,12 +795,12 @@ impl MirrorClient {
                     .get("version")
                     .and_then(|v| v.as_str())
                     .and_then(|v| NuGetVersion::parse(v).ok());
-                if let (true, Some(version)) = (hidden, version) {
-                    unlisted.insert(version.normalized().to_lowercase());
+                if let Some(version) = version {
+                    listing.insert(version.normalized().to_lowercase(), !hidden);
                 }
             }
         }
-        Ok(unlisted)
+        Ok(listing)
     }
 
     /// Stream the upstream's `.nupkg` for `lower_id`/`version` to `dest`,
@@ -1608,7 +1622,7 @@ impl MirrorTarget<'_> {
         self.resources_ready().await?;
         match self.fetch_one(lower_id, version).await {
             Fetched::Mirrored => {
-                self.follow_listing(lower_id, version, &mut None).await;
+                self.follow_listing(lower_id, version).await;
                 Ok(1)
             }
             Fetched::NotMirrored => Ok(0),
@@ -1657,7 +1671,6 @@ impl MirrorTarget<'_> {
         let mut mirrored = 0;
         let deadline = Instant::now() + MIRROR_BUDGET;
         let mut complete = true;
-        let mut unlisted = None;
 
         for version in versions {
             if !self.wanted(lower_id, &version).await {
@@ -1675,16 +1688,15 @@ impl MirrorTarget<'_> {
                 break;
             }
             match self.fetch_one(lower_id, &version).await {
-                Fetched::Mirrored => {
-                    mirrored += 1;
-                    self.follow_listing(lower_id, &version, &mut unlisted).await;
-                }
+                Fetched::Mirrored => mirrored += 1,
                 Fetched::NotMirrored => {}
                 Fetched::DownloadFailed(e) => {
                     tracing::warn!(%feed, id = %lower_id, version = %version.normalized(), error = %e, "mirror download failed");
                 }
             }
         }
+        // The versions just mirrored and the ones held from before alike.
+        self.reconcile_listing(lower_id).await;
         if complete {
             client.tracker.with(
                 &MirrorClient::key(feed, lower_id),
@@ -1698,31 +1710,77 @@ impl MirrorTarget<'_> {
     }
 
     /// Unlist a just-mirrored version when the upstream has it unlisted, so a
-    /// version hidden there stays out of search and "latest" here. Reads the
-    /// upstream's list once per fetch, into `unlisted`; best-effort, since a
-    /// registration that cannot be read must not undo the mirroring.
-    async fn follow_listing(
-        &self,
-        lower_id: &str,
-        version: &NuGetVersion,
-        unlisted: &mut Option<std::collections::HashSet<String>>,
-    ) {
+    /// version hidden there stays out of search and "latest" here.
+    /// Best-effort, since a registration that cannot be read must not undo
+    /// the mirroring; the next refresh tries again.
+    async fn follow_listing(&self, lower_id: &str, version: &NuGetVersion) {
         let feed = self.feed;
-        if unlisted.is_none() {
-            *unlisted = Some(match self.client.upstream_unlisted(lower_id).await {
-                Ok(set) => set,
-                Err(e) => {
-                    tracing::warn!(%feed, id = %lower_id, error = %e, "could not read which versions the upstream unlisted");
-                    Default::default()
-                }
-            });
-        }
-        let hidden = unlisted
-            .as_ref()
-            .is_some_and(|set| set.contains(&version.normalized().to_lowercase()));
-        if hidden {
-            if let Err(e) = self.db.set_listed(feed, lower_id, version, false).await {
+        let Some(listing) = self.upstream_listing(lower_id).await else {
+            return;
+        };
+        if listing.get(&version.normalized().to_lowercase()) == Some(&false) {
+            if let Err(e) = self
+                .db
+                .follow_upstream_listing(feed, lower_id, version, false)
+                .await
+            {
                 tracing::warn!(%feed, id = %lower_id, error = %e, "could not unlist a version the upstream unlisted");
+            }
+        }
+    }
+
+    /// Bring the listing of every version of `lower_id` the feed holds in
+    /// line with the upstream's, on each refresh: a version unlisted there
+    /// after it was mirrored is unlisted here, and one relisted there is
+    /// listed again. Not where the listing was set by hand, which wins (see
+    /// [`PackageDatabase::follow_upstream_listing`]), nor for a version the
+    /// upstream's registration does not mention. Best-effort, like
+    /// [`Self::follow_listing`].
+    async fn reconcile_listing(&self, lower_id: &str) {
+        let feed = self.feed;
+        let held = match self.db.find_all_versions(feed, lower_id).await {
+            Ok(held) if !held.is_empty() => held,
+            Ok(_) => return,
+            Err(e) => {
+                tracing::warn!(%feed, id = %lower_id, error = %e, "could not read the versions to follow the upstream's listing for");
+                return;
+            }
+        };
+        let Some(listing) = self.upstream_listing(lower_id).await else {
+            return;
+        };
+        for v in &held {
+            let version = &v.package.version;
+            let Some(&listed) = listing.get(&version.normalized().to_lowercase()) else {
+                continue;
+            };
+            if listed == v.package.listed {
+                continue;
+            }
+            match self
+                .db
+                .follow_upstream_listing(feed, lower_id, version, listed)
+                .await
+            {
+                Ok(true) => {
+                    tracing::info!(%feed, id = %lower_id, version = %version.normalized(), listed, "followed the upstream's listing");
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::warn!(%feed, id = %lower_id, error = %e, "could not follow the upstream's listing");
+                }
+            }
+        }
+    }
+
+    /// The upstream's listing of `lower_id`, or `None`, logged, when its
+    /// registration cannot be read.
+    async fn upstream_listing(&self, lower_id: &str) -> Option<HashMap<String, bool>> {
+        match self.client.upstream_listing(lower_id).await {
+            Ok(listing) => Some(listing),
+            Err(e) => {
+                tracing::warn!(feed = %self.feed, id = %lower_id, error = %e, "could not read which versions the upstream unlisted");
+                None
             }
         }
     }

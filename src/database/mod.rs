@@ -516,8 +516,20 @@ pub trait PackageDatabase: Send + Sync {
         include_unlisted: bool,
     ) -> Result<Vec<Package>>;
 
-    /// Set the listed flag for a membership. Returns `true` if a row was updated.
+    /// Set the listed flag for a membership by hand (an unlist or relist), so
+    /// a mirror no longer follows its upstream's listing for it. Returns
+    /// `true` if a row was updated.
     async fn set_listed(
+        &self,
+        feed: &str,
+        id: &str,
+        version: &NuGetVersion,
+        listed: bool,
+    ) -> Result<bool>;
+
+    /// Set the listed flag as a mirror's upstream has it, unless it was set
+    /// by hand ([`Self::set_listed`]). Returns `true` if it changed.
+    async fn follow_upstream_listing(
         &self,
         feed: &str,
         id: &str,

@@ -308,6 +308,16 @@ impl PackageDatabase for SqliteDatabase {
         memberships::set_listed(self, feed, id, version, listed).await
     }
 
+    async fn follow_upstream_listing(
+        &self,
+        feed: &str,
+        id: &str,
+        version: &NuGetVersion,
+        listed: bool,
+    ) -> Result<bool> {
+        memberships::follow_upstream_listing(self, feed, id, version, listed).await
+    }
+
     async fn set_enabled(
         &self,
         feed: &str,

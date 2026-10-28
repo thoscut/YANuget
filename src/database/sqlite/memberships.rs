@@ -127,7 +127,29 @@ pub(super) async fn set_listed(
     listed: bool,
 ) -> Result<bool> {
     let result = sqlx::query(
-        "UPDATE feed_packages SET listed = ?4 WHERE feed = ?1 AND lower_id = ?2 AND normalized_version = ?3",
+        "UPDATE feed_packages SET listed = ?4, listing_set = 1 \
+         WHERE feed = ?1 AND lower_id = ?2 AND normalized_version = ?3",
+    )
+    .bind(feed)
+    .bind(canonical_id(id))
+    .bind(version.normalized())
+    .bind(i64::from(listed))
+    .execute(&db.pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+pub(super) async fn follow_upstream_listing(
+    db: &SqliteDatabase,
+    feed: &str,
+    id: &str,
+    version: &NuGetVersion,
+    listed: bool,
+) -> Result<bool> {
+    let result = sqlx::query(
+        "UPDATE feed_packages SET listed = ?4 \
+         WHERE feed = ?1 AND lower_id = ?2 AND normalized_version = ?3 \
+           AND listing_set = 0 AND listed <> ?4",
     )
     .bind(feed)
     .bind(canonical_id(id))

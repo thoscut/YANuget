@@ -507,6 +507,12 @@ How the mirror keeps up, and what it does not repeat:
 * **New upstream releases appear.** A package's version list is fetched again
   once it is older than `refresh_secs` — in the background when the feed
   already has versions of it, so the read that noticed is not held up.
+* **The upstream's listing is followed.** Each time the list is fetched, the
+  upstream's registration says which versions it lists, and a version unlisted
+  there (or listed again) is unlisted (or listed) here too. Not one whose
+  listing was set on this feed by hand, with `dotnet nuget delete` or a
+  relist: that stays as set. Versions already unlisted when the database is
+  migrated to schema version 9 count as set by hand.
 * **The version a client asks for is fetched first**, even when it is older
   than the newest `max_versions_per_package`, so a project pinned to an old
   version restores.

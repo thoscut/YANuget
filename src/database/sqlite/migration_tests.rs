@@ -881,3 +881,48 @@ async fn step_8_marks_versions_past_its_first_page() {
         .unwrap();
     assert_eq!(unmarked, 0);
 }
+
+/// Step 9 marks the versions unlisted before it as set by hand, and a mirror
+/// then leaves them alone; the listed ones it may still follow.
+#[tokio::test]
+async fn step_9_keeps_an_earlier_unlist() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("old.db").to_string_lossy().into_owned();
+    {
+        let pool = open(&path).await;
+        migrate_to(&mut pool.acquire().await.unwrap(), 8)
+            .await
+            .unwrap();
+        // What a build at step 8 wrote, through its own queries.
+        let db = SqliteDatabase { pool: pool.clone() };
+        for version in ["1.0.0", "2.0.0"] {
+            db.add_to_feed(FEED, &sample("Kept", version))
+                .await
+                .unwrap();
+        }
+        run(
+            &pool,
+            "UPDATE feed_packages SET listed = 0 WHERE normalized_version = '1.0.0'",
+        )
+        .await;
+        pool.close().await;
+    }
+    let db = SqliteDatabase::connect(&path).await.unwrap();
+    assert_eq!(user_version(&db).await, LATEST);
+    let marked = count(
+        &db,
+        "SELECT COUNT(*) FROM feed_packages WHERE listing_set = 1 AND normalized_version = '1.0.0'",
+    )
+    .await;
+    assert_eq!(marked, 1);
+    assert!(!db
+        .follow_upstream_listing(FEED, "kept", &v("1.0.0"), true)
+        .await
+        .unwrap());
+    assert!(db
+        .follow_upstream_listing(FEED, "kept", &v("2.0.0"), false)
+        .await
+        .unwrap());
+    let all = db.find_all_versions(FEED, "kept").await.unwrap();
+    assert!(all.iter().all(|v| !v.package.listed));
+}
