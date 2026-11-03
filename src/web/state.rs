@@ -303,12 +303,6 @@ impl AppState {
         self.space.admit(incoming).await
     }
 
-    /// The check of [`Self::reserve_disk_space`] for more bytes of a resumable
-    /// upload, which its row already promises (see [`SpaceGuard::resume`]).
-    pub(super) async fn resume_disk_space(&self) -> Result<Reservation> {
-        self.space.resume().await
-    }
-
     /// `writer`, made to fail part-way once the storage volume drops below
     /// `min_free_disk_bytes` (see [`crate::space::DiskReserve`]). What goes
     /// through is taken off `reservation`.

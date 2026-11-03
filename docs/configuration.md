@@ -25,7 +25,7 @@ A fully commented template lives in
 | `api_keys` | `YANUGET_API_KEYS` | string[] | `[]` | Additional accepted push/delete keys (env: comma-separated). Any of these or `api_key` authenticates. |
 | `admin_api_key` | `YANUGET_ADMIN_API_KEY` | string | *(none)* | Protects `/admin` (Basic auth). Unset ⇒ admin area off. |
 | `gallery_page_size` | `YANUGET_GALLERY_PAGE_SIZE` | int | `20` | Packages per gallery page (`?take=` overrides, up to 100 or this size, whichever is larger). |
-| `max_package_size_bytes` | `YANUGET_MAX_PACKAGE_SIZE_BYTES` | int | *(unlimited)* | Upload cap; streamed either way. |
+| `max_package_size_bytes` | `YANUGET_MAX_PACKAGE_SIZE_BYTES` | int | *(unlimited)* | Upload cap; streamed either way. A push whose `Content-Length` is over it (allowing 64 KiB for multipart boundaries) is refused with `413` before anything is written or reserved. |
 | `upload_idle_timeout_secs` | `YANUGET_UPLOAD_IDLE_TIMEOUT_SECS` | int | `300` | Abort an upload after this long without a byte arriving (`408`). Only silence counts; a slow transfer is never cut off. `0` waits forever. |
 | `min_free_disk_bytes` | `YANUGET_MIN_FREE_DISK_BYTES` | int | `2147483648` (2 GiB) | Refuse an upload (`507`) that would leave less than this free on the storage volume. Checked against the declared size when there is one, counting the space promised to the uploads still in progress (what they declared and have not written yet, resumable ones included) as used, and again every 64 MiB while a body streams in, so an upload without a `Content-Length` is held to it too; a resumable upload is checked again on every `PATCH`. Mirror fetches and inbox imports are admitted the same way, against the upstream's `Content-Length` or the file's size: they reserve that space too, and see what uploads were promised. `yanuget migrate` downloads are held to the reserve. `0` turns the check off. |
 | `max_connections` | `YANUGET_MAX_CONNECTIONS` | int | `4096` | Concurrent connections accepted; one over the cap is closed at once. `0` is unlimited. |
@@ -335,7 +335,7 @@ wherever their version goes, retention included.
 | `files.enabled` | `YANUGET_FILES_ENABLED` | bool | `true` | Accept and serve attached files. |
 | `files.max_file_size_bytes` | `YANUGET_FILES_MAX_FILE_SIZE_BYTES` | int | *(`max_package_size_bytes`)* | Largest file accepted; unset falls back to the package limit, and both unset is unlimited. |
 | `files.allowed_extensions` | `YANUGET_FILES_ALLOWED_EXTENSIONS` | string[] | `wim, swm, esd, iso, vhd, vhdx, zip, 7z, cab` | Accepted file types (env: comma-separated). |
-| `files.upload_expiry_hours` | `YANUGET_FILES_UPLOAD_EXPIRY_HOURS` | int | `72` | How long an unfinished resumable upload is kept. |
+| `files.upload_expiry_hours` | `YANUGET_FILES_UPLOAD_EXPIRY_HOURS` | int | `72` | How long an unfinished resumable upload is kept. It holds the space it has still to receive against `min_free_disk_bytes` only for an hour after it was created or its last `PATCH` ended; idle for longer, its next `PATCH` is admitted again like a new upload of what is left (`507` when that no longer fits). |
 | `files.max_open_uploads` | `YANUGET_FILES_MAX_OPEN_UPLOADS` | int | `32` | How many unfinished resumable uploads one feed may hold at once; another is refused with `429` until one finishes, is deleted or expires. `0` is no limit. |
 | `files.inbox_dir` | `YANUGET_FILES_INBOX_DIR` | path | *(off)* | The SSH inbox (below). |
 | `files.inbox_scan_secs` | `YANUGET_FILES_INBOX_SCAN_SECS` | int | `30` | How often the inbox is scanned (at least 5). |

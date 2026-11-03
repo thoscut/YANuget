@@ -612,6 +612,7 @@ mod tests {
             received: 0,
             expected_sha256: None,
             expires: Utc::now(),
+            held_since: None,
         })
         .await
         .unwrap();

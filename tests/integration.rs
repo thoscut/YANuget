@@ -5394,6 +5394,135 @@ async fn a_feed_holds_a_bounded_number_of_open_resumable_uploads() {
     );
 }
 
+#[tokio::test]
+async fn concurrent_creations_cannot_overrun_max_open_uploads() {
+    let server = spawn_with(|c| c.files.max_open_uploads = 3).await;
+    push_multipart(&server, API_KEY, build_nupkg("Res.Pkg", "1.0.0", b"x")).await;
+    let names: Vec<String> = (0..4).map(|i| format!("{i}.wim")).collect();
+    let statuses =
+        futures::future::join_all(names.iter().map(|name| create_tus(&server, name, 10))).await;
+    let count = |want| statuses.iter().filter(|(s, _)| *s == want).count();
+    assert_eq!(count(reqwest::StatusCode::CREATED), 3, "{statuses:?}");
+    assert_eq!(
+        count(reqwest::StatusCode::TOO_MANY_REQUESTS),
+        1,
+        "{statuses:?}"
+    );
+}
+
+#[tokio::test]
+async fn max_open_uploads_of_zero_is_no_limit() {
+    let server = spawn_with(|c| c.files.max_open_uploads = 0).await;
+    push_multipart(&server, API_KEY, build_nupkg("Res.Pkg", "1.0.0", b"x")).await;
+    for i in 0..5 {
+        let (status, _) = create_tus(&server, &format!("{i}.wim"), 10).await;
+        assert_eq!(status, reqwest::StatusCode::CREATED, "upload {i}");
+    }
+}
+
+/// `PATCH` `body` onto the resumable upload at `location`, from `offset`.
+async fn patch_tus(
+    server: &TestServer,
+    location: &str,
+    offset: u64,
+    body: Vec<u8>,
+) -> reqwest::Response {
+    tus(server.client.patch(location))
+        .header("Content-Type", "application/offset+octet-stream")
+        .header("Upload-Offset", offset.to_string())
+        .body(body)
+        .send()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_partial_patch_no_longer_promises_what_it_wrote() {
+    let (server, length) = spawn_with_room_for_one().await;
+    let (_, first) = create_tus(&server, "a.wim", length).await;
+    let first = first.unwrap();
+    // The free space is fixed here, so what fits besides the first upload is
+    // exactly what it no longer promises.
+    let rest = ROOM - length / 2 - 10;
+    assert_eq!(
+        create_tus(&server, "b.wim", rest).await.0,
+        reqwest::StatusCode::INSUFFICIENT_STORAGE
+    );
+    let half = patch_tus(&server, &first, 0, vec![1u8; (length / 2) as usize]).await;
+    assert_eq!(half.status(), reqwest::StatusCode::NO_CONTENT);
+    assert_eq!(
+        create_tus(&server, "b.wim", rest).await.0,
+        reqwest::StatusCode::CREATED
+    );
+}
+
+#[tokio::test]
+async fn an_abandoned_resumable_upload_stops_holding_its_space() {
+    let (server, length) = spawn_with_room_for_one().await;
+    let (_, first) = create_tus(&server, "a.wim", length).await;
+    let first = first.unwrap();
+    assert_eq!(
+        create_tus(&server, "b.wim", length).await.0,
+        reqwest::StatusCode::INSUFFICIENT_STORAGE
+    );
+
+    // The client went away without a `DELETE`. Past the hold, the upload is
+    // still open, but holds nothing.
+    let db = SqliteDatabase::connect(&server._dir.path().join("yanuget.db").to_string_lossy())
+        .await
+        .unwrap();
+    let id = first.rsplit('/').next().unwrap();
+    let idle_since = chrono::Utc::now() - chrono::Duration::hours(2);
+    db.set_upload_held(id, Some(idle_since)).await.unwrap();
+    let (status, second) = create_tus(&server, "b.wim", length).await;
+    assert_eq!(status, reqwest::StatusCode::CREATED);
+
+    // Coming back, it is admitted again like a new upload of what it has
+    // left, and the space went to the other one meanwhile.
+    let refused = patch_tus(&server, &first, 0, vec![1u8; 10]).await;
+    assert_eq!(refused.status(), reqwest::StatusCode::INSUFFICIENT_STORAGE);
+    // Refused, it keeps the hold it had.
+    let held = db.get_upload(id).await.unwrap().unwrap().held_since;
+    assert_eq!(held.map(|t| t.timestamp()), Some(idle_since.timestamp()));
+
+    // Once the other one is abandoned, it goes on where it was.
+    let deleted = tus(server.client.delete(second.unwrap()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(deleted.status(), reqwest::StatusCode::NO_CONTENT);
+    let resumed = patch_tus(&server, &first, 0, vec![1u8; 10]).await;
+    assert_eq!(resumed.status(), reqwest::StatusCode::NO_CONTENT);
+    assert_eq!(resumed.headers()["upload-offset"], "10");
+}
+
+#[tokio::test]
+async fn a_push_declaring_more_than_the_size_limit_reserves_nothing() {
+    let server = spawn_with_free_space(
+        |c| {
+            c.min_free_disk_bytes = 1;
+            c.max_package_size_bytes = Some(10_000);
+        },
+        Some(ROOM),
+    )
+    .await;
+    // Bigger than the volume: reserved first, it was refused as a full disk,
+    // and while it trickled in it kept every other upload out.
+    let resp = server
+        .client
+        .put(server.url("/api/v2/package"))
+        .header("X-NuGet-ApiKey", API_KEY)
+        .body(vec![0u8; 2 * ROOM as usize])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::PAYLOAD_TOO_LARGE);
+    // A multipart push of a package under the limit is not refused for its
+    // boundaries.
+    let pushed = push_multipart(&server, API_KEY, build_nupkg("Small.Pkg", "1.0.0", b"x")).await;
+    assert_eq!(pushed.status(), reqwest::StatusCode::CREATED);
+}
+
 // ---------------------------------------------------------------------------
 // Monitoring: /metrics and /health/status
 // ---------------------------------------------------------------------------

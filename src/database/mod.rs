@@ -116,6 +116,10 @@ pub struct UploadSession {
     /// The SHA-256 (hex) the finished file must have, if the client said.
     pub expected_sha256: Option<String>,
     pub expires: chrono::DateTime<chrono::Utc>,
+    /// Since when the upload has held the space it has still to receive: its
+    /// creation or the end of its last request. `None` while a request is
+    /// writing it, which holds that space itself.
+    pub held_since: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// How many packages of a feed carry one tag.
@@ -683,11 +687,25 @@ pub trait PackageDatabase: Send + Sync {
 
     async fn create_upload(&self, upload: &UploadSession) -> Result<()>;
     async fn get_upload(&self, id: &str) -> Result<Option<UploadSession>>;
+    /// Record that `received` bytes of upload `id` have arrived, which
+    /// renews its hold on the space it has still to receive.
     async fn set_upload_received(&self, id: &str, received: u64) -> Result<()>;
+    /// Set since when upload `id` holds its space; `None` gives it up.
+    async fn set_upload_held(
+        &self,
+        id: &str,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<()>;
     async fn delete_upload(&self, id: &str) -> Result<()>;
     /// The bytes the uploads current at `now` have still to receive, over
-    /// every feed: space they were admitted with and have not used yet.
-    async fn outstanding_upload_bytes(&self, now: chrono::DateTime<chrono::Utc>) -> Result<u64>;
+    /// every feed, counting only those that have held their space since
+    /// `held_after` or later: space they were admitted with and have not
+    /// used yet. One idle for longer holds none until its next request.
+    async fn outstanding_upload_bytes(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+        held_after: chrono::DateTime<chrono::Utc>,
+    ) -> Result<u64>;
     /// How many uploads of `feed` are current (not expired) at `now`.
     async fn open_uploads(&self, feed: &str, now: chrono::DateTime<chrono::Utc>) -> Result<u64>;
     /// Uploads whose expiry has passed at `now`.

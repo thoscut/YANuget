@@ -16,7 +16,7 @@ use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
@@ -32,6 +32,14 @@ pub type Measure = Arc<dyn Fn(&Path) -> io::Result<u64> + Send + Sync>;
 
 /// How many bytes [`DiskReserve`] lets through between two measurements.
 pub const RESERVE_CHECK_INTERVAL: u64 = 64 * 1024 * 1024;
+
+/// How long an unfinished resumable upload holds the space it has still to
+/// receive after its last request ended (or after it was created). An upload
+/// may stay open for `upload_expiry_hours`, but one a client abandoned
+/// without a `DELETE` must not keep every other upload out for that long:
+/// past this, it holds nothing, and its next request is admitted again like
+/// a new upload of what is left.
+pub const RESUMABLE_HOLD: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
 /// The admission of writes into one staging directory: its volume's free
 /// space, the reserve to keep, and the bytes promised to writes in progress.
@@ -102,7 +110,7 @@ impl SpaceGuard {
 
     /// The bytes promised now to writes in progress through this guard (not
     /// counting resumable uploads between two requests).
-    pub fn promised(&self) -> i64 {
+    pub fn promised(&self) -> u64 {
         self.pool.promised()
     }
 
@@ -118,18 +126,17 @@ impl SpaceGuard {
     /// cannot be measured the write is let through, since a guard that fails
     /// closed would take the server down with it.
     pub async fn admit(&self, incoming: Option<u64>) -> Result<Reservation> {
-        let reservation = self.pool.reserve(incoming.unwrap_or(0));
+        let reservation = self.reserve(incoming.unwrap_or(0));
         self.check(incoming.unwrap_or(0)).await?;
         Ok(reservation)
     }
 
-    /// The check of [`Self::admit`] for more bytes of a resumable upload,
-    /// which its row already promises: an [offset](Reservations::offset) for
-    /// the request that writes them.
-    pub async fn resume(&self) -> Result<Reservation> {
-        let reservation = self.pool.offset();
-        self.check(0).await?;
-        Ok(reservation)
+    /// The first half of [`Self::admit`]: promise `bytes` without checking.
+    /// For a caller that gives up another promise of the same bytes (a
+    /// resumable upload's row) before it [checks](Self::check), so that they
+    /// are counted twice for a moment rather than not at all.
+    pub fn reserve(&self, bytes: u64) -> Reservation {
+        self.pool.reserve(bytes)
     }
 
     /// The free space of the volume, measured off the async worker (a
@@ -151,8 +158,12 @@ impl SpaceGuard {
     }
 
     /// Whether the volume has room for everything promised, `incoming` (part
-    /// of it) included, and the reserve.
-    async fn check(&self, incoming: u64) -> Result<()> {
+    /// of it, already [reserved](Self::reserve)) included, and the reserve.
+    ///
+    /// A refusal says (in the log, for a `507`) how much of the space is
+    /// promised and to what: an operator looking at one on a half-empty disk
+    /// needs to see that it is held by uploads that have not arrived.
+    pub async fn check(&self, incoming: u64) -> Result<()> {
         if self.reserve == 0 {
             return Ok(());
         }
@@ -160,17 +171,27 @@ impl SpaceGuard {
             return Ok(());
         };
         let resumable = match &self.resumable {
-            Some(db) => db.outstanding_upload_bytes(chrono::Utc::now()).await?,
+            Some(db) => {
+                let now = chrono::Utc::now();
+                let hold = chrono::Duration::from_std(RESUMABLE_HOLD).unwrap_or_default();
+                db.outstanding_upload_bytes(now, now - hold).await?
+            }
             None => 0,
         };
-        let promised = (self.pool.promised() as i128 + resumable as i128).max(0) as u64;
-        let others = promised.saturating_sub(incoming);
-        let needed = promised.max(incoming).saturating_add(self.reserve);
+        let pool = self.pool.promised();
+        let in_flight = pool.saturating_sub(incoming);
+        let needed = pool
+            .max(incoming)
+            .saturating_add(resumable)
+            .saturating_add(self.reserve);
         if available < needed {
             return Err(Error::InsufficientStorage(format!(
-                "{available} bytes free on the storage volume, {needed} needed \
-                 ({incoming} incoming, {others} promised to other uploads in progress, \
-                 and the configured reserve)"
+                "{available} bytes free on the storage volume, {needed} needed: \
+                 {incoming} incoming, {in_flight} promised to other uploads in progress, \
+                 {resumable} held by unfinished resumable uploads (each for up to {} min \
+                 after its last request), and the configured reserve of {}",
+                RESUMABLE_HOLD.as_secs() / 60,
+                self.reserve
             )));
         }
         Ok(())
@@ -215,14 +236,12 @@ impl SpaceGuard {
 /// the check counts what is promised to the others too.
 #[derive(Debug, Default)]
 pub struct Reservations {
-    promised: AtomicI64,
+    promised: AtomicU64,
 }
 
 impl Reservations {
-    /// The bytes promised now, over every [`Reservation`] still held. Below
-    /// zero while [offsets](Self::offset) hold more than is promised here:
-    /// the bytes they took off are still counted where they were promised.
-    pub fn promised(&self) -> i64 {
+    /// The bytes promised now, over every [`Reservation`] still held.
+    pub fn promised(&self) -> u64 {
         self.promised.load(Ordering::SeqCst)
     }
 
@@ -231,25 +250,13 @@ impl Reservations {
     /// volume's free space shows it from then on; what is left goes when the
     /// reservation is dropped, finished or not.
     pub fn reserve(self: &Arc<Self>, bytes: u64) -> Reservation {
-        let bytes = bytes.min(i64::MAX as u64) as i64;
+        // No volume holds 2^63 bytes; capped, the sum of any sane number of
+        // promises cannot wrap.
+        let bytes = bytes.min(i64::MAX as u64);
         self.promised.fetch_add(bytes, Ordering::SeqCst);
         Reservation {
             pool: Arc::clone(self),
-            held: AtomicI64::new(bytes),
-            bounded: true,
-        }
-    }
-
-    /// A reservation for bytes promised somewhere else — a resumable upload's
-    /// row, which says how much of it is still to come. It starts at nothing,
-    /// and each byte written through it is taken off until it is dropped:
-    /// written, the byte shows in the free space while the row still counts
-    /// it, and would otherwise be counted twice.
-    pub fn offset(self: &Arc<Self>) -> Reservation {
-        Reservation {
-            pool: Arc::clone(self),
-            held: AtomicI64::new(0),
-            bounded: false,
+            held: AtomicU64::new(bytes),
         }
     }
 }
@@ -258,19 +265,17 @@ impl Reservations {
 #[derive(Debug)]
 pub struct Reservation {
     pool: Arc<Reservations>,
-    held: AtomicI64,
-    /// Whether the share stops at zero: true for a promise of its own, false
-    /// for an [`offset`](Reservations::offset), which goes below.
-    bounded: bool,
+    held: AtomicU64,
 }
 
 impl Reservation {
-    /// `n` bytes went to disk through this upload.
+    /// `n` bytes went to disk through this upload: off the promise, never
+    /// more than it holds, so a write longer than declared takes nothing off
+    /// another upload's share.
     fn consumed(&self, n: u64) {
-        let n = n.min(i64::MAX as u64) as i64;
         // One writer at a time per reservation, so no other update races this.
         let held = self.held.load(Ordering::SeqCst);
-        let take = if self.bounded { n.min(held.max(0)) } else { n };
+        let take = n.min(held);
         self.held.store(held - take, Ordering::SeqCst);
         self.pool.promised.fetch_sub(take, Ordering::SeqCst);
     }
@@ -422,18 +427,6 @@ mod tests {
         // An upload that stops part-way gives back the rest.
         drop(second);
         assert_eq!(pool.promised(), 0);
-
-        // An offset takes written bytes off what others promised for it, and
-        // puts them back when it goes.
-        let row = pool.reserve(1000);
-        let offset = pool.offset();
-        let mut guarded = space.guard(&mut sink, &offset);
-        guarded.write_all(&[0u8; 300]).await.unwrap();
-        assert_eq!(pool.promised(), 700);
-        drop(offset);
-        assert_eq!(pool.promised(), 1000);
-        drop(row);
-        assert_eq!(pool.promised(), 0);
     }
 
     #[tokio::test]
@@ -453,6 +446,39 @@ mod tests {
         assert!(fixed(100, 50).admit(None).await.is_err());
         // Off, nothing is checked.
         assert!(fixed(0, 0).admit(Some(u64::MAX)).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn resumable_uploads_hold_their_rest_until_they_go_idle() {
+        use crate::database::{SqliteDatabase, UploadSession};
+        let db = Arc::new(SqliteDatabase::in_memory().await.unwrap());
+        let space = fixed(1, 1000).with_resumable(db.clone());
+        let now = chrono::Utc::now();
+        let mut upload = UploadSession {
+            id: "up".into(),
+            feed: "default".into(),
+            lower_id: "res.pkg".into(),
+            normalized_version: "1.0.0".into(),
+            name: "a.wim".into(),
+            length: 900,
+            received: 0,
+            expected_sha256: None,
+            expires: now + chrono::Duration::hours(72),
+            held_since: Some(now),
+        };
+        db.create_upload(&upload).await.unwrap();
+        let err = space.admit(Some(500)).await.unwrap_err();
+        let why = err.to_string();
+        assert!(
+            why.contains("900 held by unfinished resumable uploads"),
+            "{why}"
+        );
+
+        // Idle for longer than the hold, it holds nothing.
+        db.delete_upload("up").await.unwrap();
+        upload.held_since = Some(now - chrono::Duration::from_std(RESUMABLE_HOLD).unwrap() * 2);
+        db.create_upload(&upload).await.unwrap();
+        assert!(space.admit(Some(500)).await.is_ok());
     }
 
     #[tokio::test]

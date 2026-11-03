@@ -552,6 +552,12 @@ async fn upgrade(era: Era) {
         assert_eq!(files[0].downloads, 4);
         let upload = db.get_upload("up1").await.unwrap().unwrap();
         assert_eq!(upload.received, 4);
+        // An upload from before holds since it was created: long idle here.
+        assert_eq!(
+            upload.held_since.map(|t| t.to_rfc3339()).as_deref(),
+            Some("2020-01-01T00:00:00+00:00"),
+            "{era:?}"
+        );
     }
     if era == Era::Unnumbered {
         assert!(db.is_tombstoned(FEED, "gone", &v("1.0.0")).await.unwrap());

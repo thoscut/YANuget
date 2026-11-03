@@ -21,7 +21,7 @@ generic message to the client and the cause in the server log
 | `413` | The package is larger than `max_package_size_bytes`, or a reverse proxy's own body limit. | Raise the limit; behind nginx set `client_max_body_size 0;`. See [Reverse proxy](configuration.md#reverse-proxy). |
 | `421` | `base_url` is set and the request named another host. | Use the host in `base_url`, or add the name to `allowed_hosts`. Behind a proxy, forward the original `Host`. See [Host validation](configuration.md#host-validation). |
 | `429` | The per-IP rate limit was exceeded. NuGet does not retry, so the restore fails. Or the feed already holds `files.max_open_uploads` unfinished resumable uploads. | Behind a proxy, list it in `trusted_proxies`, otherwise every client shares the proxy's bucket. Raise `rate_limit.max_requests` for large CI farms behind one address. For uploads: finish or delete the open ones, or let them expire. |
-| `507` | The upload would leave less than `min_free_disk_bytes` (2 GiB by default) free, counting the space other uploads in progress have declared. | Free space on the storage volume, or lower the threshold. The server log says when uploads in progress are what holds the space. |
+| `507` | The upload would leave less than `min_free_disk_bytes` (2 GiB by default) free, counting the space promised to uploads, mirror downloads and inbox imports still in progress and to resumable uploads active in the last hour. | The server log's `request failed` line says how much is free and how much is promised to what. Free space on the storage volume, delete an abandoned resumable upload (`DELETE` on its location), or lower the threshold. |
 
 ## Common problems
 

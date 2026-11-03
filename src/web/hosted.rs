@@ -716,6 +716,7 @@ pub(super) async fn tus_create(
             received: 0,
             expected_sha256: expected,
             expires,
+            held_since: Some(Utc::now()),
         })
         .await?;
     let location = state.url_builder(&headers).upload(&upload);
@@ -829,9 +830,19 @@ pub(super) async fn tus_patch(
         return built(tus_response(StatusCode::CONFLICT).header("upload-offset", s.received));
     }
     // Checked at creation for the whole upload, but a resumed one may come
-    // back hours later to a fuller disk. The row promises what is still to
-    // come; the offset keeps what this request writes from counting twice.
-    let reservation = state.resume_disk_space().await?;
+    // back hours later to a fuller disk, and one idle for longer than
+    // `RESUMABLE_HOLD` holds nothing any more. So the request reserves what
+    // is still to come itself, like a new upload, and the row stops promising
+    // it until the request ends: promised here first, then given up there,
+    // then checked, so it is never counted twice in a check, nor missed.
+    let rest = s.length - s.received;
+    let reservation = state.space.reserve(rest);
+    state.db.set_upload_held(&upload, None).await?;
+    if let Err(e) = state.space.check(rest).await {
+        // Refused: the upload keeps whatever hold it had.
+        let _ = state.db.set_upload_held(&upload, s.held_since).await;
+        return Err(e);
+    }
     let part = part_path(&state, &upload);
     resume_hash(&mut hashing, &part, s.received).await?;
     // Out of the slot while bytes go in: if this request is cancelled
@@ -869,10 +880,13 @@ pub(super) async fn tus_patch(
     // Should the row then not be updated, the two disagree and the next
     // request rebuilds the hash from the file.
     *hashing = Some(h);
-    // Counted twice for a moment rather than not at all: the offset goes
-    // before the row stops promising what was written.
+    // The row holds what is left again from now (and so this request's
+    // reservation can go): counted twice for a moment rather than not at
+    // all. Should the update fail, the upload holds nothing until its next
+    // request, which is admitted afresh.
+    let recorded = state.db.set_upload_received(&upload, received).await;
     drop(reservation);
-    state.db.set_upload_received(&upload, received).await?;
+    recorded?;
     if let Err(e) = streamed {
         return Err(map_upload_err(e));
     }

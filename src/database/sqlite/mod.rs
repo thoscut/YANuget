@@ -500,12 +500,20 @@ impl PackageDatabase for SqliteDatabase {
         uploads::set_upload_received(self, id, received).await
     }
 
+    async fn set_upload_held(&self, id: &str, since: Option<DateTime<Utc>>) -> Result<()> {
+        uploads::set_upload_held(self, id, since).await
+    }
+
     async fn delete_upload(&self, id: &str) -> Result<()> {
         uploads::delete_upload(self, id).await
     }
 
-    async fn outstanding_upload_bytes(&self, now: DateTime<Utc>) -> Result<u64> {
-        uploads::outstanding_upload_bytes(self, now).await
+    async fn outstanding_upload_bytes(
+        &self,
+        now: DateTime<Utc>,
+        held_after: DateTime<Utc>,
+    ) -> Result<u64> {
+        uploads::outstanding_upload_bytes(self, now, held_after).await
     }
 
     async fn open_uploads(&self, feed: &str, now: DateTime<Utc>) -> Result<u64> {
