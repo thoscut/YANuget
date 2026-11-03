@@ -580,6 +580,14 @@ fn an_atomic_write_leaves_no_temporary_file_and_follows_no_link() {
             .file_type()
             .is_symlink());
         assert_eq!(std::fs::read(&linked).unwrap(), b"four");
+
+        // The file gets the permissions any new file gets here, not the
+        // owner-only ones of a temporary file: node_exporter reads it.
+        use std::os::unix::fs::PermissionsExt;
+        let plain = dir.path().join("plain");
+        std::fs::write(&plain, b"").unwrap();
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&path), mode(&plain));
     }
 }
 
