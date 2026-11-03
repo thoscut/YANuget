@@ -620,9 +620,9 @@ pub async fn verify(
 /// does not.
 fn has_digest(path: &Path, digest: &Digest) -> bool {
     use base64::Engine;
-    fn hash<D: sha2::Digest + std::io::Write>(path: &Path) -> Option<Vec<u8>> {
+    fn hash<D: sha2::Digest>(path: &Path) -> Option<Vec<u8>> {
         let mut hasher = D::new();
-        std::io::copy(&mut std::fs::File::open(path).ok()?, &mut hasher).ok()?;
+        crate::streaming::hash_reader(&mut std::fs::File::open(path).ok()?, &mut hasher).ok()?;
         Some(hasher.finalize().to_vec())
     }
     match digest {

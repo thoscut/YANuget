@@ -8,6 +8,7 @@ use base64::Engine;
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use sha2::{Digest, Sha512};
+use std::io::Read;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 /// Result of streaming a payload to disk: the number of bytes written and the
@@ -16,6 +17,24 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 pub struct StreamSummary {
     pub size: u64,
     pub sha512_base64: String,
+}
+
+/// Feed everything `reader` yields into `hasher`, returning the byte count.
+/// The blocking counterpart of the stream helpers below; `std::io::copy`
+/// into a hasher would need the `io::Write` impl digest 0.11 dropped.
+pub fn hash_reader<D: Digest>(reader: &mut impl Read, hasher: &mut D) -> std::io::Result<u64> {
+    let mut buf = [0u8; 64 * 1024];
+    let mut total = 0u64;
+    loop {
+        let n = match reader.read(&mut buf) {
+            Ok(0) => return Ok(total),
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        hasher.update(&buf[..n]);
+        total += n as u64;
+    }
 }
 
 /// Copy a byte stream into `writer`, computing the SHA-512 hash on the fly.

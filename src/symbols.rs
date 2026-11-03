@@ -442,7 +442,7 @@ fn sha256_file(file: &mut File) -> Result<[u8; 32]> {
     use std::io::{Seek, SeekFrom};
     file.seek(SeekFrom::Start(0))?;
     let mut hasher = Sha256::new();
-    std::io::copy(file, &mut hasher)?;
+    crate::streaming::hash_reader(file, &mut hasher)?;
     Ok(hasher.finalize().into())
 }
 
