@@ -318,6 +318,10 @@ impl PackageDatabase for SqliteDatabase {
         memberships::follow_upstream_listing(self, feed, id, version, listed).await
     }
 
+    async fn upstream_listed(&self, feed: &str, id: &str) -> Result<Vec<(String, bool)>> {
+        memberships::upstream_listed(self, feed, id).await
+    }
+
     async fn set_enabled(
         &self,
         feed: &str,

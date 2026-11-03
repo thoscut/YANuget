@@ -546,6 +546,11 @@ pub trait PackageDatabase: Send + Sync {
         listed: bool,
     ) -> Result<bool>;
 
+    /// The versions of `id` in `feed` that follow the upstream's listing
+    /// (their listing was not set by hand), each normalized with whether it
+    /// is listed. Only these two columns, for a mirror's listing refresh.
+    async fn upstream_listed(&self, feed: &str, id: &str) -> Result<Vec<(String, bool)>>;
+
     /// Set the admin `enabled` flag for a membership. A disabled membership is
     /// withheld entirely. Returns `true` if a row was updated.
     async fn set_enabled(

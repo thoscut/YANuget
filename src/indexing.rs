@@ -55,6 +55,10 @@ pub struct IndexOptions {
     /// overwrite replaces the build in every feed that holds the version, so
     /// the new build is held to each of their policies too.
     pub other_license_policies: Vec<(String, LicensePolicyConfig)>,
+    /// A version new to the feed arrives unlisted: a mirror copying one its
+    /// upstream has unlisted. Not set by hand, so the mirror keeps following
+    /// the upstream's listing for it. An overwrite keeps the listing it had.
+    pub unlisted: bool,
 }
 
 /// The id/version a caller requires the indexed manifest to declare.
@@ -220,6 +224,7 @@ async fn index_inner(
         //     payload again if that fails.
         store_payload(storage, &id, &normalized, temp_path, &sidecars).await?;
         let membership = Membership {
+            listed: !options.unlisted,
             pending: options.pending,
             flagged,
             flag_reason: outcome.violation.clone(),
@@ -255,6 +260,7 @@ async fn index_inner(
             store_payload(storage, &id, &normalized, temp_path, &sidecars).await?;
         }
         let membership = Membership {
+            listed: !options.unlisted,
             pending: options.pending,
             flagged,
             flag_reason: outcome.violation.clone(),

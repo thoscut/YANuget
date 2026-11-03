@@ -310,6 +310,7 @@ pub async fn run(
         // A migration overwrites with `Enabled` or not at all, never
         // `pending-only`, which is the only mode that reads these.
         other_license_policies: Vec::new(),
+        unlisted: false,
     };
 
     let outcomes: Vec<Outcome> = stream::iter(work)

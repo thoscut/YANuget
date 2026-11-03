@@ -38,6 +38,7 @@ pub(super) async fn push_package(
             .filter(|f| f.name != state.feed.name)
             .map(|f| (f.name.clone(), f.license_policy.clone()))
             .collect(),
+        unlisted: false,
     };
     let state = state.clone();
     detached(async move {

@@ -1642,3 +1642,82 @@ async fn a_copied_version_unlisted_by_hand_stays_unlisted_in_the_target_mirror()
     assert!(there.listing_set);
     assert!(!there.listed, "the target's refresh must not relist it");
 }
+
+/// A version the upstream has unlisted is indexed unlisted, not listed until
+/// the end of the fetch: the registration is read once, before the first
+/// download, and serves the versions and the reconciliation alike (COR-39,
+/// PERF-13).
+#[tokio::test]
+async fn a_refresh_reads_the_registration_once_before_downloading() {
+    let upstream = Upstream::start().await;
+    for v in ["1.0.0", "2.0.0", "3.0.0"] {
+        upstream.publish("Early.Pkg", v);
+    }
+    upstream.behave(|b| {
+        b.registration = true;
+        b.unlisted.insert(("early.pkg".into(), "3.0.0".into()));
+    });
+    let local = local_feed().await;
+    assert_eq!(
+        local
+            .mirror(&upstream, "Early.Pkg", MirrorOptions::default())
+            .await,
+        3
+    );
+    let paths: Vec<String> = upstream.seen().into_iter().map(|s| s.path).collect();
+    let registration = |p: &String| p.starts_with("/registration/");
+    assert_eq!(
+        paths.iter().filter(|p| registration(p)).count(),
+        1,
+        "{paths:?}"
+    );
+    let first_download = paths.iter().position(|p| p.ends_with(".nupkg")).unwrap();
+    assert!(
+        paths[..first_download].iter().any(registration),
+        "{paths:?}"
+    );
+    let m = local.membership("early.pkg", "3.0.0").await.unwrap();
+    assert!(!m.listed);
+    assert!(!m.listing_set, "the upstream's, not a hand-set listing");
+    assert!(local.listed("early.pkg", "2.0.0").await);
+}
+
+/// Read-through fetches of several versions share one registration read
+/// within `refresh_secs`, instead of one each (PERF-13).
+#[tokio::test]
+async fn read_through_versions_share_one_registration_read() {
+    let upstream = Upstream::start().await;
+    for v in ["1.0.0", "2.0.0", "3.0.0"] {
+        upstream.publish("Shared.Pkg", v);
+    }
+    upstream.behave(|b| {
+        b.registration = true;
+        b.unlisted.insert(("shared.pkg".into(), "1.0.0".into()));
+    });
+    let local = local_feed().await;
+    let client = yanuget::mirror::MirrorClient::from_config(&mirror_config(&upstream)).unwrap();
+    let options = MirrorOptions::default();
+    let target = yanuget::mirror::MirrorTarget {
+        client: &client,
+        storage: &local.storage,
+        db: &local.db,
+        feed: "mirror",
+        temp_dir: &local.temp,
+        options: &options,
+    };
+    for v in ["1.0.0", "2.0.0", "3.0.0"] {
+        let version = NuGetVersion::parse(v).unwrap();
+        assert_eq!(
+            target.ensure_version("Shared.Pkg", &version).await.unwrap(),
+            1
+        );
+    }
+    let registrations = upstream
+        .seen()
+        .iter()
+        .filter(|s| s.path.starts_with("/registration/"))
+        .count();
+    assert_eq!(registrations, 1);
+    assert!(!local.listed("shared.pkg", "1.0.0").await);
+    assert!(local.listed("shared.pkg", "3.0.0").await);
+}

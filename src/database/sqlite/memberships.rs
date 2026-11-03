@@ -161,6 +161,25 @@ pub(super) async fn follow_upstream_listing(
     Ok(result.rows_affected() > 0)
 }
 
+pub(super) async fn upstream_listed(
+    db: &SqliteDatabase,
+    feed: &str,
+    id: &str,
+) -> Result<Vec<(String, bool)>> {
+    let rows: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT normalized_version, listed FROM feed_packages \
+         WHERE feed = ?1 AND lower_id = ?2 AND listing_set = 0",
+    )
+    .bind(feed)
+    .bind(canonical_id(id))
+    .fetch_all(&db.pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(version, listed)| (version, listed != 0))
+        .collect())
+}
+
 pub(super) async fn set_enabled(
     db: &SqliteDatabase,
     feed: &str,
