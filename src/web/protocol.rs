@@ -280,7 +280,7 @@ pub(super) async fn registration_index(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<String>,
-) -> Result<Json<serde_json::Value>> {
+) -> Result<Response> {
     registration_index_for(&state, &headers, &id, false).await
 }
 
@@ -288,7 +288,7 @@ pub(super) async fn registration_index_semver2(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<String>,
-) -> Result<Json<serde_json::Value>> {
+) -> Result<Response> {
     registration_index_for(&state, &headers, &id, true).await
 }
 
@@ -297,7 +297,7 @@ async fn registration_index_for(
     headers: &HeaderMap,
     id: &str,
     semver2: bool,
-) -> Result<Json<serde_json::Value>> {
+) -> Result<Response> {
     check_id(id)?;
     state.require_read(headers)?;
     // Registration includes unlisted versions (flagged listed=false).
@@ -316,14 +316,14 @@ async fn registration_index_for(
         return Err(Error::PackageNotFound);
     }
     let urls = state.url_builder(headers).with_hive(semver2);
-    Ok(Json(nuget::registration_index(&urls, id, &packages)))
+    Ok(Json(nuget::registration_index(&urls, id, &packages)).into_response())
 }
 
 pub(super) async fn registration_page(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path((id, lower, upper)): Path<(String, String, String)>,
-) -> Result<Json<serde_json::Value>> {
+) -> Result<Response> {
     registration_page_for(&state, &headers, &id, &lower, &upper, false).await
 }
 
@@ -331,7 +331,7 @@ pub(super) async fn registration_page_semver2(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path((id, lower, upper)): Path<(String, String, String)>,
-) -> Result<Json<serde_json::Value>> {
+) -> Result<Response> {
     registration_page_for(&state, &headers, &id, &lower, &upper, true).await
 }
 
@@ -342,7 +342,7 @@ async fn registration_page_for(
     lower: &str,
     upper: &str,
     semver2: bool,
-) -> Result<Json<serde_json::Value>> {
+) -> Result<Response> {
     check_id(id)?;
     state.require_read(headers)?;
     let upper = upper.strip_suffix(".json").unwrap_or(upper);
@@ -356,14 +356,14 @@ async fn registration_page_for(
         return Err(Error::PackageNotFound);
     }
     let urls = state.url_builder(headers).with_hive(semver2);
-    Ok(Json(nuget::registration_page(&urls, id, &packages)))
+    Ok(Json(nuget::registration_page(&urls, id, &packages)).into_response())
 }
 
 pub(super) async fn registration_leaf(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path((id, version)): Path<(String, String)>,
-) -> Result<Json<serde_json::Value>> {
+) -> Result<Response> {
     registration_leaf_for(&state, &headers, &id, &version, false).await
 }
 
@@ -371,7 +371,7 @@ pub(super) async fn registration_leaf_semver2(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path((id, version)): Path<(String, String)>,
-) -> Result<Json<serde_json::Value>> {
+) -> Result<Response> {
     registration_leaf_for(&state, &headers, &id, &version, true).await
 }
 
@@ -381,7 +381,7 @@ async fn registration_leaf_for(
     id: &str,
     version: &str,
     semver2: bool,
-) -> Result<Json<serde_json::Value>> {
+) -> Result<Response> {
     check_id(id)?;
     state.require_read(headers)?;
     let version = version.strip_suffix(".json").unwrap_or(version);
@@ -396,7 +396,7 @@ async fn registration_leaf_for(
         return Err(Error::PackageNotFound);
     }
     let urls = state.url_builder(headers).with_hive(semver2);
-    Ok(Json(nuget::registration_leaf(&urls, id, &package)))
+    Ok(Json(nuget::registration_leaf(&urls, id, &package)).into_response())
 }
 
 /// Restrict a version list to what the requested hive may expose.
@@ -435,7 +435,7 @@ pub(super) async fn search(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(params): Query<SearchParams>,
-) -> Result<Json<serde_json::Value>> {
+) -> Result<Response> {
     state.require_read(&headers)?;
     let request = SearchRequest {
         query: params.q.unwrap_or_default(),
@@ -455,7 +455,7 @@ pub(super) async fn search(
     let urls = state
         .url_builder(&headers)
         .with_hive(request.include_semver2);
-    Ok(Json(nuget::search_response(&urls, &page)))
+    Ok(Json(nuget::search_response(&urls, &page)).into_response())
 }
 
 #[derive(Debug, Deserialize)]

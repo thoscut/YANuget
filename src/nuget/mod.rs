@@ -10,6 +10,7 @@ mod urls;
 pub use urls::UrlBuilder;
 
 use chrono::SecondsFormat;
+use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::database::{SearchGroup, SearchPage};
@@ -123,6 +124,121 @@ const REGISTRATION_INLINE_MAX: usize = 128;
 /// Versions per external registration page.
 const REGISTRATION_PAGE_SIZE: usize = 64;
 
+// The registration and search documents are the largest the server sends,
+// so they are serialized straight from these structs rather than built as a
+// `serde_json::Value` tree first. Their fields are declared in the sorted
+// order a `Value` object writes its keys in, so the bytes are the same as
+// they were (see the test `documents_serialize_their_keys_sorted`).
+
+/// The registration index (`/v3/registration/{id}/index.json`).
+#[derive(Debug, Serialize)]
+pub struct RegistrationIndexDoc<'a> {
+    #[serde(rename = "@id")]
+    id: String,
+    #[serde(rename = "@type")]
+    types: [&'static str; 3],
+    count: usize,
+    items: Vec<RegistrationPageDoc<'a>>,
+}
+
+/// A registration page: inlined in the index, referenced from it (no
+/// `items`), or served on its own (with `@type` and `parent`).
+#[derive(Debug, Serialize)]
+pub struct RegistrationPageDoc<'a> {
+    #[serde(rename = "@id")]
+    id: String,
+    #[serde(rename = "@type", skip_serializing_if = "Option::is_none")]
+    page_type: Option<&'static str>,
+    count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    items: Option<Vec<LeafItem<'a>>>,
+    lower: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parent: Option<String>,
+    upper: String,
+}
+
+/// A registration page's item for one version.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LeafItem<'a> {
+    #[serde(rename = "@id")]
+    id: String,
+    #[serde(rename = "@type")]
+    item_type: &'static str,
+    catalog_entry: CatalogEntryDoc<'a>,
+    package_content: String,
+    registration: String,
+}
+
+/// The standalone registration leaf (`/v3/registration/{id}/{version}.json`).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RegistrationLeafDoc {
+    #[serde(rename = "@id")]
+    id: String,
+    #[serde(rename = "@type")]
+    types: [&'static str; 2],
+    catalog_entry: String,
+    listed: bool,
+    package_content: String,
+    published: String,
+    registration: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CatalogEntryDoc<'a> {
+    #[serde(rename = "@id")]
+    at_id: String,
+    #[serde(rename = "@type")]
+    entry_type: &'static str,
+    authors: String,
+    // Omitted entirely when the package has no dependencies, matching
+    // nuget.org.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    dependency_groups: Vec<DependencyGroupDoc<'a>>,
+    description: &'a str,
+    icon_url: Option<String>,
+    id: &'a str,
+    language: Option<&'a str>,
+    license_expression: Option<&'a str>,
+    license_url: Option<String>,
+    listed: bool,
+    min_client_version: Option<&'a str>,
+    package_content: String,
+    project_url: Option<&'a str>,
+    published: String,
+    release_notes: Option<&'a str>,
+    require_license_acceptance: bool,
+    summary: Option<&'a str>,
+    tags: &'a [String],
+    title: Option<&'a str>,
+    version: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DependencyGroupDoc<'a> {
+    #[serde(rename = "@id")]
+    id: String,
+    #[serde(rename = "@type")]
+    group_type: &'static str,
+    dependencies: Vec<DependencyDoc<'a>>,
+    target_framework: Option<&'a str>,
+}
+
+#[derive(Debug, Serialize)]
+struct DependencyDoc<'a> {
+    #[serde(rename = "@id")]
+    at_id: String,
+    #[serde(rename = "@type")]
+    dependency_type: &'static str,
+    id: &'a str,
+    range: &'a str,
+    registration: String,
+}
+
 /// Build the registration index (`/v3/registration/{id}/index.json`).
 ///
 /// For small packages all leaves are inlined into one page. Once a package has
@@ -130,49 +246,48 @@ const REGISTRATION_PAGE_SIZE: usize = 64;
 /// external pages of `REGISTRATION_PAGE_SIZE` versions each (served by
 /// [`registration_page`]), so the index document stays small. `packages` must be
 /// sorted ascending by version and contain at least one element.
-pub fn registration_index(urls: &UrlBuilder, id: &str, packages: &[Package]) -> Value {
+pub fn registration_index<'a>(
+    urls: &UrlBuilder,
+    id: &str,
+    packages: &'a [Package],
+) -> RegistrationIndexDoc<'a> {
     let lower_id = id.to_lowercase();
     let index_url = urls.registration_index(&lower_id);
 
-    let items: Vec<Value> = if packages.len() < REGISTRATION_INLINE_MAX {
+    let items: Vec<RegistrationPageDoc<'a>> = if packages.len() < REGISTRATION_INLINE_MAX {
         vec![inline_page(urls, &lower_id, &index_url, packages)]
     } else {
         packages
             .chunks(REGISTRATION_PAGE_SIZE)
             .map(|chunk| {
-                let lower = chunk
-                    .first()
-                    .map(|p| p.normalized_version())
-                    .unwrap_or_default();
-                let upper = chunk
-                    .last()
-                    .map(|p| p.normalized_version())
-                    .unwrap_or_default();
-                json!({
-                    "@id": urls.registration_page(&lower_id, &lower, &upper),
-                    "count": chunk.len(),
-                    "lower": lower,
-                    "upper": upper,
-                })
+                let (lower, upper) = bounds(chunk);
+                RegistrationPageDoc {
+                    id: urls.registration_page(&lower_id, &lower, &upper),
+                    page_type: None,
+                    count: chunk.len(),
+                    items: None,
+                    lower,
+                    parent: None,
+                    upper,
+                }
             })
             .collect()
     };
 
-    json!({
-        "@id": index_url,
-        "@type": ["catalog:CatalogRoot", "PackageRegistration", "catalog:Permalink"],
-        "count": items.len(),
-        "items": items,
-    })
+    RegistrationIndexDoc {
+        id: index_url,
+        types: [
+            "catalog:CatalogRoot",
+            "PackageRegistration",
+            "catalog:Permalink",
+        ],
+        count: items.len(),
+        items,
+    }
 }
 
-/// Build a single inline registration page object (used inside the index for
-/// small packages).
-fn inline_page(urls: &UrlBuilder, lower_id: &str, index_url: &str, packages: &[Package]) -> Value {
-    let leaves: Vec<Value> = packages
-        .iter()
-        .map(|p| registration_leaf_item(urls, lower_id, p))
-        .collect();
+/// The normalized versions of the first and last of `packages`.
+fn bounds(packages: &[Package]) -> (String, String) {
     let lower = packages
         .first()
         .map(|p| p.normalized_version())
@@ -181,41 +296,58 @@ fn inline_page(urls: &UrlBuilder, lower_id: &str, index_url: &str, packages: &[P
         .last()
         .map(|p| p.normalized_version())
         .unwrap_or_default();
-    json!({
-        "@id": format!("{index_url}#page/{lower}/{upper}"),
-        "count": packages.len(),
-        "lower": lower,
-        "upper": upper,
-        "items": leaves,
-    })
+    (lower, upper)
+}
+
+/// Build a single inline registration page object (used inside the index for
+/// small packages).
+fn inline_page<'a>(
+    urls: &UrlBuilder,
+    lower_id: &str,
+    index_url: &str,
+    packages: &'a [Package],
+) -> RegistrationPageDoc<'a> {
+    let (lower, upper) = bounds(packages);
+    RegistrationPageDoc {
+        id: format!("{index_url}#page/{lower}/{upper}"),
+        page_type: None,
+        count: packages.len(),
+        items: Some(
+            packages
+                .iter()
+                .map(|p| registration_leaf_item(urls, lower_id, p))
+                .collect(),
+        ),
+        lower,
+        parent: None,
+        upper,
+    }
 }
 
 /// Build a standalone registration page document
 /// (`/v3/registration/{id}/page/{lower}/{upper}.json`) with its leaves inlined.
 /// `packages` is the slice of versions covered by this page, sorted ascending.
-pub fn registration_page(urls: &UrlBuilder, id: &str, packages: &[Package]) -> Value {
+pub fn registration_page<'a>(
+    urls: &UrlBuilder,
+    id: &str,
+    packages: &'a [Package],
+) -> RegistrationPageDoc<'a> {
     let lower_id = id.to_lowercase();
-    let leaves: Vec<Value> = packages
-        .iter()
-        .map(|p| registration_leaf_item(urls, &lower_id, p))
-        .collect();
-    let lower = packages
-        .first()
-        .map(|p| p.normalized_version())
-        .unwrap_or_default();
-    let upper = packages
-        .last()
-        .map(|p| p.normalized_version())
-        .unwrap_or_default();
-    json!({
-        "@id": urls.registration_page(&lower_id, &lower, &upper),
-        "@type": "catalog:CatalogPage",
-        "count": packages.len(),
-        "lower": lower,
-        "upper": upper,
-        "parent": urls.registration_index(&lower_id),
-        "items": leaves,
-    })
+    let (lower, upper) = bounds(packages);
+    RegistrationPageDoc {
+        id: urls.registration_page(&lower_id, &lower, &upper),
+        page_type: Some("catalog:CatalogPage"),
+        count: packages.len(),
+        items: Some(
+            packages
+                .iter()
+                .map(|p| registration_leaf_item(urls, &lower_id, p))
+                .collect(),
+        ),
+        lower,
+        parent: Some(urls.registration_index(&lower_id)),
+        upper,
+    }
 }
 
 /// Build a standalone registration leaf document
@@ -226,33 +358,33 @@ pub fn registration_page(urls: &UrlBuilder, id: &str, packages: &[Package]) -> V
 /// object and `listed`/`published` at the top level. YANuget has no catalog, so
 /// `catalogEntry` names the leaf itself — the one resource describing this
 /// version — as the page items' `catalogEntry.@id` already does.
-pub fn registration_leaf(urls: &UrlBuilder, id: &str, package: &Package) -> Value {
+pub fn registration_leaf(urls: &UrlBuilder, id: &str, package: &Package) -> RegistrationLeafDoc {
     let lower_id = id.to_lowercase();
     let version = package.normalized_version();
     let leaf_url = urls.registration_leaf(&lower_id, &version);
-    json!({
-        "@id": leaf_url,
-        "@type": ["Package", "http://schema.nuget.org/catalog#Permalink"],
-        "catalogEntry": leaf_url,
-        "listed": package.listed,
-        "packageContent": urls.package_download(&lower_id, &version),
-        "published": published(package),
-        "registration": urls.registration_index(&lower_id),
-    })
+    RegistrationLeafDoc {
+        id: leaf_url.clone(),
+        types: ["Package", "http://schema.nuget.org/catalog#Permalink"],
+        catalog_entry: leaf_url,
+        listed: package.listed,
+        package_content: urls.package_download(&lower_id, &version),
+        published: published(package),
+        registration: urls.registration_index(&lower_id),
+    }
 }
 
-fn registration_leaf_item(urls: &UrlBuilder, lower_id: &str, p: &Package) -> Value {
+fn registration_leaf_item<'a>(urls: &UrlBuilder, lower_id: &str, p: &'a Package) -> LeafItem<'a> {
     let version = p.normalized_version();
     let leaf_url = urls.registration_leaf(lower_id, &version);
     let content_url = urls.package_download(lower_id, &version);
 
-    json!({
-        "@id": leaf_url,
-        "@type": "Package",
-        "packageContent": content_url,
-        "registration": urls.registration_index(lower_id),
-        "catalogEntry": catalog_entry(urls, lower_id, p, &content_url),
-    })
+    LeafItem {
+        catalog_entry: catalog_entry(urls, lower_id, p, &leaf_url, &content_url),
+        id: leaf_url,
+        item_type: "Package",
+        package_content: content_url,
+        registration: urls.registration_index(lower_id),
+    }
 }
 
 /// NuGet signals an unlisted version by reporting a `published` date in the
@@ -311,147 +443,190 @@ fn url_encode(s: &str) -> String {
     out
 }
 
-fn catalog_entry(urls: &UrlBuilder, lower_id: &str, p: &Package, content_url: &str) -> Value {
-    let version = p.normalized_version();
-    let mut entry = json!({
-        "@id": urls.registration_leaf(lower_id, &version),
-        "@type": "PackageDetails",
-        "id": p.id,
-        // For display: the publisher's casing and the build metadata, as
-        // nuget.org reports it. URLs keep the normalized, lower-cased form.
-        "version": p.version.to_full_string(),
-        "authors": p.authors.join(", "),
-        "description": p.description,
-        "iconUrl": icon_url(urls, lower_id, p),
-        "language": p.language,
-        "licenseExpression": p.license_expression,
-        "licenseUrl": license_url(p),
-        "listed": p.listed,
-        "minClientVersion": p.min_client_version,
-        "packageContent": content_url,
-        "projectUrl": p.project_url,
-        "published": published(p),
-        "releaseNotes": p.release_notes,
-        "requireLicenseAcceptance": p.require_license_acceptance,
-        "summary": p.summary,
-        "tags": p.tags,
-        "title": p.title,
-    });
-    // `dependencyGroups` is omitted entirely when the package has no
-    // dependencies, matching nuget.org.
-    if !p.dependencies.is_empty() {
-        entry["dependencyGroups"] = dependency_groups(urls, lower_id, &version, &p.dependencies);
-    }
-    entry
-}
-
-fn dependency_groups(
+fn catalog_entry<'a>(
     urls: &UrlBuilder,
     lower_id: &str,
-    version: &str,
-    groups: &[DependencyGroup],
-) -> Value {
-    let base = format!(
-        "{}#dependencygroup",
-        urls.registration_leaf(lower_id, version)
-    );
+    p: &'a Package,
+    leaf_url: &str,
+    content_url: &str,
+) -> CatalogEntryDoc<'a> {
+    CatalogEntryDoc {
+        at_id: leaf_url.to_string(),
+        entry_type: "PackageDetails",
+        authors: p.authors.join(", "),
+        dependency_groups: dependency_groups(urls, leaf_url, &p.dependencies),
+        description: &p.description,
+        icon_url: icon_url(urls, lower_id, p),
+        id: &p.id,
+        language: p.language.as_deref(),
+        license_expression: p.license_expression.as_deref(),
+        license_url: license_url(p),
+        listed: p.listed,
+        min_client_version: p.min_client_version.as_deref(),
+        package_content: content_url.to_string(),
+        project_url: p.project_url.as_deref(),
+        published: published(p),
+        release_notes: p.release_notes.as_deref(),
+        require_license_acceptance: p.require_license_acceptance,
+        summary: p.summary.as_deref(),
+        tags: &p.tags,
+        title: p.title.as_deref(),
+        // For display: the publisher's casing and the build metadata, as
+        // nuget.org reports it. URLs keep the normalized, lower-cased form.
+        version: p.version.to_full_string(),
+    }
+}
+
+fn dependency_groups<'a>(
+    urls: &UrlBuilder,
+    leaf_url: &str,
+    groups: &'a [DependencyGroup],
+) -> Vec<DependencyGroupDoc<'a>> {
+    let base = format!("{leaf_url}#dependencygroup");
     // The fragments are percent-encoded like any other URL segment: a target
     // framework such as `portable-net45+win8` or `.NETFramework4.7.2` carries
     // characters that do not belong raw in a URL.
-    let items: Vec<Value> = groups
+    groups
         .iter()
         .map(|g| {
-            let tfm = g.target_framework.clone();
-            let group_id = match &tfm {
+            let tfm = g.target_framework.as_deref();
+            let group_id = match tfm {
                 Some(f) => format!("{base}/{}", urls::enc(&f.to_lowercase())),
                 None => base.clone(),
             };
-            let deps: Vec<Value> = g
+            let dependencies = g
                 .dependencies
                 .iter()
-                .map(|d| {
-                    json!({
-                        "@id": format!("{group_id}/{}", urls::enc(&d.id.to_lowercase())),
-                        "@type": "PackageDependency",
-                        "id": d.id,
-                        // `<dependency id="X" />` with no `version` attribute is
-                        // legal and means "any version". Emitting it as JSON
-                        // `null` is not: nuget.org writes the unbounded range as
-                        // `(, )`, and NuGet.Protocol hands the value straight to
-                        // `VersionRange.Parse`, which throws on null rather than
-                        // degrading to `VersionRange.All` — so reading the
-                        // metadata fails instead of the dependency being open.
-                        "range": d.version_range.clone().unwrap_or_else(|| "(, )".into()),
-                        "registration": urls.registration_index(&d.id.to_lowercase()),
-                    })
+                .map(|d| DependencyDoc {
+                    at_id: format!("{group_id}/{}", urls::enc(&d.id.to_lowercase())),
+                    dependency_type: "PackageDependency",
+                    id: &d.id,
+                    // `<dependency id="X" />` with no `version` attribute is
+                    // legal and means "any version". Emitting it as JSON
+                    // `null` is not: nuget.org writes the unbounded range as
+                    // `(, )`, and NuGet.Protocol hands the value straight to
+                    // `VersionRange.Parse`, which throws on null rather than
+                    // degrading to `VersionRange.All` — so reading the
+                    // metadata fails instead of the dependency being open.
+                    range: d.version_range.as_deref().unwrap_or("(, )"),
+                    registration: urls.registration_index(&d.id.to_lowercase()),
                 })
                 .collect();
-            json!({
-                "@id": group_id,
-                "@type": "PackageDependencyGroup",
-                "targetFramework": tfm,
-                "dependencies": deps,
-            })
+            DependencyGroupDoc {
+                id: group_id,
+                group_type: "PackageDependencyGroup",
+                dependencies,
+                target_framework: tfm,
+            }
         })
-        .collect();
-    Value::Array(items)
+        .collect()
+}
+
+/// The search response (`/v3/search`).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchResponseDoc<'a> {
+    #[serde(rename = "@context")]
+    context: SearchContext,
+    data: Vec<SearchResultDoc<'a>>,
+    total_hits: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct SearchContext {
+    #[serde(rename = "@base")]
+    base: String,
+    #[serde(rename = "@vocab")]
+    vocab: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SearchResultDoc<'a> {
+    #[serde(rename = "@type")]
+    result_type: &'static str,
+    authors: &'a [String],
+    description: &'a str,
+    icon_url: Option<String>,
+    id: &'a str,
+    license_url: Option<String>,
+    package_types: Vec<PackageTypeDoc<'a>>,
+    project_url: Option<&'a str>,
+    registration: String,
+    summary: Option<&'a str>,
+    tags: &'a [String],
+    title: Option<&'a str>,
+    total_downloads: u64,
+    verified: bool,
+    version: String,
+    versions: Vec<SearchVersionDoc>,
+}
+
+#[derive(Debug, Serialize)]
+struct PackageTypeDoc<'a> {
+    name: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+struct SearchVersionDoc {
+    #[serde(rename = "@id")]
+    id: String,
+    downloads: u64,
+    version: String,
 }
 
 /// Build the search response (`/v3/search`).
-pub fn search_response(urls: &UrlBuilder, page: &SearchPage) -> Value {
-    let data: Vec<Value> = page.groups.iter().map(|g| search_result(urls, g)).collect();
-    json!({
-        "@context": {
-            "@vocab": "http://schema.nuget.org/schema#",
-            "@base": urls.registration_base(),
+pub fn search_response<'a>(urls: &UrlBuilder, page: &'a SearchPage) -> SearchResponseDoc<'a> {
+    SearchResponseDoc {
+        context: SearchContext {
+            base: urls.registration_base(),
+            vocab: "http://schema.nuget.org/schema#",
         },
-        "totalHits": page.total_hits,
-        "data": data,
-    })
+        data: page.groups.iter().map(|g| search_result(urls, g)).collect(),
+        total_hits: page.total_hits,
+    }
 }
 
-fn search_result(urls: &UrlBuilder, group: &SearchGroup) -> Value {
+fn search_result<'a>(urls: &UrlBuilder, group: &'a SearchGroup) -> SearchResultDoc<'a> {
     let latest = group.latest();
     let lower_id = latest.lower_id();
-    let versions: Vec<Value> = group
+    let versions = group
         .packages
         .iter()
-        .map(|p| {
-            json!({
-                "@id": urls.registration_leaf(&lower_id, &p.normalized_version()),
-                "version": p.version.to_full_string(),
-                "downloads": p.downloads,
-            })
+        .map(|p| SearchVersionDoc {
+            id: urls.registration_leaf(&lower_id, &p.normalized_version()),
+            downloads: p.downloads,
+            version: p.version.to_full_string(),
         })
         .collect();
-    let package_types: Vec<Value> = if latest.package_types.is_empty() {
-        vec![json!({ "name": "Dependency" })]
+    let package_types = if latest.package_types.is_empty() {
+        vec![PackageTypeDoc { name: "Dependency" }]
     } else {
         latest
             .package_types
             .iter()
-            .map(|t| json!({ "name": t.name }))
+            .map(|t| PackageTypeDoc { name: &t.name })
             .collect()
     };
 
-    json!({
-        "@type": "Package",
-        "registration": urls.registration_index(&lower_id),
-        "id": latest.id,
-        "version": latest.version.to_full_string(),
-        "description": latest.description,
-        "summary": latest.summary,
-        "title": latest.title,
-        "iconUrl": icon_url(urls, &lower_id, latest),
-        "licenseUrl": license_url(latest),
-        "projectUrl": latest.project_url,
-        "tags": latest.tags,
-        "authors": latest.authors,
-        "totalDownloads": group.total_downloads(),
-        "verified": false,
-        "packageTypes": package_types,
-        "versions": versions,
-    })
+    SearchResultDoc {
+        result_type: "Package",
+        authors: &latest.authors,
+        description: &latest.description,
+        icon_url: icon_url(urls, &lower_id, latest),
+        id: &latest.id,
+        license_url: license_url(latest),
+        package_types,
+        project_url: latest.project_url.as_deref(),
+        registration: urls.registration_index(&lower_id),
+        summary: latest.summary.as_deref(),
+        tags: &latest.tags,
+        title: latest.title.as_deref(),
+        total_downloads: group.total_downloads(),
+        verified: false,
+        version: latest.version.to_full_string(),
+        versions,
+    }
 }
 
 /// Build the id-autocomplete response (`/v3/autocomplete`).
@@ -476,6 +651,23 @@ pub fn enumerate_versions_response(versions: &[String]) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The documents as `Value`s, so a test can index into them.
+    fn registration_index(urls: &UrlBuilder, id: &str, packages: &[Package]) -> Value {
+        serde_json::to_value(super::registration_index(urls, id, packages)).unwrap()
+    }
+
+    fn registration_page(urls: &UrlBuilder, id: &str, packages: &[Package]) -> Value {
+        serde_json::to_value(super::registration_page(urls, id, packages)).unwrap()
+    }
+
+    fn registration_leaf(urls: &UrlBuilder, id: &str, package: &Package) -> Value {
+        serde_json::to_value(super::registration_leaf(urls, id, package)).unwrap()
+    }
+
+    fn search_response(urls: &UrlBuilder, page: &SearchPage) -> Value {
+        serde_json::to_value(super::search_response(urls, page)).unwrap()
+    }
     use crate::version::NuGetVersion;
     use chrono::Utc;
 
@@ -808,5 +1000,92 @@ mod tests {
         let doc = flat_container_index(&v);
         assert_eq!(doc["versions"][0], "1.0.0");
         assert_eq!(doc["versions"][1], "1.1.0");
+    }
+
+    /// A rich set of versions: dependencies with and without a framework or
+    /// a range, an unlisted one, an embedded icon, a license expression only,
+    /// package types, enough versions for paged registrations.
+    fn varied() -> Vec<Package> {
+        let mut out = Vec::new();
+        for i in 0..130 {
+            let mut p = pkg("Mixed.Pkg", &format!("1.{i}.0"));
+            p.listed = i % 7 != 3;
+            p.has_embedded_icon = i % 5 == 0;
+            p.license_expression = (i % 2 == 0).then(|| "MIT OR Apache-2.0".into());
+            p.license_url = (i % 3 == 0).then(|| "https://example.com/LICENSE".into());
+            p.summary = Some(format!("summary {i}"));
+            p.release_notes = (i % 4 == 0).then(|| "notes \"quoted\"\n".into());
+            p.language = Some("en-US".into());
+            p.min_client_version = (i % 6 == 0).then(|| "5.0".into());
+            p.require_license_acceptance = i % 8 == 0;
+            p.package_types = if i % 2 == 0 {
+                vec![crate::models::PackageType {
+                    name: "DotnetTool".into(),
+                    version: None,
+                }]
+            } else {
+                vec![]
+            };
+            if i % 3 != 1 {
+                p.dependencies = vec![
+                    DependencyGroup {
+                        target_framework: Some(".NETFramework4.7.2".into()),
+                        dependencies: vec![crate::models::Dependency {
+                            id: "Some.Dep".into(),
+                            version_range: Some("[1.0.0, )".into()),
+                            include: None,
+                            exclude: None,
+                        }],
+                    },
+                    DependencyGroup {
+                        target_framework: None,
+                        dependencies: vec![crate::models::Dependency {
+                            id: "Open.Dep".into(),
+                            version_range: None,
+                            include: None,
+                            exclude: None,
+                        }],
+                    },
+                ];
+            }
+            out.push(p);
+        }
+        out
+    }
+
+    /// Each document serializes its keys in sorted order, which is how a
+    /// `serde_json::Value` object writes them: the bytes are those the
+    /// documents had when they were built as `Value` trees.
+    #[test]
+    fn documents_serialize_their_keys_sorted() {
+        fn same<T: serde::Serialize>(doc: T) {
+            let direct = serde_json::to_string(&doc).unwrap();
+            let via_value = serde_json::to_string(&serde_json::to_value(&doc).unwrap()).unwrap();
+            assert_eq!(direct, via_value);
+        }
+        let all = varied();
+        let urls = urls();
+        same(super::registration_index(&urls, "Mixed.Pkg", &all[..5]));
+        same(super::registration_index(&urls, "Mixed.Pkg", &all));
+        same(super::registration_page(&urls, "Mixed.Pkg", &all[..64]));
+        for p in &all[..8] {
+            same(super::registration_leaf(&urls, "Mixed.Pkg", p));
+        }
+        let page = SearchPage {
+            total_hits: 2,
+            groups: vec![
+                SearchGroup {
+                    version_count: 3,
+                    total_downloads: 9,
+                    packages: all[..3].to_vec(),
+                },
+                SearchGroup {
+                    version_count: 1,
+                    total_downloads: 0,
+                    packages: all[3..4].to_vec(),
+                },
+            ],
+        };
+        same(super::search_response(&urls, &page));
     }
 }
