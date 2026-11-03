@@ -434,7 +434,9 @@ stores a version first owns it everywhere: pushing different bytes under the
 same id and version is refused (`409`, logged as a failure) in every feed,
 and a mirror fetch of it fails the same way. Package metadata, readmes,
 icons and attached files are shared too, so detaching a file in one feed
-detaches it in all of them. A push key on a low-trust feed, or an anonymous
+detaches it in all of them (which an approval in another feed stops; see
+[Attached files of an approved version](#attached-files-of-an-approved-version)).
+A push key on a low-trust feed, or an anonymous
 read that fills a mirror feed, can therefore claim a version another feed
 meant to publish. `reserved_id_prefixes` closes that for your own ids: a feed
 that reserves `Contoso.` is the only one that may push, mirror or migrate
@@ -585,6 +587,29 @@ listing set there by hand stays set by hand, so a mirror in the target does not
 relist a version that was unlisted on purpose. Feeds without
 `promotes_to` are simply independent sets a version can be added to.
 
+#### Attached files of an approved version
+
+[Attached files](#attached-files) belong to the version, not to a feed, and
+the package hash does not cover them. A source feed keeps its copy after a
+promotion, so without a rule its push key could replace `setup.exe` of a
+version production approved. Once a feed that reviews what it serves
+(`requires_approval`, or `allow_overwrite = "pending-only"`) has approved a
+version, its files stay as they were approved, whatever the requesting
+feed's own `allow_overwrite`:
+
+- Attaching or deleting a file of it, from any feed holding the version, is
+  `403` with the push key alone, and the message names the feeds where it is
+  approved.
+- The admin key of **every** feed that approved it sets this aside: send it as
+  HTTP Basic credentials along with the push key, or delete from that feed's
+  admin page. The admin key of the feed the request comes in on is not
+  enough when another feed approved the version. Such a change is logged as
+  a warning that names those feeds.
+- While the version is still pending everywhere that reviews, and in feeds
+  that approve on arrival, the push key attaches and deletes as before.
+- The file inbox holds no credentials: for a feed with `requires_approval` or
+  `pending-only`, a file dropped for a version approved anywhere is refused.
+
 #### Previewing pending versions
 
 A pending version is withheld from every client. To test one before
@@ -623,9 +648,10 @@ and re-runs against, can set `allow_overwrite = "pending-only"`:
   wins (the push is refused and the approved build stays, files included) or
   waits until the replacement is recorded.
 - Its attached files stay as they are too. Attaching or deleting a file of a
-  version approved anywhere, over HTTP or through the inbox, is `403` with the
-  push key alone; a request that also carries the feed's admin key as HTTP
-  Basic credentials, and the admin page, may still change them.
+  version approved anywhere, even in a feed that approves on arrival, over
+  HTTP or through the inbox, is `403` with the push key alone; see
+  [Attached files of an approved version](#attached-files-of-an-approved-version)
+  for which admin keys may still change them.
 - The admin page approves what it showed: a build replaced, or files attached
   or deleted, after the page was loaded make the approval `409`, and a reload
   shows what is there now.

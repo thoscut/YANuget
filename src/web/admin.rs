@@ -341,8 +341,10 @@ pub(super) async fn admin_file_delete(
     check_id(&id)?;
     require_admin_action(&state, &headers, &body)?;
     let v = parse_version(&version)?;
-    // The admin may change the files of an approved version too.
-    hosted::detach(&state, &id, &v, &name, false).await?;
+    // This feed's admin key sets aside an approval here, not one another
+    // feed's admin gave: that takes its key too.
+    let guard = hosted::ApprovalGuard::for_request(&state, &headers);
+    hosted::detach(&state, &id, &v, &name, guard).await?;
     Ok(Redirect::to(&admin_package_url(&state.feed.prefix, &id)).into_response())
 }
 

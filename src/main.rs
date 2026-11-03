@@ -893,9 +893,13 @@ fn spawn_file_tasks(
         return tasks;
     }
     let names: Vec<String> = feeds.iter().map(|f| f.name.clone()).collect();
+    // The inbox holds no credentials: a feed that reviews what it serves
+    // leaves the files of an approved version alone, as its push key must.
     let pending_only: Vec<String> = feeds
         .iter()
-        .filter(|f| f.allow_overwrite == yanuget::config::OverwriteMode::PendingOnly)
+        .filter(|f| {
+            f.requires_approval || f.allow_overwrite == yanuget::config::OverwriteMode::PendingOnly
+        })
         .map(|f| f.name.clone())
         .collect();
     let feed_extensions: std::collections::HashMap<String, Vec<String>> = feeds

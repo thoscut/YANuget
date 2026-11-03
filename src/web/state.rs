@@ -171,6 +171,9 @@ pub struct FeedMeta {
     pub name: String,
     pub prefix: String,
     pub requires_approval: bool,
+    /// Under `pending-only` an approval here holds the files of the version
+    /// against changes from every feed (see `hosted::ApprovalGuard`).
+    pub allow_overwrite: OverwriteMode,
     /// The target feed's own license policy, so a promotion into it is held to
     /// the same rule a direct push would be.
     pub license_policy: LicensePolicyConfig,
@@ -186,6 +189,7 @@ impl FeedMeta {
             name: feed.name.clone(),
             prefix: feed.prefix.clone(),
             requires_approval: feed.requires_approval,
+            allow_overwrite: feed.allow_overwrite,
             license_policy: feed.license_policy.clone(),
             admin: AdminAuth::new(feed.admin_api_key.clone()),
         }

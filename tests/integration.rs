@@ -2900,10 +2900,15 @@ async fn put_gated_file(
 /// The `build` and `files` fields the admin page of `Ring.Pkg` shows for its
 /// pending version, form-encoded.
 async fn shown_review_fields(server: &TestServer) -> String {
+    shown_review_fields_in(server, "/gated", ADMIN_KEY).await
+}
+
+/// [`shown_review_fields`] on the admin page of the feed at `prefix`.
+async fn shown_review_fields_in(server: &TestServer, prefix: &str, admin_key: &str) -> String {
     let page = server
         .client
-        .get(server.url("/gated/admin/packages/ring.pkg"))
-        .basic_auth("admin", Some(ADMIN_KEY))
+        .get(server.url(&format!("{prefix}/admin/packages/ring.pkg")))
+        .basic_auth("admin", Some(admin_key))
         .send()
         .await
         .unwrap()
@@ -2997,6 +3002,132 @@ async fn the_files_of_an_approved_version_change_only_with_the_admin_key() {
     assert_eq!(
         put_gated_file(&server, "setup.zip", image_bytes(3), true).await,
         reqwest::StatusCode::CREATED
+    );
+}
+
+/// Files hang off the version, not the feed: once `prod` approved a version
+/// promoted from `staging`, neither staging's push key nor its admin key may
+/// change its files, whatever staging's `allow_overwrite`; prod's admin key
+/// may (`SEC-33`).
+#[tokio::test]
+async fn the_files_of_a_version_approved_elsewhere_change_only_with_that_feeds_admin_key() {
+    const STAGING_ADMIN: &str = "staging-admin";
+    const PROD_ADMIN: &str = "prod-admin";
+    let server = spawn_feeds(|c| {
+        c.api_key = Some(API_KEY.into());
+        let mut staging = feed("staging");
+        staging.admin_api_key = Some(STAGING_ADMIN.into());
+        staging.promotes_to = Some("prod".into());
+        let mut prod = feed("prod");
+        prod.admin_api_key = Some(PROD_ADMIN.into());
+        prod.requires_approval = true;
+        c.feeds = vec![staging, prod];
+    })
+    .await;
+    let pushed = push_to(
+        &server,
+        "/staging/api/v2/package",
+        API_KEY,
+        build_nupkg("Ring.Pkg", "1.0.0", b"x"),
+    )
+    .await;
+    assert_eq!(pushed.status(), reqwest::StatusCode::CREATED);
+    let file = |name: &str| server.url(&format!("/staging/api/v2/files/Ring.Pkg/1.0.0/{name}"));
+    let put = |name: &str, body: Vec<u8>, admin: Option<&'static str>| {
+        let mut req = server
+            .client
+            .put(file(name))
+            .header("X-NuGet-ApiKey", API_KEY)
+            .body(body);
+        if let Some(key) = admin {
+            req = req.basic_auth("admin", Some(key));
+        }
+        req.send()
+    };
+    let delete = |name: &str, admin: Option<&'static str>| {
+        let mut req = server
+            .client
+            .delete(file(name))
+            .header("X-NuGet-ApiKey", API_KEY);
+        if let Some(key) = admin {
+            req = req.basic_auth("admin", Some(key));
+        }
+        req.send()
+    };
+    // Approved on arrival in staging, which reviews nothing: the push key
+    // attaches as it likes.
+    assert_eq!(
+        put("setup.zip", image_bytes(1), None)
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::CREATED
+    );
+    let promoted = no_redirect()
+        .post(server.url("/staging/admin/packages/ring.pkg/1.0.0/promote"))
+        .basic_auth("admin", Some(STAGING_ADMIN))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(admin_body(STAGING_ADMIN))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(promoted.status(), reqwest::StatusCode::SEE_OTHER);
+    // Pending in prod: nothing reviewed yet, so still changeable.
+    assert_eq!(
+        put("notes.zip", image_bytes(2), None)
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::CREATED
+    );
+    let approve_fields = shown_review_fields_in(&server, "/prod", PROD_ADMIN).await;
+    let approved = no_redirect()
+        .post(server.url("/prod/admin/packages/ring.pkg/1.0.0/approve"))
+        .basic_auth("admin", Some(PROD_ADMIN))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(format!("{}&{approve_fields}", admin_body(PROD_ADMIN)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(approved.status(), reqwest::StatusCode::SEE_OTHER);
+
+    // Approved in prod: staging's push key, alone or with staging's admin
+    // key, changes nothing, and neither does staging's admin page.
+    for admin in [None, Some(STAGING_ADMIN)] {
+        let refused = delete("setup.zip", admin).await.unwrap();
+        assert_eq!(refused.status(), reqwest::StatusCode::FORBIDDEN);
+        assert!(refused.text().await.unwrap().contains("prod"));
+        assert_eq!(
+            put("other.zip", image_bytes(3), admin)
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::FORBIDDEN
+        );
+    }
+    let from_page = no_redirect()
+        .post(server.url("/staging/admin/packages/ring.pkg/1.0.0/files/setup.zip/delete"))
+        .basic_auth("admin", Some(STAGING_ADMIN))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(admin_body(STAGING_ADMIN))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(from_page.status(), reqwest::StatusCode::FORBIDDEN);
+    let served = server.url("/prod/files/ring.pkg/1.0.0/setup.zip");
+    assert_eq!(
+        server.client.get(&served).send().await.unwrap().status(),
+        reqwest::StatusCode::OK,
+        "the file is still there"
+    );
+
+    // Prod's admin key sets prod's approval aside.
+    assert_eq!(
+        delete("setup.zip", Some(PROD_ADMIN))
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::NO_CONTENT
     );
 }
 

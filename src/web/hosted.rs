@@ -195,39 +195,132 @@ async fn version_in_feed(state: &AppState, id: &str, v: &NuGetVersion) -> Result
     }
 }
 
-/// Whether this request's attaches and detaches are held to
-/// [`check_not_approved`]: under `allow_overwrite = "pending-only"`, unless
-/// the request also presents the feed's admin key.
-fn keeps_approved(state: &AppState, headers: &HeaderMap) -> bool {
-    state.feed.allow_overwrite == OverwriteMode::PendingOnly
-        && !state.feed.admin.check_headers(headers)
+/// Whose approvals keep a version's files as they are, and which of them a
+/// request may set aside (see [`check_not_approved`]).
+///
+/// Files hang off the version, not the feed, and the package hash does not
+/// cover them: a feed that keeps its membership after a promotion could
+/// otherwise replace `setup.exe` of a version another feed reviewed and
+/// serves. So an approval in a feed that reviews what it serves
+/// (`requires_approval`, or `allow_overwrite = "pending-only"`) holds the
+/// files whatever the requesting feed's own `allow_overwrite`, and only the
+/// admin key of that feed sets it aside: one feed's admin key is no say over
+/// another's approval.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ApprovalGuard {
+    /// Every approval counts, not only those of `reviewing` feeds: the
+    /// requesting feed is under `pending-only`, which keeps a version
+    /// approved anywhere as it is.
+    any: bool,
+    /// The configured feeds whose approval is a review.
+    reviewing: Vec<String>,
+    /// The feeds whose admin key the request presents.
+    admin_of: Vec<String>,
+    /// The feed the request came in on.
+    feed: String,
 }
 
-/// With `keep_approved`, refuse to change the files of a version some feed
-/// has approved. The package hash does not cover them, and a source feed
-/// keeps its membership after a promotion: without this its push key could
-/// replace `setup.exe` of a version approved in production, while
-/// `pending-only` promises that a version approved anywhere stays as it is.
+impl ApprovalGuard {
+    /// The guard for a request on `state`'s feed, with its credentials.
+    pub(crate) fn for_request(state: &AppState, headers: &HeaderMap) -> Self {
+        let own = &state.feed;
+        let reviews = |requires_approval: bool, overwrite: OverwriteMode| {
+            requires_approval || overwrite == OverwriteMode::PendingOnly
+        };
+        let mut reviewing: Vec<String> = state
+            .feeds
+            .iter()
+            .filter(|m| m.name != own.name && reviews(m.requires_approval, m.allow_overwrite))
+            .map(|m| m.name.clone())
+            .collect();
+        if reviews(own.requires_approval, own.allow_overwrite) {
+            reviewing.push(own.name.clone());
+        }
+        let mut admin_of: Vec<String> = state
+            .feeds
+            .iter()
+            .filter(|m| m.name != own.name && m.admin.check_headers(headers))
+            .map(|m| m.name.clone())
+            .collect();
+        if own.admin.check_headers(headers) {
+            admin_of.push(own.name.clone());
+        }
+        Self {
+            any: own.allow_overwrite == OverwriteMode::PendingOnly,
+            reviewing,
+            admin_of,
+            feed: own.name.clone(),
+        }
+    }
+
+    /// The guard of a caller without credentials, such as the inbox: with
+    /// `keep_approved`, a version approved anywhere keeps its files; without,
+    /// nothing is held.
+    pub(crate) fn without_credentials(keep_approved: bool) -> Self {
+        Self {
+            any: keep_approved,
+            ..Self::default()
+        }
+    }
+
+    /// Whether an approval in `feed` holds the files.
+    fn holds(&self, feed: &str) -> bool {
+        self.any || self.reviewing.iter().any(|f| f == feed)
+    }
+
+    /// Whether the request may set aside an approval in `feed`: with that
+    /// feed's admin key, or, for a feed that does not review (counted only
+    /// under this feed's `pending-only`), this feed's.
+    fn may_override(&self, feed: &str) -> bool {
+        let admin = |f: &str| self.admin_of.iter().any(|a| a == f);
+        admin(feed) || (!self.reviewing.iter().any(|f| f == feed) && admin(&self.feed))
+    }
+}
+
+/// Refuse to change the files of a version an approval holds (see
+/// [`ApprovalGuard`]), unless the request sets each such approval aside.
+/// The approvals it set aside, which the caller logs once the change is made.
 async fn check_not_approved(
     db: &dyn crate::database::PackageDatabase,
     id: &str,
     v: &NuGetVersion,
-    keep_approved: bool,
-) -> Result<()> {
-    if !keep_approved {
-        return Ok(());
-    }
-    let approved = db.approved_in(id, v).await?;
+    guard: &ApprovalGuard,
+) -> Result<Vec<String>> {
+    let approved: Vec<String> = db
+        .approved_in(id, v)
+        .await?
+        .into_iter()
+        .filter(|f| guard.holds(f))
+        .collect();
     if approved.is_empty() {
-        return Ok(());
+        return Ok(approved);
+    }
+    let missing: Vec<&str> = approved
+        .iter()
+        .map(String::as_str)
+        .filter(|f| !guard.may_override(f))
+        .collect();
+    if missing.is_empty() {
+        return Ok(approved);
     }
     Err(Error::Forbidden(format!(
-        "{id} {} is approved in {}, and allow_overwrite = \"pending-only\" keeps a \
-         version approved anywhere as it is, its files included; changing them takes \
-         the feed's admin key",
+        "{id} {} is approved in {}, and an approved version keeps its files as they \
+         were approved; changing them takes the admin key of {}",
         v.normalized(),
-        approved.join(", ")
+        approved.join(", "),
+        missing.join(", ")
     )))
+}
+
+/// Log a change to the files of an approved version made with admin
+/// credentials, naming where it is approved: what the approval reviewed is
+/// no longer what is served.
+fn log_override(feed: &str, id: &str, v: &NuGetVersion, name: &str, approved: &[String]) {
+    if !approved.is_empty() {
+        tracing::warn!(%feed, %id, version = %v.normalized(), %name,
+            approved_in = %approved.join(", "),
+            "changed a file of an approved version with admin credentials");
+    }
 }
 
 /// How an attach went.
@@ -263,7 +356,7 @@ pub(crate) async fn attach(
     v: &NuGetVersion,
     name: &str,
     file: Finished,
-    keep_approved: bool,
+    guard: ApprovalGuard,
 ) -> Result<Attached> {
     let state = state.clone();
     let (id, v, name) = (id.to_string(), v.clone(), name.to_string());
@@ -272,11 +365,12 @@ pub(crate) async fn attach(
             storage: state.storage.as_ref(),
             db: state.db.as_ref(),
             feed: state.feed(),
-            keep_approved,
+            keep_approved: false,
         };
         let Finished { temp, sha256, size } = file;
-        attach_to(
+        attach_guarded(
             &target,
+            &guard,
             &id,
             &v,
             &name,
@@ -294,8 +388,10 @@ pub(crate) struct Target<'a> {
     pub storage: &'a dyn crate::storage::PackageStorage,
     pub db: &'a dyn crate::database::PackageDatabase,
     pub feed: &'a str,
-    /// Leave the files of an approved version alone (see
-    /// [`check_not_approved`]).
+    /// For a caller without credentials ([`attach_to`]): leave the files of
+    /// a version approved anywhere alone (see
+    /// [`ApprovalGuard::without_credentials`]). [`attach_guarded`] takes the
+    /// request's guard instead and does not read it.
     pub keep_approved: bool,
 }
 
@@ -310,15 +406,33 @@ pub(crate) async fn attach_to(
     sha256: &str,
     size: u64,
 ) -> Result<Attached> {
-    let result = attach_locked(target, id, v, name, &temp, sha256, size).await;
+    let guard = ApprovalGuard::without_credentials(target.keep_approved);
+    attach_guarded(target, &guard, id, v, name, temp, sha256, size).await
+}
+
+/// [`attach_to`], held to a request's [`ApprovalGuard`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn attach_guarded(
+    target: &Target<'_>,
+    guard: &ApprovalGuard,
+    id: &str,
+    v: &NuGetVersion,
+    name: &str,
+    temp: PathBuf,
+    sha256: &str,
+    size: u64,
+) -> Result<Attached> {
+    let result = attach_locked(target, guard, id, v, name, &temp, sha256, size).await;
     if !matches!(result, Ok(Attached::New(_))) {
         let _ = tokio::fs::remove_file(&temp).await;
     }
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn attach_locked(
     target: &Target<'_>,
+    approval: &ApprovalGuard,
     id: &str,
     v: &NuGetVersion,
     name: &str,
@@ -327,10 +441,7 @@ async fn attach_locked(
     size: u64,
 ) -> Result<Attached> {
     let Target {
-        storage,
-        db,
-        feed,
-        keep_approved,
+        storage, db, feed, ..
     } = *target;
     // Under the lock an approval takes too, so the two cannot cross.
     let _guard = crate::locks::lock_version(id, &v.normalized()).await;
@@ -347,7 +458,7 @@ async fn attach_locked(
             )))
         };
     }
-    check_not_approved(db, id, v, keep_approved).await?;
+    let overridden = check_not_approved(db, id, v, approval).await?;
     // The blob may be shared with other versions, whose locks are not ours:
     // from finding it stored to the row that references it, no detach or
     // purge elsewhere may count it unused and delete it.
@@ -375,11 +486,12 @@ async fn attach_locked(
         });
     }
     tracing::info!(%feed, %id, version = %v.normalized(), %name, size, %sha256, "attached file");
+    log_override(feed, id, v, name, &overridden);
     Ok(Attached::New(file))
 }
 
 /// Detach a file from a version, deleting its blob when nothing else uses it.
-/// With `keep_approved`, not from a version some feed has approved.
+/// Not from a version an approval holds, unless `guard` sets it aside.
 ///
 /// In a task of its own, like [`attach`]: a client that disconnects must not
 /// stop it between the row and the blob. A blob left behind all the same (a
@@ -390,20 +502,21 @@ pub(crate) async fn detach(
     id: &str,
     v: &NuGetVersion,
     name: &str,
-    keep_approved: bool,
+    guard: ApprovalGuard,
 ) -> Result<()> {
     let state = state.clone();
     let (id, v, name) = (id.to_string(), v.clone(), name.to_string());
     detached(async move {
         let _guard = crate::locks::lock_version(&id, &v.normalized()).await;
         version_in_feed(&state, &id, &v).await?;
-        check_not_approved(state.db.as_ref(), &id, &v, keep_approved).await?;
+        let overridden = check_not_approved(state.db.as_ref(), &id, &v, &guard).await?;
         let file = state
             .db
             .delete_file(&id, &v, &name)
             .await?
             .ok_or(Error::PackageNotFound)?;
         tracing::info!(feed = %state.feed(), %id, version = %v.normalized(), %name, "detached file");
+        log_override(state.feed(), &id, &v, &name, &overridden);
         // Counted and deleted as one step against attaches to other versions.
         // The file is detached either way; a blob that stays is swept.
         let _blob = crate::locks::lock_blob(&file.sha256).await;
@@ -470,8 +583,8 @@ pub(super) async fn put(
     crate::validation::validate_file_name(&name, &state.feed.allowed_extensions)?;
     version_in_feed(&state, &id, &v).await?;
     // Before the body, not to take gigabytes in vain; again when attaching.
-    let keep_approved = keeps_approved(&state, &headers);
-    check_not_approved(state.db.as_ref(), &id, &v, keep_approved).await?;
+    let guard = ApprovalGuard::for_request(&state, &headers);
+    check_not_approved(state.db.as_ref(), &id, &v, &guard).await?;
     let expected = headers
         .get("x-checksum-sha256")
         .and_then(|h| h.to_str().ok())
@@ -506,7 +619,7 @@ pub(super) async fn put(
         )));
     }
     let finished = Finished { temp, sha256, size };
-    let (status, file) = match attach(&state, &id, &v, &name, finished, keep_approved).await? {
+    let (status, file) = match attach(&state, &id, &v, &name, finished, guard).await? {
         Attached::New(f) => (StatusCode::CREATED, f),
         Attached::Same(f) => (StatusCode::OK, f),
     };
@@ -521,7 +634,14 @@ pub(super) async fn delete(
     check_id(&id)?;
     authorize_upload(&state, &headers)?;
     let v = parse_version(&version)?;
-    detach(&state, &id, &v, &name, keeps_approved(&state, &headers)).await?;
+    detach(
+        &state,
+        &id,
+        &v,
+        &name,
+        ApprovalGuard::for_request(&state, &headers),
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -677,7 +797,13 @@ pub(super) async fn tus_create(
     crate::validation::validate_file_name(name, &state.feed.allowed_extensions)?;
     let expected = meta.get("sha256").map(|s| parse_sha256(s)).transpose()?;
     version_in_feed(&state, id, &v).await?;
-    check_not_approved(state.db.as_ref(), id, &v, keeps_approved(&state, &headers)).await?;
+    check_not_approved(
+        state.db.as_ref(),
+        id,
+        &v,
+        &ApprovalGuard::for_request(&state, &headers),
+    )
+    .await?;
     if state.db.get_file(id, &v, name).await?.is_some() {
         return Err(Error::Conflict(format!(
             "{id} {} already has a file named {name}",
@@ -902,14 +1028,14 @@ pub(super) async fn tus_patch(
             _writing: hashing,
         };
         let (task_state, task_session) = (state.clone(), s.clone());
-        let keep_approved = keeps_approved(&state, &headers);
+        let guard = ApprovalGuard::for_request(&state, &headers);
         detached(finish(
             task_state,
             task_session,
             part,
             h.hasher,
             finishing,
-            keep_approved,
+            guard,
         ))
         .await?;
     }
@@ -928,7 +1054,7 @@ async fn finish(
     part: PathBuf,
     hasher: Sha256,
     finishing: Finishing,
-    keep_approved: bool,
+    guard: ApprovalGuard,
 ) -> Result<()> {
     let sha256 = hex::encode(hasher.finalize());
     // The bytes leave the upload's name for one of their own before anything
@@ -955,10 +1081,20 @@ async fn finish(
         storage: state.storage.as_ref(),
         db: state.db.as_ref(),
         feed: state.feed(),
-        keep_approved,
+        keep_approved: false,
     };
     let path = finished.path().to_path_buf();
-    attach_to(&target, &s.lower_id, &v, &s.name, path, &sha256, s.length).await?;
+    attach_guarded(
+        &target,
+        &guard,
+        &s.lower_id,
+        &v,
+        &s.name,
+        path,
+        &sha256,
+        s.length,
+    )
+    .await?;
     drop(finishing);
     Ok(())
 }
