@@ -1496,4 +1496,62 @@ mod tests {
         assert!(storage.get_blob(&kept).await.is_ok());
         assert_eq!(sweep_unreferenced_blobs(&storage, &db).await, 0);
     }
+
+    /// A blob an attach has stored but not yet recorded is unreferenced for
+    /// a moment; the blob lock the attach holds keeps the sweep off it.
+    #[tokio::test]
+    async fn the_blob_sweep_leaves_a_blob_being_attached() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FilesystemStorage::new(dir.path()).await.unwrap();
+        let db = SqliteDatabase::in_memory().await.unwrap();
+        db.add_to_feed(FEED, &pkg("1.0.0", 0)).await.unwrap();
+        let sha = "d".repeat(64);
+        // As `attach` does: the lock first, then the bytes, then the row.
+        let held = crate::locks::lock_blob(&sha).await;
+        let tmp = dir.path().join("blob.tmp");
+        tokio::fs::write(&tmp, b"attaching").await.unwrap();
+        storage.store_blob(&sha, tmp).await.unwrap();
+        let sweep = {
+            let (storage, db) = (storage.clone(), db.clone());
+            tokio::spawn(async move { sweep_unreferenced_blobs(&storage, &db).await })
+        };
+        // Long enough for the sweep to list the blob and wait on its lock.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(!sweep.is_finished(), "the sweep waits for the attach");
+        db.add_file(&crate::database::PackageFile {
+            lower_id: "pkg".into(),
+            normalized_version: "1.0.0".into(),
+            name: "image.wim".into(),
+            sha256: sha.clone(),
+            size: 9,
+            uploaded: Utc::now(),
+            downloads: 0,
+        })
+        .await
+        .unwrap();
+        drop(held);
+        assert_eq!(sweep.await.unwrap(), 0);
+        assert!(storage.get_blob(&sha).await.is_ok());
+    }
+
+    /// A blob whose references cannot be counted is kept: only a count of
+    /// zero frees it.
+    #[tokio::test]
+    async fn the_blob_sweep_keeps_a_blob_it_cannot_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FilesystemStorage::new(dir.path()).await.unwrap();
+        let db = SqliteDatabase::in_memory().await.unwrap();
+        let sha = "e".repeat(64);
+        let tmp = dir.path().join("blob.tmp");
+        tokio::fs::write(&tmp, b"unknown").await.unwrap();
+        storage.store_blob(&sha, tmp).await.unwrap();
+        // Every count now fails.
+        sqlx::query("DROP TABLE package_files")
+            .execute(crate::database::sqlite::test_support::pool(&db))
+            .await
+            .unwrap();
+        assert!(db.blob_references(&sha).await.is_err());
+        assert_eq!(sweep_unreferenced_blobs(&storage, &db).await, 0);
+        assert!(storage.get_blob(&sha).await.is_ok());
+    }
 }

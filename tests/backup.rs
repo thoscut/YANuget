@@ -257,6 +257,53 @@ async fn a_copied_file_with_the_right_size_but_other_bytes_fails_verification() 
     );
 }
 
+/// A run into an existing backup skips what has the live file's size and
+/// modification time, and does not hash it: verifying covers what the run
+/// copied, not every byte the backup holds (`TEST-16`). A copy damaged in the
+/// backup with its size and time intact goes unnoticed, and so does a live
+/// file rewritten in place with both kept.
+#[tokio::test]
+async fn a_second_run_does_not_hash_what_it_skips() {
+    let live = tempfile::tempdir().unwrap();
+    let base = serve(config_for(live.path())).await;
+    push(&base, "Alpha", "1.0.0").await;
+    push(&base, "Beta", "1.0.0").await;
+    let backups = tempfile::tempdir().unwrap();
+    let first = yanuget::backup::backup(&config_for(live.path()), backups.path(), hidden())
+        .await
+        .unwrap();
+    assert!(first.manifest.missing.is_empty());
+
+    // Same length and time, other bytes: once in the backup, once live.
+    let rewrite = |path: &Path| {
+        let meta = std::fs::metadata(path).unwrap();
+        std::fs::write(path, vec![b'x'; meta.len() as usize]).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(meta.modified().unwrap())
+            .unwrap();
+    };
+    let alpha = "alpha/1.0.0/alpha.1.0.0.nupkg";
+    let copy = backups.path().join("packages").join(alpha);
+    rewrite(&copy);
+    rewrite(&live.path().join("packages/beta/1.0.0/beta.1.0.0.nupkg"));
+
+    let second = yanuget::backup::backup(&config_for(live.path()), backups.path(), hidden())
+        .await
+        .unwrap();
+    assert!(
+        second.manifest.missing.is_empty(),
+        "{:?}",
+        second.manifest.missing
+    );
+    assert!(
+        std::fs::read(&copy).unwrap().iter().all(|b| *b == b'x'),
+        "the damaged copy was skipped, not copied again"
+    );
+}
+
 /// A live file whose bytes no longer match its row is copied, hashed, and
 /// reported like a missing one.
 #[tokio::test]
