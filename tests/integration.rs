@@ -6155,6 +6155,68 @@ async fn a_wrong_preview_key_is_unauthorized_on_an_open_feed() {
     assert!(get(Some(PREVIEW_KEY)).await.unwrap().status().is_success());
 }
 
+/// `SEC-37`: only a key offered where the preview key goes, and none of the
+/// feed's, is a guess. A client that sends the push key with every request,
+/// a gateway's `Bearer` token or the admin's credentials gets the `404` of
+/// a miss, which `max_failed_auth` does not count.
+#[tokio::test]
+async fn only_a_wrong_key_where_the_preview_key_goes_is_unauthorized() {
+    let server = spawn_feeds(|c| {
+        c.api_key = Some(API_KEY.into());
+        c.admin_api_key = Some(ADMIN_KEY.into());
+        let mut intake = feed("intake");
+        intake.requires_approval = true;
+        intake.preview_api_key = Some(PREVIEW_KEY.into());
+        c.feeds = vec![intake];
+    })
+    .await;
+    let pushed = push_to(
+        &server,
+        "/intake/api/v2/package",
+        API_KEY,
+        build_nupkg("Guess.Pkg", "1.0.0", b"x"),
+    )
+    .await;
+    assert_eq!(pushed.status(), reqwest::StatusCode::CREATED);
+    let nupkg = server.url("/intake/v3/package/guess.pkg/1.0.0/guess.pkg.1.0.0.nupkg");
+    let status = |req: reqwest::RequestBuilder| async move { req.send().await.unwrap().status() };
+    let get = || server.client.get(&nupkg);
+    use reqwest::StatusCode;
+    assert_eq!(
+        status(get().header("X-NuGet-ApiKey", API_KEY)).await,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        status(get().bearer_auth("a-gateway-token")).await,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        status(get().basic_auth("admin", Some(ADMIN_KEY))).await,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        status(get().basic_auth("user", Some(""))).await,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        status(get().basic_auth("user", Some("a-guess"))).await,
+        StatusCode::UNAUTHORIZED
+    );
+    // The push key does not cover a guess sent along with it.
+    assert_eq!(
+        status(
+            get()
+                .header("X-NuGet-ApiKey", API_KEY)
+                .basic_auth("user", Some("a-guess"))
+        )
+        .await,
+        StatusCode::UNAUTHORIZED
+    );
+    assert!(status(get().basic_auth("user", Some(PREVIEW_KEY)))
+        .await
+        .is_success());
+}
+
 /// `INT-32`: the preview key downloads a pending version and its files, and
 /// nothing else.
 #[tokio::test]

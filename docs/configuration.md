@@ -628,6 +628,13 @@ key on those download URLs only. A disabled version stays withheld. Responses
 to it are `Cache-Control: private` and never `immutable`, with `Vary` on the
 credential headers, and they are not counted as downloads.
 
+On a feed with open reads, a download that finds nothing to serve is `401`
+rather than `404` when the request offers a key where the preview key goes
+(`X-NuGet-ApiKey`, or the password of HTTP Basic credentials) that is none of
+the feed's keys, so guesses at the preview key count against
+[`max_failed_auth`](#rate-limiting). The feed's push or admin key, a blank
+password and other schemes such as a gateway's `Bearer` token get the `404`.
+
 `yanuget config check` warns when the preview key is also another key of the
 feed.
 

@@ -358,15 +358,25 @@ impl AppState {
     /// 404 to anyone without the key and a 200 with it, and a 404 does not
     /// count toward `max_failed_auth`: the key could be guessed at the
     /// request limiter's pace instead of the failed-authentication one. So a
-    /// request that carries a credential which is neither the feed's read
-    /// key nor its preview key is answered `401` (`SEC-28`).
+    /// request that offers a key where the preview key goes (see
+    /// [`crate::auth::offered_keys`]) which is none of the feed's keys is
+    /// answered `401` (`SEC-28`).
+    ///
+    /// Only that: a client that sends the feed's push key with every request,
+    /// a `Bearer` token a gateway adds, or the admin's Basic credentials is
+    /// not guessing, and a `401` for each missing version would count it
+    /// toward `max_failed_auth` until its address is locked out (`SEC-37`).
     pub(super) fn download_miss(&self, headers: &HeaderMap) -> Error {
-        let credential = headers.contains_key(header::AUTHORIZATION)
-            || headers.contains_key(crate::auth::API_KEY_HEADER);
-        if self.feed.preview_auth.is_enabled()
-            && credential
-            && !self.feed.preview_auth.presented(headers)
-            && !self.feed.read_auth.presented(headers)
+        let feed = &self.feed;
+        let guessed = || {
+            crate::auth::offered_keys(headers)
+                .iter()
+                .any(|k| !feed.auth.is_key(k) && !feed.admin.is_key(k))
+        };
+        if feed.preview_auth.is_enabled()
+            && !feed.preview_auth.presented(headers)
+            && !feed.read_auth.presented(headers)
+            && guessed()
         {
             Error::Unauthorized
         } else {
