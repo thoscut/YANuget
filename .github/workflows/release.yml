@@ -78,6 +78,9 @@ jobs:
         with:
           ref: refs/tags/${{ steps.tag.outputs.tag }}
           persist-credentials: false
+          # The whole history and its tags, for the `yanuget-pkg` version
+          # check below.
+          fetch-depth: 0
 
       - id: check
         shell: bash
@@ -100,6 +103,47 @@ jobs:
             exit 1
           fi
           echo "releasing $TAG ($sha) from Cargo.toml version $version"
+
+      # crates.io takes a version once. `yanuget-pkg` is versioned on its own,
+      # and the publish step skips it when crates.io has its version already,
+      # so a release that changed the crate without raising its version would
+      # publish `yanuget` against the old `yanuget-pkg`. Checked here, before
+      # anything is published, and only when publishing to crates.io is on.
+      - name: Check yanuget-pkg was bumped if it changed
+        if: vars.PUBLISH_TO_CRATES_IO == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          prev=$(git describe --tags --abbrev=0 --match 'v[0-9]*' HEAD^ 2>/dev/null || true)
+          if [ -z "$prev" ]; then
+            echo "no earlier release tag; nothing to compare"
+            exit 0
+          fi
+          if git diff --quiet "$prev" HEAD -- crates/yanuget-pkg; then
+            echo "yanuget-pkg unchanged since $prev"
+            exit 0
+          fi
+          now=$(sed -n 's/^version = "\(.*\)"$/\1/p' crates/yanuget-pkg/Cargo.toml | head -1)
+          before=$(git show "$prev:crates/yanuget-pkg/Cargo.toml" | sed -n 's/^version = "\(.*\)"$/\1/p' | head -1)
+          if [ "$now" != "$before" ]; then
+            echo "yanuget-pkg changed since $prev and went from $before to $now"
+            exit 0
+          fi
+          # Unchanged version: fine as long as crates.io does not have it yet.
+          status=$(curl -s -o /dev/null -w '%{http_code}' \
+            -A "yanuget release workflow (github.com/thoscut/yanuget)" \
+            "https://crates.io/api/v1/crates/yanuget-pkg/$now")
+          case "$status" in
+            404) echo "yanuget-pkg $now is not on crates.io yet" ;;
+            200)
+              echo "::error::crates/yanuget-pkg changed since $prev, but $now is on crates.io already; raise its version"
+              exit 1
+              ;;
+            *)
+              echo "::error::crates.io answered HTTP $status for yanuget-pkg $now; retry"
+              exit 1
+              ;;
+          esac
 
   # The whole CI workflow, run against the commit being released: tests on
   # stable and the MSRV, clippy, the Windows/macOS check, cargo audit and
@@ -190,6 +234,32 @@ jobs:
           TARGET: ${{ matrix.target }}
         run: cargo build --release --locked --target "$TARGET"
 
+      # A binary that links but does not start (a wrong cross linker, a
+      # missing runtime library) would otherwise reach users untried: nothing
+      # else runs the aarch64 Linux or the x86_64 macOS build. Each is started
+      # where it can be: natively, under Rosetta 2 on the arm64 macOS runner,
+      # or under QEMU user emulation with the cross toolchain's libraries.
+      - name: Smoke-test the binary
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          EXT: ${{ matrix.ext }}
+          VERSION: ${{ needs.guard.outputs.version }}
+        run: |
+          set -euo pipefail
+          bin="target/$TARGET/release/yanuget${EXT}"
+          case "$TARGET" in
+            aarch64-unknown-linux-gnu)
+              sudo apt-get install -y qemu-user
+              out=$(qemu-aarch64 -L /usr/aarch64-linux-gnu "$bin" --version) ;;
+            x86_64-apple-darwin)
+              out=$(arch -x86_64 "$bin" --version) ;;
+            *)
+              out=$("$bin" --version) ;;
+          esac
+          echo "$out"
+          [ "$out" = "yanuget $VERSION" ]
+
       - name: Package artifact
         shell: bash
         env:
@@ -278,6 +348,23 @@ jobs:
             # `latest` must not follow a pre-release, or `docker pull yanuget`
             # starts handing people a release candidate.
             type=raw,value=latest,enable=${{ !contains(needs.guard.outputs.version, '-') }}
+
+      # CI starts the amd64 image of this commit, but nothing starts the arm64
+      # one, and the image pushed below is a build of its own. So each
+      # platform is built into the local image store and started first; the
+      # push then reuses the layers this builder already holds.
+      - name: Smoke-test the image on each platform
+        env:
+          VERSION: ${{ needs.guard.outputs.version }}
+        run: |
+          set -euo pipefail
+          for platform in linux/amd64 linux/arm64; do
+            docker buildx build --load --platform "$platform" \
+              --build-arg REQUIRE_DOCS=1 -t yanuget:smoke .
+            out=$(docker run --rm --platform "$platform" yanuget:smoke --version)
+            echo "$platform: $out"
+            [ "$out" = "yanuget $VERSION" ]
+          done
 
       # No `cache-from`/`cache-to`: the image is built from the pinned base
       # images and the lockfiles alone.
@@ -430,9 +517,15 @@ jobs:
           status=$(curl -s -o /dev/null -w '%{http_code}' \
             -A "yanuget release workflow (github.com/thoscut/yanuget)" \
             "https://crates.io/api/v1/crates/yanuget-pkg/$pkg")
-          if [ "$status" = "404" ]; then
-            cargo publish --locked -p yanuget-pkg
-          else
-            echo "yanuget-pkg $pkg is on crates.io already (HTTP $status)"
-          fi
+          # Only a definite answer decides: 200 means published, 404 means
+          # not yet. Anything else (a 403 for the user agent, a 429, a 5xx)
+          # stops here, before `yanuget` is published against a guess.
+          case "$status" in
+            200) echo "yanuget-pkg $pkg is on crates.io already" ;;
+            404) cargo publish --locked -p yanuget-pkg ;;
+            *)
+              echo "::error::crates.io answered HTTP $status for yanuget-pkg $pkg; retry the job"
+              exit 1
+              ;;
+          esac
           cargo publish --locked -p yanuget
