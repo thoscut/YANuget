@@ -77,6 +77,7 @@ pub(super) async fn get_membership(
         lower_id: r.get("lower_id"),
         normalized_version: r.get("normalized_version"),
         listed: r.get::<i64, _>("listed") != 0,
+        listing_set: r.get::<i64, _>("listing_set") != 0,
         enabled: r.get::<i64, _>("enabled") != 0,
         pending: r.get::<i64, _>("pending") != 0,
         flagged: r.get::<i64, _>("flagged") != 0,
@@ -283,8 +284,8 @@ pub(super) async fn insert_membership(conn: &mut SqliteConnection, m: &Membershi
     let result = sqlx::query(
         r#"INSERT INTO feed_packages
                (feed, lower_id, normalized_version, listed, enabled, pending,
-                flagged, flag_reason, added, downloads, pinned)
-           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10)"#,
+                flagged, flag_reason, added, downloads, pinned, listing_set)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10, ?11)"#,
     )
     .bind(&m.feed)
     .bind(canonical_id(&m.lower_id))
@@ -296,6 +297,7 @@ pub(super) async fn insert_membership(conn: &mut SqliteConnection, m: &Membershi
     .bind(&m.flag_reason)
     .bind(Utc::now().to_rfc3339())
     .bind(i64::from(m.pinned))
+    .bind(i64::from(m.listing_set))
     .execute(&mut *conn)
     .await;
     match result {

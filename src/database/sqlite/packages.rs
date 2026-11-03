@@ -228,10 +228,11 @@ async fn replace_rows(
     sqlx::query(
         r#"INSERT INTO feed_packages
                (feed, lower_id, normalized_version, listed, enabled, pending,
-                flagged, flag_reason, added, downloads, pinned)
-           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10)
+                flagged, flag_reason, added, downloads, pinned, listing_set)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10, ?11)
            ON CONFLICT(feed, lower_id, normalized_version) DO UPDATE SET
-               listed = excluded.listed, enabled = excluded.enabled,
+               listed = excluded.listed, listing_set = excluded.listing_set,
+               enabled = excluded.enabled,
                pending = excluded.pending, flagged = excluded.flagged,
                flag_reason = excluded.flag_reason, pinned = excluded.pinned,
                added = excluded.added"#,
@@ -246,6 +247,7 @@ async fn replace_rows(
     .bind(&m.flag_reason)
     .bind(Utc::now().to_rfc3339())
     .bind(i64::from(m.pinned))
+    .bind(i64::from(m.listing_set))
     .execute(&mut **tx)
     .await?;
     Ok(())

@@ -513,7 +513,12 @@ How the mirror keeps up, and what it does not repeat:
   there (or listed again) is unlisted (or listed) here too. Not one whose
   listing was set on this feed by hand, with `dotnet nuget delete` or a
   relist: that stays as set. Versions already unlisted when the database is
-  migrated to schema version 9 count as set by hand.
+  migrated to schema version 9 count as set by hand. This applies to every
+  version the feed holds, not only to the ones the mirror fetched: one pushed,
+  imported or promoted into the feed follows the upstream's listing too
+  whenever the upstream has the same id and version, unless its listing was
+  set here by hand. Unlisting it (or relisting it) once is how to keep a local
+  build's listing apart from the upstream's.
 * **The version a client asks for is fetched first**, even when it is older
   than the newest `max_versions_per_package`, so a project pinned to an old
   version restores.
@@ -575,7 +580,9 @@ ring, where it waits for approval if that ring gates. The source feed's admin
 page then says so and links to the target's admin page, where the version is
 approved; its row shows `pending in stable` until then. A promoted (or copied)
 version keeps the state it had: one that is unlisted, disabled or still
-pending in the source arrives unlisted, disabled or pending in the target. Feeds without
+pending in the source arrives unlisted, disabled or pending in the target. A
+listing set there by hand stays set by hand, so a mirror in the target does not
+relist a version that was unlisted on purpose. Feeds without
 `promotes_to` are simply independent sets a version can be added to.
 
 #### Previewing pending versions

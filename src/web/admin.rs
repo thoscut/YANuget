@@ -449,7 +449,10 @@ async fn transfer_version(
         pending: target.requires_approval || here.pending,
         flagged: outcome.violation.is_some(),
         flag_reason: outcome.violation,
+        // Whether the listing was set by hand travels with it: otherwise the
+        // target's mirror would relist a version unlisted here on purpose.
         listed: here.listed,
+        listing_set: here.listing_set,
         enabled: here.enabled,
         pinned: mode == Transfer::Move && here.pinned,
         ..Membership::active(&target.name, &package)

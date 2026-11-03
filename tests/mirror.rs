@@ -1593,3 +1593,52 @@ async fn a_listing_set_by_hand_is_not_undone_by_a_refresh() {
     assert!(local.listed("curated.pkg", "1.0.0").await);
     assert!(!local.listed("curated.pkg", "2.0.0").await);
 }
+
+/// A version unlisted by hand in one mirror feed and copied (or moved, or
+/// promoted) into another arrives with the mark, as the admin page's transfer
+/// builds it, so the target's refresh leaves it unlisted (COR-38, TEST-14).
+#[tokio::test]
+async fn a_copied_version_unlisted_by_hand_stays_unlisted_in_the_target_mirror() {
+    let upstream = Upstream::start().await;
+    upstream.publish("Copied.Pkg", "1.0.0");
+    upstream.behave(|b| b.registration = true);
+    let local = local_feed().await;
+    let options = MirrorOptions::default();
+    local.mirror(&upstream, "Copied.Pkg", options.clone()).await;
+    let v = NuGetVersion::parse("1.0.0").unwrap();
+    assert!(local
+        .db
+        .set_listed("mirror", "copied.pkg", &v, false)
+        .await
+        .unwrap());
+
+    let here = local.membership("copied.pkg", "1.0.0").await.unwrap();
+    local
+        .db
+        .add_membership(&Membership {
+            feed: "target".into(),
+            ..here
+        })
+        .await
+        .unwrap();
+    let client = yanuget::mirror::MirrorClient::from_config(&mirror_config(&upstream)).unwrap();
+    yanuget::mirror::ensure_package(
+        &client,
+        &local.storage,
+        &local.db,
+        "target",
+        &local.temp,
+        "Copied.Pkg",
+        &options,
+    )
+    .await
+    .unwrap();
+    let there = local
+        .db
+        .get_membership("target", "copied.pkg", &v)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(there.listing_set);
+    assert!(!there.listed, "the target's refresh must not relist it");
+}

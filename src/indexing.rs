@@ -296,6 +296,7 @@ async fn index_inner(
     // again where the feed gates; the same bytes do not.
     let membership = Membership {
         listed: previous.listed,
+        listing_set: previous.listing_set,
         enabled: previous.enabled,
         pending: previous.pending || (options.pending && !same_content),
         flagged,
@@ -832,6 +833,7 @@ mod tests {
             lower_id: "octave.install".into(),
             normalized_version: "11.3.0".into(),
             listed: false,
+            listing_set: true,
             enabled: true,
             pending: false,
             flagged: false,
@@ -1086,6 +1088,53 @@ mod tests {
         assert!(fv.pinned);
         assert_eq!(fv.package.downloads, 1);
         assert_eq!(db.files_for("contoso.utils", &v).await.unwrap().len(), 1);
+    }
+
+    /// An overwrite keeps whether the listing was set by hand, so a mirror
+    /// refresh after it neither relists a version an admin unlisted nor stops
+    /// following the upstream for one nobody touched (TEST-14).
+    #[tokio::test]
+    async fn an_overwrite_keeps_whether_the_listing_was_set_by_hand() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let storage = FilesystemStorage::new(store_dir.path()).await.unwrap();
+        let db = SqliteDatabase::in_memory().await.unwrap();
+        let v = v123();
+        let membership = || async {
+            db.get_membership(FEED, "contoso.utils", &v)
+                .await
+                .unwrap()
+                .unwrap()
+        };
+
+        // Untouched: the overwrite leaves it following the upstream.
+        push(&storage, &db, FEED, false, &overwriting())
+            .await
+            .unwrap();
+        push(&storage, &db, FEED, true, &overwriting())
+            .await
+            .unwrap();
+        assert!(!membership().await.listing_set);
+        assert!(db
+            .follow_upstream_listing(FEED, "contoso.utils", &v, false)
+            .await
+            .unwrap());
+
+        // Set by hand, then overwritten: still set, so a refresh that finds
+        // the version listed upstream leaves it unlisted.
+        db.set_listed(FEED, "contoso.utils", &v, false)
+            .await
+            .unwrap();
+        push(&storage, &db, FEED, false, &overwriting())
+            .await
+            .unwrap();
+        let after = membership().await;
+        assert!(after.listing_set);
+        assert!(!after.listed);
+        assert!(!db
+            .follow_upstream_listing(FEED, "contoso.utils", &v, true)
+            .await
+            .unwrap());
+        assert!(!membership().await.listed);
     }
 
     #[tokio::test]

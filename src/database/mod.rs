@@ -254,6 +254,10 @@ pub struct Membership {
     pub normalized_version: String,
     /// Visible in search/registration (the NuGet "list" flag).
     pub listed: bool,
+    /// [`Self::listed`] was set by hand (an unlist or relist), so a mirror
+    /// leaves it as it is rather than following the upstream's listing
+    /// ([`PackageDatabase::follow_upstream_listing`]).
+    pub listing_set: bool,
     /// Admin enable flag; a disabled membership is withheld entirely.
     pub enabled: bool,
     /// Awaiting approval (release-ring gate / mirror approval). A pending
@@ -277,6 +281,7 @@ impl Membership {
             lower_id: package.lower_id(),
             normalized_version: package.normalized_version(),
             listed: true,
+            listing_set: false,
             enabled: true,
             pending: false,
             flagged: false,

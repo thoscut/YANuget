@@ -3248,6 +3248,73 @@ async fn status_of(server: &TestServer, path: &str) -> reqwest::StatusCode {
         .status()
 }
 
+/// A version unlisted by hand keeps that mark when it is promoted, copied or
+/// moved: in a mirror feed the mark is what stops the upstream's listing from
+/// relisting it (COR-38). One whose listing nobody set arrives without it.
+#[tokio::test]
+async fn a_transfer_keeps_whether_the_listing_was_set_by_hand() {
+    let server = spawn_feeds(|c| {
+        c.api_key = Some(API_KEY.into());
+        c.admin_api_key = Some(ADMIN_KEY.into());
+        let mut dev = feed("dev");
+        dev.promotes_to = Some("stable".into());
+        c.feeds = vec![dev, feed("stable")];
+    })
+    .await;
+    for v in ["1.0.0", "2.0.0", "3.0.0", "4.0.0"] {
+        push_to(
+            &server,
+            "/dev/api/v2/package",
+            API_KEY,
+            build_nupkg("Hidden.Pkg", v, b"x"),
+        )
+        .await;
+    }
+    for v in ["1.0.0", "2.0.0", "3.0.0"] {
+        let resp = server
+            .client
+            .delete(server.url(&format!("/dev/api/v2/package/hidden.pkg/{v}")))
+            .header("X-NuGet-ApiKey", API_KEY)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT);
+    }
+    for v in ["1.0.0", "4.0.0"] {
+        let promote = admin_action(
+            &server,
+            &format!("/dev/admin/packages/hidden.pkg/{v}/promote"),
+        )
+        .await;
+        assert_eq!(promote.status(), reqwest::StatusCode::SEE_OTHER);
+    }
+    for body in [
+        "op=copy&target=stable&v=2.0.0",
+        "op=move&target=stable&v=3.0.0",
+    ] {
+        let resp = admin_bulk(&server, "/dev", "hidden.pkg", ADMIN_KEY, body).await;
+        assert_eq!(resp.status(), reqwest::StatusCode::SEE_OTHER);
+    }
+
+    let db = SqliteDatabase::connect(&server._dir.path().join("yanuget.db").to_string_lossy())
+        .await
+        .unwrap();
+    for (v, listed) in [
+        ("1.0.0", false),
+        ("2.0.0", false),
+        ("3.0.0", false),
+        ("4.0.0", true),
+    ] {
+        let m = db
+            .get_membership("stable", "hidden.pkg", &NuGetVersion::parse(v).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(m.listed, listed, "{v}");
+        assert_eq!(m.listing_set, !listed, "{v}");
+    }
+}
+
 #[tokio::test]
 async fn admin_can_move_and_copy_versions_into_a_feed_it_administers() {
     let server = spawn_feeds(|c| {
