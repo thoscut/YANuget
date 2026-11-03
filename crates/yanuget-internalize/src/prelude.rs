@@ -492,6 +492,27 @@ mod tests {
         );
     }
 
+    /// `SEC-35`, `SEC-39`: what `tests/prelude.rs` runs where `pwsh` is,
+    /// in the template wherever it is not.
+    #[test]
+    fn the_template_refuses_what_reaches_another_machine() {
+        // The provider's prefix comes off before the path is judged, and a
+        // drive is asked whether it is a network one.
+        assert!(TEMPLATE.contains("$Path.IndexOf('::')"));
+        assert!(TEMPLATE.contains(r"'^(Microsoft\.PowerShell\.Core\\)?FileSystem$'"));
+        assert!(TEMPLATE.contains("[System.IO.DriveType]::Network"));
+        assert!(TEMPLATE.contains("$drive.DisplayRoot"));
+        // The pin holds under --ignore-checksums: the variable Chocolatey
+        // skips its check by is taken away while a helper runs, and put
+        // back once it is done.
+        assert!(TEMPLATE.contains("Remove-Item -Path Env:ChocolateyIgnoreChecksums"));
+        assert!(TEMPLATE.contains("`$__yanugetIgnored = __Yanuget-Enforce `$__yanugetExpect"));
+        assert!(TEMPLATE.contains("`$__yanugetExpect `$__yanugetIgnored"));
+        // A feed URL from the client must be http or https.
+        assert!(TEMPLATE.contains("$uri.Scheme -ne 'http' -and $uri.Scheme -ne 'https'"));
+        assert!(TEMPLATE.is_ascii());
+    }
+
     #[test]
     fn the_loader_finds_the_prelude_from_its_folder() {
         let install = |depth| loader(depth, UPSTREAM_SCRIPT);

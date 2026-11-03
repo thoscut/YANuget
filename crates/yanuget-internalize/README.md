@@ -232,17 +232,26 @@ wrapper:
 
 - replaces each `http(s)` or `ftp(s)` URL with the attached file's URL;
 - replaces the checksum with the file's SHA-256, whatever the package
-  declared;
-- for `Get-WebFile`, which takes no checksum, checks the file it wrote.
+  declared, and keeps Chocolatey checking it under `--ignore-checksums` (or
+  with `checksumFiles` off): it takes `$env:ChocolateyIgnoreChecksums` away
+  while the helper runs, with a warning, and puts it back afterwards. The
+  `Install-*` helpers run what they downloaded before they return, so
+  checking afterwards would come too late;
+- for `Get-WebFile`, `Get-FtpFile` and `Get-ChocolateyWebFile` (without
+  `-GetOriginalFileName`), also checks the file they wrote itself.
 
 A URL that is not in the map stops the install with a message naming the
 package; it never falls back to the internet. Whatever starts with `http` or
 `ftp` once the blanks around it are trimmed counts as a URL, as it does for
 the helpers, so ` https://...` or `https:\\host\file` cannot slip past. A
 file on this machine (a drive path, a relative path, a `file:` URI without
-a host) is left alone. A UNC path (`\\host\share`), a `file:` URI with a
-host or any other scheme stops the install as well: the helpers would copy
-it over the network. Normalizing such a value and copying it anyway was
+a host, each also behind the FileSystem provider's prefix such as
+`Microsoft.PowerShell.Core\FileSystem::`) is left alone. A UNC path
+(`\\host\share`), a mapped network drive or a PowerShell drive rooted at a
+UNC path (asked through `Get-PSDrive` and `DriveInfo`), a relative path
+while the current folder is on one, a `file:` URI with a host, another
+provider (`Registry::`) or any other scheme stops the install as well: the
+helpers would copy it over the network, or it names no file. Normalizing such a value and copying it anyway was
 the alternative; refusing is the one that cannot reach another machine by
 a spelling the prelude did not foresee. Calls the helpers make among
 themselves are not wrapped, so they keep the URL they were given.
@@ -254,7 +263,10 @@ recorded in canonical form still matches. No text a package wrote is
 written into the prelude, only hashes, the file names `INT-18` checked and
 the feed's URL. That URL is `target.url`. A client sets
 `YANUGET_INTERNALIZED_FEED_URL` to fetch from another address, after a host
-move.
+move. It has to be an `http` or `https` URL with a host, or the install
+stops; plain `http` is taken with a warning rather than refused, since
+`target.url` may be one too and the SHA-256 pin, which holds either way, is
+what vouches for each file.
 
 A package with no attached files is published as it is. A feed with a
 `read_api_key` cannot serve the files to `choco install` yet (`INT-31`).

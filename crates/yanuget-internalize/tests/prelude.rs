@@ -275,8 +275,8 @@ fn pwsh() -> Option<PathBuf> {
 }
 
 /// A stand-in for Chocolatey's `chocolateyInstaller` module: the helper
-/// downloads its URL and checks the checksum it is given, as the real one
-/// does, and says what it got.
+/// downloads its URL and checks the checksum it is given unless told to
+/// ignore checksums, as the real one does, and says what it got.
 const MODULE: &str = r#"
 function Install-ChocolateyPackage {
   param(
@@ -293,8 +293,12 @@ function Install-ChocolateyPackage {
   )
   $out = Join-Path $env:YANUGET_TEST_DIR 'download.bin'
   Invoke-WebRequest -Uri $url -OutFile $out -UseBasicParsing
-  $hash = (Get-FileHash -LiteralPath $out -Algorithm $checksumType).Hash.ToLowerInvariant()
-  if ($hash -ne $checksum) { throw "checksum mismatch: $hash" }
+  if ($env:ChocolateyIgnoreChecksums -eq 'true') {
+    "checksums ignored"
+  } else {
+    $hash = (Get-FileHash -LiteralPath $out -Algorithm $checksumType).Hash.ToLowerInvariant()
+    if ($hash -ne $checksum) { throw "checksum mismatch: $hash" }
+  }
   "installed $url ($checksumType)"
 }
 Export-ModuleMember -Function *
@@ -442,6 +446,51 @@ async fn an_install_fetches_the_attached_file() {
     .await
     .unwrap();
     assert!(!out.status.success());
+    // An address that is not a feed's is refused before anything is
+    // fetched from it (`SEC-39`).
+    for moved in [
+        "\\\\fileserver\\share\\choco",
+        "file:///C:/choco/",
+        "ftp://host/choco/",
+    ] {
+        let out = run(vec![("YANUGET_INTERNALIZED_FEED_URL", moved.into())])
+            .await
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{moved}");
+        assert!(
+            stderr.contains("which is not the http or https URL of a feed"),
+            "{moved}: {stderr}"
+        );
+    }
+
+    // `--ignore-checksums` does not turn the pin off: the helper checks the
+    // attached file's SHA-256 all the same, and the setting is back once it
+    // is done (`SEC-39`).
+    let own = dir.path().join("pkg/tools/chocolateyInstall.upstream.ps1");
+    std::fs::write(
+        &own,
+        "Install-ChocolateyPackage 'tool' -Url 'https://example.com/setup.exe' -Checksum 'x' \
+         -ChecksumType md5\r\n\"ignore=$env:ChocolateyIgnoreChecksums\"\r\n",
+    )
+    .unwrap();
+    let out = run(vec![("ChocolateyIgnoreChecksums", "true".into())])
+        .await
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout.contains(&format!(
+            "installed {feed}files/tool.install/1.0.0/setup.exe (sha256)"
+        )),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("checksums ignored"), "{stdout}");
+    assert!(stdout.contains("ignore=true"), "{stdout}");
 
     // Spellings that .NET downloads from but a plain `https://` test misses
     // are looked up all the same: a captured file is redirected, anything
@@ -474,7 +523,25 @@ async fn an_install_fetches_the_attached_file() {
             "smb://fileserver/share/setup.exe",
             Err("nor a file on this machine"),
         ),
+        // A path with the FileSystem provider's prefix is judged by what
+        // follows it (`SEC-35`); another provider names no file.
+        (
+            "Microsoft.PowerShell.Core\\FileSystem::\\\\fileserver\\share\\setup.exe",
+            Err("nor a file on this machine"),
+        ),
+        (
+            "filesystem:://fileserver/share/setup.exe",
+            Err("nor a file on this machine"),
+        ),
+        (
+            "Registry::HKEY_LOCAL_MACHINE\\SOFTWARE",
+            Err("nor a file on this machine"),
+        ),
         ("C:\\setup.exe", Err("the stand-in")),
+        (
+            "Microsoft.PowerShell.Core\\FileSystem::C:\\setup.exe",
+            Err("the stand-in"),
+        ),
     ] {
         std::fs::write(
             &script,
