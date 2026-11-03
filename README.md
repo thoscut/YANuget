@@ -364,7 +364,7 @@ the [large-package design](docs/large-packages.md).
 
 Release binaries and the container image ship the rendered docs; a plain
 `cargo build` without MkDocs still compiles (a small placeholder page is embedded
-instead), as does an install from crates.io. The Markdown sources live in
+instead), as does `cargo install --git … --tag vX.Y.Z`. The Markdown sources live in
 [`docs/`](docs/).
 
 ## Admin moderation

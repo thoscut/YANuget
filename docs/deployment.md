@@ -293,10 +293,9 @@ told to compress `application/octet-stream`.
 2. Back up with `yanuget backup`. This is the step people skip.
 3. Replace the binary or pull the new image and restart.
 
-Schema changes are applied automatically at startup and are additive, so an
-upgrade needs no migration command and re-running it is a no-op. **Downgrading
-is not supported**: an older binary may not understand columns a newer one
-added. Roll back by restoring the backup from step 2 **with the older release's
+Schema changes are applied automatically at startup, so an upgrade needs no
+migration command and re-running it is a no-op. **Downgrading is not
+supported**: an older binary refuses a database a newer one migrated. Roll back by restoring the backup from step 2 **with the older release's
 binary**: `yanuget restore` opens the restored database the way the server does,
 so a newer binary migrates it to its own schema again.
 

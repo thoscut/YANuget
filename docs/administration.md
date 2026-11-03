@@ -40,6 +40,11 @@ or `YANUGET_ADMIN_API_KEY`, or a feed's own `admin_api_key`. Open `/admin`
 key as the password. A package's gallery page links to its admin page
 ("Manage versions").
 
+The dashboard at `/admin` lists the feed's packages with pending ones first.
+Each row carries badges with the number of pending and flagged versions, the
+filters **All**, **Pending** and **Flagged** narrow the list
+(`/admin?filter=pending`), and long lists are paged.
+
 ## Version states
 
 A version in a feed is in one or more of these states. The admin area shows
@@ -64,7 +69,9 @@ next to one version or by ticking several versions and choosing an operation
 for all of them.
 
 * **Disable / enable** a version to withdraw it from clients and bring it back.
-* **Approve** a pending version in a gated feed.
+* **Approve** a pending version in a gated feed. Approve answers `409` when
+  a push replaced the build, or its attached files changed, since the page was
+  loaded: reload it and review what is there now.
 * **Promote** a version into the feed named by `promotes_to`, or **copy** or
   **move** versions to another feed. The page then says what happened in the
   target (added, pending there with a link to approve it, or already there),

@@ -31,7 +31,7 @@ Useful things to include, as far as you have them:
 - a reproduction: a request, a crafted `.nupkg`, or a short script.
 
 You can expect an acknowledgement within a few days and an assessment within two
-weeks. Fixes are released as a new patch version with a GitHub Security Advisory,
+weeks. Fixes ship in the next release (a patch version where possible) with a GitHub Security Advisory,
 crediting you unless you ask otherwise.
 
 ## Scope
@@ -128,6 +128,9 @@ Configuration choices that matter most:
 - **Use a real certificate** (`tls_cert_path`/`tls_key_path`), or terminate TLS
   at a proxy and set `tls_enabled = false`.
 - **Set `max_package_size_bytes`** on any feed open to more than a few people.
+- **Set `monitoring.token` when you enable `[monitoring]`.** Without one,
+  `/metrics` and `/health/status` tell anyone who asks which feeds exist and
+  how large they are, and every request costs database scans.
 - **Keep `admin_api_key` distinct** from the push key, and do not expose `/admin`
   to the internet.
 - **Gate reads with a `[[feeds]]` entry.** `read_api_key` is a per-feed

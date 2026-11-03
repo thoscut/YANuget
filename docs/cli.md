@@ -89,7 +89,7 @@ All options, authentication and resumption are described in
 
 ## `yanuget healthcheck`
 
-Requests the readiness endpoint (`/health`) of the server on this machine, using
+Requests the readiness endpoint (`/health/ready`) of the server on this machine, using
 the port and scheme from the configuration, and exits `0` if it answers `200`
 and `1` otherwise. It does not verify the certificate (it talks to its own
 process over loopback) and ignores proxy settings. The container image uses it
@@ -163,4 +163,15 @@ command, then start it again.
 systemctl stop yanuget
 sudo -u yanuget yanuget --config /etc/yanuget/yanuget.toml feeds rename prod production
 systemctl start yanuget
+```
+
+In a container, `docker compose exec` is refused because the server is
+running in it. Stop the service and run the command in a one-off container on
+the same volume, as for [restore](backup.md#in-a-container); stop it first, because in a
+one-off container the check finds no server:
+
+```bash
+docker compose stop yanuget
+docker compose run --rm --no-deps yanuget feeds rename prod production
+docker compose start yanuget
 ```

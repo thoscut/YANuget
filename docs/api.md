@@ -693,6 +693,16 @@ only permitted inline style and script are the two the server itself emits,
 pinned by SHA-256. The embedded documentation site sets its own, looser policy
 (mkdocs emits inline bootstrap code this crate does not control).
 
+## Compression
+
+JSON, HTML and text responses are compressed with gzip or brotli when the
+request's `Accept-Encoding` asks for one. Package, symbol and attached-file
+downloads, byte ranges and `application/octet-stream` never are: they are zips
+already, and a range has to address the stored bytes. A compressed response
+carries `Vary: Accept-Encoding` and its `ETag` turns weak (`W/"…"`). A request
+that refuses every encoding the server has (`Accept-Encoding: identity;q=0`
+without gzip or brotli) answers `406`.
+
 ## Error bodies
 
 Errors return the appropriate status with a JSON body `{ "error": "<message>" }`.
