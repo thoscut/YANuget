@@ -38,13 +38,6 @@ the detail; this list is the index.
 - `INT-33` internalization requests, if the open question about it is
   answered for it.
 
-**Tests and CI, by choice not yet**
-
-- `CI-04` No SBOM and no `cargo auditable`; `CI-20` no coverage measurement.
-  Fuzzing is a property test over the NuGet v3 reader for now
-  (`crates/yanuget-pkg/tests/v3_robustness.rs`), not a `cargo fuzz` target.
-  See the [review of 2026-11-03](#review-of-2026-11-03).
-
 **Features under discussion**
 
 - Markdown readmes on the package page; see [Features](#features).
@@ -66,8 +59,7 @@ the detail; this list is the index.
 
 A multi-expert review of `main` at 0.9.0 (`544e2f0`): architecture and
 correctness, security, Rust code, tests and CI, operations and
-documentation. Every finding was fixed with it, with tests, apart from the
-two under *Left open*. The changelog's *Unreleased* section describes them
+documentation. Every finding was fixed with it, with tests. The changelog's *Unreleased* section describes them
 for operators.
 
 ### Security and integrity
@@ -194,12 +186,19 @@ for operators.
   the example config, SECURITY.md, the upgrade text and the CLI page.
   *Done.*
 
-### Left open
+### Left open by the review of 2026-09-30, done now
 
-- [ ] **`CI-04`** (from 2026-09-30) No SBOM and no `cargo auditable` for the
-  release artifacts.
-- [ ] **`CI-20` No coverage measurement.** A `cargo llvm-cov` job would show
-  what the 800 tests leave out; nothing gates on it yet.
+- [x] **`CI-04` No SBOM and no `cargo auditable`.** *Done:* the release
+  binaries and the image's are built with `cargo auditable`; each release
+  attaches a CycloneDX SBOM (`yanuget-vX.Y.Z.cdx.json`, attested with the
+  archives), and the image carries a BuildKit SBOM attestation. CI generates
+  the SBOM on every pull request and checks the image's binary for its
+  dependency section.
+- [x] **`CI-20` No coverage measurement.** *Done:* a `cargo llvm-cov` job
+  writes a summary to each CI run and uploads the lcov report. Nothing gates
+  on it. Fuzzing stays a property test over the NuGet v3 reader
+  (`crates/yanuget-pkg/tests/v3_robustness.rs`) rather than a `cargo fuzz`
+  target, which would need a nightly toolchain.
 
 ## Review of 2026-10-27
 

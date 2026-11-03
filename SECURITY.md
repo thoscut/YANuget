@@ -171,3 +171,22 @@ signatures found" for an image that is signed).
 
 Either check failing means the file or image did not come from this
 repository's release workflow run for a tag; do not use it.
+
+### What a release is built from
+
+From the release after 0.9.0 on, each GitHub Release carries
+`yanuget-vX.Y.Z.cdx.json`, a CycloneDX software bill of materials of every
+crate the workspace resolves for any of its targets (name, version, source,
+checksum, license). It is listed in `SHA256SUMS` and attested like the
+archives. The binaries, in the archives and in the image, are built with
+`cargo auditable`, so they carry their own dependency list, and the image has
+a BuildKit SBOM attestation (Debian packages and crates):
+
+```bash
+# Known advisories for exactly the crates a binary was built from.
+cargo audit bin ./yanuget
+
+# The image's SBOM.
+docker buildx imagetools inspect ghcr.io/thoscut/yanuget:X.Y.Z \
+  --format '{{ json .SBOM }}'
+```

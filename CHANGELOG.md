@@ -96,11 +96,16 @@ server on the same data refuses to start, and so do `restore` and
   failed syncs name the underlying I/O, TOML, JSON or HTTP error.
 - The internalizer writes its sync state and metrics through `tempfile`.
 - The server uses sha2 0.11 like the internalizer.
+- Release binaries, in the archives and in the image, are built with
+  `cargo auditable` and carry their dependency tree (`cargo audit bin` reads
+  it); each GitHub Release attaches a CycloneDX SBOM,
+  `yanuget-vX.Y.Z.cdx.json`, attested with the archives, and the image has a
+  BuildKit SBOM attestation.
 - Releases: each binary and each image platform is started before it is
   published, the crates.io step stops on any answer but `200` or `404`, and a
   release that changed `yanuget-pkg` without a new version is refused. CI
-  checks rustdoc, tests `yanuget-pkg` without default features and runs the
-  ignored tests weekly.
+  checks rustdoc, tests `yanuget-pkg` without default features, runs the
+  ignored tests weekly and reports line coverage.
 - Documentation: troubleshooting for the newer status codes, a Compression
   section in the API reference, the dashboard filters, `config check`'s
   warnings, and `yanuget feeds` in a container.

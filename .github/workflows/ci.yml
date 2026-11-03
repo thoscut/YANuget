@@ -262,6 +262,77 @@ jobs:
       - name: Check licenses and sources
         run: cargo deny check licenses bans sources
 
+      # The release attaches this bill of materials; generating it here finds
+      # a tool or metadata problem on the pull request rather than at tag time.
+      - name: Install cargo-cyclonedx
+        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+        with:
+          tool: cargo-cyclonedx@0.5.9
+
+      - name: Generate the software bill of materials
+        run: |
+          set -euo pipefail
+          cargo cyclonedx --format json --spec-version 1.5 --target all \
+            --all-features --override-filename yanuget-ci.cdx
+          jq -e '.metadata.component.name == "yanuget" and (.components | length) > 100' \
+            yanuget-ci.cdx.json >/dev/null
+
+  # Line coverage of the whole test suite, as a summary on the run and an
+  # lcov file to download. Nothing gates on the number: it shows what the tests
+  # leave out, and a change that drops it says so in the summary. Not run when
+  # the release workflow calls this one; a release needs the tests, not the
+  # report.
+  coverage:
+    name: Coverage
+    if: ${{ !inputs.ref }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        id: toolchain
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+          components: llvm-tools-preview
+
+      - name: Cache cargo
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-coverage-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-coverage-${{ steps.toolchain.outputs.cachekey }}-
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+        with:
+          tool: cargo-llvm-cov@0.9.1
+
+      # No docs site: the build script embeds its placeholder, which the tests
+      # do not mind.
+      - name: Measure coverage
+        run: |
+          set -euo pipefail
+          cargo llvm-cov --workspace --all-features --locked --lcov --output-path lcov.info
+          {
+            echo '### Line coverage'
+            echo '```'
+            cargo llvm-cov report --summary-only
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the lcov report
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverage-lcov
+          path: lcov.info
+
   package:
     # The release path is not the same as the build path: `cargo publish`
     # packages a tarball from a clean checkout and rebuilds it in isolation, and
@@ -333,6 +404,16 @@ jobs:
             exit 1
           fi
           docker rm -f yanuget-ci
+
+      # The image's binary is built with `cargo auditable`: its dependency
+      # tree is embedded in a `.dep-v0` section for scanners to read.
+      - name: The image's binary carries its dependency tree
+        run: |
+          set -euo pipefail
+          id=$(docker create yanuget:ci)
+          docker cp "$id:/usr/local/bin/yanuget" ./yanuget-image
+          docker rm "$id"
+          objdump -h ./yanuget-image | grep -q '\.dep-v0'
 
   client-compat:
     # The Rust tests drive the server with `reqwest` — a faithful HTTP client,

@@ -113,9 +113,10 @@ existing tag points at.
 | --- | --- |
 | `guard` | Refuses the release unless the tag exists, the run started from it, and the tag, `Cargo.toml` and `CHANGELOG.md` agree. Every later job builds the commit it resolved. |
 | `ci` | Runs the whole CI workflow (`ci.yml`) on the commit `guard` resolved, with a read-only token, no secrets and no caches. `image`, `release` and `crates-io` wait for it. |
-| `build` | Compiles for five targets (Linux x86-64/aarch64, macOS x86-64/aarch64, Windows x86-64) with the rendered docs embedded, and packages each with the README, licence, changelog and example config, plus the systemd unit and its `sysusers.d` file on Linux. Each binary has to print its version first (aarch64 Linux under QEMU, x86-64 macOS under Rosetta 2). Read-only token, no caches. |
-| `image` | Builds and starts the image on each platform, then publishes `ghcr.io/thoscut/yanuget` for `linux/amd64` and `linux/arm64`, tagged `X.Y.Z`, `X.Y` and `latest`; attests its build provenance and signs it with cosign (keyless). |
-| `release` | Attests the provenance of every archive and `SHA256SUMS`, and attaches them to a GitHub Release whose notes are the changelog section for this version. |
+| `build` | Compiles for five targets (Linux x86-64/aarch64, macOS x86-64/aarch64, Windows x86-64) with the rendered docs embedded, and packages each with the README, licence, changelog and example config, plus the systemd unit and its `sysusers.d` file on Linux. Built with `cargo auditable`, so each binary embeds its dependency tree. Each binary has to print its version first (aarch64 Linux under QEMU, x86-64 macOS under Rosetta 2). Read-only token, no caches. |
+| `sbom` | Writes the CycloneDX bill of materials `yanuget-vX.Y.Z.cdx.json` from `Cargo.lock` (every target), with a read-only token; `release` attaches and attests it with the archives. |
+| `image` | Builds and starts the image on each platform, then publishes `ghcr.io/thoscut/yanuget` for `linux/amd64` and `linux/arm64`, tagged `X.Y.Z`, `X.Y` and `latest`; attests its build provenance, pushes a BuildKit SBOM attestation, and signs it with cosign (keyless). |
+| `release` | Attests the provenance of every archive, the SBOM and `SHA256SUMS`, and attaches them to a GitHub Release whose notes are the changelog section for this version. |
 | `crates-io` | Publishes `yanuget-pkg` (when crates.io answers `404` for its version; any answer but `200` or `404` stops the job), then `yanuget`, through trusted publishing — **only** when the repository variable `PUBLISH_TO_CRATES_IO` is `true`. Off by default: a crates.io version can be yanked but never replaced. |
 
 Only `image`, `release` and `crates-io` hold a write scope or an OIDC token,

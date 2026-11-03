@@ -55,7 +55,15 @@ code the Linux jobs never compile.
 
 CI also runs `cargo audit` and `cargo deny check licenses bans sources`
 (policy in `deny.toml`): a new dependency under a license not on the list
-there fails the build until someone has looked at it.
+there fails the build until someone has looked at it. It generates the
+release's CycloneDX bill of materials, so a problem with it shows on the pull
+request, and measures line coverage with `cargo llvm-cov`: the run's summary
+shows the numbers, and the `coverage-lcov` artifact has the per-line report.
+Nothing gates on coverage; to see it locally:
+
+```bash
+cargo llvm-cov --workspace --all-features --html   # target/llvm-cov/html/
+```
 
 Every action in `.github/workflows/` is pinned to a full commit SHA with the
 release in a comment (`uses: actions/checkout@<sha> # v7.0.1`). Keep it that
