@@ -22,6 +22,10 @@ use yanuget_pkg::rewrite::Source;
 use yanuget_pkg::NuGetVersion;
 
 fn nupkg(path: &Path, id: &str, script: Option<&str>) {
+    nupkg_with(path, id, script.as_slice());
+}
+
+fn nupkg_with(path: &Path, id: &str, scripts: &[&str]) {
     let mut zip = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
     let opts = zip::write::SimpleFileOptions::default();
     zip.start_file("[Content_Types].xml", opts).unwrap();
@@ -35,8 +39,8 @@ fn nupkg(path: &Path, id: &str, script: Option<&str>) {
             .as_bytes(),
     )
     .unwrap();
-    if let Some(name) = script {
-        zip.start_file(name, opts).unwrap();
+    for name in scripts {
+        zip.start_file(*name, opts).unwrap();
         zip.write_all(b"Install-ChocolateyPackage upstream")
             .unwrap();
     }
@@ -74,6 +78,42 @@ async fn the_script_is_replaced_in_place_or_added() {
             "tools/ChocolateyInstall.ps1".to_string(),
             "Write-Host internal".to_string()
         )]
+    );
+
+    // A package with two: both are replaced, whichever Chocolatey runs, and
+    // nothing else is touched.
+    nupkg_with(
+        &input,
+        "tool",
+        &[
+            "tools/chocolateyInstall.ps1",
+            "legacy/CHOCOLATEYINSTALL.PS1",
+            "tools/other.ps1",
+        ],
+    );
+    with_script(&input, &output, b"Write-Host internal".to_vec())
+        .await
+        .unwrap();
+    let scripts: Vec<_> = entries(&output)
+        .into_iter()
+        .filter(|(n, _)| n.ends_with(".ps1") || n.ends_with(".PS1"))
+        .collect();
+    assert_eq!(
+        scripts,
+        [
+            (
+                "tools/chocolateyInstall.ps1".to_string(),
+                "Write-Host internal".to_string()
+            ),
+            (
+                "legacy/CHOCOLATEYINSTALL.PS1".to_string(),
+                "Write-Host internal".to_string()
+            ),
+            (
+                "tools/other.ps1".to_string(),
+                "Install-ChocolateyPackage upstream".to_string()
+            ),
+        ]
     );
 
     nupkg(&input, "tool", None);

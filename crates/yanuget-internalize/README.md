@@ -273,7 +273,7 @@ silently left out. `config check` loads them.
 ```toml
 versions = "[2.51,)"                       # the versions it applies to; all without
 package_parameters = "/NoShellIntegration" # --params for the install, as the root
-script = "git.install.ps1"                 # replaces chocolateyInstall.ps1
+script = "git.install.ps1"                 # replaces every chocolateyInstall.ps1
 
 [[download]]                               # a download the capture misses
 url = "https://example.com/extra.cab"
@@ -287,8 +287,9 @@ to = "https://mirror.example.com/setup.exe"
 
 Or, alone in the file, `skip = "why"`: the package is left out of runs, and
 `plan` says so. The script is a path inside `overrides_dir`; it goes into a
-copy of the package before the capture, under the name the package's own
-has, and that copy is what is published, so the capture runs it and the
+copy of the package before the capture, in place of every
+`chocolateyInstall.ps1` the package has (in whatever folder, as the prelude
+wraps them) and under its name, and that copy is what is published, so the capture runs it and the
 feed gets it. Package parameters go to the root's install only; a
 dependency's are a warning in its report. A rewritten URL is still the one
 the package asks for, and the prelude maps it to the attached file. Every
