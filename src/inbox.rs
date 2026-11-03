@@ -39,6 +39,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use crate::config::FilesConfig;
 use crate::database::PackageDatabase;
 use crate::error::{Error, Result};
+use crate::space::{Reservation, SpaceGuard};
 use crate::storage::{PackageStorage, TempPath};
 use crate::version::NuGetVersion;
 use crate::web::hosted::{attach_to, Attached, Target};
@@ -65,11 +66,10 @@ pub struct Inbox<'a> {
     /// The feeds under `allow_overwrite = "pending-only"`: a file dropped for
     /// one of them is not attached to a version some feed has approved.
     pub pending_only: &'a [String],
-    /// The server's private staging directory (the store's `.uploads`).
-    pub staging: &'a Path,
-    /// Free space an import must leave on the staging volume
-    /// (`min_free_disk_bytes`); 0 checks nothing.
-    pub min_free_disk_bytes: u64,
+    /// The admission of writes into the server's private staging directory
+    /// (the store's `.uploads`), shared with its uploads and mirrors: an
+    /// import is held to `min_free_disk_bytes` and reserves its size there.
+    pub space: &'a SpaceGuard,
 }
 
 /// Refuse an inbox inside the package store: the importer removes files from
@@ -196,17 +196,18 @@ impl Inbox<'_> {
 
         // Out of the uploader's reach first, then verified: a copy only the
         // server can write, removed on any way out of here but the store.
-        tokio::fs::create_dir_all(self.staging).await?;
+        let staging = self.space.dir();
+        tokio::fs::create_dir_all(staging).await?;
         // The copy needs the file's size again on the store's volume, and the
-        // uploader's quota is not the server's: held to the same reserve as a
-        // push, so an inbox full of images cannot fill the disk the database
-        // lives on.
-        ensure_disk_space(self.staging, size, self.min_free_disk_bytes)?;
-        let staged = TempPath::new(
-            self.staging
-                .join(format!("inbox-{}.tmp", uuid::Uuid::new_v4().simple())),
-        );
-        let (copied, actual) = copy_hashed(source, staged.path(), size).await?;
+        // uploader's quota is not the server's: admitted like a push, so an
+        // inbox full of images cannot fill the disk the database lives on,
+        // nor take the space promised to the uploads in progress.
+        let reservation = self.space.admit(Some(size)).await?;
+        let staged =
+            TempPath::new(staging.join(format!("inbox-{}.tmp", uuid::Uuid::new_v4().simple())));
+        let (copied, actual) =
+            copy_hashed(source, staged.path(), size, self.space, &reservation).await?;
+        drop(reservation);
         if actual != expected {
             // Not the hash itself: whatever the file is, the report says only
             // that it is not what the checksum file promised.
@@ -283,30 +284,6 @@ fn write_report(dir: &dir::InboxDir, report: &str, e: &Error) {
     }
 }
 
-/// Refuse a copy of `incoming` bytes that would leave `dir`'s volume with
-/// less than `reserve` free. Unmeasurable free space lets the import through,
-/// as it does a push: a guard that fails closed would stop every import.
-fn ensure_disk_space(dir: &Path, incoming: u64, reserve: u64) -> Result<()> {
-    if reserve == 0 {
-        return Ok(());
-    }
-    let available = match fs4::available_space(dir) {
-        Ok(n) => n,
-        Err(e) => {
-            tracing::warn!(error = %e, "could not measure free disk space");
-            return Ok(());
-        }
-    };
-    let needed = incoming.saturating_add(reserve);
-    if available < needed {
-        return Err(Error::InsufficientStorage(format!(
-            "{available} bytes free on the storage volume, {needed} needed \
-             (the file plus the configured reserve)"
-        )));
-    }
-    Ok(())
-}
-
 /// The SHA-256 a checksum file names: its first word, 64 hex digits, as
 /// `sha256sum` writes it (`<hex>  <name>`).
 fn read_marker(file: std::fs::File) -> Result<String> {
@@ -336,10 +313,18 @@ fn parse_marker(raw: &str) -> Result<String> {
 /// Copy the first `len` bytes of `from` to a new file at `to`, hashing them on
 /// the way, and sync it. `len` is the size the file had when it was opened: an
 /// uploader still appending cannot keep the scanner copying forever. Returns
-/// how many bytes were copied and their SHA-256.
-async fn copy_hashed(from: std::fs::File, to: &Path, len: u64) -> Result<(u64, String)> {
+/// how many bytes were copied and their SHA-256. The copy is written through
+/// `space`, which takes it off `reservation`.
+async fn copy_hashed(
+    from: std::fs::File,
+    to: &Path,
+    len: u64,
+    space: &SpaceGuard,
+    reservation: &Reservation,
+) -> Result<(u64, String)> {
     let mut src = tokio::fs::File::from_std(from).take(len);
-    let mut dst = tokio::fs::File::create_new(to).await?;
+    let mut file = tokio::fs::File::create_new(to).await?;
+    let mut dst = space.guard(&mut file, reservation);
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 256 * 1024];
     let mut copied = 0u64;
@@ -352,7 +337,8 @@ async fn copy_hashed(from: std::fs::File, to: &Path, len: u64) -> Result<(u64, S
         dst.write_all(&buf[..n]).await?;
         copied += n as u64;
     }
-    dst.sync_all().await?;
+    drop(dst);
+    file.sync_all().await?;
     Ok((copied, hex::encode(hasher.finalize())))
 }
 

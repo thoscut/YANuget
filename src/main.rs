@@ -242,6 +242,10 @@ async fn run_server(config_path: Option<&str>) -> anyhow::Result<()> {
     // Every background task, joined on shutdown so none is cut off mid-write.
     let mut background: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     let mut states = Vec::with_capacity(feeds.len());
+    // One admission for everything written to the staging directory: every
+    // feed's uploads, its mirror's downloads and the inbox's imports see
+    // what the others promised.
+    let space = Arc::new(yanuget::space::SpaceGuard::for_store(&config, db.clone()));
     for feed in &feeds {
         let state = AppState::for_feed(
             storage.clone(),
@@ -249,6 +253,7 @@ async fn run_server(config_path: Option<&str>) -> anyhow::Result<()> {
             config.clone(),
             feed,
             feeds_meta.clone(),
+            space.clone(),
         )
         .await?;
         // Shared with the admin page, so a sweep and a manual cleanup never
@@ -351,6 +356,7 @@ async fn run_server(config_path: Option<&str>) -> anyhow::Result<()> {
         &config,
         &storage,
         &db,
+        &space,
         &feeds,
         &shutdown_rx,
     ));
@@ -850,6 +856,7 @@ fn spawn_file_tasks(
     config: &Arc<Config>,
     storage: &Arc<FilesystemStorage>,
     db: &Arc<SqliteDatabase>,
+    space: &Arc<yanuget::space::SpaceGuard>,
     feeds: &[yanuget::config::ResolvedFeed],
     shutdown: &tokio::sync::watch::Receiver<bool>,
 ) -> Vec<tokio::task::JoinHandle<()>> {
@@ -857,7 +864,7 @@ fn spawn_file_tasks(
     if !config.files.enabled {
         return tasks;
     }
-    let staging = config.storage_path().join(".uploads");
+    let staging = space.dir().to_path_buf();
 
     // Expired uploads: once at startup, then every quarter hour.
     {
@@ -899,7 +906,7 @@ fn spawn_file_tasks(
         let _ = std::fs::create_dir_all(inbox.join(name));
     }
     tracing::info!(inbox = %inbox.display(), every_secs = config.files.inbox_scan_secs, "file inbox enabled");
-    let (config, storage, db) = (config.clone(), storage.clone(), db.clone());
+    let (config, storage, db, space) = (config.clone(), storage.clone(), db.clone(), space.clone());
     let mut shutdown = shutdown.clone();
     tasks.push(tokio::spawn(async move {
         let period = Duration::from_secs(config.files.inbox_scan_secs.max(5));
@@ -920,8 +927,7 @@ fn spawn_file_tasks(
                 max_file_size: config.max_file_size_bytes(),
                 feeds: &names,
                 pending_only: &pending_only,
-                staging: &staging,
-                min_free_disk_bytes: config.min_free_disk_bytes,
+                space: &space,
             };
             let report = scan.scan().await;
             if report.imported + report.failed > 0 {

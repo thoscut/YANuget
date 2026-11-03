@@ -51,8 +51,11 @@ pub struct MirrorClient {
     /// Deadline for one whole `.nupkg` download. `None` leaves only the read
     /// timeout, which bounds how long the upstream may go silent.
     download_deadline: Option<Duration>,
-    /// Free space a download must leave on the volume (`min_free_disk_bytes`).
+    /// Free space a download must leave on the volume (`min_free_disk_bytes`),
+    /// when no [`space`](Self::set_space) is shared with the server's uploads.
     min_free_disk_bytes: u64,
+    /// The admission of downloads, shared with the server's uploads.
+    space: Option<std::sync::Arc<crate::space::SpaceGuard>>,
     /// How long a package's upstream version list is trusted (`refresh_secs`).
     refresh: Duration,
     resources: OnceCell<MirrorResources>,
@@ -281,6 +284,7 @@ impl MirrorClient {
                 secs => Some(Duration::from_secs(secs)),
             },
             min_free_disk_bytes: 0,
+            space: None,
             refresh: Duration::from_secs(config.refresh_secs),
             resources: OnceCell::new(),
             tracker: Tracker::default(),
@@ -308,6 +312,15 @@ impl MirrorClient {
     /// starts, was not, and could fill the volume the database lives on.
     pub fn set_min_free_disk_bytes(&mut self, reserve: u64) {
         self.min_free_disk_bytes = reserve;
+    }
+
+    /// Admit downloads through `space` — the guard the server's uploads go
+    /// through — instead of checking the reserve alone: a download then
+    /// reserves the length the upstream declared, as an upload does, and
+    /// counts what is promised to the uploads in progress. Downloads must be
+    /// written to `space`'s volume.
+    pub fn set_space(&mut self, space: std::sync::Arc<crate::space::SpaceGuard>) {
+        self.space = Some(space);
     }
 
     /// Reject an upstream-supplied resource URL that we should not fetch.
@@ -851,7 +864,20 @@ impl MirrorClient {
                 )));
             }
         }
-        ensure_free_space(dest, resp.content_length(), self.min_free_disk_bytes)?;
+        // The same admission as a push: the declared length is promised for
+        // the rest of the download, and the reserve is watched while it runs.
+        let standalone;
+        let space = match &self.space {
+            Some(space) => space.as_ref(),
+            None => {
+                standalone = crate::space::SpaceGuard::new(
+                    dest.parent().unwrap_or(dest),
+                    self.min_free_disk_bytes,
+                );
+                &standalone
+            }
+        };
+        let reservation = space.admit(resp.content_length()).await?;
         let mut file = tokio::fs::File::create(dest).await?;
         let stream = resp.bytes_stream().map(|r| {
             if let Ok(chunk) = &r {
@@ -864,7 +890,7 @@ impl MirrorClient {
         // packages upstream happens to host. The push path is capped; so is this.
         let summary = streaming::stream_to_writer_limited(
             Box::pin(stream),
-            &mut file,
+            &mut space.guard(&mut file, &reservation),
             self.max_package_size_bytes,
             // The mirror's own silence timeout already bounds a stalled upstream.
             None,
@@ -1897,36 +1923,6 @@ fn ensure_trailing_slash(s: &str) -> String {
     } else {
         format!("{s}/")
     }
-}
-
-/// Refuse to write `incoming` bytes (when the upstream declared a length) next
-/// to `dest` if that would leave the volume with less than `reserve` free.
-///
-/// The same rule a push is held to: a full disk does not fail cleanly, since
-/// the database and every other writer on the volume run out with it. With no
-/// declared length only the reserve itself is checked, and the size cap bounds
-/// the rest. Free space that cannot be measured lets the download through,
-/// since a guard that fails closed would stop the mirror over a `statvfs`.
-fn ensure_free_space(dest: &Path, incoming: Option<u64>, reserve: u64) -> Result<()> {
-    if reserve == 0 {
-        return Ok(());
-    }
-    let dir = dest.parent().unwrap_or(dest);
-    let available = match fs4::available_space(dir) {
-        Ok(n) => n,
-        Err(e) => {
-            tracing::warn!(error = %e, "could not measure free disk space");
-            return Ok(());
-        }
-    };
-    let needed = incoming.unwrap_or(0).saturating_add(reserve);
-    if available < needed {
-        return Err(Error::InsufficientStorage(format!(
-            "{available} bytes free on the storage volume, {needed} needed \
-             (the upstream package plus the configured reserve)"
-        )));
-    }
-    Ok(())
 }
 
 /// An error from sending an upstream request, without the URL reqwest would

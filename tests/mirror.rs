@@ -522,12 +522,20 @@ async fn spawn_mirror_with(
             .map(FeedMeta::from_resolved)
             .collect::<Vec<_>>(),
     );
+    let space = Arc::new(yanuget::space::SpaceGuard::for_store(&config, db.clone()));
     let mut states = Vec::new();
     for f in &feeds {
         states.push(
-            AppState::for_feed(storage.clone(), db.clone(), config.clone(), f, meta.clone())
-                .await
-                .unwrap(),
+            AppState::for_feed(
+                storage.clone(),
+                db.clone(),
+                config.clone(),
+                f,
+                meta.clone(),
+                space.clone(),
+            )
+            .await
+            .unwrap(),
         );
     }
     let app = web::build_app(states);
@@ -787,6 +795,38 @@ async fn a_download_that_would_eat_the_disk_reserve_is_refused() {
         .download_nupkg("big.pkg", "1.0.0", &dest)
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn a_download_does_not_take_the_space_promised_to_uploads() {
+    let upstream = Upstream::start().await;
+    upstream.publish("Big.Pkg", "1.0.0");
+    let dir = tempfile::tempdir().unwrap();
+    let space =
+        Arc::new(yanuget::space::SpaceGuard::new(dir.path(), 1).with_measure(|_| Ok(10_000_000)));
+    let mut client = yanuget::mirror::MirrorClient::from_config(&mirror_config(&upstream)).unwrap();
+    client.set_space(space.clone());
+    let dest = dir.path().join("big.nupkg");
+
+    // A push in progress was promised all of the volume.
+    let push = space.admit(Some(9_999_999)).await.unwrap();
+    let err = client
+        .download_nupkg("big.pkg", "1.0.0", &dest)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, yanuget::Error::InsufficientStorage(_)),
+        "{err}"
+    );
+    assert!(!dest.exists(), "nothing may be written");
+
+    drop(push);
+    client
+        .download_nupkg("big.pkg", "1.0.0", &dest)
+        .await
+        .unwrap();
+    // What the download reserved went with it.
+    assert_eq!(space.promised(), 0);
 }
 
 #[tokio::test]

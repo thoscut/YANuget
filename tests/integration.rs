@@ -32,6 +32,15 @@ async fn spawn() -> TestServer {
 }
 
 async fn spawn_with(customize: impl FnOnce(&mut Config)) -> TestServer {
+    spawn_with_free_space(customize, None).await
+}
+
+/// [`spawn_with`], on a storage volume that always has `free` bytes free when
+/// given, rather than whatever the test machine's disk has.
+async fn spawn_with_free_space(
+    customize: impl FnOnce(&mut Config),
+    free: Option<u64>,
+) -> TestServer {
     let dir = tempfile::tempdir().unwrap();
     let mut config = Config {
         data_dir: dir.path().to_path_buf(),
@@ -51,8 +60,14 @@ async fn spawn_with(customize: impl FnOnce(&mut Config)) -> TestServer {
             .await
             .unwrap(),
     );
+    let mut space = yanuget::space::SpaceGuard::for_store(&config, db.clone());
+    if let Some(free) = free {
+        space = space.with_measure(move |_| Ok(free));
+    }
     let config = Arc::new(config);
-    let state = AppState::new(storage, db, config).await.unwrap();
+    let state = AppState::new_with_space(storage, db, config, Arc::new(space))
+        .await
+        .unwrap();
     let app = web::router(state);
 
     let listener = tokio::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
@@ -1635,7 +1650,7 @@ async fn files_dropped_in_the_inbox_are_verified_and_attached() {
         .unwrap();
     let files = yanuget::config::FilesConfig::default();
     let feeds = vec!["default".to_string()];
-    let staging = data.join("packages/.uploads");
+    let space = yanuget::space::SpaceGuard::new(data.join("packages/.uploads"), 0);
     let scan = yanuget::inbox::Inbox {
         dir: inbox.path(),
         storage: &storage,
@@ -1645,8 +1660,7 @@ async fn files_dropped_in_the_inbox_are_verified_and_attached() {
         max_file_size: None,
         feeds: &feeds,
         pending_only: &[],
-        staging: &staging,
-        min_free_disk_bytes: 0,
+        space: &space,
     };
     let report = scan.scan().await;
     assert_eq!(
@@ -2575,6 +2589,7 @@ async fn spawn_feeds(customize: impl FnOnce(&mut Config)) -> TestServer {
             .map(FeedMeta::from_resolved)
             .collect::<Vec<_>>(),
     );
+    let space = Arc::new(yanuget::space::SpaceGuard::for_store(&config, db.clone()));
     let mut states = Vec::new();
     for f in &feeds {
         states.push(
@@ -2584,6 +2599,7 @@ async fn spawn_feeds(customize: impl FnOnce(&mut Config)) -> TestServer {
                 config.clone(),
                 f,
                 feeds_meta.clone(),
+                space.clone(),
             )
             .await
             .unwrap(),
@@ -5263,18 +5279,24 @@ async fn create_tus(
     (created.status(), location)
 }
 
+/// The free space of the volume [`spawn_with_room_for_one`] serves from.
+const ROOM: u64 = 1_000_000;
+
 /// A server whose free space holds one upload of the returned size, and not
-/// two: each passes the free-space check alone.
+/// two: each passes the free-space check alone. The free space is a fixed
+/// [`ROOM`], so nothing else writing to the test machine's disk moves it.
 async fn spawn_with_room_for_one() -> (TestServer, u64) {
-    let server = spawn_with(|c| {
-        c.min_free_disk_bytes = 1;
-        c.max_package_size_bytes = None;
-        c.files.max_file_size_bytes = None;
-    })
+    let server = spawn_with_free_space(
+        |c| {
+            c.min_free_disk_bytes = 1;
+            c.max_package_size_bytes = None;
+            c.files.max_file_size_bytes = None;
+        },
+        Some(ROOM),
+    )
     .await;
     push_multipart(&server, API_KEY, build_nupkg("Res.Pkg", "1.0.0", b"x")).await;
-    let free = fs4::available_space(server._dir.path()).unwrap();
-    (server, free / 10 * 6)
+    (server, ROOM / 10 * 6)
 }
 
 #[tokio::test]

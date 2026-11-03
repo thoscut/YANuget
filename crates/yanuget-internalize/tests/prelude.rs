@@ -231,12 +231,20 @@ async fn server(dir: &Path) -> String {
             .map(FeedMeta::from_resolved)
             .collect::<Vec<_>>(),
     );
+    let space = Arc::new(yanuget::space::SpaceGuard::for_store(&config, db.clone()));
     let mut states = Vec::new();
     for f in &resolved {
         states.push(
-            AppState::for_feed(storage.clone(), db.clone(), config.clone(), f, meta.clone())
-                .await
-                .unwrap(),
+            AppState::for_feed(
+                storage.clone(),
+                db.clone(),
+                config.clone(),
+                f,
+                meta.clone(),
+                space.clone(),
+            )
+            .await
+            .unwrap(),
         );
     }
     let app = web::build_app(states);

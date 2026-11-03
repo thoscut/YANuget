@@ -14,8 +14,9 @@ use super::{AppState, FeedCounters};
 use crate::error::{Error, Result};
 use crate::indexing::{self, IndexOptions};
 use crate::retention::{self, RetentionPolicy};
+use crate::space::Reservation;
 use crate::storage::TempPath;
-use crate::streaming::{self, Reservation, StreamSummary};
+use crate::streaming::{self, StreamSummary};
 use crate::symbols;
 
 pub(super) async fn push_package(
