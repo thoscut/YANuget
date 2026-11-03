@@ -346,7 +346,7 @@ const INSTALL_SCRIPT: &str = "tools/chocolateyInstall.ps1";
 /// Write the package at `nupkg` to `out` with its `chocolateyInstall.ps1`
 /// replaced by `script`, so the capture runs the override's script and the
 /// feed gets it. Every `chocolateyInstall.ps1` the package has, in whatever
-/// folder, is replaced and keeps its name ([`crate::prelude::find_scripts`],
+/// folder, is replaced and keeps its name (`prelude::find_scripts`,
 /// the search the prelude wraps them by): which one Chocolatey runs depends
 /// on how it walks the extracted package, so whichever it is runs the
 /// override's. A package without one gets `tools/chocolateyInstall.ps1`.
