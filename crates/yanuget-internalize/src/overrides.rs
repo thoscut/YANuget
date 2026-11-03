@@ -44,8 +44,17 @@ const MAX_PARAMETER_CHARS: usize = 4096;
 
 /// Why the overrides cannot be used.
 #[derive(Debug, thiserror::Error)]
-#[error("{0}")]
-pub struct OverrideError(pub String);
+pub enum OverrideError {
+    #[error("overrides_dir {}", dir.display())]
+    ReadDir {
+        dir: std::path::PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    /// Files that do not parse or check out, each with why, sorted.
+    #[error("{}", .0.join("; "))]
+    Invalid(Vec<String>),
+}
 
 /// An override file as written.
 #[derive(Debug, Deserialize)]
@@ -128,14 +137,15 @@ impl Overrides {
     /// that does not parse or check out fails the whole set, so a run never
     /// goes ahead with an override silently left out.
     pub fn load(dir: &Path) -> Result<Self, OverrideError> {
-        let entries = std::fs::read_dir(dir)
-            .map_err(|e| OverrideError(format!("overrides_dir {}: {e}", dir.display())))?;
+        let read_dir = |source| OverrideError::ReadDir {
+            dir: dir.to_path_buf(),
+            source,
+        };
+        let entries = std::fs::read_dir(dir).map_err(read_dir)?;
         let mut by_id = BTreeMap::new();
         let mut errors = Vec::new();
         for entry in entries {
-            let path = entry
-                .map_err(|e| OverrideError(format!("overrides_dir {}: {e}", dir.display())))?
-                .path();
+            let path = entry.map_err(read_dir)?.path();
             let Some(id) = path
                 .file_name()
                 .and_then(|n| n.to_str())
@@ -163,7 +173,7 @@ impl Overrides {
             Ok(Overrides { by_id })
         } else {
             errors.sort();
-            Err(OverrideError(errors.join("; ")))
+            Err(OverrideError::Invalid(errors))
         }
     }
 

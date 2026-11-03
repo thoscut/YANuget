@@ -25,5 +25,22 @@ pub mod sync;
 pub mod target;
 pub mod upstream;
 
+/// An error with its causes, `: `-separated, for a message that has room
+/// for one line only (a check report, a sync's reason). A cause already in
+/// the text is not repeated.
+pub fn error_chain(e: &dyn std::error::Error) -> String {
+    let mut s = e.to_string();
+    let mut source = e.source();
+    while let Some(cause) = source {
+        let c = cause.to_string();
+        if !s.contains(&c) {
+            s.push_str(": ");
+            s.push_str(&c);
+        }
+        source = cause.source();
+    }
+    s
+}
+
 /// What the tool calls itself in HTTP requests.
 pub const USER_AGENT: &str = concat!("yanuget-internalize/", env!("CARGO_PKG_VERSION"));

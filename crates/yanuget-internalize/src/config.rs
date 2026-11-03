@@ -27,8 +27,25 @@ pub const COMMUNITY_REPOSITORY: &str = "https://community.chocolatey.org/api/v2/
 
 /// A configuration that cannot be used, with the reason.
 #[derive(Debug, thiserror::Error)]
-#[error("{0}")]
-pub struct ConfigError(pub String);
+pub enum ConfigError {
+    #[error("cannot read config {path}")]
+    Read {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("config {path}: invalid TOML")]
+    File {
+        path: String,
+        #[source]
+        source: toml::de::Error,
+    },
+    #[error("invalid TOML")]
+    Toml(#[source] toml::de::Error),
+    /// A value that does not check out.
+    #[error("{0}")]
+    Invalid(String),
+}
 
 type Result<T, E = ConfigError> = std::result::Result<T, E>;
 
@@ -386,9 +403,14 @@ impl Config {
     ) -> Result<Self> {
         let mut config = match path {
             Some(p) => {
-                let text = std::fs::read_to_string(p)
-                    .map_err(|e| ConfigError(format!("cannot read config {p}: {e}")))?;
-                Self::from_toml(&text).map_err(|e| ConfigError(format!("config {p}: {e}")))?
+                let text = std::fs::read_to_string(p).map_err(|source| ConfigError::Read {
+                    path: p.to_string(),
+                    source,
+                })?;
+                toml::from_str(&text).map_err(|source| ConfigError::File {
+                    path: p.to_string(),
+                    source,
+                })?
             }
             None => Config::default(),
         };
@@ -400,7 +422,7 @@ impl Config {
     /// Parse a TOML document over the defaults, without the environment or
     /// validation.
     pub fn from_toml(text: &str) -> Result<Self> {
-        toml::from_str(text).map_err(|e| ConfigError(format!("invalid TOML: {e}")))
+        toml::from_str(text).map_err(ConfigError::Toml)
     }
 
     fn apply_env(
@@ -556,11 +578,11 @@ impl Config {
                 reqwest::Url::parse(proxy)
                     .ok()
                     .filter(|u| matches!(u.scheme(), "http" | "https"))
-                    .ok_or_else(|| ConfigError(format!("{name} is not a proxy URL")))?;
+                    .ok_or_else(|| ConfigError::Invalid(format!("{name} is not a proxy URL")))?;
             }
         }
         if self.target.allowed_extensions.is_empty() {
-            return Err(ConfigError(
+            return Err(ConfigError::Invalid(
                 "target.allowed_extensions is empty; the feed takes no attached files then".into(),
             ));
         }
@@ -570,7 +592,7 @@ impl Config {
                 || bare.len() > 16
                 || !bare.bytes().all(|b| b.is_ascii_alphanumeric())
             {
-                return Err(ConfigError(format!(
+                return Err(ConfigError::Invalid(format!(
                     "target.allowed_extensions: {ext:?} is not a file extension"
                 )));
             }
@@ -582,7 +604,7 @@ impl Config {
                 && reqwest::Url::parse(&format!("http://{host}/"))
                     .is_ok_and(|u| u.host_str().is_some_and(|h| h.eq_ignore_ascii_case(host)));
             if !valid {
-                return Err(ConfigError(format!(
+                return Err(ConfigError::Invalid(format!(
                     "downloads.allow_private_hosts: {host:?} is not a host name or address"
                 )));
             }
@@ -590,17 +612,17 @@ impl Config {
         let u = &self.upstream;
         match (&u.username, &u.password, &u.token) {
             (Some(_), None, _) => {
-                return Err(ConfigError(
+                return Err(ConfigError::Invalid(
                     "upstream.username needs upstream.password".into(),
                 ))
             }
             (None, Some(_), _) => {
-                return Err(ConfigError(
+                return Err(ConfigError::Invalid(
                     "upstream.password needs upstream.username".into(),
                 ))
             }
             (Some(_), Some(_), Some(_)) => {
-                return Err(ConfigError(
+                return Err(ConfigError::Invalid(
                     "upstream sets both username (HTTP Basic) and token (Bearer); \
                      both need the Authorization header, so set only one"
                         .into(),
@@ -614,7 +636,7 @@ impl Config {
                 || name.eq_ignore_ascii_case("authorization")
                     && (u.username.is_some() || u.token.is_some())
             {
-                return Err(ConfigError(format!(
+                return Err(ConfigError::Invalid(format!(
                     "upstream.headers: {name:?} is not a header name, or repeats the Authorization header"
                 )));
             }
@@ -625,7 +647,7 @@ impl Config {
             .as_ref()
             .is_some_and(|k| k.expose().trim().is_empty())
         {
-            return Err(ConfigError(
+            return Err(ConfigError::Invalid(
                 "target.api_key is empty; leave it out instead".into(),
             ));
         }
@@ -651,11 +673,11 @@ impl Config {
             ("sandbox.kvm.cpus", self.sandbox.kvm.cpus as u64),
         ] {
             if value == 0 {
-                return Err(ConfigError(format!("{name} must be at least 1")));
+                return Err(ConfigError::Invalid(format!("{name} must be at least 1")));
             }
         }
         if self.sandbox.kvm.qemu.as_os_str().is_empty() {
-            return Err(ConfigError("sandbox.kvm.qemu is empty".into()));
+            return Err(ConfigError::Invalid("sandbox.kvm.qemu is empty".into()));
         }
         Ok(())
     }
@@ -675,22 +697,22 @@ fn list(v: &str) -> Vec<String> {
 /// a document (a v3 service index ending in `.json`).
 fn normalize_url(name: &str, raw: &str) -> Result<String> {
     let url = reqwest::Url::parse(raw.trim())
-        .map_err(|e| ConfigError(format!("{name} {raw:?} is not a URL: {e}")))?;
+        .map_err(|e| ConfigError::Invalid(format!("{name} {raw:?} is not a URL: {e}")))?;
     if !matches!(url.scheme(), "http" | "https") {
-        return Err(ConfigError(format!(
+        return Err(ConfigError::Invalid(format!(
             "{name} {raw:?} must be an http or https URL"
         )));
     }
     if url.host_str().is_none_or(str::is_empty) {
-        return Err(ConfigError(format!("{name} {raw:?} has no host")));
+        return Err(ConfigError::Invalid(format!("{name} {raw:?} has no host")));
     }
     if !url.username().is_empty() || url.password().is_some() {
-        return Err(ConfigError(format!(
+        return Err(ConfigError::Invalid(format!(
             "{name} must not carry credentials; use the key settings instead"
         )));
     }
     if url.query().is_some() || url.fragment().is_some() {
-        return Err(ConfigError(format!(
+        return Err(ConfigError::Invalid(format!(
             "{name} {raw:?} must not have a query or a fragment"
         )));
     }
@@ -715,7 +737,7 @@ fn parse_bool(name: &str, v: &str) -> Result<bool> {
 }
 
 fn env_error(name: &str, why: &str) -> ConfigError {
-    ConfigError(format!("environment variable {name} {why}"))
+    ConfigError::Invalid(format!("environment variable {name} {why}"))
 }
 
 /// A plain decimal integer: digits only, so `10G`, `1e9` and `-1` are errors
@@ -840,18 +862,21 @@ mod tests {
             &[],
         )
         .unwrap_err();
-        assert!(e.0.contains("push_key"), "{e}");
+        let e = crate::error_chain(&e);
+        assert!(e.contains("push_key"), "{e}");
         let e = load(Some("[sandbox]\nbackend = \"docker\"\n"), &[]).unwrap_err();
-        assert!(e.0.contains("docker"), "{e}");
+        assert!(matches!(e, ConfigError::File { .. }), "{e:?}");
+        let e = crate::error_chain(&e);
+        assert!(e.contains("docker"), "{e}");
         for (var, value) in [
             ("YANUGET_INTERNALIZE_UPSTREAM_CONCURRENCY", "2x"),
             ("YANUGET_INTERNALIZE_SANDBOX_TIMEOUT_SECS", "-1"),
             ("YANUGET_INTERNALIZE_SANDBOX_BACKEND", "hyperv"),
             ("YANUGET_INTERNALIZE_UPSTREAM_CONCURRENCY", "0"),
         ] {
-            let e = load(None, &[(var, value)]).unwrap_err();
+            let e = load(None, &[(var, value)]).unwrap_err().to_string();
             assert!(
-                e.0.contains(var) || e.0.contains("concurrency"),
+                e.contains(var) || e.contains("concurrency"),
                 "{var}={value}: {e}"
             );
         }
@@ -916,8 +941,9 @@ mod tests {
                 ("YANUGET_INTERNALIZE_TARGET_API_KEY", "other"),
             ],
         )
-        .unwrap_err();
-        assert!(e.0.contains("both set"), "{e}");
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("both set"), "{e}");
         for path in [empty.to_str().unwrap(), "/nonexistent/key"] {
             assert!(load(None, &[("YANUGET_INTERNALIZE_TARGET_API_KEY_FILE", path)]).is_err());
         }

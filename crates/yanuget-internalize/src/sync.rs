@@ -60,8 +60,46 @@ const MAX_REASONS: usize = 10;
 
 /// Why a sync cannot go ahead.
 #[derive(Debug, thiserror::Error)]
-#[error("{0}")]
-pub struct SyncError(pub String);
+pub enum SyncError {
+    #[error("watch list {}", path.display())]
+    ReadWatchList {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    /// The watch list does not check out; every mistake is listed.
+    #[error("watch list {}: {reason}", path.display())]
+    WatchList { path: PathBuf, reason: String },
+    #[error("state file {}", path.display())]
+    ReadState {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    /// The state file is not JSON of the state's shape.
+    #[error("state file {}", path.display())]
+    BrokenState {
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error(
+        "state file {}: schema {schema} is not {STATE_SCHEMA}, the one this version reads",
+        path.display()
+    )]
+    StateSchema { path: PathBuf, schema: u32 },
+    /// Another sync runs: not a fault of this one's.
+    #[error("another sync holds {}; this one does nothing", path.display())]
+    Locked { path: PathBuf },
+    #[error("lock file {}", path.display())]
+    Lock {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("cannot save the state")]
+    Save(#[source] std::io::Error),
+}
 
 /// The watch list as written.
 #[derive(Debug, Deserialize)]
@@ -126,9 +164,14 @@ pub struct WatchList {
 impl WatchList {
     /// The watch list at `path`.
     pub fn load(path: &Path) -> Result<Self, SyncError> {
-        let text = std::fs::read_to_string(path)
-            .map_err(|e| SyncError(format!("watch list {}: {e}", path.display())))?;
-        Self::parse(&text).map_err(|e| SyncError(format!("watch list {}: {e}", path.display())))
+        let text = std::fs::read_to_string(path).map_err(|source| SyncError::ReadWatchList {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        Self::parse(&text).map_err(|reason| SyncError::WatchList {
+            path: path.to_path_buf(),
+            reason,
+        })
     }
 
     /// A watch list from TOML. Every mistake is listed, and any fails the
@@ -254,18 +297,26 @@ struct StateFile {
 impl State {
     /// The state at `path`; empty when there is no file yet.
     pub fn load(path: &Path) -> Result<Self, SyncError> {
-        let fail = |m: String| SyncError(format!("state file {}: {m}", path.display()));
         let bytes = match std::fs::read(path) {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(State::default()),
-            Err(e) => return Err(fail(e.to_string())),
+            Err(source) => {
+                return Err(SyncError::ReadState {
+                    path: path.to_path_buf(),
+                    source,
+                })
+            }
         };
-        let file: StateFile = serde_json::from_slice(&bytes).map_err(|e| fail(e.to_string()))?;
+        let file: StateFile =
+            serde_json::from_slice(&bytes).map_err(|source| SyncError::BrokenState {
+                path: path.to_path_buf(),
+                source,
+            })?;
         if file.schema != STATE_SCHEMA {
-            return Err(fail(format!(
-                "schema {} is not {STATE_SCHEMA}, the one this version reads",
-                file.schema
-            )));
+            return Err(SyncError::StateSchema {
+                path: path.to_path_buf(),
+                schema: file.schema,
+            });
         }
         Ok(State {
             by_key: file.versions.into_iter().map(|e| (e.key(), e)).collect(),
@@ -360,24 +411,24 @@ pub fn lock(state_file: &Path) -> Result<File, SyncError> {
     name.push(".lock");
     let path = PathBuf::from(name);
     if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
-        std::fs::create_dir_all(dir)
-            .map_err(|e| SyncError(format!("cannot create {}: {e}", dir.display())))?;
+        std::fs::create_dir_all(dir).map_err(|source| SyncError::Lock {
+            path: path.clone(),
+            source,
+        })?;
     }
     let file = File::options()
         .create(true)
         .truncate(false)
         .write(true)
         .open(&path)
-        .map_err(|e| SyncError(format!("lock file {}: {e}", path.display())))?;
+        .map_err(|source| SyncError::Lock {
+            path: path.clone(),
+            source,
+        })?;
     match file.try_lock() {
         Ok(()) => Ok(file),
-        Err(std::fs::TryLockError::WouldBlock) => Err(SyncError(format!(
-            "another sync holds {}; this one does nothing",
-            path.display()
-        ))),
-        Err(std::fs::TryLockError::Error(e)) => {
-            Err(SyncError(format!("lock file {}: {e}", path.display())))
-        }
+        Err(std::fs::TryLockError::WouldBlock) => Err(SyncError::Locked { path }),
+        Err(std::fs::TryLockError::Error(source)) => Err(SyncError::Lock { path, source }),
     }
 }
 
@@ -392,7 +443,7 @@ pub trait Feed: Sync {
 #[async_trait]
 impl Feed for Target {
     async fn served(&self, id: &str) -> Result<Option<Vec<NuGetVersion>>, String> {
-        self.versions(id).await.map_err(|e| e.to_string())
+        self.versions(id).await.map_err(|e| crate::error_chain(&e))
     }
 }
 
@@ -522,7 +573,7 @@ pub async fn sync(
         if options.dry_run {
             return Ok(());
         }
-        save(state).map_err(|e| SyncError(format!("cannot save the state: {e}")))
+        save(state).map_err(SyncError::Save)
     };
 
     let mut ids: Vec<String> = watch.entries.iter().map(|w| w.id.clone()).collect();
