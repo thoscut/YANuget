@@ -1,8 +1,11 @@
 name: CI
 
 on:
+  # Branches other than `main` are checked through their pull request; a
+  # push trigger on them as well ran every job twice for each push to an open
+  # pull request. `workflow_dispatch` runs CI on a branch that has none.
   push:
-    branches: [main, "claude/**"]
+    branches: [main]
   pull_request:
     branches: [main]
   # Weekly, so an advisory published against something already in Cargo.lock
@@ -117,6 +120,25 @@ jobs:
 
       - name: Test
         run: cargo test --workspace --all-features --locked
+
+      # On crates.io `yanuget-pkg` comes without its `net` feature, which the
+      # workspace always turns on (by `--all-features` above, and by feature
+      # unification). This is the only run of its tests as it is published.
+      - name: Test yanuget-pkg without default features
+        run: cargo test -p yanuget-pkg --no-default-features --locked
+
+      # A broken intra-doc link is a dead link on docs.rs; `yanuget-pkg` is
+      # meant to be published there.
+      - name: Documentation lints
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo doc --workspace --no-deps --all-features --locked
+
+      # The tests too slow or too large for every push (a 5 GiB zip entry
+      # streamed in constant memory) run on the weekly schedule.
+      - name: Ignored tests
+        if: github.event_name == 'schedule'
+        run: cargo test --workspace --all-features --locked --release -- --ignored
 
       - name: Build release
         run: cargo build --release --locked

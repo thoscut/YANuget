@@ -227,7 +227,7 @@ impl NuGetVersion {
     ///
     /// The lower-casing is what makes this string an *identity*. Two versions
     /// whose pre-release labels differ only in case are the same version — that
-    /// is what [`compare_identifier`] implements and what NuGet clients assume —
+    /// is what `compare_identifier` implements and what NuGet clients assume —
     /// and every other place that identifies a version already agrees: storage
     /// paths are lower-cased, and so are the URLs clients request. Leaving the
     /// case here made the database the one component that disagreed, so

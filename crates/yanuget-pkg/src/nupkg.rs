@@ -105,7 +105,7 @@ fn read_archive_blocking(path: &Path) -> Result<ArchiveContents, Error> {
 }
 
 /// Open an archive for reading, after checking that its central directory
-/// means the same thing to every reader (see [`check_central_directory`]).
+/// means the same thing to every reader (see `check_central_directory`).
 pub fn open_archive(path: &Path) -> Result<zip::ZipArchive<File>, Error> {
     let mut file = File::open(path)?;
     let directory = check_central_directory(&mut file)?;

@@ -5,7 +5,7 @@
 //! unconditionally is a real hazard, because two things downstream depend on
 //! them:
 //!
-//! * [`crate::web::AppState::url_builder`] derives the externally visible base
+//! * `AppState::url_builder` derives the externally visible base
 //!   URL — and therefore every absolute `packageContent`/registration URL the
 //!   NuGet client is told to fetch — from the forwarded host and scheme. A
 //!   caller who can steer those (directly, or by poisoning a shared HTTP cache

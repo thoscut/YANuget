@@ -126,8 +126,8 @@ const REGISTRATION_PAGE_SIZE: usize = 64;
 /// Build the registration index (`/v3/registration/{id}/index.json`).
 ///
 /// For small packages all leaves are inlined into one page. Once a package has
-/// [`REGISTRATION_INLINE_MAX`] or more versions, the index instead lists
-/// external pages of [`REGISTRATION_PAGE_SIZE`] versions each (served by
+/// `REGISTRATION_INLINE_MAX` or more versions, the index instead lists
+/// external pages of `REGISTRATION_PAGE_SIZE` versions each (served by
 /// [`registration_page`]), so the index document stays small. `packages` must be
 /// sorted ascending by version and contain at least one element.
 pub fn registration_index(urls: &UrlBuilder, id: &str, packages: &[Package]) -> Value {

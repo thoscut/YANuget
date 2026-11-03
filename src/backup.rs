@@ -65,7 +65,7 @@ const SCRATCH_DIRS: [&str; 2] = [".uploads", ".migrate"];
 /// What `backup.json` records.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Manifest {
-    /// Layout version; see [`FORMAT`].
+    /// Layout version; see `FORMAT`.
     pub format: u32,
     /// The `yanuget` version that wrote the backup.
     pub yanuget_version: String,

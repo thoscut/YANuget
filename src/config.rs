@@ -827,7 +827,7 @@ impl Config {
     ///
     /// The TOML file rejects a misspelled key; a misspelled variable is
     /// simply never asked for, so `YANUGET_ADMIN_APIKEY` leaves `/admin` off
-    /// without a word. What [`Self::apply_env_from`] asks for is the list of
+    /// without a word. What `apply_env_from` asks for is the list of
     /// names it knows, feed variables included (for the feeds this
     /// configuration declares), plus the ones the command line reads.
     pub fn unknown_env_names<'a>(&self, names: impl IntoIterator<Item = &'a str>) -> Vec<String> {
