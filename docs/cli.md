@@ -93,7 +93,9 @@ refuse while one uses the data. Two checks:
   through loopback) and refuses when anything answers. That also catches a
   server of a release before this lock.
 
-A `--dry-run` of `feeds rename` or `feeds remove` takes neither: it only reads.
+A `--dry-run` of `feeds rename` or `feeds remove` takes neither: it opens the
+database read-only, as `config check` does, and does not migrate it, so it can
+look at the database of a server of another release.
 
 ## `yanuget migrate`
 
@@ -162,7 +164,7 @@ serves them; the server warns about them at startup, and so does
 `config check`. These commands deal with them:
 
 ```text
-yanuget feeds rename <old> <new> [--dry-run]
+yanuget feeds rename <old> <new> [--dry-run] [--keep-approval | --hold-for-approval]
 yanuget feeds remove <name> [--dry-run] [--yes]
 ```
 
@@ -171,6 +173,16 @@ yanuget feeds remove <name> [--dry-run] [--yes]
   deleted from it, and resumable uploads in progress. `<new>` must be a
   configured feed and `<old>` must not be. It refuses when both hold the same
   version; delete it from one of them first.
+
+  A rename is not a push or a promotion: `<new>`'s `requires_approval`,
+  license policy and `reserved_id_prefixes` are not applied to the versions
+  it moves, which keep the state they had. So that a slip (`staging` typed
+  for `old-production`) cannot make what an ungated feed approved on arrival
+  visible in a gated one, a rename into a feed with `requires_approval` that
+  would carry approved versions needs `--keep-approval` (the feed was only
+  renamed) or `--hold-for-approval` (every version moved arrives pending, to
+  be approved again). `--dry-run` says how many are approved, pending and
+  disabled.
 - `remove` drops everything recorded under `<name>`, which must not be
   configured, and, as retention does, deletes the packages, attached files and
   symbols of versions no other feed holds. It cannot be undone and needs

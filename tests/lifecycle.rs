@@ -342,15 +342,27 @@ async fn yanuget(
     port: u16,
     args: &[&str],
 ) -> std::process::Output {
+    let tables: String = feeds
+        .iter()
+        .map(|name| format!("[[feeds]]\nname = '{name}'\n"))
+        .collect();
+    yanuget_with(data, &tables, port, args).await
+}
+
+/// [`yanuget`] with the `[[feeds]]` tables written out.
+async fn yanuget_with(
+    data: &std::path::Path,
+    feeds: &str,
+    port: u16,
+    args: &[&str],
+) -> std::process::Output {
     let config = data.join("cli.toml");
     // A TOML literal string takes a Windows path's backslashes as they are.
     let mut toml = format!(
         "data_dir = '{}'\ntls_enabled = false\nhost = '127.0.0.1'\nport = {port}\n",
         data.display()
     );
-    for name in feeds {
-        toml.push_str(&format!("[[feeds]]\nname = '{name}'\n"));
-    }
+    toml.push_str(feeds);
     std::fs::write(&config, toml).unwrap();
     tokio::process::Command::new(env!("CARGO_BIN_EXE_yanuget"))
         .arg("--config")
@@ -515,4 +527,116 @@ async fn removing_a_gone_feed_frees_what_only_it_held() {
     let storage = FilesystemStorage::new(path.join("packages")).await.unwrap();
     assert!(!storage.package_exists("only.pkg", "1.0.0").await);
     assert!(storage.package_exists("shared.pkg", "1.0.0").await);
+}
+
+/// `DEP-11`: a dry run opens the database read-only. Opened the way the
+/// server does, it would migrate a database an older server still uses.
+#[tokio::test]
+async fn a_dry_run_does_not_migrate_the_database() {
+    use sqlx::ConnectOptions;
+
+    let data = tempfile::tempdir().unwrap();
+    let path = data.path().to_path_buf();
+    let server = spawn_feeds(|c| {
+        c.data_dir = path.clone();
+        c.min_free_disk_bytes = 0;
+        c.feeds = vec![feed("gone")];
+    })
+    .await;
+    assert_eq!(
+        push(&server, "/gone", build_nupkg("Dry.Pkg", "1.0.0", b"d")).await,
+        reqwest::StatusCode::CREATED
+    );
+    server.stop().await;
+    // As a database of the release before the last schema step looks.
+    let mut conn = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(path.join("yanuget.db"))
+        .connect()
+        .await
+        .unwrap();
+    let version = "PRAGMA user_version";
+    let older = sqlx::query_scalar::<_, i64>(version)
+        .fetch_one(&mut conn)
+        .await
+        .unwrap()
+        - 1;
+    sqlx::query(&format!("PRAGMA user_version = {older}"))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+    let free = silent_port().await;
+    for args in [
+        &["feeds", "rename", "gone", "kept", "--dry-run"][..],
+        &["feeds", "remove", "gone", "--dry-run"][..],
+    ] {
+        let dry = yanuget(&path, &["kept"], free, args).await;
+        assert!(dry.status.success(), "{args:?}: {}", text(&dry));
+        assert!(text(&dry).contains("1 version(s)"), "{}", text(&dry));
+    }
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(version)
+            .fetch_one(&mut conn)
+            .await
+            .unwrap(),
+        older,
+        "the dry runs left the schema as it was"
+    );
+}
+
+/// `SEC-38`: a rename into a feed that requires approval does not carry the
+/// approvals of an ungated feed across unasked.
+#[tokio::test]
+async fn a_rename_into_a_gated_feed_confirms_the_approvals_it_carries() {
+    let data = tempfile::tempdir().unwrap();
+    let path = data.path().to_path_buf();
+    let server = spawn_feeds(|c| {
+        c.data_dir = path.clone();
+        c.min_free_disk_bytes = 0;
+        c.feeds = vec![feed("staging")];
+    })
+    .await;
+    assert_eq!(
+        push(&server, "/staging", build_nupkg("Gate.Pkg", "1.0.0", b"g")).await,
+        reqwest::StatusCode::CREATED
+    );
+    server.stop().await;
+    let gated = "[[feeds]]\nname = 'prod'\nrequires_approval = true\n";
+    let free = silent_port().await;
+    let rename = |extra: &'static [&'static str]| {
+        let mut args = vec!["feeds", "rename", "staging", "prod"];
+        args.extend_from_slice(extra);
+        let path = path.clone();
+        async move { yanuget_with(&path, gated, free, &args).await }
+    };
+
+    let dry = rename(&["--dry-run"]).await;
+    assert!(dry.status.success(), "{}", text(&dry));
+    assert!(
+        text(&dry).contains("1 approved, 0 pending"),
+        "{}",
+        text(&dry)
+    );
+    assert!(text(&dry).contains("--keep-approval"), "{}", text(&dry));
+    let refused = rename(&[]).await;
+    assert!(!refused.status.success());
+    assert!(
+        text(&refused).contains("requires approval"),
+        "{}",
+        text(&refused)
+    );
+    let held = rename(&["--hold-for-approval"]).await;
+    assert!(held.status.success(), "{}", text(&held));
+
+    let after = spawn_feeds(|c| {
+        c.data_dir = path.clone();
+        let mut prod = feed("prod");
+        prod.requires_approval = true;
+        c.feeds = vec![prod];
+    })
+    .await;
+    assert!(
+        offered(&after, "/prod", "gate.pkg").await.is_empty(),
+        "pending until approved again"
+    );
 }

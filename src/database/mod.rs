@@ -778,9 +778,10 @@ pub trait PackageDatabase: Send + Sync {
     /// memberships, tombstones and unfinished uploads, in one transaction.
     /// Refused with [`Error::BadRequest`](crate::error::Error::BadRequest)
     /// when `to` already holds one of `from`'s versions, since the two
-    /// memberships' states cannot both be kept. Returns how many memberships
-    /// moved.
-    async fn rename_feed(&self, from: &str, to: &str) -> Result<u64>;
+    /// memberships' states cannot both be kept. With `hold`, every version
+    /// moved arrives pending, to be approved again. Returns how many
+    /// memberships moved.
+    async fn rename_feed(&self, from: &str, to: &str, hold: bool) -> Result<u64>;
 
     /// Every version `feed` holds, in any state, as (lower-cased id,
     /// version).
@@ -800,6 +801,10 @@ pub struct StoredFeed {
     /// Of those, the ones no other feed holds: removing the feed's
     /// memberships frees their payload.
     pub exclusive: i64,
+    /// Of those, the ones pending approval.
+    pub pending: i64,
+    /// Of those, the ones an admin disabled.
+    pub disabled: i64,
     /// Versions deleted from it.
     pub tombstones: i64,
 }

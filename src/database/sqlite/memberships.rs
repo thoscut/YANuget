@@ -329,6 +329,7 @@ pub(super) async fn insert_membership(conn: &mut SqliteConnection, m: &Membershi
 pub(super) async fn stored_feeds(db: &SqliteDatabase) -> Result<Vec<StoredFeed>> {
     let rows = sqlx::query(
         "SELECT name, SUM(versions) AS versions, SUM(exclusive) AS exclusive, \
+                SUM(pending) AS pending, SUM(disabled) AS disabled, \
                 SUM(tombstones) AS tombstones \
          FROM ( \
              SELECT fp.feed AS name, COUNT(*) AS versions, \
@@ -336,10 +337,11 @@ pub(super) async fn stored_feeds(db: &SqliteDatabase) -> Result<Vec<StoredFeed>>
                         WHERE o.lower_id = fp.lower_id \
                           AND o.normalized_version = fp.normalized_version \
                           AND o.feed <> fp.feed)) AS exclusive, \
+                    SUM(fp.pending <> 0) AS pending, SUM(fp.enabled = 0) AS disabled, \
                     0 AS tombstones \
              FROM feed_packages fp GROUP BY fp.feed \
              UNION ALL \
-             SELECT feed, 0, 0, COUNT(*) FROM tombstones GROUP BY feed \
+             SELECT feed, 0, 0, 0, 0, COUNT(*) FROM tombstones GROUP BY feed \
          ) GROUP BY name ORDER BY name",
     )
     .fetch_all(&db.pool)
@@ -350,6 +352,8 @@ pub(super) async fn stored_feeds(db: &SqliteDatabase) -> Result<Vec<StoredFeed>>
                 name: r.try_get("name")?,
                 versions: r.try_get("versions")?,
                 exclusive: r.try_get("exclusive")?,
+                pending: r.try_get("pending")?,
+                disabled: r.try_get("disabled")?,
                 tombstones: r.try_get("tombstones")?,
             })
         })
@@ -368,7 +372,12 @@ pub(super) async fn shared_versions(conn: &mut SqliteConnection, a: &str, b: &st
     .await?)
 }
 
-pub(super) async fn rename_feed(db: &SqliteDatabase, from: &str, to: &str) -> Result<u64> {
+pub(super) async fn rename_feed(
+    db: &SqliteDatabase,
+    from: &str,
+    to: &str,
+    hold: bool,
+) -> Result<u64> {
     let mut tx = db.write_tx().await?;
     // Checked inside the transaction, so nothing lands in between.
     let shared = shared_versions(&mut tx, from, to).await?;
@@ -377,12 +386,15 @@ pub(super) async fn rename_feed(db: &SqliteDatabase, from: &str, to: &str) -> Re
             "{shared} version(s) are in both {from:?} and {to:?}; remove them from one first"
         )));
     }
-    let moved = sqlx::query("UPDATE feed_packages SET feed = ?2 WHERE feed = ?1")
-        .bind(from)
-        .bind(to)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
+    let moved = sqlx::query(
+        "UPDATE feed_packages SET feed = ?2, pending = (pending OR ?3) WHERE feed = ?1",
+    )
+    .bind(from)
+    .bind(to)
+    .bind(hold)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
     // A version deleted from both keeps one tombstone. One deleted only from
     // the new name but held under the old is held now, which a membership
     // and a tombstone together never say.
@@ -638,10 +650,12 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(db.rename_feed("old", "new").await.unwrap(), 1);
+        assert_eq!(db.rename_feed("old", "new", false).await.unwrap(), 1);
         // The state comes along.
         let moved = db.get_membership("new", "moved.pkg", &a.version).await;
-        assert!(!moved.unwrap().unwrap().enabled);
+        let moved = moved.unwrap().unwrap();
+        assert!(!moved.enabled);
+        assert!(!moved.pending);
         assert!(!db.exists("old", "moved.pkg", &a.version).await.unwrap());
         assert!(db
             .is_tombstoned("new", "moved.pkg", &b.version)
@@ -672,9 +686,40 @@ mod tests {
         db.add_to_feed("new", &p).await.unwrap();
         assert_eq!(db.shared_versions("old", "new").await.unwrap(), 1);
         assert!(matches!(
-            db.rename_feed("old", "new").await,
+            db.rename_feed("old", "new", false).await,
             Err(Error::BadRequest(_))
         ));
         assert!(db.exists("old", "both.pkg", &p.version).await.unwrap());
+    }
+
+    /// `SEC-38`: held for approval, every version moved arrives pending, and
+    /// only those; what the target held before is left as it was.
+    #[tokio::test]
+    async fn a_rename_can_hold_what_it_moves_for_approval() {
+        let db = SqliteDatabase::in_memory().await.unwrap();
+        let (a, b, c) = (
+            sample("Held.Pkg", "1.0.0"),
+            sample("Held.Pkg", "2.0.0"),
+            sample("Kept.Pkg", "1.0.0"),
+        );
+        db.add_to_feed("old", &a).await.unwrap();
+        db.add_to_feed("old", &b).await.unwrap();
+        db.set_enabled("old", "held.pkg", &b.version, false)
+            .await
+            .unwrap();
+        db.add_to_feed("new", &c).await.unwrap();
+        let stored = db.stored_feeds().await.unwrap();
+        let old = stored.iter().find(|f| f.name == "old").unwrap();
+        assert_eq!((old.versions, old.pending, old.disabled), (2, 0, 1));
+
+        assert_eq!(db.rename_feed("old", "new", true).await.unwrap(), 2);
+        for v in [&a.version, &b.version] {
+            let m = db.get_membership("new", "held.pkg", v).await.unwrap();
+            assert!(m.unwrap().pending, "{v}");
+        }
+        let kept = db.get_membership("new", "kept.pkg", &c.version).await;
+        assert!(!kept.unwrap().unwrap().pending);
+        let stored = db.stored_feeds().await.unwrap();
+        assert_eq!(stored[0].pending, 2, "{stored:?}");
     }
 }

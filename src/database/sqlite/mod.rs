@@ -580,8 +580,8 @@ impl PackageDatabase for SqliteDatabase {
         memberships::shared_versions(&mut *self.pool.acquire().await?, a, b).await
     }
 
-    async fn rename_feed(&self, from: &str, to: &str) -> Result<u64> {
-        memberships::rename_feed(self, from, to).await
+    async fn rename_feed(&self, from: &str, to: &str, hold: bool) -> Result<u64> {
+        memberships::rename_feed(self, from, to, hold).await
     }
 
     async fn feed_members(&self, feed: &str) -> Result<Vec<(String, NuGetVersion)>> {
