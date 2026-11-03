@@ -53,7 +53,8 @@ pub struct IndexOptions {
     pub reserved_elsewhere: Vec<ReservedPrefix>,
     /// The license policies of the other feeds, by name. A `pending-only`
     /// overwrite replaces the build in every feed that holds the version, so
-    /// the new build is held to each of their policies too.
+    /// the new build is held to each of their policies too. Only read
+    /// under `pending-only`; a caller under another mode may leave it empty.
     pub other_license_policies: Vec<(String, LicensePolicyConfig)>,
     /// A version new to the feed arrives unlisted: a mirror copying one its
     /// upstream has unlisted. Not set by hand, so the mirror keeps following

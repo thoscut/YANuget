@@ -11,6 +11,7 @@ use super::helpers::{
     check_id, content_length, detached, map_upload_err, parse_version, to_io_err,
 };
 use super::{AppState, FeedCounters};
+use crate::config::OverwriteMode;
 use crate::error::{Error, Result};
 use crate::indexing::{self, IndexOptions};
 use crate::retention::{self, RetentionPolicy};
@@ -32,12 +33,18 @@ pub(super) async fn push_package(
         // A push is self-describing: the manifest defines the identity.
         expect: None,
         reserved_elsewhere: state.feed.reserved_elsewhere.clone(),
-        other_license_policies: state
-            .feeds
-            .iter()
-            .filter(|f| f.name != state.feed.name)
-            .map(|f| (f.name.clone(), f.license_policy.clone()))
-            .collect(),
+        // Read only when a pending-only push replaces a build every feed
+        // holding it gets (see `indexing`): not copied for any other push.
+        other_license_policies: if state.feed.allow_overwrite == OverwriteMode::PendingOnly {
+            state
+                .feeds
+                .iter()
+                .filter(|f| f.name != state.feed.name)
+                .map(|f| (f.name.clone(), f.license_policy.clone()))
+                .collect()
+        } else {
+            Vec::new()
+        },
         unlisted: false,
     };
     let state = state.clone();
