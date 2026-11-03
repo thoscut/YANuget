@@ -5,6 +5,7 @@ use super::format::{human_size, kv, kv_html};
 use super::layout::{layout, Nav, VERSION};
 use crate::config::Config;
 use crate::nuget::UrlBuilder;
+use std::fmt::Write as _;
 
 /// A read-only overview of the server's relevant settings.
 ///
@@ -116,10 +117,11 @@ pub fn settings_page(urls: &UrlBuilder, config: &Config, feed: &crate::web::Feed
     }
     retention.push_str("</div>");
     if feed.admin.is_enabled() {
-        retention.push_str(&format!(
+        let _ = write!(
+            retention,
             "<p><a href=\"{}\">See what the next cleanup would delete</a></p>",
             escape_html(&urls.app("/admin/retention"))
-        ));
+        );
     }
 
     let fc = &config.files;

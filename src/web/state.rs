@@ -2,7 +2,7 @@
 //! with, the cross-feed [`FeedMeta`] registry, and the cloneable [`AppState`]
 //! every handler receives.
 
-use std::path::PathBuf;
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -205,7 +205,7 @@ pub struct AppState {
     pub config: Arc<Config>,
     pub feed: Arc<FeedContext>,
     pub(super) feeds: Arc<Vec<FeedMeta>>,
-    pub(super) temp_dir: PathBuf,
+    pub(super) temp_dir: Arc<Path>,
     /// The admission of writes into `temp_dir`, shared by every feed, mirror
     /// and the inbox that write there.
     pub(super) space: Arc<SpaceGuard>,
@@ -263,7 +263,7 @@ impl AppState {
             config,
             feed,
             feeds,
-            temp_dir,
+            temp_dir: temp_dir.into(),
             space,
         })
     }

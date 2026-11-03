@@ -8,6 +8,7 @@ use super::package::{command_html, render_tags};
 use crate::database::SearchSort;
 use crate::database::TagCount;
 use crate::nuget::UrlBuilder;
+use std::fmt::Write as _;
 
 /// What the gallery was asked to show: the search, the page, the order, and the
 /// filters that every paging link and form has to carry.
@@ -52,16 +53,16 @@ impl GalleryView<'_> {
             self.take
         );
         if let Some(pre) = self.prerelease {
-            href.push_str(&format!("&amp;prerelease={pre}"));
+            let _ = write!(href, "&amp;prerelease={pre}");
         }
         if let Some(ty) = self.package_type {
-            href.push_str(&format!("&amp;packageType={}", enc_path(ty)));
+            let _ = write!(href, "&amp;packageType={}", enc_path(ty));
         }
         if let Some(tag) = self.tag {
-            href.push_str(&format!("&amp;tag={}", enc_path(tag)));
+            let _ = write!(href, "&amp;tag={}", enc_path(tag));
         }
         if sort != SearchSort::default() {
-            href.push_str(&format!("&amp;sort={}", sort.as_str()));
+            let _ = write!(href, "&amp;sort={}", sort.as_str());
         }
         href
     }
@@ -74,15 +75,17 @@ impl GalleryView<'_> {
             escape_html(self.query)
         );
         if let Some(pre) = self.prerelease {
-            out.push_str(&format!(
+            let _ = write!(
+                out,
                 "<input type=\"hidden\" name=\"prerelease\" value=\"{pre}\">"
-            ));
+            );
         }
         if let Some(ty) = self.package_type {
-            out.push_str(&format!(
+            let _ = write!(
+                out,
                 "<input type=\"hidden\" name=\"packageType\" value=\"{}\">",
                 escape_html(ty)
-            ));
+            );
         }
         out.push_str(&tag_field(self.tag));
         out.push_str(&sort_field(self.sort));
@@ -137,10 +140,11 @@ fn sort_links(urls: &UrlBuilder, view: &GalleryView) -> String {
         } else {
             ""
         };
-        links.push_str(&format!(
+        let _ = write!(
+            links,
             "<a href=\"{}\"{current}>{label}</a>",
             view.href_sorted(urls, 0, sort)
-        ));
+        );
     }
     format!(
         "<nav class=\"sort\" aria-label=\"Sort order\">Sort by <span class=\"seg\">{links}</span></nav>"
@@ -275,11 +279,12 @@ pub fn gallery_page(
             ),
             None => String::new(),
         };
-        rows.push_str(&format!(
+        let _ = write!(
+            rows,
             "<div class=\"bar\"><h1 class=\"title\">{heading}</h1>{sort}</div>{filter}{popular}\
              <ul class=\"manifest\">",
             popular = popular_tags(urls, view.popular),
-        ));
+        );
         for group in &page.groups {
             // The newest *stable* version, matching what a NuGet client
             // searching this feed is offered.
@@ -301,7 +306,8 @@ pub fn gallery_page(
             } else {
                 format!("<div>by {}</div>", escape_html(&p.authors.join(", ")))
             };
-            rows.push_str(&format!(
+            let _ = write!(
+                rows,
                 "<li class=\"pkg\"><h2><a href=\"{url}\">{id}</a> \
                  <span class=\"ver\">{ver}</span>{pre}</h2>{desc}\
                  <div class=\"figs\"><div>{nv} version{vs}, {dl} download{ds}</div>{authors}</div>\
@@ -312,7 +318,7 @@ pub fn gallery_page(
                 dl = group_digits(group.total_downloads() as i64),
                 ds = plural(group.total_downloads() as i64),
                 tags = render_tags(urls, &p.tags),
-            ));
+            );
         }
         rows.push_str("</ul>");
         rows.push_str(&gallery_pager(
@@ -465,14 +471,15 @@ fn first_run_panel(urls: &UrlBuilder) -> String {
     // Safari unless it says so.
     let mut snippets = String::new();
     for (label, cmd) in steps {
-        snippets.push_str(&format!(
+        let _ = write!(
+            snippets,
             "<li><h2>{label}</h2><div class=\"snip\">\
              <button type=\"button\" class=\"copy\" aria-label=\"Copy the command to {what}\" \
              hidden>Copy</button>\
              <pre><code>{cmd}</code></pre></div></li>",
             what = label.to_lowercase(),
             cmd = command_html(&cmd),
-        ));
+        );
     }
 
     format!(
@@ -565,7 +572,8 @@ pub(super) fn pager(paging: &Paging, shown: i64, total: i64) -> String {
             }
         };
         let from = if shown == 0 { 0 } else { skip + 1 };
-        out.push_str(&format!(
+        let _ = write!(
+            out,
             "{prev}<span class=\"muted\">{from}\u{2013}{to} of {total}</span>{next}",
             prev = link(
                 (skip - take).max(0),
@@ -578,13 +586,14 @@ pub(super) fn pager(paging: &Paging, shown: i64, total: i64) -> String {
                 "Next <span aria-hidden=\"true\">\u{2192}</span>"
             ),
             to = skip + shown,
-        ));
+        );
     }
     out.push_str("<div class=\"pager-go\">");
     if paged {
         let pages = (total + take - 1) / take;
         let current = skip / take + 1;
-        out.push_str(&format!(
+        let _ = write!(
+            out,
             "<form method=\"get\" action=\"{action}\">{hidden}\
              <input type=\"hidden\" name=\"take\" value=\"{take}\">\
              <label for=\"pg-page\">Page</label>\
@@ -592,7 +601,7 @@ pub(super) fn pager(paging: &Paging, shown: i64, total: i64) -> String {
              max=\"{pages}\" value=\"{current}\" required aria-describedby=\"pg-of\">\
              <span id=\"pg-of\" class=\"muted\">of {pages}</span>\
              <button type=\"submit\">Go<span class=\"vh\"> to page</span></button></form>"
-        ));
+        );
     }
     if sizable {
         let options: String = sizes
@@ -602,13 +611,14 @@ pub(super) fn pager(paging: &Paging, shown: i64, total: i64) -> String {
                 format!("<option value=\"{n}\"{sel}>{n}</option>")
             })
             .collect();
-        out.push_str(&format!(
+        let _ = write!(
+            out,
             "<form method=\"get\" action=\"{action}\">{hidden}\
              <input type=\"hidden\" name=\"skip\" value=\"{skip}\">\
              <label for=\"pg-take\">Per page</label>\
              <select id=\"pg-take\" name=\"take\">{options}</select>\
              <button type=\"submit\">Apply<span class=\"vh\"> page size</span></button></form>"
-        ));
+        );
     }
     out.push_str("</div></nav>");
     out
@@ -625,12 +635,13 @@ pub fn feeds_index_page(feeds: &[(String, String)], some_hidden: bool) -> String
     let urls = UrlBuilder::new("");
     let mut list = String::from("<ul class=\"rank\">");
     for (name, prefix) in feeds {
-        list.push_str(&format!(
+        let _ = write!(
+            list,
             "<li><a href=\"{prefix}\">{name}</a> \
              <span class=\"muted\"><a href=\"{prefix}/v3/index.json\">service index</a></span></li>",
             prefix = escape_html(prefix),
             name = escape_html(name),
-        ));
+        );
     }
     list.push_str("</ul>");
     let hidden = if some_hidden {
@@ -726,8 +737,8 @@ mod tests {
         };
         let mut group = crate::database::SearchGroup {
             packages: vec![versioned("1.9.0"), versioned("2.0.0-beta")],
-            total_downloads: 0,
-            version_count: 0,
+            id_downloads: 0,
+            admitted_versions: 0,
         };
         assert_eq!(group.latest().normalized_version(), "2.0.0-beta");
         assert_eq!(group.headline().normalized_version(), "1.9.0");
@@ -739,8 +750,8 @@ mod tests {
         let page = crate::database::SearchPage {
             groups: vec![crate::database::SearchGroup {
                 packages: vec![versioned("1.9.0"), versioned("2.0.0-beta")],
-                total_downloads: 0,
-                version_count: 0,
+                id_downloads: 0,
+                admitted_versions: 0,
             }],
             total_hits: 1,
         };

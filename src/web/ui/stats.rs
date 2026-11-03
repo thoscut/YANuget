@@ -5,6 +5,7 @@ use super::format::{group_digits, human_size, plural};
 use super::layout::{layout, Nav};
 use crate::models::Package;
 use crate::nuget::UrlBuilder;
+use std::fmt::Write as _;
 
 /// The statistics page: feed-wide totals, the most-downloaded packages, and the
 /// most recently published versions.
@@ -31,11 +32,12 @@ pub fn stats_page(
     // The same ruled cells as the package label: a caption over each value.
     let mut tiles = String::from("<div class=\"stats\">");
     for (n, l) in cards {
-        tiles.push_str(&format!(
+        let _ = write!(
+            tiles,
             "<div class=\"stat\"><div class=\"l\">{}</div><div class=\"n\">{}</div></div>",
             l,
             escape_html(&n),
-        ));
+        );
     }
     tiles.push_str("</div>");
 
@@ -46,7 +48,8 @@ pub fn stats_page(
         for g in &top.groups {
             // The version a client would be offered, as in the gallery.
             let p = g.headline();
-            out.push_str(&format!(
+            let _ = write!(
+                out,
                 "<li><span><a class=\"id\" href=\"{href}\">{id}</a> \
                  <span class=\"muted\">{ver}</span></span>\
                  <span class=\"muted\">{dl} download{ds}</span></li>",
@@ -55,7 +58,7 @@ pub fn stats_page(
                 ver = escape_html(&p.normalized_version()),
                 dl = group_digits(g.total_downloads() as i64),
                 ds = plural(g.total_downloads() as i64),
-            ));
+            );
         }
         out.push_str("</ul>");
         out
@@ -66,7 +69,8 @@ pub fn stats_page(
     } else {
         let mut out = String::from("<ul class=\"rank\">");
         for p in recent {
-            out.push_str(&format!(
+            let _ = write!(
+                out,
                 "<li><span><a class=\"id\" href=\"{href}\">{id}</a> \
                  <span class=\"muted\">{dv}</span></span>\
                  <span class=\"muted\">{when}</span></li>",
@@ -78,7 +82,7 @@ pub fn stats_page(
                 id = escape_html(&p.id),
                 dv = escape_html(&p.normalized_version()),
                 when = escape_html(&p.published.format("%Y-%m-%d").to_string()),
-            ));
+            );
         }
         out.push_str("</ul>");
         out

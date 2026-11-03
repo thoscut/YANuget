@@ -648,6 +648,14 @@ impl MirrorClient {
         self.health.status()
     }
 
+    /// Versions mirrored into the feed since startup: the one counter of
+    /// [`Self::upstream_status`], without its lock and copy.
+    pub fn mirrored(&self) -> u64 {
+        self.health
+            .mirrored
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Ask the upstream for its service index, outside any client request.
     ///
     /// Read-through traffic alone only notices an outage when someone asks

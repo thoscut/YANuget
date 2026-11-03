@@ -7,6 +7,7 @@ use super::gallery::{pager, Paging};
 use super::layout::{layout, Nav};
 use crate::database::{AdminFilter, AdminOverview, PackageFile};
 use crate::nuget::UrlBuilder;
+use std::fmt::Write as _;
 
 /// The form field (and header) carrying the admin CSRF token.
 pub const CSRF_FIELD: &str = "_csrf";
@@ -85,11 +86,12 @@ pub fn admin_dashboard_page(
         } else {
             ""
         };
-        links.push_str(&format!(
+        let _ = write!(
+            links,
             "<a href=\"{}\"{current}>{label} ({})</a>",
             view.href(urls, filter, 0),
             group_digits(overview.matching(filter)),
-        ));
+        );
     }
     let filters = format!(
         "<nav class=\"sort\" aria-label=\"Filter\">Show <span class=\"seg\">{links}</span></nav>"
@@ -126,18 +128,21 @@ pub fn admin_dashboard_page(
         for p in &overview.packages {
             let mut badges = String::new();
             if p.pending > 0 {
-                badges.push_str(&format!(
+                let _ = write!(
+                    badges,
                     " <span class=\"badge pre\">{} pending</span>",
                     group_digits(p.pending)
-                ));
+                );
             }
             if p.flagged > 0 {
-                badges.push_str(&format!(
+                let _ = write!(
+                    badges,
                     " <span class=\"badge\" title=\"policy\">{} flagged</span>",
                     group_digits(p.flagged)
-                ));
+                );
             }
-            list.push_str(&format!(
+            let _ = write!(
+                list,
                 "<li><span><a class=\"id\" href=\"{href}\">{id}</a>{badges}</span>\
                  <span class=\"muted\">{n} version{s}</span></li>",
                 href = escape_html(&urls.app(&format!(
@@ -147,7 +152,7 @@ pub fn admin_dashboard_page(
                 id = escape_html(&p.id),
                 n = group_digits(p.versions),
                 s = plural(p.versions),
-            ));
+            );
         }
         list.push_str("</ul>");
         list
@@ -368,20 +373,22 @@ impl TransferNotice {
                     plural(total as i64)
                 );
                 if self.present > 0 {
-                    text.push_str(&format!(
+                    let _ = write!(
+                        text,
                         " {} {} already there and kept {} state there.",
                         self.present,
                         if self.present == 1 { "was" } else { "were" },
                         if self.present == 1 { "its" } else { "their" },
-                    ));
+                    );
                 }
                 if self.pending > 0 {
-                    text.push_str(&format!(
+                    let _ = write!(
+                        text,
                         " {} {} pending there; clients cannot see {} until you {approve}.",
                         self.pending,
                         if self.pending == 1 { "is" } else { "are" },
                         if self.pending == 1 { "it" } else { "them" },
-                    ));
+                    );
                 }
                 (text, false)
             }
@@ -459,10 +466,11 @@ pub fn admin_package_page(
         // Only what clients could fetch too: a disabled or pending version is
         // withheld by the download endpoint, and a link to a 404 helps nobody.
         if p.enabled && !fv.pending {
-            actions.push_str(&format!(
+            let _ = write!(
+                actions,
                 "<a class=\"btn\" href=\"{}\" aria-label=\"Download {dv}\">Download</a>",
                 escape_html(&urls.package_download(&lower, &v)),
-            ));
+            );
         }
         let report = extras.reports.iter().find(|r| r.version == v);
         let problems = report.map(|r| r.problems(extras.files)).unwrap_or_default();
@@ -476,26 +484,29 @@ pub fn admin_package_page(
             // And its files, which the package hash does not cover.
             if extras.files_enabled {
                 let shown = extras.files.iter().filter(|f| f.normalized_version == v);
-                build.push_str(&format!(
+                let _ = write!(
+                    build,
                     "<input type=\"hidden\" name=\"files\" value=\"{}\">",
                     escape_html(&format!(
                         "{v}:{}",
                         crate::database::files_fingerprint(shown)
                     ))
-                ));
+                );
             }
             // The same fields for the selection form; no value holds a quote.
             actions.push_str(&build.replace("\">", "\" form=\"bulk\">"));
             if problems.is_empty() {
-                actions.push_str(&format!(
+                let _ = write!(
+                    actions,
                     "<form method=\"post\" action=\"{}\">{csrf}{build}\
                      <button type=\"submit\">Approve</button></form>",
                     action(&v, "approve")
-                ));
+                );
             } else {
                 // Not refused: the reviewer may know better (a file attached
                 // under another name, a report from an older run). Asked.
-                actions.push_str(&format!(
+                let _ = write!(
+                    actions,
                     "<form method=\"post\" action=\"{a}\" data-confirm=\"{confirm}\">{csrf}{build}\
                      <button type=\"submit\">Approve</button></form>",
                     a = action(&v, "approve"),
@@ -504,21 +515,27 @@ pub fn admin_package_page(
                          Approve it anyway?",
                         problems.join("; ")
                     )),
-                ));
+                );
             }
         }
         if let Some(target) = extras.promote_target {
             // Promoting what the target already holds changes nothing there,
             // so the row says where it is instead of offering the button.
             match extras.in_target.iter().find(|(tv, _)| *tv == v) {
-                Some((_, true)) => status.push_str(&format!(
-                    " <span class=\"badge pre\">pending in {}</span>",
-                    escape_html(target)
-                )),
-                Some((_, false)) => status.push_str(&format!(
-                    " <span class=\"badge ok\">in {}</span>",
-                    escape_html(target)
-                )),
+                Some((_, true)) => {
+                    let _ = write!(
+                        status,
+                        " <span class=\"badge pre\">pending in {}</span>",
+                        escape_html(target)
+                    );
+                }
+                Some((_, false)) => {
+                    let _ = write!(
+                        status,
+                        " <span class=\"badge ok\">in {}</span>",
+                        escape_html(target)
+                    );
+                }
                 None => actions.push_str(&button(
                     &v,
                     "promote",
@@ -549,12 +566,13 @@ pub fn admin_package_page(
                 "Remove {id} {v} from this feed? If no other feed uses it, the files are deleted."
             )
         };
-        actions.push_str(&format!(
+        let _ = write!(
+            actions,
             "<form method=\"post\" action=\"{a}\" data-confirm=\"{confirm}\">{csrf}\
              <button type=\"submit\" class=\"danger\">Delete</button></form>",
             a = action(&v, "delete"),
             confirm = escape_html(&confirm),
-        ));
+        );
 
         let mut notes = match (fv.flagged, fv.flag_reason.as_deref()) {
             (true, Some(r)) => format!("<div class=\"meta\">{}</div>", escape_html(r)),
@@ -566,24 +584,27 @@ pub fn admin_package_page(
             } else {
                 format!("Do not approve yet: {}.", problems.join("; "))
             };
-            notes.push_str(&format!(
+            let _ = write!(
+                notes,
                 "<div class=\"meta{cls}\"><a href=\"#report-{anchor}\">{what}</a></div>",
                 cls = if problems.is_empty() { "" } else { " doomed" },
                 anchor = escape_html(&r.version),
                 what = escape_html(&what),
-            ));
+            );
         }
         if let Some(planned) = extras
             .retention_plan
             .iter()
             .find(|planned| planned.version == p.version)
         {
-            notes.push_str(&format!(
+            let _ = write!(
+                notes,
                 "<div class=\"meta doomed\">The next cleanup deletes this: {}.</div>",
                 escape_html(&planned.reason.describe())
-            ));
+            );
         }
-        rows.push_str(&format!(
+        let _ = write!(
+            rows,
             "<tr><td class=\"pick\"><input type=\"checkbox\" name=\"v\" value=\"{dv}\" \
              form=\"bulk\" aria-label=\"Select {dv}\"></td>\
              <td>{pre}<span class=\"nw\">{dv}</span>{notes}</td><td>{status}</td>\
@@ -595,7 +616,7 @@ pub fn admin_package_page(
                 ""
             },
             dl = group_digits(p.downloads as i64),
-        ));
+        );
     }
 
     // The selection form. "Enable" comes first on purpose: pressing Enter in a
@@ -701,9 +722,10 @@ fn admin_reports(id: &str, extras: &AdminPackageExtras) -> String {
                 )
             }
         };
-        out.push_str(&format!(
+        let _ = write!(
+            out,
             "<div class=\"card\" id=\"report-{v}\"><h2>Internalizer report: {v}</h2>{warn}{body}</div>"
-        ));
+        );
     }
     out
 }
@@ -795,7 +817,8 @@ fn report_body(
                 ),
                 (ChecksumStatus::Unknown, _) => "<span class=\"badge\">unknown</span>".into(),
             };
-            rows.push_str(&format!(
+            let _ = write!(
+                rows,
                 "<tr><td><code>{url}</code>{helper}</td><td>{file}</td><td class=\"muted\">{size}</td>\
                  <td>{checksum}</td></tr>",
                 url = escape_html(&d.url),
@@ -805,13 +828,14 @@ fn report_body(
                     .map(|h| format!("<div class=\"meta\">{}</div>", escape_html(h)))
                     .unwrap_or_default(),
                 size = d.size.map(human_size).unwrap_or_default(),
-            ));
+            );
         }
-        out.push_str(&format!(
+        let _ = write!(
+            out,
             "<h3>Downloads</h3><div class=\"scroll\"><table class=\"atbl\"><thead><tr>\
              <th>Original URL</th><th>File</th><th>Size</th><th>Checksum</th></tr></thead>\
              <tbody>{rows}</tbody></table></div>"
-        ));
+        );
     }
     if !report.warnings.is_empty() {
         let items: String = report
@@ -819,7 +843,7 @@ fn report_body(
             .iter()
             .map(|w| format!("<li>{}</li>", escape_html(w)))
             .collect();
-        out.push_str(&format!("<h3>Warnings</h3><ul>{items}</ul>"));
+        let _ = write!(out, "<h3>Warnings</h3><ul>{items}</ul>");
     }
     // A person's overrides change what the package installs, so the reviewer
     // sees them next to the warnings.
@@ -829,14 +853,15 @@ fn report_body(
             .iter()
             .map(|o| format!("<li>{}</li>", escape_html(o)))
             .collect();
-        out.push_str(&format!("<h3>Overrides</h3><ul>{items}</ul>"));
+        let _ = write!(out, "<h3>Overrides</h3><ul>{items}</ul>");
     }
     if let (Some(entry), Some(Ok(text))) = (report.prelude.as_deref(), prelude) {
-        out.push_str(&format!(
+        let _ = write!(
+            out,
             "<details><summary>Prelude <code>{}</code></summary><pre>{}</pre></details>",
             escape_html(entry),
             escape_html(text)
-        ));
+        );
     }
     out
 }
@@ -866,7 +891,8 @@ fn admin_files(urls: &UrlBuilder, id: &str, extras: &AdminPackageExtras, csrf: &
             enc_path(&f.normalized_version),
             enc_path(&f.name)
         )));
-        rows.push_str(&format!(
+        let _ = write!(
+            rows,
             "<tr><td><span class=\"nw\">{v}</span></td><td>{name}</td><td class=\"muted\">{size}</td>\
              <td><code title=\"{sha}\">{short}\u{2026}</code></td><td class=\"muted\">{dl}</td>\
              <td><div class=\"actions\"><a class=\"btn\" href=\"{href}\" aria-label=\"Download {name}\">Download</a>\
@@ -883,7 +909,7 @@ fn admin_files(urls: &UrlBuilder, id: &str, extras: &AdminPackageExtras, csrf: &
                 "Delete {} from {id} {}? Install scripts that fetch it will fail.",
                 f.name, f.normalized_version
             )),
-        ));
+        );
     }
     format!(
         "<div class=\"card\"><h2>Files</h2><div class=\"scroll\"><table class=\"atbl files\">\
@@ -1021,7 +1047,8 @@ pub fn admin_retention_page(urls: &UrlBuilder, view: &RetentionView) -> String {
                  <th>Version</th><th>Added</th><th>Why</th><th>Frees</th></tr></thead><tbody>",
             );
             for p in plan.planned.iter().take(MAX_PREVIEW_ROWS) {
-                table.push_str(&format!(
+                let _ = write!(
+                    table,
                     "<tr><td><a class=\"id\" href=\"{href}\">{id}</a></td>\
                      <td><span class=\"nw\">{v}</span></td><td class=\"muted\">{when}</td>\
                      <td>{why}</td><td class=\"muted\">{frees}</td></tr>",
@@ -1038,7 +1065,7 @@ pub fn admin_retention_page(urls: &UrlBuilder, view: &RetentionView) -> String {
                     } else {
                         "Kept by another feed".to_string()
                     },
-                ));
+                );
             }
             table.push_str("</tbody></table></div>");
             let more = plan.planned.len().saturating_sub(MAX_PREVIEW_ROWS);
@@ -1087,7 +1114,8 @@ pub fn admin_retention_page(urls: &UrlBuilder, view: &RetentionView) -> String {
         Some(plan) if !plan.pinned.is_empty() => {
             let mut list = String::from("<ul class=\"rank\">");
             for (id, v) in &plan.pinned {
-                list.push_str(&format!(
+                let _ = write!(
+                    list,
                     "<li><span><a class=\"id\" href=\"{href}\">{eid}</a> \
                      <span class=\"muted\">{v}</span></span></li>",
                     href = escape_html(
@@ -1095,7 +1123,7 @@ pub fn admin_retention_page(urls: &UrlBuilder, view: &RetentionView) -> String {
                     ),
                     eid = escape_html(id),
                     v = escape_html(&v.normalized()),
-                ));
+                );
             }
             list.push_str("</ul>");
             format!("<div class=\"card\"><h2>Pinned, kept regardless</h2>{list}</div>")

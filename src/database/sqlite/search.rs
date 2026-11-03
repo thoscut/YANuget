@@ -330,9 +330,9 @@ pub(super) async fn load_groups(
         if let Some(mut packages) = by_id.remove(id) {
             packages.sort_by(|a, b| a.version.cmp(&b.version));
             groups.push(SearchGroup {
-                version_count: packages.len() as u64,
+                admitted_versions: packages.len() as u64,
                 packages,
-                total_downloads: totals.get(id).copied().unwrap_or(0),
+                id_downloads: totals.get(id).copied().unwrap_or(0),
             });
         }
     }
@@ -448,8 +448,8 @@ pub(super) async fn load_headlines(
         if let (Some(package), Some((_, _, count))) = (by_id.remove(id), heads.get(id)) {
             groups.push(SearchGroup {
                 packages: vec![package],
-                version_count: *count,
-                total_downloads: totals.get(id).copied().unwrap_or(0),
+                admitted_versions: *count,
+                id_downloads: totals.get(id).copied().unwrap_or(0),
             });
         }
     }

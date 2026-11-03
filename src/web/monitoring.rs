@@ -134,11 +134,7 @@ impl Monitor {
                 let counters = &state.feed.counters;
                 counters.pushes.load(Ordering::Relaxed)
                     + counters.promotions.load(Ordering::Relaxed)
-                    + state
-                        .feed
-                        .mirror
-                        .as_ref()
-                        .map_or(0, |m| m.upstream_status().mirrored)
+                    + state.feed.mirror.as_ref().map_or(0, |m| m.mirrored())
             })
             .sum()
     }

@@ -191,12 +191,13 @@ impl SearchSort {
 pub struct SearchGroup {
     pub packages: Vec<Package>,
     /// How many versions the search admitted. `packages.len()` unless only
-    /// the headline was loaded.
-    pub version_count: u64,
+    /// the headline was loaded. Read through [`Self::version_count`].
+    pub(crate) admitted_versions: u64,
     /// Downloads of every version of the id this feed serves, whether or not
     /// the search's filters (pre-release, SemVer2, listed) admitted it: the
-    /// package's total, as `totalDownloads` means on nuget.org.
-    pub total_downloads: u64,
+    /// package's total, as `totalDownloads` means on nuget.org. Read through
+    /// [`Self::total_downloads`].
+    pub(crate) id_downloads: u64,
 }
 
 /// Whether `candidate` headlines a package rather than `current`: a stable
@@ -239,19 +240,19 @@ impl SearchGroup {
             .expect("a search group always has at least one package")
     }
 
-    /// How many versions the search admitted (the `version_count` field);
+    /// How many versions the search admitted (`admitted_versions`);
     /// never less than the versions loaded, so a group built without it still
     /// counts.
     pub fn version_count(&self) -> u64 {
-        self.version_count.max(self.packages.len() as u64)
+        self.admitted_versions.max(self.packages.len() as u64)
     }
 
     /// Total downloads of the package, across all its versions in the feed
-    /// (the `total_downloads` field); never less than what the matching
+    /// (`id_downloads`); never less than what the matching
     /// versions alone add up to, so a group built without it still counts.
     pub fn total_downloads(&self) -> u64 {
         let shown: u64 = self.packages.iter().map(|p| p.downloads).sum();
-        self.total_downloads.max(shown)
+        self.id_downloads.max(shown)
     }
 }
 

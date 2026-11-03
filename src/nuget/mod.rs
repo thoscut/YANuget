@@ -825,8 +825,8 @@ mod tests {
     fn search_response_groups_versions() {
         let group = SearchGroup {
             packages: vec![pkg("Contoso.Utils", "1.0.0"), pkg("Contoso.Utils", "1.1.0")],
-            total_downloads: 0,
-            version_count: 0,
+            id_downloads: 0,
+            admitted_versions: 0,
         };
         let page = SearchPage {
             total_hits: 1,
@@ -851,8 +851,8 @@ mod tests {
             total_hits: 1,
             groups: vec![SearchGroup {
                 packages: vec![pkg("Contoso.Utils", "1.0.0")],
-                total_downloads: 1_000,
-                version_count: 0,
+                id_downloads: 1_000,
+                admitted_versions: 0,
             }],
         };
         let resp = search_response(&urls(), &page);
@@ -878,8 +878,8 @@ mod tests {
             total_hits: 1,
             groups: vec![SearchGroup {
                 packages: vec![p],
-                total_downloads: 0,
-                version_count: 0,
+                id_downloads: 0,
+                admitted_versions: 0,
             }],
         };
         let item = &search_response(&urls(), &page)["data"][0];
@@ -957,8 +957,8 @@ mod tests {
             total_hits: 1,
             groups: vec![SearchGroup {
                 packages: vec![p],
-                total_downloads: 0,
-                version_count: 0,
+                id_downloads: 0,
+                admitted_versions: 0,
             }],
         };
         assert_eq!(
@@ -1075,13 +1075,13 @@ mod tests {
             total_hits: 2,
             groups: vec![
                 SearchGroup {
-                    version_count: 3,
-                    total_downloads: 9,
+                    admitted_versions: 3,
+                    id_downloads: 9,
                     packages: all[..3].to_vec(),
                 },
                 SearchGroup {
-                    version_count: 1,
-                    total_downloads: 0,
+                    admitted_versions: 1,
+                    id_downloads: 0,
                     packages: all[3..4].to_vec(),
                 },
             ],
