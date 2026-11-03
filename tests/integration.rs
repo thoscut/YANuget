@@ -6126,6 +6126,7 @@ fn build_nupkg_with_entries(id: &str, version: &str, entries: &[(&str, &[u8])]) 
 
 /// `INT-30`: a pending version's internalizer report is on its admin page,
 /// escaped, and a file it lists but the version lacks holds up the approval.
+/// Characters that hide or reorder text are written out (`SEC-40`).
 #[tokio::test]
 async fn the_admin_page_shows_a_pending_versions_report() {
     let server = spawn_intake().await;
@@ -6142,7 +6143,7 @@ async fn the_admin_page_shows_a_pending_versions_report() {
               {{"url": "https://vendor.example/extra.msi", "file": "extra.msi",
                 "checksum": {{"status": "trust-on-first-use"}}}}
             ],
-            "warnings": ["<script>alert(1)</script>"],
+            "warnings": ["<script>alert(1)</script>", "evil\u202eexe.txt", "zero\u200bwidth"],
             "overrides": ["download <b>setup.exe</b> replaced"],
             "prelude": "tools/prelude.ps1",
             "a_later_field": true}}"#,
@@ -6196,6 +6197,9 @@ async fn the_admin_page_shows_a_pending_versions_report() {
     assert!(html.contains("setup.exe?a=1&amp;b=&lt;2&gt;"));
     assert!(html.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
     assert!(!html.contains("<script>alert(1)"));
+    assert!(html.contains("<li>evil[U+202E]exe.txt</li>"), "{html}");
+    assert!(html.contains("<li>zero[U+200B]width</li>"));
+    assert!(!html.contains(['\u{202E}', '\u{200B}']));
     assert!(html
         .contains("<h3>Overrides</h3><ul><li>download &lt;b&gt;setup.exe&lt;/b&gt; replaced</li>"));
     assert!(html.contains("tools/prelude.ps1"));

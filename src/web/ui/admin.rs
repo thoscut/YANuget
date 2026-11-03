@@ -664,7 +664,9 @@ pub fn admin_package_page(
 /// The internalizer reports of the pending versions: where the package came
 /// from, each original URL with the file that replaces it, whether a checksum
 /// vouched for it, the warnings and the prelude. Every value is the report's,
-/// which is the package's, so all of it is escaped and no URL is a link.
+/// which is the package's, so all of it is escaped, no URL is a link, and the
+/// characters that hide or reorder text are written out
+/// ([`crate::report::Report::revealed`]).
 fn admin_reports(id: &str, extras: &AdminPackageExtras) -> String {
     let mut out = String::new();
     for vr in extras.reports {
@@ -675,7 +677,7 @@ fn admin_reports(id: &str, extras: &AdminPackageExtras) -> String {
         } else {
             let items: String = problems
                 .iter()
-                .map(|p| format!("<li>{}</li>", escape_html(p)))
+                .map(|p| format!("<li>{}</li>", escape_html(&yanuget_pkg::text::reveal(p))))
                 .collect();
             format!(
                 "<div class=\"notice warn\" role=\"status\">This version does not match its \
@@ -686,7 +688,17 @@ fn admin_reports(id: &str, extras: &AdminPackageExtras) -> String {
         let body = match &vr.view {
             ReportView::Unreadable(_) => String::new(),
             ReportView::Read { report, prelude } => {
-                report_body(id, &vr.version, report, prelude.as_ref(), extras.files)
+                let prelude = prelude.as_ref().map(|p| {
+                    p.clone()
+                        .map(|t| yanuget_pkg::text::reveal(&t).into_owned())
+                });
+                report_body(
+                    id,
+                    &vr.version,
+                    &report.revealed(),
+                    prelude.as_ref(),
+                    extras.files,
+                )
             }
         };
         out.push_str(&format!(
