@@ -7,7 +7,7 @@ use crate::database::{
     canonical_id, AdminFilter, AdminOverview, AdminPackageSummary, DatabaseStats, FeedVersion,
     VersionFootprint,
 };
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::models::Package;
 use crate::version::NuGetVersion;
 
@@ -140,7 +140,10 @@ pub(super) async fn all_package_ids(db: &SqliteDatabase, feed: &str) -> Result<V
     .bind(feed)
     .fetch_all(&db.pool)
     .await?;
-    Ok(rows.iter().map(|r| r.get::<String, _>("id")).collect())
+    Ok(rows
+        .iter()
+        .map(|r| r.try_get::<String, _>("id"))
+        .collect::<std::result::Result<_, _>>()?)
 }
 
 pub(super) async fn admin_overview(
@@ -151,58 +154,61 @@ pub(super) async fn admin_overview(
     take: i64,
 ) -> Result<AdminOverview> {
     // Every membership counts, as in `all_package_ids`: the dashboard is
-    // where an operator finds what clients cannot see yet.
-    macro_rules! per_id {
-        () => {
-            "SELECT MAX(p.id) AS id, p.lower_id AS lower_id, COUNT(*) AS versions, \
+    // where an operator finds what clients cannot see yet. One pass over the
+    // feed's versions, grouped once, gives both the page and the counters:
+    // the totals row comes back even when the page is empty, its page
+    // columns NULL then.
+    let rows = sqlx::query(
+        "WITH per_id AS MATERIALIZED ( \
+             SELECT MAX(p.id) AS id, fp.lower_id AS lower_id, COUNT(*) AS versions, \
                     COALESCE(SUM(fp.pending), 0) AS pending, \
                     COALESCE(SUM(fp.flagged), 0) AS flagged \
-             FROM packages p JOIN feed_packages fp \
-               ON fp.lower_id = p.lower_id AND fp.normalized_version = p.normalized_version \
+             FROM feed_packages fp JOIN packages p \
+               ON p.lower_id = fp.lower_id AND p.normalized_version = fp.normalized_version \
              WHERE fp.feed = ?1 \
-             GROUP BY p.lower_id"
-        };
-    }
-    let rows = sqlx::query(concat!(
-        "SELECT id, versions, pending, flagged FROM (",
-        per_id!(),
-        ") WHERE ?2 = 'all' OR (?2 = 'pending' AND pending > 0) \
-              OR (?2 = 'flagged' AND flagged > 0) \
-         ORDER BY pending > 0 DESC, flagged > 0 DESC, lower_id ASC LIMIT ?3 OFFSET ?4"
-    ))
+             GROUP BY fp.lower_id \
+         ), totals AS ( \
+             SELECT COUNT(*) AS total, \
+                    COALESCE(SUM(pending > 0), 0) AS total_pending, \
+                    COALESCE(SUM(flagged > 0), 0) AS total_flagged \
+             FROM per_id \
+         ), page AS ( \
+             SELECT id, lower_id, versions, pending, flagged FROM per_id \
+             WHERE ?2 = 'all' OR (?2 = 'pending' AND pending > 0) \
+                OR (?2 = 'flagged' AND flagged > 0) \
+             ORDER BY pending > 0 DESC, flagged > 0 DESC, lower_id ASC LIMIT ?3 OFFSET ?4 \
+         ) \
+         SELECT totals.total, totals.total_pending, totals.total_flagged, \
+                page.id, page.versions, page.pending, page.flagged \
+         FROM totals LEFT JOIN page ON 1 \
+         ORDER BY page.pending > 0 DESC, page.flagged > 0 DESC, page.lower_id ASC",
+    )
     .bind(feed)
     .bind(filter.as_str())
     .bind(take.max(0))
     .bind(skip.max(0))
     .fetch_all(&db.pool)
     .await?;
-    let packages = rows
-        .iter()
-        .map(|r| -> Result<AdminPackageSummary> {
-            Ok(AdminPackageSummary {
-                id: r.try_get("id")?,
-                versions: r.try_get("versions")?,
-                pending: r.try_get("pending")?,
-                flagged: r.try_get("flagged")?,
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
-
-    let counts = sqlx::query(concat!(
-        "SELECT COUNT(*) AS total, \
-                COALESCE(SUM(pending > 0), 0) AS pending, \
-                COALESCE(SUM(flagged > 0), 0) AS flagged FROM (",
-        per_id!(),
-        ")"
-    ))
-    .bind(feed)
-    .fetch_one(&db.pool)
-    .await?;
+    let first = rows
+        .first()
+        .ok_or(Error::Database(sqlx::Error::RowNotFound))?;
+    let mut packages = Vec::with_capacity(rows.len());
+    for r in &rows {
+        let Some(id) = r.try_get::<Option<String>, _>("id")? else {
+            continue;
+        };
+        packages.push(AdminPackageSummary {
+            id,
+            versions: r.try_get("versions")?,
+            pending: r.try_get("pending")?,
+            flagged: r.try_get("flagged")?,
+        });
+    }
     Ok(AdminOverview {
         packages,
-        total: counts.try_get("total")?,
-        pending: counts.try_get("pending")?,
-        flagged: counts.try_get("flagged")?,
+        total: first.try_get("total")?,
+        pending: first.try_get("total_pending")?,
+        flagged: first.try_get("total_flagged")?,
     })
 }
 
@@ -456,6 +462,22 @@ mod tests {
             .unwrap();
         assert_eq!(ids(&page), ["Zed", "Beta"]);
         assert_eq!(page.total, 4);
+        // A filter and a page together: the second pending package, and the
+        // filter's own count for the pager.
+        let pending_page = db
+            .admin_overview(FEED, AdminFilter::Pending, 1, 1)
+            .await
+            .unwrap();
+        assert_eq!(ids(&pending_page), ["Zed"]);
+        assert_eq!(pending_page.matching(AdminFilter::Pending), 2);
+        assert_eq!(pending_page.total, 4);
+        // Past the end: no rows, the counts all the same.
+        let past = db
+            .admin_overview(FEED, AdminFilter::Flagged, 5, 10)
+            .await
+            .unwrap();
+        assert!(past.packages.is_empty());
+        assert_eq!((past.total, past.pending, past.flagged), (4, 2, 2));
 
         let empty = db
             .admin_overview("nothing", AdminFilter::All, 0, 10)

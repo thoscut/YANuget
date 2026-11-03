@@ -199,6 +199,18 @@ pub struct SearchGroup {
     pub total_downloads: u64,
 }
 
+/// Whether `candidate` headlines a package rather than `current`: a stable
+/// version beats any pre-release, and otherwise the higher one wins. The one
+/// rule behind [`SearchGroup::headline`] and the gallery's headline query, so
+/// the gallery and `/v3/search` never show different versions.
+pub fn headline_beats(candidate: &NuGetVersion, current: &NuGetVersion) -> bool {
+    match (candidate.is_prerelease(), current.is_prerelease()) {
+        (false, true) => true,
+        (true, false) => false,
+        _ => candidate > current,
+    }
+}
+
 impl SearchGroup {
     /// The version chosen to represent the group (the highest one).
     pub fn latest(&self) -> &Package {
@@ -217,9 +229,14 @@ impl SearchGroup {
     pub fn headline(&self) -> &Package {
         self.packages
             .iter()
-            .rev()
-            .find(|p| !p.is_prerelease())
-            .unwrap_or_else(|| self.latest())
+            .reduce(|head, p| {
+                if headline_beats(&p.version, &head.version) {
+                    p
+                } else {
+                    head
+                }
+            })
+            .expect("a search group always has at least one package")
     }
 
     /// How many versions the search admitted (the `version_count` field);
@@ -866,4 +883,55 @@ pub fn approved_refusal(p: &Package, feeds: &[String]) -> String {
         p.normalized_version(),
         feeds.join(", ")
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn file(name: &str, sha256: &str) -> PackageFile {
+        PackageFile {
+            lower_id: "a".into(),
+            normalized_version: "1.0.0".into(),
+            name: name.into(),
+            sha256: sha256.into(),
+            size: 1,
+            uploaded: chrono::Utc::now(),
+            downloads: 0,
+        }
+    }
+
+    #[test]
+    fn the_files_fingerprint_is_of_names_and_contents_in_any_order() {
+        let (a, b) = (file("setup.exe", "aa"), file("base.wim", "bb"));
+        let both = files_fingerprint([&a, &b]);
+        assert_eq!(both, files_fingerprint([&b, &a]), "order does not count");
+        // A name is unique ignoring case, and digested so.
+        assert_eq!(
+            files_fingerprint([&file("Setup.EXE", "aa"), &b]),
+            both,
+            "case does not count"
+        );
+        // The same name with other bytes is another set of files.
+        assert_ne!(files_fingerprint([&file("setup.exe", "cc"), &b]), both);
+        // So is one file fewer, and no files is a digest of its own.
+        assert_ne!(files_fingerprint([&b]), both);
+        let none: [&PackageFile; 0] = [];
+        assert_ne!(files_fingerprint(none), files_fingerprint([&b]));
+        // The separators keep a name from running into a hash.
+        assert_ne!(
+            files_fingerprint([&file("ab", "c")]),
+            files_fingerprint([&file("a", "bc")])
+        );
+    }
+
+    #[test]
+    fn a_stable_version_headlines_over_any_pre_release() {
+        let v = |s: &str| NuGetVersion::parse(s).unwrap();
+        assert!(headline_beats(&v("1.0.0"), &v("2.0.0-beta")));
+        assert!(!headline_beats(&v("2.0.0-beta"), &v("1.0.0")));
+        assert!(headline_beats(&v("1.10.0"), &v("1.9.0")));
+        assert!(headline_beats(&v("0.2.0-alpha"), &v("0.1.0-beta")));
+        assert!(!headline_beats(&v("1.0.0"), &v("1.0.0")));
+    }
 }

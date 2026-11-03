@@ -550,24 +550,27 @@ pub async fn verify(
     .fetch_all(&mut conn)
     .await?
     {
-        let id = row.get::<String, _>(0).to_ascii_lowercase();
-        let version = row.get::<String, _>(1).to_ascii_lowercase();
-        let size: i64 = row.get(2);
-        let algorithm: String = row.get(4);
+        let id = row.try_get::<String, _>(0)?.to_ascii_lowercase();
+        let version = row.try_get::<String, _>(1)?.to_ascii_lowercase();
+        let size: i64 = row.try_get(2)?;
+        let algorithm: String = row.try_get(4)?;
+        let digest = if algorithm.eq_ignore_ascii_case("SHA512") {
+            Some(Digest::Sha512Base64(row.try_get(3)?))
+        } else {
+            None
+        };
         expected.push(Expected {
             rel: format!("{id}/{version}/{id}.{version}.nupkg"),
             size: Some(size as u64),
-            digest: algorithm
-                .eq_ignore_ascii_case("SHA512")
-                .then(|| Digest::Sha512Base64(row.get(3))),
+            digest,
         });
     }
     for row in sqlx::query("SELECT DISTINCT sha256, size FROM package_files")
         .fetch_all(&mut conn)
         .await?
     {
-        let sha: String = row.get(0);
-        let size: i64 = row.get(1);
+        let sha: String = row.try_get(0)?;
+        let size: i64 = row.try_get(1)?;
         if sha.len() > 2 {
             expected.push(Expected {
                 rel: format!(".blobs/sha256/{}/{sha}", &sha[..2]),
@@ -580,8 +583,8 @@ pub async fn verify(
         .fetch_all(&mut conn)
         .await?
     {
-        let key = row.get::<String, _>(0).to_ascii_lowercase();
-        let file = row.get::<String, _>(1).to_ascii_lowercase();
+        let key = row.try_get::<String, _>(0)?.to_ascii_lowercase();
+        let file = row.try_get::<String, _>(1)?.to_ascii_lowercase();
         expected.push(Expected {
             rel: format!(".symbols/{key}/{file}"),
             size: None,

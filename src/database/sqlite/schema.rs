@@ -598,9 +598,10 @@ async fn ensure_column(
     let rows = sqlx::query(&format!("PRAGMA table_info({table})"))
         .fetch_all(&mut *c)
         .await?;
-    let exists = rows
-        .iter()
-        .any(|r| r.get::<String, _>("name").eq_ignore_ascii_case(column));
+    let mut exists = false;
+    for r in &rows {
+        exists |= r.try_get::<String, _>("name")?.eq_ignore_ascii_case(column);
+    }
     if !exists {
         sqlx::query(&format!("ALTER TABLE {table} ADD COLUMN {column} {def}"))
             .execute(&mut *c)

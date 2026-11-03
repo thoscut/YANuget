@@ -1913,6 +1913,56 @@ async fn the_admin_dashboard_filters_and_reads_its_query_leniently() {
     assert!(!pending.contains("/admin/packages/dash.pkg"), "{pending}");
 }
 
+/// A filter and a page together page through the filtered packages, and a
+/// page size past the pager's largest is capped (`TEST-15`).
+#[tokio::test]
+async fn the_admin_dashboard_pages_through_a_filter_and_caps_the_page_size() {
+    let server = spawn_feeds(|c| {
+        c.api_key = Some(API_KEY.into());
+        c.admin_api_key = Some(ADMIN_KEY.into());
+        let mut gated = feed("gated");
+        gated.requires_approval = true;
+        c.feeds = vec![gated];
+    })
+    .await;
+    for id in ["Page.A", "Page.B", "Page.C"] {
+        let pushed = push_to(
+            &server,
+            "/gated/api/v2/package",
+            API_KEY,
+            build_nupkg(id, "1.0.0", b"x"),
+        )
+        .await;
+        assert_eq!(pushed.status(), reqwest::StatusCode::CREATED);
+    }
+    let get = |path: &'static str| {
+        let request = server
+            .client
+            .get(server.url(path))
+            .basic_auth("admin", Some(ADMIN_KEY));
+        async move {
+            let resp = request.send().await.unwrap();
+            assert!(resp.status().is_success(), "{path}: {}", resp.status());
+            resp.text().await.unwrap()
+        }
+    };
+    let second = get("/gated/admin?filter=pending&take=1&page=2").await;
+    let shown = |page: &str, id: &str| page.contains(&format!("/gated/admin/packages/{id}\""));
+    assert!(shown(&second, "page.b"), "{second}");
+    assert!(
+        !shown(&second, "page.a") && !shown(&second, "page.c"),
+        "{second}"
+    );
+    assert!(second.contains("Pending (3)"), "{second}");
+
+    let capped = get("/gated/admin?filter=pending&take=100000").await;
+    for id in ["page.a", "page.b", "page.c"] {
+        assert!(shown(&capped, id), "{id}: {capped}");
+    }
+    assert!(capped.contains("take=100\""), "{capped}");
+    assert!(!capped.contains("take=100000"), "{capped}");
+}
+
 #[tokio::test]
 async fn admin_area_absent_without_key() {
     let server = spawn().await; // no admin key configured
@@ -3186,6 +3236,65 @@ async fn approving_from_the_admin_page_approves_the_files_it_showed() {
         .unwrap()
         .status()
         .is_success());
+}
+
+/// The files a reviewer saw are what an approval approves, whichever way
+/// they changed since: added to none, replaced under the same name with
+/// other bytes, or detached (`TEST-10`).
+#[tokio::test]
+async fn approving_refuses_files_replaced_detached_or_added_to_none() {
+    let server = spawn_gated_pending_only().await;
+    let approve = |fields: String| {
+        no_redirect()
+            .post(server.url("/gated/admin/packages/ring.pkg/1.0.0/approve"))
+            .basic_auth("admin", Some(ADMIN_KEY))
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(format!("{}&{fields}", admin_body(ADMIN_KEY)))
+            .send()
+    };
+    let detach = |name: &'static str| {
+        server
+            .client
+            .delete(server.url(&format!("/gated/api/v2/files/Ring.Pkg/1.0.0/{name}")))
+            .header("X-NuGet-ApiKey", API_KEY)
+            .send()
+    };
+    let conflict = reqwest::StatusCode::CONFLICT;
+
+    // The page showed no files; one arrives.
+    let none = shown_review_fields(&server).await;
+    assert_eq!(
+        put_gated_file(&server, "setup.zip", image_bytes(1), false).await,
+        reqwest::StatusCode::CREATED
+    );
+    assert_eq!(approve(none).await.unwrap().status(), conflict);
+
+    // The page showed setup.zip; it is replaced with other bytes.
+    let one = shown_review_fields(&server).await;
+    assert_eq!(
+        detach("setup.zip").await.unwrap().status(),
+        reqwest::StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        put_gated_file(&server, "setup.zip", image_bytes(2), false).await,
+        reqwest::StatusCode::CREATED
+    );
+    assert_eq!(approve(one).await.unwrap().status(), conflict);
+
+    // The page showed setup.zip; it is detached.
+    let replaced = shown_review_fields(&server).await;
+    assert_eq!(
+        detach("setup.zip").await.unwrap().status(),
+        reqwest::StatusCode::NO_CONTENT
+    );
+    assert_eq!(approve(replaced).await.unwrap().status(), conflict);
+
+    // What the page shows now is approved.
+    let now = shown_review_fields(&server).await;
+    assert_eq!(
+        approve(now).await.unwrap().status(),
+        reqwest::StatusCode::SEE_OTHER
+    );
 }
 
 #[tokio::test]

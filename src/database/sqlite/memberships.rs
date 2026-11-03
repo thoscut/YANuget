@@ -72,17 +72,21 @@ pub(super) async fn get_membership(
     .bind(version.normalized())
     .fetch_optional(&db.pool)
     .await?;
-    Ok(row.map(|r| Membership {
-        feed: r.get("feed"),
-        lower_id: r.get("lower_id"),
-        normalized_version: r.get("normalized_version"),
-        listed: r.get::<i64, _>("listed") != 0,
-        listing_set: r.get::<i64, _>("listing_set") != 0,
-        enabled: r.get::<i64, _>("enabled") != 0,
-        pending: r.get::<i64, _>("pending") != 0,
-        flagged: r.get::<i64, _>("flagged") != 0,
-        flag_reason: r.get("flag_reason"),
-        pinned: r.get::<i64, _>("pinned") != 0,
+    let Some(r) = row else {
+        return Ok(None);
+    };
+    let flag = |name: &str| -> Result<bool> { Ok(r.try_get::<i64, _>(name)? != 0) };
+    Ok(Some(Membership {
+        feed: r.try_get("feed")?,
+        lower_id: r.try_get("lower_id")?,
+        normalized_version: r.try_get("normalized_version")?,
+        listed: flag("listed")?,
+        listing_set: flag("listing_set")?,
+        enabled: flag("enabled")?,
+        pending: flag("pending")?,
+        flagged: flag("flagged")?,
+        flag_reason: r.try_get("flag_reason")?,
+        pinned: flag("pinned")?,
     }))
 }
 
