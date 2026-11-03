@@ -151,7 +151,7 @@ ones included) and each mirror's upstream host. The probes `/health`,
 | TOML key | Env var | Type | Default | Description |
 | --- | --- | --- | --- | --- |
 | `monitoring.enabled` | `YANUGET_MONITORING_ENABLED` | bool | `false` | Serve `/metrics` and `/health/status`. |
-| `monitoring.token` | `YANUGET_MONITORING_TOKEN` | string | *(none)* | When set, both endpoints require `Authorization: Bearer <token>`. Unset, anyone who can reach the server can read them. Like the keys, it can come from `YANUGET_MONITORING_TOKEN_FILE`, and a blank variable is an error. |
+| `monitoring.token` | `YANUGET_MONITORING_TOKEN` | string | *(none)* | When set, both endpoints require `Authorization: Bearer <token>`. Unset, anyone who can reach the server can read them. Like the keys, it can come from `YANUGET_MONITORING_TOKEN_FILE`. A blank value, in the variable or as `token = ""` in the file, is an error, and `config check` warns about one shorter than 32 characters. |
 
 Like the health probes, `/metrics` answers whatever the `Host`, so a scraper
 can use the server's address. A Prometheus job:

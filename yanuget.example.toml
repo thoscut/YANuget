@@ -177,8 +177,9 @@ max_failed_auth = 30          # YANUGET_RATELIMIT_MAX_FAILED_AUTH
 # ---------------------------------------------------------------------------
 [monitoring]
 enabled = false               # YANUGET_MONITORING_ENABLED
-# When set, both endpoints require "Authorization: Bearer <token>".
-# token = "a-long-random-scrape-token"   # YANUGET_MONITORING_TOKEN or …_TOKEN_FILE; blank is an error
+# When set, both endpoints require "Authorization: Bearer <token>". A blank
+# token is an error rather than "no token".
+# token = "a-long-random-scrape-token"   # YANUGET_MONITORING_TOKEN or …_TOKEN_FILE
 
 # ---------------------------------------------------------------------------
 # Package retention — automatic pruning of old versions.

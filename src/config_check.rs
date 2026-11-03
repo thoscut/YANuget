@@ -67,12 +67,18 @@ pub fn check_loaded(config: &Config, report: &mut Report) {
         }
     }
     check_tls(config, report);
-    if config.monitoring.enabled && config.monitoring.token.is_none() {
-        report.warnings.push(
+    // What the router reads: a blank token is no token (and `validate`
+    // refuses it when the configuration is loaded).
+    match config.monitoring.token() {
+        None if config.monitoring.enabled => report.warnings.push(
             "monitoring is enabled without a token: anyone who can reach the server \
              reads /metrics and /health/status (feed names, mirror upstreams)"
                 .into(),
-        );
+        ),
+        Some(token) if token.chars().count() < MIN_KEY_CHARS => report.warnings.push(format!(
+            "monitoring.token is shorter than {MIN_KEY_CHARS} characters"
+        )),
+        _ => {}
     }
 
     if config.data_dir.exists() && !config.data_dir.is_dir() {
@@ -387,6 +393,19 @@ mod tests {
         config.monitoring.enabled = true;
         let open = |r: &Report| r.warnings.iter().any(|w| w.contains("monitoring"));
         assert!(open(&checked(config.clone())));
+        // A blank token, as a template with an empty variable writes it, is
+        // no token: the router serves the endpoints to anyone.
+        config.monitoring.token = Some("  ".into());
+        assert!(open(&checked(config.clone())));
+        config.monitoring.token = Some("short".into());
+        let report = checked(config.clone());
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("monitoring.token is shorter")),
+            "{report:?}"
+        );
         config.monitoring.token = Some("t".repeat(32));
         assert!(!open(&checked(config)));
     }

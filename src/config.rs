@@ -687,6 +687,17 @@ pub struct MonitoringConfig {
     pub token: Option<String>,
 }
 
+impl MonitoringConfig {
+    /// The token both endpoints require, trimmed; `None` when unset or blank
+    /// (which [`Config::validate`] refuses).
+    pub fn token(&self) -> Option<&str> {
+        self.token
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+    }
+}
+
 impl std::fmt::Debug for MonitoringConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MonitoringConfig")
@@ -1118,6 +1129,16 @@ impl Config {
             // silently serving something other than what was configured.
             return Err(Error::BadRequest(
                 "tls_cert_path and tls_key_path must be set together".into(),
+            ));
+        }
+        if self.monitoring.token.is_some() && self.monitoring.token().is_none() {
+            // What a template writes for an empty variable: as for
+            // `YANUGET_MONITORING_TOKEN`, a blank token would quietly serve
+            // /metrics to anyone instead of requiring one.
+            return Err(Error::BadRequest(
+                "monitoring.token is set but blank; give it a token, or remove it to \
+                 serve /metrics and /health/status without one"
+                    .into(),
             ));
         }
         Ok(())
@@ -2229,6 +2250,21 @@ mod tests {
             unknown,
             ["YANUGET_ADMIN_APIKEY", "YANUGET_FEED_STAGING_API_KEY"]
         );
+    }
+
+    #[test]
+    fn a_blank_monitoring_token_in_the_file_is_an_error() {
+        // As for `YANUGET_MONITORING_TOKEN`: a template with an empty
+        // variable must not open /metrics without a word.
+        for blank in ["", "   "] {
+            let toml = format!("[monitoring]\nenabled = true\ntoken = {blank:?}\n");
+            let c: Config = toml::from_str(&toml).unwrap();
+            let err = c.validate().unwrap_err().to_string();
+            assert!(err.contains("monitoring.token"), "{blank:?}: {err}");
+        }
+        let c: Config = toml::from_str("[monitoring]\ntoken = \" tok \"\n").unwrap();
+        c.validate().unwrap();
+        assert_eq!(c.monitoring.token(), Some("tok"));
     }
 
     #[test]

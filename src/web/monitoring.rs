@@ -105,12 +105,7 @@ pub(super) fn routes(states: &[AppState]) -> Router {
     }
     let monitor = Arc::new(Monitor {
         states: states.to_vec(),
-        token: config
-            .token
-            .as_deref()
-            .map(str::trim)
-            .filter(|t| !t.is_empty())
-            .map(str::to_string),
+        token: config.token().map(str::to_string),
         started: Instant::now(),
         scans: Recent::new(),
     });
