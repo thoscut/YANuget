@@ -8,6 +8,8 @@
 //! files the server would only open later: the TLS certificate and key, and
 //! each mirror's CA bundle.
 
+use std::path::{Path, PathBuf};
+
 use crate::config::{Config, ResolvedFeed};
 
 /// What the check found, most serious first when printed.
@@ -90,6 +92,39 @@ pub fn check_loaded(config: &Config, report: &mut Report) {
         report.notes.push(format!(
             "data_dir {} does not exist yet; the server creates it",
             config.data_dir.display()
+        ));
+    }
+    check_relative_paths(config, report);
+}
+
+/// Warn about a data path that depends on the directory a command runs in.
+/// The service finds it from its working directory, but `yanuget backup`,
+/// `restore` and `feeds` run by hand look in theirs, and `restore` refuses
+/// one outright.
+fn check_relative_paths(config: &Config, report: &mut Report) {
+    let relative = |path: &Path| !path.is_absolute();
+    let mut paths: Vec<(&str, PathBuf)> = Vec::new();
+    if relative(&config.data_dir) {
+        paths.push(("data_dir", config.data_dir.clone()));
+    }
+    // Set apart from `data_dir`; derived from it, it is covered above.
+    if let Some(p) = config.storage_path.as_ref().filter(|p| relative(p)) {
+        paths.push(("storage_path", p.clone()));
+    }
+    if let Some(p) = config
+        .database_path
+        .as_ref()
+        .map(PathBuf::from)
+        .filter(|p| relative(p))
+    {
+        paths.push(("database_path", p));
+    }
+    for (key, path) in paths {
+        report.warnings.push(format!(
+            "{key} {} is relative: the server and every command (`yanuget backup`, \
+             `restore`, `feeds`) resolve it against the directory they run in, and \
+             `restore` refuses it; set an absolute path",
+            path.display()
         ));
     }
 }
@@ -408,6 +443,42 @@ mod tests {
         );
         config.monitoring.token = Some("t".repeat(32));
         assert!(!open(&checked(config)));
+    }
+
+    #[test]
+    fn relative_data_paths_are_warned_about() {
+        let about = |r: &Report, key: &str| {
+            r.warnings
+                .iter()
+                .filter(|w| w.starts_with(&format!("{key} ")) && w.contains("is relative"))
+                .count()
+        };
+        let mut config = Config {
+            tls_enabled: false,
+            data_dir: PathBuf::from("./data"),
+            ..Config::default()
+        };
+        let report = checked(config.clone());
+        assert!(report.is_ok(), "{report:?}");
+        assert_eq!(about(&report, "data_dir"), 1, "{report:?}");
+        assert_eq!(about(&report, "storage_path"), 0, "{report:?}");
+
+        let dir = tempfile::tempdir().unwrap();
+        config.data_dir = dir.path().to_path_buf();
+        config.storage_path = Some(PathBuf::from("packages"));
+        config.database_path = Some("db/yanuget.db".into());
+        let report = checked(config.clone());
+        assert_eq!(about(&report, "data_dir"), 0, "{report:?}");
+        assert_eq!(about(&report, "storage_path"), 1, "{report:?}");
+        assert_eq!(about(&report, "database_path"), 1, "{report:?}");
+
+        config.storage_path = Some(dir.path().join("packages"));
+        config.database_path = Some(dir.path().join("yanuget.db").display().to_string());
+        let report = checked(config);
+        assert!(
+            !report.warnings.iter().any(|w| w.contains("is relative")),
+            "{report:?}"
+        );
     }
 
     #[test]
