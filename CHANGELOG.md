@@ -12,13 +12,109 @@ expected to change incompatibly at any version.
 
 ## [Unreleased]
 
+**Upgrading:** the database is migrated on first start to schema version 10,
+which records when a resumable upload last held its space. Afterwards 0.9.0
+refuses to open it, so take a `yanuget backup` first and go back with
+**0.9.0's** `yanuget restore --force`; pushes since the backup are lost. The
+server now holds a lock on `<database_path>.lock` while it runs: a second
+server on the same data refuses to start, and so do `restore` and
+`yanuget feeds` while one runs, even where it does not answer on loopback.
+
+### Security
+
+- Once a feed with `requires_approval` or `pending-only` has approved a
+  version, its attached files can no longer be changed with the push key from
+  any feed holding it, whatever that feed's `allow_overwrite`; it takes the
+  admin key of every feed that approved it. The file inbox is held the same
+  way. It used to apply only under `pending-only`, and a source feed's admin
+  key could always change them.
+- A single resumable upload could reserve all free space for 72 hours and
+  block every push with `507`. An upload now holds its remaining space for an
+  hour after its last request, and a push declaring more than
+  `max_package_size_bytes` is refused with `413` before it reserves anything.
+- Behind a proxy (`mirror.proxy`, or `HTTP(S)_PROXY` for `migrate`) the mirror
+  resolves each upstream host locally too and refuses private addresses, as
+  the internalizer does; `config check` warns that the proxy should refuse
+  them as well.
+- A blank `[monitoring] token` in the configuration file is an error, like a
+  blank `YANUGET_MONITORING_TOKEN`, and `config check` warns about a token
+  shorter than 32 characters.
+- Only a wrong key offered where the preview key goes (`X-NuGet-ApiKey` or a
+  Basic password) turns a download miss into `401`; push keys, admin
+  credentials and Bearer tokens get `404` and no longer count against
+  `max_failed_auth`, which could lock out clients that always send one.
+- The approve page shows invisible and bidirectional control characters in an
+  internalizer report as `[U+XXXX]` instead of letting them reorder or hide
+  text.
+- The internalizer's prelude refuses provider-qualified paths to other
+  machines (`Microsoft.PowerShell.Core\FileSystem::\\host\share`), other
+  PowerShell providers, mapped network drives and drives rooted at a UNC
+  path; it keeps the SHA-256 pin of an internalized package's files under
+  `--ignore-checksums`, and refuses a `YANUGET_INTERNALIZED_FEED_URL` that is
+  not an http or https URL (plain http with a warning).
+
+### Fixed
+
+- Promoting, copying or moving a version keeps whether its listing was set by
+  hand, so a mirror in the target feed no longer relists a version unlisted
+  on purpose.
+- A version the upstream has unlisted is mirrored unlisted from the start,
+  instead of being listed until the whole fetch finished.
+- The mirror resolves relative catalog page ids, and registration page ids
+  against the URL it was redirected to.
+- Mirror downloads and inbox imports reserve their size on the same space
+  pool as uploads and see what uploads were promised; the four free-space
+  checks are one shared guard.
+- `feeds rename/remove --dry-run` opens the database read-only and no longer
+  migrates it.
+- `feeds rename` into a feed that requires approval asks for
+  `--keep-approval` or `--hold-for-approval`, and `--dry-run` reports
+  approved, pending and disabled counts.
+- An override's `script` replaces every `chocolateyInstall.ps1` in the
+  package, found by the same search the prelude uses, instead of whichever
+  the ZIP listed first.
+- The internalizer reads a registration leaf without a `catalogEntry` as the
+  mirror does, and takes a `published` date in 1900 as unlisted.
+- Database and backup row reads report errors instead of panicking.
+
+### Changed
+
+- `config check` warns about a relative `data_dir`, `storage_path` or
+  `database_path`, which `restore` refuses.
+- Free-space measurements and the inbox scan no longer block an async worker.
+- A mirror refresh reads the registration once and no longer loads full
+  package rows to follow the upstream's listing; read-through fetches share
+  one registration read.
+- Registration and search responses are serialized straight from structs;
+  the output is unchanged.
+- A push copies the other feeds' license policies only under `pending-only`;
+  the admin dashboard gets its page and counters from one aggregation; the
+  gallery and search share one headline rule.
+- The mirror and the internalizer share how they read registration leaves,
+  decode gzipped documents and redact URLs; the internalizer parses off the
+  async runtime, and its errors keep their causes, so `config check` and
+  failed syncs name the underlying I/O, TOML, JSON or HTTP error.
+- The internalizer writes its sync state and metrics through `tempfile`.
+- The server uses sha2 0.11 like the internalizer.
+- Releases: each binary and each image platform is started before it is
+  published, the crates.io step stops on any answer but `200` or `404`, and a
+  release that changed `yanuget-pkg` without a new version is refused. CI
+  checks rustdoc, tests `yanuget-pkg` without default features and runs the
+  ignored tests weekly.
+- Documentation: troubleshooting for the newer status codes, a Compression
+  section in the API reference, the dashboard filters, `config check`'s
+  warnings, and `yanuget feeds` in a container.
+
 ## [0.9.0] — 2026-10-28
 
 **Upgrading:** the database is migrated on first start to schema version 9,
 which marks a listing set by hand on a feed. Afterwards 0.8.0 refuses to open
-it, so back the database up first if you may need to go back. Versions that
-are unlisted at migration time count as unlisted by hand, so a mirror does not
-relist them.
+it, so take a `yanuget backup` first, and go back with **0.8.0's** `yanuget
+restore --force` (this release's would migrate it again); pushes since the
+backup are lost. Versions that are unlisted at migration time count as
+unlisted by hand, so a mirror does not relist them. If the TOML file still has
+the example's `data_dir = "./data"`, set the absolute path the service uses:
+`restore` now refuses a relative one.
 
 ### Security
 
@@ -89,6 +185,8 @@ relist them.
 - The bundled docs under `/docs` carry an `ETag` and
   `Cache-Control: public, max-age=300`, and answer `304` to a matching
   `If-None-Match`.
+- The gallery and statistics pages load each package's headline version
+  and a version count instead of every version.
 
 ### Added
 
