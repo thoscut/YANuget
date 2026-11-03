@@ -899,12 +899,22 @@ async fn step_9_keeps_an_earlier_unlist() {
         migrate_to(&mut pool.acquire().await.unwrap(), 8)
             .await
             .unwrap();
-        // What a build at step 8 wrote, through its own queries.
+        // What a build at step 8 wrote: the package rows through today's
+        // queries, the memberships without the column step 9 adds.
         let db = SqliteDatabase { pool: pool.clone() };
         for version in ["1.0.0", "2.0.0"] {
-            db.add_to_feed(FEED, &sample("Kept", version))
+            db.upsert_package_data(&sample("Kept", version))
                 .await
                 .unwrap();
+            run(
+                &pool,
+                &format!(
+                    "INSERT INTO feed_packages (feed, lower_id, normalized_version, listed, \
+                     enabled, pending, flagged, added, downloads, pinned) \
+                     VALUES ('{FEED}', 'kept', '{version}', 1, 1, 0, 0, '2024-01-01T00:00:00Z', 0, 0)"
+                ),
+            )
+            .await;
         }
         run(
             &pool,
