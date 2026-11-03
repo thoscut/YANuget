@@ -56,6 +56,7 @@ Everything mutable lives under one directory (`data_dir`, default `./data`):
 ```
 data/
 ├── yanuget.db          SQLite index (plus -wal and -shm while running)
+├── yanuget.db.lock     locked while a server runs; offline commands check it
 ├── packages/
 │   ├── <id>/<version>/<id>.<version>.nupkg
 │   ├── <id>/<version>/<id>.<version>.snupkg

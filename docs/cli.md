@@ -74,6 +74,27 @@ connections, lets requests in progress and background work finish for up to ten
 seconds, then exits. A transfer still running after that is cut off; an upload
 cut off this way is discarded, never stored half-written.
 
+### Offline commands and a running server
+
+`restore`, `feeds rename` and `feeds remove` write to the database and the
+package store behind a server's back, outside the locks it takes, so they
+refuse while one uses the data. Two checks:
+
+- A running server holds a lock on `<database_path>.lock` (`yanuget.db.lock`
+  in `data_dir` by default) until it exits. The commands take the same lock
+  for as long as they work, so a server started meanwhile refuses to start
+  too, and so does a second server on the same data. It is an advisory lock
+  (`flock` on Unix, `LockFileEx` on Windows) that the system releases when a
+  process ends, so a crash leaves nothing to clean up. It covers a server in
+  another container that mounts the same volume, or one that does not answer
+  on loopback. On a file system that does not support locks, such as some
+  network mounts, a warning says so and only the second check is left.
+- The command asks the configured port on this machine (`/health/ready`
+  through loopback) and refuses when anything answers. That also catches a
+  server of a release before this lock.
+
+A `--dry-run` of `feeds rename` or `feeds remove` takes neither: it only reads.
+
 ## `yanuget migrate`
 
 Copies every package from another NuGet v3 server into a local feed, with live
@@ -156,8 +177,8 @@ yanuget feeds remove <name> [--dry-run] [--yes]
   `--yes`.
 
 With `--dry-run`, either command only prints what it would do. Otherwise both
-refuse while a server answers on the configured port: stop it first, run the
-command, then start it again.
+refuse while a server uses the data: stop it first, run the command, then
+start it again; see [Offline commands and a running server](#offline-commands-and-a-running-server).
 
 ```bash
 systemctl stop yanuget

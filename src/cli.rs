@@ -326,9 +326,13 @@ pub async fn run_feeds(config_path: Option<&str>, args: FeedsArgs) -> anyhow::Re
         bail!("no database at {path}");
     }
     // A dry run only reads, so it may look at a database a server is using.
-    if !dry_run {
-        crate::refuse_while_serving(&config, "changing what it stores").await?;
-    }
+    // Otherwise the data lock is held to the end, so no server starts while
+    // this changes what it would serve.
+    let _data_lock = if dry_run {
+        None
+    } else {
+        crate::refuse_while_serving(&config, "changing what it stores").await?
+    };
     let db = SqliteDatabase::connect(&path).await?;
     let Some(stored) = db
         .stored_feeds()

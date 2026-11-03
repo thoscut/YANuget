@@ -17,12 +17,28 @@ const ADMIN_KEY: &str = "admin-key";
 struct TestServer {
     base: String,
     client: reqwest::Client,
+    shutdown: tokio::sync::oneshot::Sender<()>,
+    serving: tokio::task::JoinHandle<()>,
     _dir: tempfile::TempDir,
 }
 
 impl TestServer {
     fn url(&self, path: &str) -> String {
         format!("{}{}", self.base, path)
+    }
+
+    /// Shut the server down and wait until it has, as an operator stops the
+    /// service before an offline command.
+    async fn stop(self) {
+        let Self {
+            client,
+            shutdown,
+            serving,
+            ..
+        } = self;
+        drop(client);
+        let _ = shutdown.send(());
+        serving.await.unwrap();
     }
 }
 
@@ -74,11 +90,15 @@ async fn spawn_feeds(customize: impl FnOnce(&mut Config)) -> TestServer {
         .await
         .unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
+    let (shutdown, stopped) = tokio::sync::oneshot::channel::<()>();
+    let serving = tokio::spawn(async move {
         axum::serve(
             listener,
             app.into_make_service_with_connect_info::<SocketAddr>(),
         )
+        .with_graceful_shutdown(async move {
+            let _ = stopped.await;
+        })
         .await
         .unwrap();
     });
@@ -88,6 +108,8 @@ async fn spawn_feeds(customize: impl FnOnce(&mut Config)) -> TestServer {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .unwrap(),
+        shutdown,
+        serving,
         _dir: dir,
     }
 }
@@ -339,13 +361,20 @@ async fn yanuget(
         .unwrap()
 }
 
-/// A port nothing listens on.
-fn free_port() -> u16 {
-    std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+/// A port where the CLI's probe for a running server gets no answer: bound
+/// for the rest of the test, so no server another test starts can take it
+/// meanwhile, and every connection is closed unread.
+async fn silent_port() -> u16 {
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        while let Ok((conn, _)) = listener.accept().await {
+            drop(conn);
+        }
+    });
+    port
 }
 
 fn text(out: &std::process::Output) -> String {
@@ -372,7 +401,7 @@ async fn a_renamed_feed_gets_its_versions_back() {
     let port: u16 = before.base.rsplit(':').next().unwrap().parse().unwrap();
 
     // Renamed in the configuration: the check says what was left behind.
-    let free = free_port();
+    let free = silent_port().await;
     let check = yanuget(&path, &["new"], free, &["config", "check"]).await;
     assert!(check.status.success(), "{}", text(&check));
     assert!(
@@ -395,6 +424,7 @@ async fn a_renamed_feed_gets_its_versions_back() {
     let live = yanuget(&path, &["new"], free, &["feeds", "rename", "new", "old"]).await;
     assert!(!live.status.success());
 
+    // A dry run only reads, so it may look while the server runs.
     let args = ["feeds", "rename", "old", "new", "--dry-run"];
     let dry = yanuget(&path, &["new"], free, &args).await;
     assert!(dry.status.success(), "{}", text(&dry));
@@ -403,6 +433,19 @@ async fn a_renamed_feed_gets_its_versions_back() {
         "{}",
         text(&dry)
     );
+
+    // Nor while a server holds the data lock, wherever it answers: in
+    // another container on the same volume, say.
+    before.stop().await;
+    {
+        let db = path.join("yanuget.db");
+        let _held = yanuget::data_lock::DataLock::try_acquire(&db.to_string_lossy())
+            .unwrap()
+            .expect("the lock is free once the server stopped");
+        let locked = yanuget(&path, &["new"], free, &["feeds", "rename", "old", "new"]).await;
+        assert!(!locked.status.success());
+        assert!(text(&locked).contains("is locked"), "{}", text(&locked));
+    }
     let moved = yanuget(&path, &["new"], free, &["feeds", "rename", "old", "new"]).await;
     assert!(moved.status.success(), "{}", text(&moved));
 
@@ -441,7 +484,7 @@ async fn removing_a_gone_feed_frees_what_only_it_held() {
         reqwest::StatusCode::CREATED
     );
 
-    let free = free_port();
+    let free = silent_port().await;
     let unconfirmed = yanuget(&path, &["kept"], free, &["feeds", "remove", "gone"]).await;
     assert!(!unconfirmed.status.success());
     assert!(
@@ -456,6 +499,7 @@ async fn removing_a_gone_feed_frees_what_only_it_held() {
         "{}",
         text(&dry)
     );
+    server.stop().await;
     let args = ["feeds", "remove", "gone", "--yes"];
     let removed = yanuget(&path, &["kept"], free, &args).await;
     assert!(removed.status.success(), "{}", text(&removed));

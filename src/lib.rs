@@ -16,6 +16,7 @@ pub mod auth;
 pub mod backup;
 pub mod config;
 pub mod config_check;
+pub mod data_lock;
 pub mod database;
 pub mod error;
 pub mod feed_data;

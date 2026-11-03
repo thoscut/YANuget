@@ -149,8 +149,9 @@ somewhere else once the command has finished.
 ## Restoring
 
 The server must be stopped: the database file is replaced underneath it, and
-`yanuget restore` refuses to run while a server answers on the configured
-port.
+`yanuget restore` refuses to run while a server holds the data lock or answers
+on the configured port (see
+[Offline commands and a running server](cli.md#offline-commands-and-a-running-server)).
 
 ```bash
 systemctl stop yanuget

@@ -196,6 +196,10 @@ async fn run_server(config_path: Option<&str>) -> anyhow::Result<()> {
     let config = Config::load(config_path)?;
     tokio::fs::create_dir_all(&config.data_dir).await?;
     tokio::fs::create_dir_all(config.storage_path()).await?;
+    // Held until the server exits, so `restore` and `feeds rename/remove`
+    // see it from wherever they run (see `yanuget::data_lock`).
+    let _data_lock = yanuget::data_lock::DataLock::try_acquire(&config.database_path())
+        .map_err(|e| anyhow::anyhow!("{e}; is another server running on it?"))?;
 
     for name in config.unknown_env() {
         tracing::warn!(variable = %name, "environment variable {name} is not a setting and is ignored");
@@ -606,7 +610,7 @@ async fn run_backup(config_path: Option<&str>, args: BackupArgs) -> anyhow::Resu
 async fn run_restore(config_path: Option<&str>, args: RestoreArgs) -> anyhow::Result<()> {
     init_tracing_quiet();
     let config = Config::load(config_path)?;
-    refuse_while_serving(&config, "restoring").await?;
+    let _data_lock = refuse_while_serving(&config, "restoring").await?;
     let s = yanuget::backup::restore(
         &config,
         &args.src,
@@ -626,10 +630,18 @@ async fn run_restore(config_path: Option<&str>, args: RestoreArgs) -> anyhow::Re
     Ok(())
 }
 
-/// Refuse to go on while a server answers on the configured port: what
-/// follows writes to the database and store behind its back, outside the
-/// locks it takes in-process.
-async fn refuse_while_serving(config: &Config, doing: &str) -> anyhow::Result<()> {
+/// Refuse to go on while a server uses the data: what follows writes to the
+/// database and store behind its back, outside the locks it takes
+/// in-process. The [data lock](yanuget::data_lock) is taken and returned, to
+/// be held while the command works, so no server starts meanwhile; a server
+/// that answers on the configured port is refused as well, in case it is one
+/// that does not take the lock (an older release).
+async fn refuse_while_serving(
+    config: &Config,
+    doing: &str,
+) -> anyhow::Result<Option<yanuget::data_lock::DataLock>> {
+    let lock = yanuget::data_lock::DataLock::try_acquire(&config.database_path())
+        .map_err(|e| anyhow::anyhow!("{e}; stop it before {doing}"))?;
     let url = healthcheck_url(config);
     let probe = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
@@ -640,7 +652,7 @@ async fn refuse_while_serving(config: &Config, doing: &str) -> anyhow::Result<()
     if probe.get(&url).send().await.is_ok() {
         anyhow::bail!("a server answers at {url}; stop it before {doing}");
     }
-    Ok(())
+    Ok(lock)
 }
 
 /// The readiness URL of the server this configuration describes, on this
