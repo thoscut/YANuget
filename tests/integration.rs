@@ -1660,6 +1660,7 @@ async fn files_dropped_in_the_inbox_are_verified_and_attached() {
         max_file_size: None,
         feeds: &feeds,
         pending_only: &[],
+        reviewing: &[],
         space: &space,
     };
     let report = scan.scan().await;
@@ -3179,6 +3180,100 @@ async fn the_files_of_a_version_approved_elsewhere_change_only_with_that_feeds_a
             .status(),
         reqwest::StatusCode::NO_CONTENT
     );
+}
+
+/// The inbox holds no credentials, so it is held like a push key: a file
+/// dropped for `staging` is not attached to a version `prod`, which reviews
+/// what it serves, has approved (`SEC-33`).
+#[tokio::test]
+async fn the_inbox_leaves_the_files_of_a_version_approved_elsewhere_alone() {
+    const PROD_ADMIN: &str = "prod-admin";
+    let server = spawn_feeds(|c| {
+        c.api_key = Some(API_KEY.into());
+        let mut staging = feed("staging");
+        staging.admin_api_key = Some("staging-admin".into());
+        staging.promotes_to = Some("prod".into());
+        let mut prod = feed("prod");
+        prod.admin_api_key = Some(PROD_ADMIN.into());
+        prod.requires_approval = true;
+        c.feeds = vec![staging, prod];
+    })
+    .await;
+    let pushed = push_to(
+        &server,
+        "/staging/api/v2/package",
+        API_KEY,
+        build_nupkg("Ring.Pkg", "1.0.0", b"x"),
+    )
+    .await;
+    assert_eq!(pushed.status(), reqwest::StatusCode::CREATED);
+    let promoted = no_redirect()
+        .post(server.url("/staging/admin/packages/ring.pkg/1.0.0/promote"))
+        .basic_auth("admin", Some("staging-admin"))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(admin_body("staging-admin"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(promoted.status(), reqwest::StatusCode::SEE_OTHER);
+    let approve_fields = shown_review_fields_in(&server, "/prod", PROD_ADMIN).await;
+    let approved = no_redirect()
+        .post(server.url("/prod/admin/packages/ring.pkg/1.0.0/approve"))
+        .basic_auth("admin", Some(PROD_ADMIN))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(format!("{}&{approve_fields}", admin_body(PROD_ADMIN)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(approved.status(), reqwest::StatusCode::SEE_OTHER);
+
+    let data = server._dir.path();
+    let inbox = tempfile::tempdir().unwrap();
+    let dir = inbox.path().join("staging/Ring.Pkg/1.0.0");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bytes = image_bytes(3);
+    std::fs::write(dir.join("setup.zip"), &bytes).unwrap();
+    std::fs::write(
+        dir.join("setup.zip.sha256"),
+        format!("{}  setup.zip\n", sha256_hex(&bytes)),
+    )
+    .unwrap();
+    let storage = FilesystemStorage::new(data.join("packages")).await.unwrap();
+    let db = SqliteDatabase::connect(&data.join("yanuget.db").to_string_lossy())
+        .await
+        .unwrap();
+    let files = yanuget::config::FilesConfig::default();
+    let feeds = vec!["staging".to_string(), "prod".to_string()];
+    let reviewing = vec!["prod".to_string()];
+    let space = yanuget::space::SpaceGuard::new(data.join("packages/.uploads"), 0);
+    let scan = yanuget::inbox::Inbox {
+        dir: inbox.path(),
+        storage: &storage,
+        db: &db,
+        files: &files,
+        feed_extensions: &Default::default(),
+        max_file_size: None,
+        feeds: &feeds,
+        pending_only: &[],
+        reviewing: &reviewing,
+        space: &space,
+    };
+    assert_eq!(
+        scan.scan().await,
+        yanuget::inbox::ScanReport {
+            imported: 0,
+            failed: 1
+        }
+    );
+    let why = std::fs::read_to_string(dir.join("setup.zip.error")).unwrap();
+    assert!(why.contains("prod"), "{why}");
+    let got = server
+        .client
+        .get(server.url("/staging/files/ring.pkg/1.0.0/setup.zip"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(got.status(), reqwest::StatusCode::NOT_FOUND);
 }
 
 /// Approving from the admin page approves the files it showed, too: under

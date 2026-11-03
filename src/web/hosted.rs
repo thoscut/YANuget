@@ -253,12 +253,14 @@ impl ApprovalGuard {
         }
     }
 
-    /// The guard of a caller without credentials, such as the inbox: with
-    /// `keep_approved`, a version approved anywhere keeps its files; without,
-    /// nothing is held.
-    pub(crate) fn without_credentials(keep_approved: bool) -> Self {
+    /// The guard of a caller without credentials, such as the inbox: an
+    /// approval in one of the `reviewing` feeds holds the files, and with
+    /// `keep_approved` (the target feed is under `pending-only`) an approval
+    /// anywhere does. Nothing sets one aside.
+    pub(crate) fn without_credentials(keep_approved: bool, reviewing: &[String]) -> Self {
         Self {
             any: keep_approved,
+            reviewing: reviewing.to_vec(),
             ..Self::default()
         }
     }
@@ -366,6 +368,7 @@ pub(crate) async fn attach(
             db: state.db.as_ref(),
             feed: state.feed(),
             keep_approved: false,
+            reviewing: &[],
         };
         let Finished { temp, sha256, size } = file;
         attach_guarded(
@@ -393,6 +396,9 @@ pub(crate) struct Target<'a> {
     /// [`ApprovalGuard::without_credentials`]). [`attach_guarded`] takes the
     /// request's guard instead and does not read it.
     pub keep_approved: bool,
+    /// For [`attach_to`] as well: the feeds that review what they serve,
+    /// whose approval holds the files whatever the target feed's settings.
+    pub reviewing: &'a [String],
 }
 
 /// [`attach`] without the web layer, for the inbox importer. `temp` is
@@ -406,7 +412,7 @@ pub(crate) async fn attach_to(
     sha256: &str,
     size: u64,
 ) -> Result<Attached> {
-    let guard = ApprovalGuard::without_credentials(target.keep_approved);
+    let guard = ApprovalGuard::without_credentials(target.keep_approved, target.reviewing);
     attach_guarded(target, &guard, id, v, name, temp, sha256, size).await
 }
 
@@ -1082,6 +1088,7 @@ async fn finish(
         db: state.db.as_ref(),
         feed: state.feed(),
         keep_approved: false,
+        reviewing: &[],
     };
     let path = finished.path().to_path_buf();
     attach_guarded(

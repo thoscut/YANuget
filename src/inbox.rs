@@ -67,6 +67,10 @@ pub struct Inbox<'a> {
     /// The feeds under `allow_overwrite = "pending-only"`: a file dropped for
     /// one of them is not attached to a version some feed has approved.
     pub pending_only: &'a [String],
+    /// The feeds that review what they serve (`requires_approval` or
+    /// `pending-only`): a file dropped for any feed is not attached to a
+    /// version one of them has approved, as a push key could not either.
+    pub reviewing: &'a [String],
     /// The admission of writes into the server's private staging directory
     /// (the store's `.uploads`), shared with its uploads and mirrors: an
     /// import is held to `min_free_disk_bytes` and reserves its size there.
@@ -288,6 +292,7 @@ impl Inbox<'_> {
             db: self.db,
             feed,
             keep_approved: self.pending_only.iter().any(|f| f == feed),
+            reviewing: self.reviewing,
         };
         // Already attached with exactly these bytes counts as done too.
         let (Attached::New(_) | Attached::Same(_)) = attach_to(

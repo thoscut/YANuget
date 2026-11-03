@@ -905,13 +905,19 @@ fn spawn_file_tasks(
         return tasks;
     }
     let names: Vec<String> = feeds.iter().map(|f| f.name.clone()).collect();
-    // The inbox holds no credentials: a feed that reviews what it serves
-    // leaves the files of an approved version alone, as its push key must.
-    let pending_only: Vec<String> = feeds
+    // The inbox holds no credentials: an approval in a feed that reviews what
+    // it serves keeps the version's files as they are, as a push key must,
+    // and a pending-only feed keeps those of a version approved anywhere.
+    let reviewing: Vec<String> = feeds
         .iter()
         .filter(|f| {
             f.requires_approval || f.allow_overwrite == yanuget::config::OverwriteMode::PendingOnly
         })
+        .map(|f| f.name.clone())
+        .collect();
+    let pending_only: Vec<String> = feeds
+        .iter()
+        .filter(|f| f.allow_overwrite == yanuget::config::OverwriteMode::PendingOnly)
         .map(|f| f.name.clone())
         .collect();
     let feed_extensions: std::collections::HashMap<String, Vec<String>> = feeds
@@ -943,6 +949,7 @@ fn spawn_file_tasks(
                 max_file_size: config.max_file_size_bytes(),
                 feeds: &names,
                 pending_only: &pending_only,
+                reviewing: &reviewing,
                 space: &space,
             };
             let report = scan.scan().await;
