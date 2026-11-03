@@ -8,6 +8,7 @@
 
 pub mod address;
 pub mod error;
+pub mod fetch;
 pub mod files;
 pub mod models;
 pub mod nupkg;

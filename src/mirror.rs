@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use tokio::sync::{watch, OnceCell};
+use yanuget_pkg::fetch::{decode_capped, with_slash, DecodeError};
 use yanuget_pkg::v3::{
     resolve_id, Catalog, PackageVersions, RegistrationIndex, SearchPage, ServiceIndex,
 };
@@ -618,24 +619,14 @@ impl MirrorClient {
         let label = what.to_string();
         let shown = redact_url(url);
         let doc = tokio::task::spawn_blocking(move || {
-            if gzipped {
-                use std::io::Read;
-                let mut decoded = Vec::new();
-                flate2::read::GzDecoder::new(body.as_slice())
-                    .take(MAX_JSON_BYTES + 1)
-                    .read_to_end(&mut decoded)
-                    .map_err(|e| {
-                        Error::Other(anyhow::anyhow!(
-                            "upstream {label} {shown} is not valid gzip: {e}"
-                        ))
-                    })?;
-                if decoded.len() as u64 > MAX_JSON_BYTES {
-                    return Err(Error::Other(anyhow::anyhow!(
-                        "upstream {label} {shown} is larger than {MAX_JSON_BYTES} bytes"
-                    )));
-                }
-                body = decoded;
-            }
+            let body = decode_capped(body, gzipped, MAX_JSON_BYTES).map_err(|e| match e {
+                DecodeError::TooLarge => Error::Other(anyhow::anyhow!(
+                    "upstream {label} {shown} is larger than {MAX_JSON_BYTES} bytes"
+                )),
+                DecodeError::Gzip(e) => Error::Other(anyhow::anyhow!(
+                    "upstream {label} {shown} is not valid gzip: {e}"
+                )),
+            })?;
             serde_json::from_slice(&body).map(Some).map_err(|e| {
                 Error::Other(anyhow::anyhow!(
                     "upstream {label} {shown} is not valid JSON: {e}"
@@ -748,7 +739,10 @@ impl MirrorClient {
                         redact_url(&self.upstream)
                     ))
                 })?;
-                let package_base = find_resource(&index, &base, &["PackageBaseAddress/3.0.0"])
+                let package_base = index
+                    .resolve(&["PackageBaseAddress/3.0.0"], &base)
+                    .map(with_slash)
+                    .map(String::from)
                     .ok_or_else(|| {
                         Error::Other(anyhow::anyhow!(
                             "upstream {} has no PackageBaseAddress resource",
@@ -757,39 +751,41 @@ impl MirrorClient {
                     })?;
                 // Search service type names are versioned; accept whichever the
                 // upstream advertises, newest first.
-                let search = find_resource(
-                    &index,
-                    &base,
-                    &[
-                        "SearchQueryService/3.5.0",
-                        "SearchQueryService/3.0.0-rc",
-                        "SearchQueryService/3.0.0-beta",
-                        "SearchQueryService",
-                    ],
-                );
-                let catalog = find_resource(&index, &base, &["Catalog/3.0.0"]);
-                let registration = find_resource(
-                    &index,
-                    &base,
-                    &[
-                        "RegistrationsBaseUrl/3.6.0",
-                        "RegistrationsBaseUrl/3.4.0",
-                        "RegistrationsBaseUrl/3.0.0-rc",
-                        "RegistrationsBaseUrl/3.0.0-beta",
-                        "RegistrationsBaseUrl",
-                    ],
-                );
+                let search = index
+                    .resolve(
+                        &[
+                            "SearchQueryService/3.5.0",
+                            "SearchQueryService/3.0.0-rc",
+                            "SearchQueryService/3.0.0-beta",
+                            "SearchQueryService",
+                        ],
+                        &base,
+                    )
+                    .map(String::from);
+                let catalog = index.resolve(&["Catalog/3.0.0"], &base).map(String::from);
+                let registration = index
+                    .resolve(
+                        &[
+                            "RegistrationsBaseUrl/3.6.0",
+                            "RegistrationsBaseUrl/3.4.0",
+                            "RegistrationsBaseUrl/3.0.0-rc",
+                            "RegistrationsBaseUrl/3.0.0-beta",
+                            "RegistrationsBaseUrl",
+                        ],
+                        &base,
+                    )
+                    .map(with_slash)
+                    .map(String::from);
                 // Every one of these is a URL the *upstream* chose; vet each
                 // before it is ever fetched. A bad optional resource is dropped
                 // rather than fatal, so one odd entry cannot disable mirroring.
                 self.check_url(&package_base, "PackageBaseAddress")?;
                 Ok(MirrorResources {
-                    package_base: ensure_trailing_slash(&package_base),
+                    package_base,
                     search: search.filter(|u| self.log_check(u, "SearchQueryService")),
                     catalog: catalog.filter(|u| self.log_check(u, "Catalog")),
                     registration: registration
-                        .filter(|u| self.log_check(u, "RegistrationsBaseUrl"))
-                        .map(|u| ensure_trailing_slash(&u)),
+                        .filter(|u| self.log_check(u, "RegistrationsBaseUrl")),
                 })
             })
             .await
@@ -1993,21 +1989,6 @@ enum Fetched {
     DownloadFailed(Error),
 }
 
-/// Return the first resource matching any of `types`, in the given priority
-/// order (used for the versioned type names), resolved against the index's
-/// URL `base`. `@type` may be a string or a list.
-fn find_resource(index: &ServiceIndex, base: &reqwest::Url, types: &[&str]) -> Option<String> {
-    index.resolve(types, base).map(String::from)
-}
-
-fn ensure_trailing_slash(s: &str) -> String {
-    if s.ends_with('/') {
-        s.to_string()
-    } else {
-        format!("{s}/")
-    }
-}
-
 /// Whether the environment names a proxy reqwest would use.
 fn env_proxy_set() -> bool {
     [
@@ -2054,15 +2035,7 @@ fn error_chain(e: &dyn std::error::Error) -> String {
 /// (`https://user:token@host/…`, a signed `?sig=…` download link).
 pub fn redact_url(url: &str) -> String {
     match reqwest::Url::parse(url) {
-        Ok(mut parsed) => {
-            let _ = parsed.set_username("");
-            let _ = parsed.set_password(None);
-            if parsed.query().is_some() {
-                parsed.set_query(Some("redacted"));
-            }
-            parsed.set_fragment(None);
-            parsed.to_string()
-        }
+        Ok(parsed) => yanuget_pkg::fetch::redact(&parsed),
         Err(_) => "<unparseable url>".to_string(),
     }
 }
@@ -2241,6 +2214,11 @@ mod tests {
         );
     }
 
+    /// The first resource of any of `types`, by preference, as a string.
+    fn find_resource(index: &ServiceIndex, base: &reqwest::Url, types: &[&str]) -> Option<String> {
+        index.resolve(types, base).map(String::from)
+    }
+
     #[test]
     fn finds_first_resource_in_priority_order() {
         let index = service_index(serde_json::json!({
@@ -2360,12 +2338,6 @@ mod tests {
         let listing = client.upstream_listing("pkg").await.unwrap();
         assert_eq!(listing.get("1.0.0"), Some(&true));
         assert_eq!(listing.get("2.0.0"), Some(&false));
-    }
-
-    #[test]
-    fn trailing_slash_is_normalized() {
-        assert_eq!(ensure_trailing_slash("https://x/flat"), "https://x/flat/");
-        assert_eq!(ensure_trailing_slash("https://x/flat/"), "https://x/flat/");
     }
 
     #[test]

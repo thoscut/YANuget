@@ -31,16 +31,8 @@ fn origin(url: &Url) -> Option<Origin> {
 }
 
 /// A URL for logs and errors: no credentials, no query (signed download links
-/// carry their signature there).
-pub fn redact(url: &Url) -> String {
-    let mut u = url.clone();
-    let _ = u.set_username("");
-    let _ = u.set_password(None);
-    if u.query().is_some() {
-        u.set_query(Some("…"));
-    }
-    u.to_string()
-}
+/// carry their signature there), the same as the server's mirror shows one.
+pub use yanuget_pkg::fetch::redact;
 
 /// When to try a request again.
 #[derive(Debug, Clone, Copy)]
