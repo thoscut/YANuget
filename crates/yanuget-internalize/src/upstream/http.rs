@@ -12,7 +12,7 @@ use std::time::Duration;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, AUTHORIZATION, LOCATION, RETRY_AFTER};
 use reqwest::{StatusCode, Url};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
-use yanuget_pkg::address::{is_private_host, is_private_ip_addr, GuardedResolver};
+use yanuget_pkg::address::{check_resolved, is_private_host, GuardedResolver, UnsafeHost};
 
 use super::UpstreamError;
 use crate::config::UpstreamConfig;
@@ -240,38 +240,25 @@ impl HttpClient {
         let Some(host) = url.host_str() else {
             return Ok(());
         };
-        if !self.proxied
-            || self.allow_private
-            || allowed(&self.allowed_private_hosts, host)
-            // A literal address was classified by `check`.
-            || host
-                .trim_start_matches('[')
-                .trim_end_matches(']')
-                .parse::<std::net::IpAddr>()
-                .is_ok()
-        {
+        if !self.proxied || self.allow_private || allowed(&self.allowed_private_hosts, host) {
             return Ok(());
         }
+        // A literal address passes here; `check` classified it.
         let label = self.label;
-        let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host, 0))
-            .await
-            .map_err(|e| {
-                UpstreamError::Refused(format!(
+        check_resolved(host, &[]).await.map_err(|why| {
+            UpstreamError::Refused(match why {
+                UnsafeHost::Unresolvable(e) => format!(
                     "{label} {what} {}: cannot resolve {host} here to check its address ({e}); \
                      behind a proxy every host is also resolved locally",
                     redact(url)
-                ))
-            })?
-            .collect();
-        if let Some(private) = addrs.iter().find(|a| is_private_ip_addr(a.ip())) {
-            return Err(UpstreamError::Refused(format!(
-                "{label} {what} {}: {host} resolves to the private address {}; {}",
-                redact(url),
-                private.ip(),
-                self.hint
-            )));
-        }
-        Ok(())
+                ),
+                UnsafeHost::Private(ip) => format!(
+                    "{label} {what} {}: {host} resolves to the private address {ip}; {}",
+                    redact(url),
+                    self.hint
+                ),
+            })
+        })
     }
 
     fn carries_credentials(&self, url: &Url) -> bool {

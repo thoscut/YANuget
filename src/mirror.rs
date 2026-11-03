@@ -43,6 +43,12 @@ pub struct MirrorClient {
     credentials: reqwest::header::HeaderMap,
     /// Permit upstream resource URLs that resolve to private/loopback hosts.
     allow_private_upstream: bool,
+    /// Requests go through a proxy, which resolves the names itself: each
+    /// host is resolved here as well ([`Self::check_proxied`]).
+    proxied: bool,
+    /// Names [`Self::check_proxied`] answers without a lookup, as the
+    /// guarded resolver does; empty outside tests.
+    fixed_dns: Vec<(String, std::net::IpAddr)>,
     /// Cap on a single mirrored `.nupkg`, in bytes.
     max_package_size_bytes: Option<u64>,
     /// Cap on versions fetched for one read-through miss.
@@ -232,6 +238,7 @@ impl MirrorClient {
         // process environment, and a proxy resolves names itself, past the
         // resolver below. So a proxy is used only when the feed names one.
         let mut proxy_host = None;
+        let proxied = config.proxy.is_some() || (env_proxy && env_proxy_set());
         match &config.proxy {
             Some(proxy) => {
                 let parsed = reqwest::Proxy::all(proxy.as_str()).map_err(|_| {
@@ -278,6 +285,8 @@ impl MirrorClient {
             upstream_origin,
             credentials,
             allow_private_upstream: config.allow_private_upstream,
+            proxied,
+            fixed_dns: dns.guarded.clone(),
             max_package_size_bytes: config.max_package_size_bytes,
             max_versions_per_package: config.max_versions_per_package,
             timeout,
@@ -365,6 +374,36 @@ impl MirrorClient {
     }
 
     /// [`Self::check_url`] as a predicate, logging why a resource was dropped.
+    /// Behind a proxy, which resolves the names itself past
+    /// [`GuardedResolver`], resolve the host here as well and refuse it when
+    /// it does not resolve or resolves to a private address (see
+    /// [`yanuget_pkg::address::check_resolved`]).
+    async fn check_proxied(&self, url: &reqwest::Url, what: &str) -> Result<()> {
+        let Some(host) = url.host_str() else {
+            return Ok(());
+        };
+        if !self.proxied || self.allow_private_upstream {
+            return Ok(());
+        }
+        yanuget_pkg::address::check_resolved(host, &self.fixed_dns)
+            .await
+            .map_err(|why| {
+                Error::Other(anyhow::anyhow!(
+                    "upstream {what} {}: refused, since {host} {}; \
+                     set allow_private_upstream = true to permit it",
+                    redact_url(url.as_str()),
+                    match why {
+                        yanuget_pkg::address::UnsafeHost::Private(ip) =>
+                            format!("resolves to the private address {ip}"),
+                        yanuget_pkg::address::UnsafeHost::Unresolvable(e) => format!(
+                            "cannot be resolved here to check its address ({e}); behind a \
+                             proxy every host is also resolved locally"
+                        ),
+                    }
+                ))
+            })
+    }
+
     fn log_check(&self, url: &str, what: &str) -> bool {
         match self.check_url(url, what) {
             Ok(()) => true,
@@ -434,6 +473,7 @@ impl MirrorClient {
             .map_err(|e| Error::Other(anyhow::anyhow!("upstream {what} url is invalid: {e}")))?;
         self.check_parsed(&current, what)?;
         for _ in 0..=MAX_REDIRECTS {
+            self.check_proxied(&current, what).await?;
             let mut request = self.client.get(current.clone());
             if self.carries_credentials(&current) {
                 request = request.headers(self.credentials.clone());
@@ -1968,6 +2008,20 @@ fn ensure_trailing_slash(s: &str) -> String {
     }
 }
 
+/// Whether the environment names a proxy reqwest would use.
+fn env_proxy_set() -> bool {
+    [
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ]
+    .iter()
+    .any(|name| std::env::var_os(name).is_some_and(|v| !v.is_empty()))
+}
+
 /// An error from sending an upstream request, without the URL reqwest would
 /// put in it (it can carry userinfo or a token in the query) but with the
 /// cause chain, which is where "timed out" or "resolves to the private
@@ -2607,6 +2661,58 @@ mod tests {
         .unwrap();
         let err = direct.upstream_versions("ok").await.unwrap_err();
         assert!(err.to_string().contains("private address"), "{err}");
+    }
+
+    /// Behind a proxy the guarded resolver never sees the upstream's names,
+    /// so each is resolved here too: one with a private address, or none,
+    /// is refused before the proxy is asked (SEC-36).
+    #[tokio::test]
+    async fn behind_a_proxy_each_host_is_resolved_here_first() {
+        // Nothing listens at the proxy: a request that got that far would
+        // fail with a connection error instead.
+        let config = MirrorConfig {
+            enabled: true,
+            upstream: "http://internal.test/v3/index.json".into(),
+            proxy: Some("http://127.0.0.1:9".into()),
+            timeout_secs: 5,
+            ..Default::default()
+        };
+        let dns = TestDns {
+            unguarded: Vec::new(),
+            guarded: vec![("internal.test".into(), "169.254.169.254".parse().unwrap())],
+        };
+        let client = MirrorClient::build_with(&config, false, &dns).unwrap();
+        let err = client.upstream_versions("pkg").await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("resolves to the private address 169.254.169.254"),
+            "{err}"
+        );
+
+        let unknown = MirrorClient::build_with(
+            &MirrorConfig {
+                upstream: "http://nothing.invalid/v3/index.json".into(),
+                ..config.clone()
+            },
+            false,
+            &dns,
+        )
+        .unwrap();
+        let err = unknown.upstream_versions("pkg").await.unwrap_err();
+        assert!(err.to_string().contains("cannot be resolved here"), "{err}");
+
+        // Allowed private upstreams skip the check, and reach the proxy.
+        let allowed = MirrorClient::build_with(
+            &MirrorConfig {
+                allow_private_upstream: true,
+                ..config
+            },
+            false,
+            &dns,
+        )
+        .unwrap();
+        let err = allowed.upstream_versions("pkg").await.unwrap_err();
+        assert!(!err.to_string().contains("private address"), "{err}");
     }
 
     #[test]

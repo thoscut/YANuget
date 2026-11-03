@@ -469,7 +469,7 @@ affected.
 | `feeds[].mirror.max_versions_per_package` | int | `50` | Newest-first cap on how many versions one read-through miss fetches. |
 | `feeds[].mirror.max_package_size_bytes` | int | *(server-wide cap, else 2 GiB)* | Cap on a single mirrored `.nupkg`. |
 | `feeds[].mirror.allow_private_upstream` | bool | `false` | Permit an upstream on a private/loopback address. |
-| `feeds[].mirror.proxy` | string | *(none)* | Outbound proxy for upstream requests. Unset, the mirror connects directly and ignores `HTTP(S)_PROXY`. |
+| `feeds[].mirror.proxy` | string | *(none)* | Outbound proxy for upstream requests. Unset, the mirror connects directly and ignores `HTTP(S)_PROXY`. Each host is still resolved locally and refused when private, unless `allow_private_upstream` is set. |
 | `feeds[].mirror.ca_cert_path` | path | *(none)* | PEM file of extra CA certificates to trust for the upstream, on top of the system store and the bundled Mozilla roots. |
 | `feeds[].mirror.probe_interval_secs` | int | `300` | Ask the upstream for its service index at startup and then every N seconds, so an outage is logged (and shown in [`/health/status`](#monitoring)) before a client needs the upstream. `0` turns the probe off. |
 | `feeds[].license_policy.enabled` | bool | `false` | Evaluate the offline license policy. |
@@ -714,8 +714,13 @@ responses also carry a `Strict-Transport-Security` header (one year).
   `allow_private_upstream = true` — checked on the addresses a host name
   resolves to when each connection is made, so a name pointing at the local
   network, a redirect to one, or a DNS answer that changes between requests is
-  refused too. Through a configured `proxy`, the proxy resolves names, so its
-  own egress rules apply. Mirrored downloads are bounded by
+  refused too. Through a configured `proxy` (or, for `yanuget migrate`, one
+  from `HTTP(S)_PROXY`) the proxy resolves the names itself, so the server
+  also resolves each host of every request and redirect hop and refuses one
+  with a private address, or one that does not resolve locally. The proxy
+  resolves again, so a DNS answer that changes in between gets past that:
+  have the proxy refuse private destinations as well (`yanuget config check`
+  warns about this). Mirrored downloads are bounded by
   `max_package_size_bytes` and `max_versions_per_package`, and a mirrored
   package must declare the id/version that was actually requested — so a
   compromised upstream cannot substitute a different package under a name your

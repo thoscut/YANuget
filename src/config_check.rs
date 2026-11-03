@@ -201,6 +201,14 @@ fn check_feed(feed: &ResolvedFeed, report: &mut Report) {
         }
     }
     if feed.mirror.enabled {
+        if feed.mirror.proxy.is_some() && !feed.mirror.allow_private_upstream {
+            report.warnings.push(format!(
+                "feed {name}: the mirror goes through a proxy, which resolves the upstream's \
+                 host names itself; the server resolves each one too and refuses private \
+                 addresses, but a DNS answer that changes in between gets past that, so \
+                 have the proxy refuse private destinations as well"
+            ));
+        }
         if let Some(ca) = &feed.mirror.ca_cert_path {
             match std::fs::read(ca) {
                 Err(e) => report.errors.push(format!(
@@ -424,6 +432,35 @@ mod tests {
             .iter()
             .any(|e| e.contains("mirror ca_cert_path")));
         assert!(report.errors.iter().any(|e| e.contains("TLS certificate")));
+    }
+
+    #[test]
+    fn a_mirror_behind_a_proxy_is_warned_about() {
+        let feed = |name: &str, allow_private_upstream: bool| FeedConfig {
+            name: name.into(),
+            mirror: crate::config::MirrorConfig {
+                enabled: true,
+                upstream: "https://upstream.example.com/v3/index.json".into(),
+                proxy: Some("http://proxy.internal:3128".into()),
+                allow_private_upstream,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let config = Config {
+            tls_enabled: false,
+            feeds: vec![feed("guarded", false), feed("private", true)],
+            ..Config::default()
+        };
+        let report = checked(config);
+        let proxied = |f: &str| {
+            report
+                .warnings
+                .iter()
+                .any(|w| w.starts_with(&format!("feed {f}: ")) && w.contains("proxy"))
+        };
+        assert!(proxied("guarded"), "{report:?}");
+        assert!(!proxied("private"), "{report:?}");
     }
 
     #[test]

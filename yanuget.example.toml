@@ -282,7 +282,8 @@ inbox_scan_secs = 30                # YANUGET_FILES_INBOX_SCAN_SECS
 #   # because your upstream really is on the private network.
 #   allow_private_upstream = false
 #   # Outbound proxy for upstream requests. Unset, the mirror connects directly:
-#   # HTTP(S)_PROXY in the environment is ignored.
+#   # HTTP(S)_PROXY in the environment is ignored. Through a proxy each host is
+#   # still resolved here and refused when private (see allow_private_upstream).
 #   # proxy = "http://proxy.internal:3128"
 #   # Extra CA certificates (PEM) for an upstream behind an internal CA. The
 #   # system store and the bundled Mozilla roots are trusted either way.
