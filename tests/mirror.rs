@@ -97,6 +97,10 @@ struct Behaviour {
     /// these (lower id, version) pairs are unlisted.
     registration: bool,
     unlisted: std::collections::BTreeSet<(String, String)>,
+    /// Write catalog and registration page `@id`s relative to their index,
+    /// and redirect each registration index to another path, where its page
+    /// is not inlined.
+    relative_ids: bool,
 }
 
 struct UpstreamState {
@@ -302,7 +306,14 @@ fn respond(state: &UpstreamState, uri: &Uri) -> Response {
     }
     if path == "/catalog/index.json" {
         let pages: Vec<serde_json::Value> = (0..behaviour.packages.len())
-            .map(|i| serde_json::json!({"@id": format!("{base}/catalog/page{i}.json")}))
+            .map(|i| {
+                let id = if behaviour.relative_ids {
+                    format!("page{i}.json")
+                } else {
+                    format!("{base}/catalog/page{i}.json")
+                };
+                serde_json::json!({ "@id": id })
+            })
             .collect();
         return axum::Json(serde_json::json!({ "items": pages })).into_response();
     }
@@ -322,22 +333,47 @@ fn respond(state: &UpstreamState, uri: &Uri) -> Response {
         }))
         .into_response();
     }
+    let leaves = |id: &str| -> Option<Vec<serde_json::Value>> {
+        let versions = behaviour.packages.get(id)?;
+        Some(
+            versions
+                .iter()
+                .map(|(v, _)| {
+                    let listed = !behaviour
+                        .unlisted
+                        .contains(&(id.to_string(), v.to_lowercase()));
+                    serde_json::json!({"catalogEntry": {"id": id, "version": v, "listed": listed}})
+                })
+                .collect(),
+        )
+    };
+    if let Some(rest) = path.strip_prefix("/hive/") {
+        let doc = match rest.split_once('/') {
+            Some((id, "index.json")) if leaves(id).is_some() => {
+                serde_json::json!({"count": 1, "items": [{"@id": "page.json"}]})
+            }
+            Some((id, "page.json")) => match leaves(id) {
+                Some(items) => serde_json::json!({ "items": items }),
+                None => return StatusCode::NOT_FOUND.into_response(),
+            },
+            _ => return StatusCode::NOT_FOUND.into_response(),
+        };
+        return axum::Json(doc).into_response();
+    }
     if let Some(id) = path
         .strip_prefix("/registration/")
         .and_then(|p| p.strip_suffix("/index.json"))
     {
-        let Some(versions) = behaviour.packages.get(id) else {
+        if behaviour.relative_ids {
+            return (
+                StatusCode::FOUND,
+                [("location", format!("{base}/hive/{id}/index.json"))],
+            )
+                .into_response();
+        }
+        let Some(leaves) = leaves(id) else {
             return StatusCode::NOT_FOUND.into_response();
         };
-        let leaves: Vec<serde_json::Value> = versions
-            .iter()
-            .map(|(v, _)| {
-                let listed = !behaviour
-                    .unlisted
-                    .contains(&(id.to_string(), v.to_lowercase()));
-                serde_json::json!({"catalogEntry": {"id": id, "version": v, "listed": listed}})
-            })
-            .collect();
         let json = serde_json::to_vec(&serde_json::json!({
             "count": 1,
             "items": [{"@id": format!("{base}/registration/{id}/index.json#page"), "items": leaves}]
@@ -1316,6 +1352,42 @@ async fn migrate_falls_back_to_the_catalog_when_search_fails() {
     });
     let summary = local_feed().await.migrate(&upstream).await;
     assert_eq!(summary.imported, 3, "{:?}", summary.failures);
+}
+
+/// Catalog page `@id`s relative to the catalog index resolve against it
+/// (MNT-07); each used to be fetched as given and failed.
+#[tokio::test]
+async fn relative_catalog_pages_are_resolved_against_the_index() {
+    let upstream = three_packages().await;
+    upstream.behave(|b| {
+        b.search_fails = true;
+        b.catalog = true;
+        b.relative_ids = true;
+    });
+    let summary = local_feed().await.migrate(&upstream).await;
+    assert_eq!(summary.imported, 3, "{:?}", summary.failures);
+    assert_eq!(summary.failed_discovery, 0, "{:?}", summary.failures);
+}
+
+/// A registration index that redirects: its relative page `@id`s resolve
+/// against where it was served from, not where it was asked for (MNT-07).
+#[tokio::test]
+async fn registration_pages_resolve_against_the_redirected_index() {
+    let upstream = Upstream::start().await;
+    upstream.publish("Moved.Pkg", "1.0.0");
+    upstream.publish("Moved.Pkg", "2.0.0");
+    upstream.behave(|b| {
+        b.registration = true;
+        b.relative_ids = true;
+        b.unlisted.insert(("moved.pkg".into(), "1.0.0".into()));
+    });
+    let local = local_feed().await;
+    local
+        .mirror(&upstream, "Moved.Pkg", MirrorOptions::default())
+        .await;
+    assert_eq!(upstream.hits("/hive/moved.pkg/page.json"), 1);
+    assert!(!local.listed("moved.pkg", "1.0.0").await);
+    assert!(local.listed("moved.pkg", "2.0.0").await);
 }
 
 #[tokio::test]

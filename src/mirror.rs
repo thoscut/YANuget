@@ -19,7 +19,9 @@ use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use tokio::sync::{watch, OnceCell};
-use yanuget_pkg::v3::{Catalog, PackageVersions, RegistrationIndex, SearchPage, ServiceIndex};
+use yanuget_pkg::v3::{
+    resolve_id, Catalog, PackageVersions, RegistrationIndex, SearchPage, ServiceIndex,
+};
 
 use crate::config::{LicensePolicyConfig, MirrorAuthConfig, MirrorConfig};
 use crate::database::PackageDatabase;
@@ -532,6 +534,15 @@ impl MirrorClient {
     where
         T: serde::de::DeserializeOwned + Send + 'static,
     {
+        Ok(self.get_json_at(url, what).await?.map(|(doc, _)| doc))
+    }
+
+    /// [`Self::get_json`], with the URL the document came from in the end,
+    /// after any redirects: the base its relative `@id`s resolve against.
+    async fn get_json_at<T>(&self, url: &str, what: &str) -> Result<Option<(T, reqwest::Url)>>
+    where
+        T: serde::de::DeserializeOwned + Send + 'static,
+    {
         let resp = self.send(url, what, Some(self.timeout)).await?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
@@ -566,7 +577,7 @@ impl MirrorClient {
         }
         let label = what.to_string();
         let shown = redact_url(url);
-        tokio::task::spawn_blocking(move || {
+        let doc = tokio::task::spawn_blocking(move || {
             if gzipped {
                 use std::io::Read;
                 let mut decoded = Vec::new();
@@ -592,7 +603,8 @@ impl MirrorClient {
             })
         })
         .await
-        .map_err(|e| Error::Other(anyhow::anyhow!("parsing the upstream {what}: {e}")))?
+        .map_err(|e| Error::Other(anyhow::anyhow!("parsing the upstream {what}: {e}")))??;
+        Ok(doc.map(|doc| (doc, final_url)))
     }
 
     /// Name the feed this client fills, so its log lines say which one.
@@ -788,24 +800,20 @@ impl MirrorClient {
             return Ok(listing);
         };
         let url = format!("{base}{lower_id}/index.json");
-        let Some(index) = self
-            .get_json::<RegistrationIndex>(&url, "registration")
+        let Some((index, index_url)) = self
+            .get_json_at::<RegistrationIndex>(&url, "registration")
             .await?
         else {
             return Ok(listing);
         };
-        // Page `@id`s may be relative to the registration index.
-        let index_url = reqwest::Url::parse(&url).ok();
         for page in index.items.into_iter().flatten() {
-            // Small packages inline their leaves; large ones page them out.
+            // Small packages inline their leaves; large ones page them out,
+            // at an `@id` that may be relative to where the index came from.
             let page = if page.items.is_some() {
                 page
             } else {
                 let Some(page_url) = page.id.as_deref().map(|id| {
-                    index_url
-                        .as_ref()
-                        .and_then(|base| base.join(id).ok())
-                        .map_or_else(|| id.to_string(), String::from)
+                    resolve_id(&index_url, id).map_or_else(|| id.to_string(), String::from)
                 }) else {
                     continue;
                 };
@@ -1014,16 +1022,18 @@ impl MirrorClient {
         catalog: &str,
         failures: &mut Vec<(String, String)>,
     ) -> Result<Vec<String>> {
-        let index: Catalog = self
-            .get_json(catalog, "catalog index")
+        let (index, index_url): (Catalog, _) = self
+            .get_json_at(catalog, "catalog index")
             .await?
             .ok_or_else(|| not_found("catalog index", catalog))?;
 
+        // A page's `@id` may be relative to the catalog index.
         let pages: Vec<String> = index
             .items
             .into_iter()
             .flatten()
             .filter_map(|p| p.id)
+            .map(|id| resolve_id(&index_url, &id).map_or(id, String::from))
             .collect();
 
         let mut ids = DedupIds::new();
