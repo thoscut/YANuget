@@ -201,6 +201,9 @@ interval_hours = 24           # YANUGET_RETENTION_INTERVAL_HOURS — background 
 # keep_latest_stable = 10       # YANUGET_RETENTION_KEEP_LATEST_STABLE
 # keep_latest_prerelease = 5    # YANUGET_RETENTION_KEEP_LATEST_PRERELEASE
 # max_age_days = 180            # YANUGET_RETENTION_MAX_AGE_DAYS — days in this feed
+# Package-id prefixes retention never prunes, ignoring case; "Contoso." also
+# covers the bare id "Contoso".
+# exclude_id_prefixes = ["Contoso."]  # YANUGET_RETENTION_EXCLUDE_ID_PREFIXES (comma-separated)
 
 # ---------------------------------------------------------------------------
 # Attached files — disk images and archives a package's install script fetches

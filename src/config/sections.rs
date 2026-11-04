@@ -151,6 +151,10 @@ pub struct RetentionConfig {
     pub keep_latest_prerelease: Option<usize>,
     /// Delete versions added to the feed more than this many days ago.
     pub max_age_days: Option<u64>,
+    /// Package-id prefixes retention leaves alone (`Contoso.`), ignoring
+    /// ASCII case: every version of a matching id is kept, whatever the
+    /// limits say. Matched like `reserved_id_prefixes`.
+    pub exclude_id_prefixes: Vec<String>,
 }
 
 impl Default for RetentionConfig {
@@ -162,6 +166,7 @@ impl Default for RetentionConfig {
             keep_latest_stable: None,
             keep_latest_prerelease: None,
             max_age_days: None,
+            exclude_id_prefixes: Vec::new(),
         }
     }
 }

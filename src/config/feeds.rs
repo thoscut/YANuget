@@ -9,7 +9,7 @@ use crate::error::{Error, Result};
 
 use super::env::combine_keys;
 use super::sections::{OverwriteMode, RetentionConfig};
-use super::validate::{reserved_prefixes, validate_feed_name};
+use super::validate::{checked_retention, reserved_prefixes, validate_feed_name};
 use super::{redact_opt, url_origin, Config};
 
 /// Action taken when a package violates a feed's policy.
@@ -318,14 +318,21 @@ impl ReservedPrefix {
     /// ending in `.` also covers the bare id before it (`Contoso.` covers
     /// `Contoso` as well as `Contoso.Utils`).
     pub fn covers(&self, id: &str) -> bool {
-        let id = id.as_bytes();
-        let prefix = self.prefix.as_bytes();
-        let starts = id.len() >= prefix.len() && id[..prefix.len()].eq_ignore_ascii_case(prefix);
-        starts
-            || prefix
-                .strip_suffix(b".")
-                .is_some_and(|bare| id.eq_ignore_ascii_case(bare))
+        id_has_prefix(id, &self.prefix)
     }
+}
+
+/// Whether `id` falls under the package-id `prefix`, ignoring ASCII case. A
+/// prefix ending in `.` also covers the bare id before it (`Contoso.` covers
+/// `Contoso` as well as `Contoso.Utils`).
+pub fn id_has_prefix(id: &str, prefix: &str) -> bool {
+    let id = id.as_bytes();
+    let prefix = prefix.as_bytes();
+    let starts = id.len() >= prefix.len() && id[..prefix.len()].eq_ignore_ascii_case(prefix);
+    starts
+        || prefix
+            .strip_suffix(b".")
+            .is_some_and(|bare| id.eq_ignore_ascii_case(bare))
 }
 
 impl Config {
@@ -350,7 +357,7 @@ impl Config {
                 promotes_to: None,
                 mirror: MirrorConfig::default(),
                 license_policy: LicensePolicyConfig::default(),
-                retention: self.retention.clone(),
+                retention: checked_retention(&self.retention, DEFAULT_FEED)?,
                 // A single feed has no other feed to reserve anything from.
                 reserved_id_prefixes: Vec::new(),
                 reserved_elsewhere: Vec::new(),
@@ -395,10 +402,10 @@ impl Config {
                 promotes_to: f.promotes_to.clone(),
                 mirror: f.mirror.clone(),
                 license_policy: f.license_policy.clone(),
-                retention: f
-                    .retention
-                    .clone()
-                    .unwrap_or_else(|| self.retention.clone()),
+                retention: checked_retention(
+                    f.retention.as_ref().unwrap_or(&self.retention),
+                    &f.name,
+                )?,
                 reserved_id_prefixes: reserved_prefixes(f)?,
                 reserved_elsewhere: Vec::new(),
                 allowed_extensions: f

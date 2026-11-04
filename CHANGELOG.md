@@ -110,6 +110,15 @@ server on the same data refuses to start, and so do `restore` and
   section in the API reference, the dashboard filters, `config check`'s
   warnings, and `yanuget feeds` in a container.
 
+### Added
+
+- `retention.exclude_id_prefixes` (`YANUGET_RETENTION_EXCLUDE_ID_PREFIXES`,
+  comma-separated): package-id prefixes that retention leaves alone, matched
+  like `reserved_id_prefixes` and ignoring ASCII case. Every version of such
+  an id is kept, whatever the limits say, so a feed can prune upstream
+  packages while keeping every release of its own. The retention and
+  settings pages list them.
+
 ## [0.9.0] — 2026-10-28
 
 **Upgrading:** the database is migrated on first start to schema version 9,

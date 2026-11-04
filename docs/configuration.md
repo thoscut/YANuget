@@ -309,8 +309,16 @@ it.
 | `retention.keep_latest_stable` | `YANUGET_RETENTION_KEEP_LATEST_STABLE` | int | *(unset)* | Keep newest N stable versions per id. |
 | `retention.keep_latest_prerelease` | `YANUGET_RETENTION_KEEP_LATEST_PRERELEASE` | int | *(unset)* | Keep newest N pre-release versions per id. |
 | `retention.max_age_days` | `YANUGET_RETENTION_MAX_AGE_DAYS` | int | *(unset)* | Prune versions added to the feed more than N days ago. |
+| `retention.exclude_id_prefixes` | `YANUGET_RETENTION_EXCLUDE_ID_PREFIXES` | string[] (env: comma-separated) | `[]` | Package-id prefixes retention never prunes. |
 
 With no limit set, the sweep does nothing even when `enabled`.
+
+`exclude_id_prefixes` takes an id out of retention entirely: every version of
+it is kept, and the page lists none of them. Prefixes match like
+`reserved_id_prefixes`, ignoring ASCII case, and one ending in `.` also covers
+the bare id before it (`Contoso.` covers `Contoso` and `Contoso.Utils`). Use it
+for a feed that should prune what it takes from upstream but keep every
+release of its own packages.
 
 An admin can **pin** a version in `/admin`; retention then keeps it whatever
 the rules say, and it does not use up one of the "newest *N*" either — a pin is

@@ -2,7 +2,7 @@
 //! actions, and the retention page.
 
 use super::escape::{enc_path, escape_html};
-use super::format::{group_digits, human_size, kv, kv_html, plural};
+use super::format::{group_digits, human_size, id_prefix_list, kv, kv_html, plural};
 use super::gallery::{pager, Paging};
 use super::layout::{layout, Nav};
 use crate::database::{AdminFilter, AdminOverview, PackageFile};
@@ -997,6 +997,10 @@ pub fn admin_retention_page(urls: &UrlBuilder, view: &RetentionView) -> String {
             Some(d) => format!("{d} day{}", plural(d as i64)),
             None => "No limit".to_string(),
         },
+    ));
+    kv_rows.push_str(&kv(
+        "Ids never pruned",
+        &id_prefix_list(&rules.exclude_id_prefixes),
     ));
     kv_rows.push_str(&kv(
         "Scheduled cleanup",

@@ -170,6 +170,13 @@ impl Config {
         if let Some(v) = get("YANUGET_RETENTION_MAX_AGE_DAYS")? {
             self.retention.max_age_days = parse_env_opt_int("YANUGET_RETENTION_MAX_AGE_DAYS", &v)?;
         }
+        if let Some(v) = get("YANUGET_RETENTION_EXCLUDE_ID_PREFIXES")? {
+            self.retention.exclude_id_prefixes = v
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+        }
         if let Some(b) = bool_var("YANUGET_MONITORING_ENABLED")? {
             self.monitoring.enabled = b;
         }

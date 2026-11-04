@@ -11,8 +11,8 @@ mod validate;
 
 pub use env::feed_env_name;
 pub use feeds::{
-    FeedConfig, FeedFilesConfig, LicensePolicyConfig, MirrorAuthConfig, MirrorConfig, PolicyAction,
-    ReservedPrefix, ResolvedFeed, DEFAULT_FEED,
+    id_has_prefix, FeedConfig, FeedFilesConfig, LicensePolicyConfig, MirrorAuthConfig,
+    MirrorConfig, PolicyAction, ReservedPrefix, ResolvedFeed, DEFAULT_FEED,
 };
 pub use sections::{
     FilesConfig, MonitoringConfig, OverwriteMode, RateLimitConfig, RetentionConfig,
@@ -627,6 +627,50 @@ mod tests {
         assert_eq!(c.retention.keep_latest_stable, Some(5));
         assert_eq!(c.retention.max_age_days, Some(90));
         assert!(c.retention.has_limits());
+    }
+
+    #[test]
+    fn retention_exclude_id_prefixes_are_checked_per_feed() {
+        let toml = r#"
+            [retention]
+            keep_latest_stable = 3
+            exclude_id_prefixes = ["Global."]
+
+            [[feeds]]
+            name = "stage"
+
+            [[feeds]]
+            name = "production"
+            [feeds.retention]
+            enabled = true
+            keep_latest_stable = 2
+            exclude_id_prefixes = [" cfturbo", "pumplinx"]
+        "#;
+        let c: Config = toml::from_str(toml).unwrap();
+        let feeds = c.resolved_feeds().unwrap();
+        // A feed without its own [feeds.retention] takes the global one.
+        assert_eq!(feeds[0].retention.exclude_id_prefixes, ["Global."]);
+        assert_eq!(
+            feeds[1].retention.exclude_id_prefixes,
+            ["cfturbo", "pumplinx"]
+        );
+
+        for bad in ["", ".cfturbo", "cft*", "a b"] {
+            let mut c = c.clone();
+            c.feeds[1].retention.as_mut().unwrap().exclude_id_prefixes = vec![bad.to_string()];
+            let err = c.resolved_feeds().expect_err(bad).to_string();
+            assert!(
+                err.contains("retention.exclude_id_prefixes"),
+                "{bad:?}: {err}"
+            );
+        }
+
+        let env = with_env(&[(
+            "YANUGET_RETENTION_EXCLUDE_ID_PREFIXES",
+            "Contoso., Fabrikam ,",
+        )])
+        .unwrap();
+        assert_eq!(env.retention.exclude_id_prefixes, ["Contoso.", "Fabrikam"]);
     }
 
     /// Apply `vars` as the environment on top of the defaults.

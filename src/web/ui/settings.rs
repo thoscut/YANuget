@@ -1,7 +1,7 @@
 //! The read-only settings page.
 
 use super::escape::escape_html;
-use super::format::{human_size, kv, kv_html};
+use super::format::{human_size, id_prefix_list, kv, kv_html};
 use super::layout::{layout, Nav, VERSION};
 use crate::config::Config;
 use crate::nuget::UrlBuilder;
@@ -113,6 +113,10 @@ pub fn settings_page(urls: &UrlBuilder, config: &Config, feed: &crate::web::Feed
                 Some(d) => format!("{d} days"),
                 None => "No limit".to_string(),
             },
+        ));
+        retention.push_str(&kv(
+            "Ids never pruned",
+            &id_prefix_list(&r.exclude_id_prefixes),
         ));
     }
     retention.push_str("</div>");

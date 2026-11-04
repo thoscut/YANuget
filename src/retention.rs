@@ -13,7 +13,8 @@
 //! package has no stable version, its newest pre-release — so retention can
 //! never make a package disappear entirely. A **pinned** version is never
 //! pruned, and does not use up one of the "newest N" either: a pin is kept in
-//! addition to what the rules keep.
+//! addition to what the rules keep. An id under one of the policy's
+//! `exclude_id_prefixes` is left alone entirely.
 //!
 //! The rules only see what clients can see. A **pending** or **disabled**
 //! version is outside them like a pin: never pruned, never ranked, and never
@@ -23,7 +24,7 @@
 
 use chrono::{DateTime, Duration, Utc};
 
-use crate::config::RetentionConfig;
+use crate::config::{id_has_prefix, RetentionConfig};
 use crate::database::{canonical_id, FeedVersion, PackageDatabase};
 use crate::error::Result;
 use crate::models::Package;
@@ -36,6 +37,8 @@ pub struct RetentionPolicy {
     pub keep_latest_stable: Option<usize>,
     pub keep_latest_prerelease: Option<usize>,
     pub max_age_days: Option<u64>,
+    /// Ids under one of these prefixes are never pruned.
+    pub exclude_id_prefixes: Vec<String>,
 }
 
 impl RetentionPolicy {
@@ -45,6 +48,13 @@ impl RetentionPolicy {
             || self.keep_latest_prerelease.is_some()
             || self.max_age_days.is_some()
     }
+
+    /// Whether `id` is excluded from retention by `exclude_id_prefixes`.
+    pub fn excludes(&self, id: &str) -> bool {
+        self.exclude_id_prefixes
+            .iter()
+            .any(|prefix| id_has_prefix(id, prefix))
+    }
 }
 
 impl From<&RetentionConfig> for RetentionPolicy {
@@ -53,6 +63,7 @@ impl From<&RetentionConfig> for RetentionPolicy {
             keep_latest_stable: c.keep_latest_stable,
             keep_latest_prerelease: c.keep_latest_prerelease,
             max_age_days: c.max_age_days,
+            exclude_id_prefixes: c.exclude_id_prefixes.clone(),
         }
     }
 }
@@ -124,13 +135,18 @@ impl<'a> Candidate<'a> {
 ///
 /// `versions` may be in any order. Pinned and unservable versions are set
 /// aside *before* ranking, so they are never pruned and never count towards
-/// "the newest N". `now` is injected for deterministic testing.
+/// "the newest N". An excluded id keeps everything. `now` is injected for
+/// deterministic testing.
 pub fn prune_plan(
     versions: &[Candidate<'_>],
     policy: &RetentionPolicy,
     now: DateTime<Utc>,
 ) -> Vec<Pruned> {
     if versions.is_empty() || !policy.has_limits() {
+        return Vec::new();
+    }
+    // All versions share one id; the first one names it.
+    if policy.excludes(&versions[0].package.id) {
         return Vec::new();
     }
 
@@ -1026,6 +1042,33 @@ mod tests {
         // Keep 2.0.0 and 1.2.0; prune 1.1.0 and 1.0.0.
         assert_eq!(
             names(versions_to_prune(&packages, &policy, Utc::now())),
+            vec!["1.0.0", "1.1.0"]
+        );
+    }
+
+    #[test]
+    fn an_excluded_id_keeps_every_version() {
+        let packages = vec![pkg("1.0.0", 400), pkg("1.1.0", 400), pkg("2.0.0", 0)];
+        let policy = |prefixes: &[&str]| RetentionPolicy {
+            keep_latest_stable: Some(1),
+            max_age_days: Some(30),
+            exclude_id_prefixes: prefixes.iter().map(|p| p.to_string()).collect(),
+            ..Default::default()
+        };
+        // The id is "Pkg": a matching prefix, in any case, keeps it all.
+        for prefixes in [&["pkg"][..], &["Other", "PK"][..], &["Pkg."][..]] {
+            assert!(
+                versions_to_prune(&packages, &policy(prefixes), Utc::now()).is_empty(),
+                "{prefixes:?}"
+            );
+        }
+        // A prefix that does not match leaves the limits in force.
+        assert_eq!(
+            names(versions_to_prune(
+                &packages,
+                &policy(&["Pkg.Extra", "Other"]),
+                Utc::now()
+            )),
             vec!["1.0.0", "1.1.0"]
         );
     }

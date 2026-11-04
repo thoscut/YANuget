@@ -2,7 +2,7 @@
 
 use crate::error::{Error, Result};
 
-use super::{Config, FeedConfig};
+use super::{Config, FeedConfig, RetentionConfig};
 
 impl Config {
     /// Reject combinations that parse but cannot mean what they say.
@@ -43,9 +43,34 @@ impl Config {
 /// A feed's `reserved_id_prefixes`, checked: made of package-id characters
 /// and starting with a letter, digit or `_`, so each can match real ids.
 pub(super) fn reserved_prefixes(feed: &FeedConfig) -> Result<Vec<String>> {
-    let mut prefixes = Vec::with_capacity(feed.reserved_id_prefixes.len());
-    for raw in &feed.reserved_id_prefixes {
-        let prefix = raw.trim();
+    id_prefixes(
+        &feed.reserved_id_prefixes,
+        &feed.name,
+        "reserved_id_prefixes",
+    )
+}
+
+/// A feed's retention with its `exclude_id_prefixes` checked and trimmed.
+pub(super) fn checked_retention(
+    retention: &RetentionConfig,
+    feed: &str,
+) -> Result<RetentionConfig> {
+    Ok(RetentionConfig {
+        exclude_id_prefixes: id_prefixes(
+            &retention.exclude_id_prefixes,
+            feed,
+            "retention.exclude_id_prefixes",
+        )?,
+        ..retention.clone()
+    })
+}
+
+/// Package-id prefixes, trimmed and checked: made of package-id characters
+/// and starting with a letter, digit or `_`, so each can match real ids.
+fn id_prefixes(raw: &[String], feed: &str, key: &str) -> Result<Vec<String>> {
+    let mut prefixes = Vec::with_capacity(raw.len());
+    for entry in raw {
+        let prefix = entry.trim();
         let valid = prefix
             .bytes()
             .next()
@@ -55,8 +80,7 @@ pub(super) fn reserved_prefixes(feed: &FeedConfig) -> Result<Vec<String>> {
                 .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'));
         if !valid || prefix.len() > crate::validation::MAX_ID_LENGTH {
             return Err(Error::BadRequest(format!(
-                "feed {:?}: invalid reserved_id_prefixes entry {raw:?}",
-                feed.name
+                "feed {feed:?}: invalid {key} entry {entry:?}"
             )));
         }
         prefixes.push(prefix.to_string());
