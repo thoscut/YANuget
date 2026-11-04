@@ -25,9 +25,9 @@ A fully commented template lives in
 | `api_keys` | `YANUGET_API_KEYS` | string[] | `[]` | Additional accepted push/delete keys (env: comma-separated). Any of these or `api_key` authenticates. |
 | `admin_api_key` | `YANUGET_ADMIN_API_KEY` | string | *(none)* | Protects `/admin` (Basic auth). Unset ⇒ admin area off. |
 | `gallery_page_size` | `YANUGET_GALLERY_PAGE_SIZE` | int | `20` | Packages per gallery page (`?take=` overrides, up to 100 or this size, whichever is larger). |
-| `max_package_size_bytes` | `YANUGET_MAX_PACKAGE_SIZE_BYTES` | int | *(unlimited)* | Upload cap; streamed either way. |
+| `max_package_size_bytes` | `YANUGET_MAX_PACKAGE_SIZE_BYTES` | int | *(unlimited)* | Upload cap; streamed either way. A push whose `Content-Length` is over it (allowing 64 KiB for multipart boundaries) is refused with `413` before anything is written or reserved. |
 | `upload_idle_timeout_secs` | `YANUGET_UPLOAD_IDLE_TIMEOUT_SECS` | int | `300` | Abort an upload after this long without a byte arriving (`408`). Only silence counts; a slow transfer is never cut off. `0` waits forever. |
-| `min_free_disk_bytes` | `YANUGET_MIN_FREE_DISK_BYTES` | int | `2147483648` (2 GiB) | Refuse an upload (`507`) that would leave less than this free on the storage volume. Checked against the declared size when there is one, counting the space promised to the uploads still in progress (what they declared and have not written yet, resumable ones included) as used, and again every 64 MiB while a body streams in, so an upload without a `Content-Length` is held to it too; a resumable upload is checked again on every `PATCH`. Mirror fetches and `yanuget migrate` downloads are held to it too, against the upstream's `Content-Length`. `0` turns the check off. |
+| `min_free_disk_bytes` | `YANUGET_MIN_FREE_DISK_BYTES` | int | `2147483648` (2 GiB) | Refuse an upload (`507`) that would leave less than this free on the storage volume. Checked against the declared size when there is one, counting the space promised to the uploads still in progress (what they declared and have not written yet, resumable ones included) as used, and again every 64 MiB while a body streams in, so an upload without a `Content-Length` is held to it too; a resumable upload is checked again on every `PATCH`. Mirror fetches and inbox imports are admitted the same way, against the upstream's `Content-Length` or the file's size: they reserve that space too, and see what uploads were promised. `yanuget migrate` downloads are held to the reserve. `0` turns the check off. |
 | `max_connections` | `YANUGET_MAX_CONNECTIONS` | int | `4096` | Concurrent connections accepted; one over the cap is closed at once. `0` is unlimited. |
 | `allow_overwrite` | `YANUGET_ALLOW_OVERWRITE` | bool \| string | `false` | Re-push an existing version: `false`, `true`, `"prerelease-only"` (overwrite pre-releases only), or `"pending-only"` (replace a version only while it is pending in every feed that holds it; see below). |
 | `hard_delete_enabled` | `YANUGET_HARD_DELETE_ENABLED` | bool | `false` | DELETE removes vs. unlists. |
@@ -151,7 +151,7 @@ ones included) and each mirror's upstream host. The probes `/health`,
 | TOML key | Env var | Type | Default | Description |
 | --- | --- | --- | --- | --- |
 | `monitoring.enabled` | `YANUGET_MONITORING_ENABLED` | bool | `false` | Serve `/metrics` and `/health/status`. |
-| `monitoring.token` | `YANUGET_MONITORING_TOKEN` | string | *(none)* | When set, both endpoints require `Authorization: Bearer <token>`. Unset, anyone who can reach the server can read them. Like the keys, it can come from `YANUGET_MONITORING_TOKEN_FILE`, and a blank variable is an error. |
+| `monitoring.token` | `YANUGET_MONITORING_TOKEN` | string | *(none)* | When set, both endpoints require `Authorization: Bearer <token>`. Unset, anyone who can reach the server can read them. Like the keys, it can come from `YANUGET_MONITORING_TOKEN_FILE`. A blank value, in the variable or as `token = ""` in the file, is an error, and `config check` warns about one shorter than 32 characters. |
 
 Like the health probes, `/metrics` answers whatever the `Host`, so a scraper
 can use the server's address. A Prometheus job:
@@ -309,8 +309,16 @@ it.
 | `retention.keep_latest_stable` | `YANUGET_RETENTION_KEEP_LATEST_STABLE` | int | *(unset)* | Keep newest N stable versions per id. |
 | `retention.keep_latest_prerelease` | `YANUGET_RETENTION_KEEP_LATEST_PRERELEASE` | int | *(unset)* | Keep newest N pre-release versions per id. |
 | `retention.max_age_days` | `YANUGET_RETENTION_MAX_AGE_DAYS` | int | *(unset)* | Prune versions added to the feed more than N days ago. |
+| `retention.exclude_id_prefixes` | `YANUGET_RETENTION_EXCLUDE_ID_PREFIXES` | string[] (env: comma-separated) | `[]` | Package-id prefixes retention never prunes. |
 
 With no limit set, the sweep does nothing even when `enabled`.
+
+`exclude_id_prefixes` takes an id out of retention entirely: every version of
+it is kept, and the page lists none of them. Prefixes match like
+`reserved_id_prefixes`, ignoring ASCII case, and one ending in `.` also covers
+the bare id before it (`Contoso.` covers `Contoso` and `Contoso.Utils`). Use it
+for a feed that should prune what it takes from upstream but keep every
+release of its own packages.
 
 An admin can **pin** a version in `/admin`; retention then keeps it whatever
 the rules say, and it does not use up one of the "newest *N*" either — a pin is
@@ -335,7 +343,7 @@ wherever their version goes, retention included.
 | `files.enabled` | `YANUGET_FILES_ENABLED` | bool | `true` | Accept and serve attached files. |
 | `files.max_file_size_bytes` | `YANUGET_FILES_MAX_FILE_SIZE_BYTES` | int | *(`max_package_size_bytes`)* | Largest file accepted; unset falls back to the package limit, and both unset is unlimited. |
 | `files.allowed_extensions` | `YANUGET_FILES_ALLOWED_EXTENSIONS` | string[] | `wim, swm, esd, iso, vhd, vhdx, zip, 7z, cab` | Accepted file types (env: comma-separated). |
-| `files.upload_expiry_hours` | `YANUGET_FILES_UPLOAD_EXPIRY_HOURS` | int | `72` | How long an unfinished resumable upload is kept. |
+| `files.upload_expiry_hours` | `YANUGET_FILES_UPLOAD_EXPIRY_HOURS` | int | `72` | How long an unfinished resumable upload is kept. It holds the space it has still to receive against `min_free_disk_bytes` only for an hour after it was created or its last `PATCH` ended; idle for longer, its next `PATCH` is admitted again like a new upload of what is left (`507` when that no longer fits). |
 | `files.max_open_uploads` | `YANUGET_FILES_MAX_OPEN_UPLOADS` | int | `32` | How many unfinished resumable uploads one feed may hold at once; another is refused with `429` until one finishes, is deleted or expires. `0` is no limit. |
 | `files.inbox_dir` | `YANUGET_FILES_INBOX_DIR` | path | *(off)* | The SSH inbox (below). |
 | `files.inbox_scan_secs` | `YANUGET_FILES_INBOX_SCAN_SECS` | int | `30` | How often the inbox is scanned (at least 5). |
@@ -380,8 +388,9 @@ transfer. The importer copies the file into the server's own staging area
 while it checks it, so what is verified is what is stored, then attaches it to
 the version, which the feed must already hold, and removes both files. The
 copy needs as much free space again on the store's volume while it runs, and
-is refused, like a push, when it would leave less than `min_free_disk_bytes`
-free. When
+is admitted like a push: refused when it would leave less than
+`min_free_disk_bytes` free, counting the space promised to uploads in
+progress, and reserving its own size until the copy is done. When
 a file cannot be imported, a `{name}.error` next to it says why; the file
 stays, and removing the `.error` retries it.
 
@@ -433,7 +442,9 @@ stores a version first owns it everywhere: pushing different bytes under the
 same id and version is refused (`409`, logged as a failure) in every feed,
 and a mirror fetch of it fails the same way. Package metadata, readmes,
 icons and attached files are shared too, so detaching a file in one feed
-detaches it in all of them. A push key on a low-trust feed, or an anonymous
+detaches it in all of them (which an approval in another feed stops; see
+[Attached files of an approved version](#attached-files-of-an-approved-version)).
+A push key on a low-trust feed, or an anonymous
 read that fills a mirror feed, can therefore claim a version another feed
 meant to publish. `reserved_id_prefixes` closes that for your own ids: a feed
 that reserves `Contoso.` is the only one that may push, mirror or migrate
@@ -468,7 +479,7 @@ affected.
 | `feeds[].mirror.max_versions_per_package` | int | `50` | Newest-first cap on how many versions one read-through miss fetches. |
 | `feeds[].mirror.max_package_size_bytes` | int | *(server-wide cap, else 2 GiB)* | Cap on a single mirrored `.nupkg`. |
 | `feeds[].mirror.allow_private_upstream` | bool | `false` | Permit an upstream on a private/loopback address. |
-| `feeds[].mirror.proxy` | string | *(none)* | Outbound proxy for upstream requests. Unset, the mirror connects directly and ignores `HTTP(S)_PROXY`. |
+| `feeds[].mirror.proxy` | string | *(none)* | Outbound proxy for upstream requests. Unset, the mirror connects directly and ignores `HTTP(S)_PROXY`. Each host is still resolved locally and refused when private, unless `allow_private_upstream` is set. |
 | `feeds[].mirror.ca_cert_path` | path | *(none)* | PEM file of extra CA certificates to trust for the upstream, on top of the system store and the bundled Mozilla roots. |
 | `feeds[].mirror.probe_interval_secs` | int | `300` | Ask the upstream for its service index at startup and then every N seconds, so an outage is logged (and shown in [`/health/status`](#monitoring)) before a client needs the upstream. `0` turns the probe off. |
 | `feeds[].license_policy.enabled` | bool | `false` | Evaluate the offline license policy. |
@@ -512,7 +523,12 @@ How the mirror keeps up, and what it does not repeat:
   there (or listed again) is unlisted (or listed) here too. Not one whose
   listing was set on this feed by hand, with `dotnet nuget delete` or a
   relist: that stays as set. Versions already unlisted when the database is
-  migrated to schema version 9 count as set by hand.
+  migrated to schema version 9 count as set by hand. This applies to every
+  version the feed holds, not only to the ones the mirror fetched: one pushed,
+  imported or promoted into the feed follows the upstream's listing too
+  whenever the upstream has the same id and version, unless its listing was
+  set here by hand. Unlisting it (or relisting it) once is how to keep a local
+  build's listing apart from the upstream's.
 * **The version a client asks for is fetched first**, even when it is older
   than the newest `max_versions_per_package`, so a project pinned to an old
   version restores.
@@ -574,8 +590,33 @@ ring, where it waits for approval if that ring gates. The source feed's admin
 page then says so and links to the target's admin page, where the version is
 approved; its row shows `pending in stable` until then. A promoted (or copied)
 version keeps the state it had: one that is unlisted, disabled or still
-pending in the source arrives unlisted, disabled or pending in the target. Feeds without
+pending in the source arrives unlisted, disabled or pending in the target. A
+listing set there by hand stays set by hand, so a mirror in the target does not
+relist a version that was unlisted on purpose. Feeds without
 `promotes_to` are simply independent sets a version can be added to.
+
+#### Attached files of an approved version
+
+[Attached files](#attached-files) belong to the version, not to a feed, and
+the package hash does not cover them. A source feed keeps its copy after a
+promotion, so without a rule its push key could replace `setup.exe` of a
+version production approved. Once a feed that reviews what it serves
+(`requires_approval`, or `allow_overwrite = "pending-only"`) has approved a
+version, its files stay as they were approved, whatever the requesting
+feed's own `allow_overwrite`:
+
+- Attaching or deleting a file of it, from any feed holding the version, is
+  `403` with the push key alone, and the message names the feeds where it is
+  approved.
+- The admin key of **every** feed that approved it sets this aside: send it as
+  HTTP Basic credentials along with the push key, or delete from that feed's
+  admin page. The admin key of the feed the request comes in on is not
+  enough when another feed approved the version. Such a change is logged as
+  a warning that names those feeds.
+- While the version is still pending everywhere that reviews, and in feeds
+  that approve on arrival, the push key attaches and deletes as before.
+- The file inbox holds no credentials: for a feed with `requires_approval` or
+  `pending-only`, a file dropped for a version approved anywhere is refused.
 
 #### Previewing pending versions
 
@@ -594,6 +635,13 @@ approve or reach `/admin`, and on a read-gated feed it stands in for the read
 key on those download URLs only. A disabled version stays withheld. Responses
 to it are `Cache-Control: private` and never `immutable`, with `Vary` on the
 credential headers, and they are not counted as downloads.
+
+On a feed with open reads, a download that finds nothing to serve is `401`
+rather than `404` when the request offers a key where the preview key goes
+(`X-NuGet-ApiKey`, or the password of HTTP Basic credentials) that is none of
+the feed's keys, so guesses at the preview key count against
+[`max_failed_auth`](#rate-limiting). The feed's push or admin key, a blank
+password and other schemes such as a gateway's `Bearer` token get the `404`.
 
 `yanuget config check` warns when the preview key is also another key of the
 feed.
@@ -615,9 +663,10 @@ and re-runs against, can set `allow_overwrite = "pending-only"`:
   wins (the push is refused and the approved build stays, files included) or
   waits until the replacement is recorded.
 - Its attached files stay as they are too. Attaching or deleting a file of a
-  version approved anywhere, over HTTP or through the inbox, is `403` with the
-  push key alone; a request that also carries the feed's admin key as HTTP
-  Basic credentials, and the admin page, may still change them.
+  version approved anywhere, even in a feed that approves on arrival, over
+  HTTP or through the inbox, is `403` with the push key alone; see
+  [Attached files of an approved version](#attached-files-of-an-approved-version)
+  for which admin keys may still change them.
 - The admin page approves what it showed: a build replaced, or files attached
   or deleted, after the page was loaded make the approval `409`, and a reload
   shows what is there now.
@@ -706,8 +755,13 @@ responses also carry a `Strict-Transport-Security` header (one year).
   `allow_private_upstream = true` — checked on the addresses a host name
   resolves to when each connection is made, so a name pointing at the local
   network, a redirect to one, or a DNS answer that changes between requests is
-  refused too. Through a configured `proxy`, the proxy resolves names, so its
-  own egress rules apply. Mirrored downloads are bounded by
+  refused too. Through a configured `proxy` (or, for `yanuget migrate`, one
+  from `HTTP(S)_PROXY`) the proxy resolves the names itself, so the server
+  also resolves each host of every request and redirect hop and refuses one
+  with a private address, or one that does not resolve locally. The proxy
+  resolves again, so a DNS answer that changes in between gets past that:
+  have the proxy refuse private destinations as well (`yanuget config check`
+  warns about this). Mirrored downloads are bounded by
   `max_package_size_bytes` and `max_versions_per_package`, and a mirrored
   package must declare the id/version that was actually requested — so a
   compromised upstream cannot substitute a different package under a name your

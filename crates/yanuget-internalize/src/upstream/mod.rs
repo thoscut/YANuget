@@ -19,6 +19,7 @@ use reqwest::{StatusCode, Url};
 use sha2::{Digest, Sha256, Sha512};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::OnceCell;
+use yanuget_pkg::fetch::{decode_capped, DecodeError};
 use yanuget_pkg::NuGetVersion;
 
 use crate::config::UpstreamConfig;
@@ -518,10 +519,64 @@ impl Upstream {
         })
     }
 
-    /// A metadata document; `None` is a `404`. Gzip-encoded bodies (Azure
-    /// blob storage serves registrations that way) are decoded, under the
-    /// same cap.
+    /// A metadata document, decoded on the blocking pool; `None` is a `404`.
     async fn document(&self, url: &Url, what: &str) -> Result<Option<Vec<u8>>, UpstreamError> {
+        self.parsed(url, what, Ok).await
+    }
+
+    /// A JSON document; `None` is a `404`.
+    async fn json<T: serde::de::DeserializeOwned + Send + 'static>(
+        &self,
+        url: &Url,
+        what: &str,
+    ) -> Result<Option<T>, UpstreamError> {
+        let shown = format!("upstream {what} {}", redact(url));
+        self.parsed(url, what, move |body| {
+            serde_json::from_slice(&body)
+                .map_err(|e| UpstreamError::Invalid(format!("{shown} is not JSON: {e}")))
+        })
+        .await
+    }
+
+    /// A metadata document, decoded (gzip, which Azure blob storage serves
+    /// registrations as, under the same cap) and then read by `parse`, both
+    /// on the blocking pool, since a large registration takes a while.
+    async fn parsed<T, F>(
+        &self,
+        url: &Url,
+        what: &str,
+        parse: F,
+    ) -> Result<Option<T>, UpstreamError>
+    where
+        T: Send + 'static,
+        F: FnOnce(Vec<u8>) -> Result<T, UpstreamError> + Send + 'static,
+    {
+        let Some((body, gzip)) = self.raw_document(url, what).await? else {
+            return Ok(None);
+        };
+        let (label, shown) = (what.to_string(), redact(url));
+        tokio::task::spawn_blocking(move || {
+            let body = decode_capped(body, gzip, MAX_DOCUMENT_BYTES).map_err(|e| match e {
+                DecodeError::TooLarge => UpstreamError::Invalid(format!(
+                    "upstream {label} {shown} is larger than {MAX_DOCUMENT_BYTES} bytes"
+                )),
+                DecodeError::Gzip(e) => {
+                    UpstreamError::Invalid(format!("upstream {label}: bad gzip: {e}"))
+                }
+            })?;
+            parse(body).map(Some)
+        })
+        .await
+        .map_err(|e| UpstreamError::Invalid(format!("reading the upstream {what}: {e}")))?
+    }
+
+    /// A metadata document's body as sent, and whether it is gzipped;
+    /// `None` is a `404`.
+    async fn raw_document(
+        &self,
+        url: &Url,
+        what: &str,
+    ) -> Result<Option<(Vec<u8>, bool)>, UpstreamError> {
         let fetched = self.http.get(url, what).await?;
         let resp = fetched.response;
         if resp.status() == StatusCode::NOT_FOUND {
@@ -563,31 +618,7 @@ impl Upstream {
             .map_err(|_| {
                 UpstreamError::Http(format!("upstream {what} {} timed out", redact(url)))
             })??;
-        if gzip {
-            let mut decoded = Vec::new();
-            flate2::read::GzDecoder::new(body.as_slice())
-                .take(MAX_DOCUMENT_BYTES + 1)
-                .read_to_end(&mut decoded)
-                .map_err(|e| UpstreamError::Invalid(format!("upstream {what}: bad gzip: {e}")))?;
-            if decoded.len() as u64 > MAX_DOCUMENT_BYTES {
-                return Err(too_large());
-            }
-            body = decoded;
-        }
-        Ok(Some(body))
-    }
-
-    async fn json<T: serde::de::DeserializeOwned>(
-        &self,
-        url: &Url,
-        what: &str,
-    ) -> Result<Option<T>, UpstreamError> {
-        match self.document(url, what).await? {
-            Some(body) => serde_json::from_slice(&body).map(Some).map_err(|e| {
-                UpstreamError::Invalid(format!("upstream {what} {} is not JSON: {e}", redact(url)))
-            }),
-            None => Ok(None),
-        }
+        Ok(Some((body, gzip)))
     }
 }
 

@@ -105,12 +105,7 @@ pub(super) fn routes(states: &[AppState]) -> Router {
     }
     let monitor = Arc::new(Monitor {
         states: states.to_vec(),
-        token: config
-            .token
-            .as_deref()
-            .map(str::trim)
-            .filter(|t| !t.is_empty())
-            .map(str::to_string),
+        token: config.token().map(str::to_string),
         started: Instant::now(),
         scans: Recent::new(),
     });
@@ -139,11 +134,7 @@ impl Monitor {
                 let counters = &state.feed.counters;
                 counters.pushes.load(Ordering::Relaxed)
                     + counters.promotions.load(Ordering::Relaxed)
-                    + state
-                        .feed
-                        .mirror
-                        .as_ref()
-                        .map_or(0, |m| m.upstream_status().mirrored)
+                    + state.feed.mirror.as_ref().map_or(0, |m| m.mirrored())
             })
             .sum()
     }

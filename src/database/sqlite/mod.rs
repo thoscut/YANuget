@@ -318,6 +318,10 @@ impl PackageDatabase for SqliteDatabase {
         memberships::follow_upstream_listing(self, feed, id, version, listed).await
     }
 
+    async fn upstream_listed(&self, feed: &str, id: &str) -> Result<Vec<(String, bool)>> {
+        memberships::upstream_listed(self, feed, id).await
+    }
+
     async fn set_enabled(
         &self,
         feed: &str,
@@ -500,12 +504,20 @@ impl PackageDatabase for SqliteDatabase {
         uploads::set_upload_received(self, id, received).await
     }
 
+    async fn set_upload_held(&self, id: &str, since: Option<DateTime<Utc>>) -> Result<()> {
+        uploads::set_upload_held(self, id, since).await
+    }
+
     async fn delete_upload(&self, id: &str) -> Result<()> {
         uploads::delete_upload(self, id).await
     }
 
-    async fn outstanding_upload_bytes(&self, now: DateTime<Utc>) -> Result<u64> {
-        uploads::outstanding_upload_bytes(self, now).await
+    async fn outstanding_upload_bytes(
+        &self,
+        now: DateTime<Utc>,
+        held_after: DateTime<Utc>,
+    ) -> Result<u64> {
+        uploads::outstanding_upload_bytes(self, now, held_after).await
     }
 
     async fn open_uploads(&self, feed: &str, now: DateTime<Utc>) -> Result<u64> {
@@ -568,8 +580,8 @@ impl PackageDatabase for SqliteDatabase {
         memberships::shared_versions(&mut *self.pool.acquire().await?, a, b).await
     }
 
-    async fn rename_feed(&self, from: &str, to: &str) -> Result<u64> {
-        memberships::rename_feed(self, from, to).await
+    async fn rename_feed(&self, from: &str, to: &str, hold: bool) -> Result<u64> {
+        memberships::rename_feed(self, from, to, hold).await
     }
 
     async fn feed_members(&self, feed: &str) -> Result<Vec<(String, NuGetVersion)>> {

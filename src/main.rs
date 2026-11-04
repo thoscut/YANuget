@@ -196,6 +196,10 @@ async fn run_server(config_path: Option<&str>) -> anyhow::Result<()> {
     let config = Config::load(config_path)?;
     tokio::fs::create_dir_all(&config.data_dir).await?;
     tokio::fs::create_dir_all(config.storage_path()).await?;
+    // Held until the server exits, so `restore` and `feeds rename/remove`
+    // see it from wherever they run (see `yanuget::data_lock`).
+    let _data_lock = yanuget::data_lock::DataLock::try_acquire(&config.database_path())
+        .map_err(|e| anyhow::anyhow!("{e}; is another server running on it?"))?;
 
     for name in config.unknown_env() {
         tracing::warn!(variable = %name, "environment variable {name} is not a setting and is ignored");
@@ -242,6 +246,10 @@ async fn run_server(config_path: Option<&str>) -> anyhow::Result<()> {
     // Every background task, joined on shutdown so none is cut off mid-write.
     let mut background: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     let mut states = Vec::with_capacity(feeds.len());
+    // One admission for everything written to the staging directory: every
+    // feed's uploads, its mirror's downloads and the inbox's imports see
+    // what the others promised.
+    let space = Arc::new(yanuget::space::SpaceGuard::for_store(&config, db.clone()));
     for feed in &feeds {
         let state = AppState::for_feed(
             storage.clone(),
@@ -249,6 +257,7 @@ async fn run_server(config_path: Option<&str>) -> anyhow::Result<()> {
             config.clone(),
             feed,
             feeds_meta.clone(),
+            space.clone(),
         )
         .await?;
         // Shared with the admin page, so a sweep and a manual cleanup never
@@ -351,6 +360,7 @@ async fn run_server(config_path: Option<&str>) -> anyhow::Result<()> {
         &config,
         &storage,
         &db,
+        &space,
         &feeds,
         &shutdown_rx,
     ));
@@ -600,7 +610,7 @@ async fn run_backup(config_path: Option<&str>, args: BackupArgs) -> anyhow::Resu
 async fn run_restore(config_path: Option<&str>, args: RestoreArgs) -> anyhow::Result<()> {
     init_tracing_quiet();
     let config = Config::load(config_path)?;
-    refuse_while_serving(&config, "restoring").await?;
+    let _data_lock = refuse_while_serving(&config, "restoring").await?;
     let s = yanuget::backup::restore(
         &config,
         &args.src,
@@ -620,10 +630,18 @@ async fn run_restore(config_path: Option<&str>, args: RestoreArgs) -> anyhow::Re
     Ok(())
 }
 
-/// Refuse to go on while a server answers on the configured port: what
-/// follows writes to the database and store behind its back, outside the
-/// locks it takes in-process.
-async fn refuse_while_serving(config: &Config, doing: &str) -> anyhow::Result<()> {
+/// Refuse to go on while a server uses the data: what follows writes to the
+/// database and store behind its back, outside the locks it takes
+/// in-process. The [data lock](yanuget::data_lock) is taken and returned, to
+/// be held while the command works, so no server starts meanwhile; a server
+/// that answers on the configured port is refused as well, in case it is one
+/// that does not take the lock (an older release).
+async fn refuse_while_serving(
+    config: &Config,
+    doing: &str,
+) -> anyhow::Result<Option<yanuget::data_lock::DataLock>> {
+    let lock = yanuget::data_lock::DataLock::try_acquire(&config.database_path())
+        .map_err(|e| anyhow::anyhow!("{e}; stop it before {doing}"))?;
     let url = healthcheck_url(config);
     let probe = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
@@ -634,7 +652,7 @@ async fn refuse_while_serving(config: &Config, doing: &str) -> anyhow::Result<()
     if probe.get(&url).send().await.is_ok() {
         anyhow::bail!("a server answers at {url}; stop it before {doing}");
     }
-    Ok(())
+    Ok(lock)
 }
 
 /// The readiness URL of the server this configuration describes, on this
@@ -850,6 +868,7 @@ fn spawn_file_tasks(
     config: &Arc<Config>,
     storage: &Arc<FilesystemStorage>,
     db: &Arc<SqliteDatabase>,
+    space: &Arc<yanuget::space::SpaceGuard>,
     feeds: &[yanuget::config::ResolvedFeed],
     shutdown: &tokio::sync::watch::Receiver<bool>,
 ) -> Vec<tokio::task::JoinHandle<()>> {
@@ -857,7 +876,7 @@ fn spawn_file_tasks(
     if !config.files.enabled {
         return tasks;
     }
-    let staging = config.storage_path().join(".uploads");
+    let staging = space.dir().to_path_buf();
 
     // Expired uploads: once at startup, then every quarter hour.
     {
@@ -886,6 +905,16 @@ fn spawn_file_tasks(
         return tasks;
     }
     let names: Vec<String> = feeds.iter().map(|f| f.name.clone()).collect();
+    // The inbox holds no credentials: an approval in a feed that reviews what
+    // it serves keeps the version's files as they are, as a push key must,
+    // and a pending-only feed keeps those of a version approved anywhere.
+    let reviewing: Vec<String> = feeds
+        .iter()
+        .filter(|f| {
+            f.requires_approval || f.allow_overwrite == yanuget::config::OverwriteMode::PendingOnly
+        })
+        .map(|f| f.name.clone())
+        .collect();
     let pending_only: Vec<String> = feeds
         .iter()
         .filter(|f| f.allow_overwrite == yanuget::config::OverwriteMode::PendingOnly)
@@ -899,7 +928,7 @@ fn spawn_file_tasks(
         let _ = std::fs::create_dir_all(inbox.join(name));
     }
     tracing::info!(inbox = %inbox.display(), every_secs = config.files.inbox_scan_secs, "file inbox enabled");
-    let (config, storage, db) = (config.clone(), storage.clone(), db.clone());
+    let (config, storage, db, space) = (config.clone(), storage.clone(), db.clone(), space.clone());
     let mut shutdown = shutdown.clone();
     tasks.push(tokio::spawn(async move {
         let period = Duration::from_secs(config.files.inbox_scan_secs.max(5));
@@ -920,8 +949,8 @@ fn spawn_file_tasks(
                 max_file_size: config.max_file_size_bytes(),
                 feeds: &names,
                 pending_only: &pending_only,
-                staging: &staging,
-                min_free_disk_bytes: config.min_free_disk_bytes,
+                reviewing: &reviewing,
+                space: &space,
             };
             let report = scan.scan().await;
             if report.imported + report.failed > 0 {

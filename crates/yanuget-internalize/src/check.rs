@@ -65,7 +65,7 @@ pub async fn check(path: Option<&str>, online: bool) -> Report {
     let config = match Config::load(path) {
         Ok(c) => c,
         Err(e) => {
-            report.errors.push(e.to_string());
+            report.errors.push(crate::error_chain(&e));
             return report;
         }
     };
@@ -113,7 +113,9 @@ pub fn check_loaded(config: &Config, host: &Host, report: &mut Report) {
                 if o.len() == 1 { "" } else { "s" },
                 dir.display()
             )),
-            Err(e) => report.errors.push(format!("overrides: {e}")),
+            Err(e) => report
+                .errors
+                .push(format!("overrides: {}", crate::error_chain(&e))),
         }
     }
     if let Some(path) = &config.sync.watch_list {
@@ -124,11 +126,11 @@ pub fn check_loaded(config: &Config, host: &Host, report: &mut Report) {
                 if w.len() == 1 { "" } else { "s" },
                 path.display()
             )),
-            Err(e) => report.errors.push(e.to_string()),
+            Err(e) => report.errors.push(crate::error_chain(&e)),
         }
     }
     if let Err(e) = crate::sync::State::load(&config.sync.state_file) {
-        report.errors.push(e.to_string());
+        report.errors.push(crate::error_chain(&e));
     }
     if let Some(dir) = config
         .sync

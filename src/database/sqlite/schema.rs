@@ -107,6 +107,11 @@ const MIGRATIONS: &[Migration] = &[
         description: "record which memberships had their listing set by hand",
         step: Step::ListingSet,
     },
+    Migration {
+        version: 10,
+        description: "record since when a resumable upload holds its space",
+        step: Step::UploadHeld,
+    },
 ];
 
 /// What a [`Migration`] runs. An enum rather than a function pointer in the
@@ -123,6 +128,7 @@ enum Step {
     AddForeignKeys,
     SemVer2Dependencies,
     ListingSet,
+    UploadHeld,
 }
 
 async fn apply(step: Step, c: &mut SqliteConnection) -> Result<()> {
@@ -136,6 +142,7 @@ async fn apply(step: Step, c: &mut SqliteConnection) -> Result<()> {
         Step::AddForeignKeys => add_foreign_keys(c).await,
         Step::SemVer2Dependencies => semver2_dependencies(c).await,
         Step::ListingSet => listing_set(c).await,
+        Step::UploadHeld => upload_held(c).await,
     }
 }
 
@@ -591,9 +598,10 @@ async fn ensure_column(
     let rows = sqlx::query(&format!("PRAGMA table_info({table})"))
         .fetch_all(&mut *c)
         .await?;
-    let exists = rows
-        .iter()
-        .any(|r| r.get::<String, _>("name").eq_ignore_ascii_case(column));
+    let mut exists = false;
+    for r in &rows {
+        exists |= r.try_get::<String, _>("name")?.eq_ignore_ascii_case(column);
+    }
     if !exists {
         sqlx::query(&format!("ALTER TABLE {table} ADD COLUMN {column} {def}"))
             .execute(&mut *c)
@@ -975,6 +983,19 @@ async fn listing_set(c: &mut SqliteConnection) -> Result<()> {
     )
     .execute(&mut *c)
     .await?;
+    Ok(())
+}
+
+/// Step 10: `uploads.held_since`, since when an unfinished resumable upload
+/// has held the space it has still to receive. It holds it only for a while
+/// after its last request (see `space::RESUMABLE_HOLD`), not until it
+/// expires; `NULL` while a request is writing it, which reserves the space
+/// itself. Uploads open now hold it from when they were created.
+async fn upload_held(c: &mut SqliteConnection) -> Result<()> {
+    ensure_column(c, "uploads", "held_since", "TEXT").await?;
+    sqlx::query("UPDATE uploads SET held_since = created WHERE held_since IS NULL")
+        .execute(&mut *c)
+        .await?;
     Ok(())
 }
 

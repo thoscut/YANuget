@@ -135,6 +135,8 @@ mod tests {
                 name: "old".into(),
                 versions: 2,
                 exclusive: 1,
+                pending: 0,
+                disabled: 0,
                 tombstones: 0
             }]
         );

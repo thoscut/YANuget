@@ -41,14 +41,29 @@ Everything CI enforces, in the order it fails fastest:
 
 ```bash
 cargo fmt --all
-cargo clippy --workspace --all-targets --all-features   # must be warning-free
-cargo test --workspace --all-features
+cargo clippy --workspace --all-targets --all-features --locked   # must be warning-free
+cargo test --workspace --all-features --locked
+cargo test -p yanuget-pkg --no-default-features --locked         # as crates.io ships it
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features --locked
 mkdocs build --strict                       # if you touched docs/
 ```
 
+`--locked` builds from `Cargo.lock` as it is; a change that needs a different
+lock has to commit it. CI also runs the tests on the minimum supported Rust
+(1.89) and a `cargo check` on Windows and macOS, for the `cfg(not(unix))`
+code the Linux jobs never compile.
+
 CI also runs `cargo audit` and `cargo deny check licenses bans sources`
 (policy in `deny.toml`): a new dependency under a license not on the list
-there fails the build until someone has looked at it.
+there fails the build until someone has looked at it. It generates the
+release's CycloneDX bill of materials, so a problem with it shows on the pull
+request, and measures line coverage with `cargo llvm-cov`: the run's summary
+shows the numbers, and the `coverage-lcov` artifact has the per-line report.
+Nothing gates on coverage; to see it locally:
+
+```bash
+cargo llvm-cov --workspace --all-features --html   # target/llvm-cov/html/
+```
 
 Every action in `.github/workflows/` is pinned to a full commit SHA with the
 release in a comment (`uses: actions/checkout@<sha> # v7.0.1`). Keep it that
@@ -90,7 +105,10 @@ log links the compare page.
 
 Review that branch rather than merging it blind — a CI runner does not render
 byte-identically to your machine, so part of any diff is the runner rather than
-your change.
+your change. GitHub starts no workflow for a pull request a workflow opened
+with its own token, so that pull request has no checks until you start CI on
+`chore/refresh-media` by hand (Actions → CI → Run workflow); the run's checks
+then show on the pull request.
 
 ## What good changes look like
 

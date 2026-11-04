@@ -122,8 +122,8 @@ pub(super) async fn search(
 
     let ids: Vec<String> = id_rows
         .iter()
-        .map(|r| r.get::<String, _>("lower_id"))
-        .collect();
+        .map(|r| r.try_get::<String, _>("lower_id"))
+        .collect::<std::result::Result<_, _>>()?;
 
     macro_rules! count {
         ($how:ident) => {
@@ -216,7 +216,10 @@ pub(super) async fn autocomplete(
     .bind(skip.max(0))
     .fetch_all(&db.pool)
     .await?;
-    let ids: Vec<String> = rows.iter().map(|r| r.get::<String, _>("id")).collect();
+    let ids: Vec<String> = rows
+        .iter()
+        .map(|r| r.try_get::<String, _>("id"))
+        .collect::<std::result::Result<_, _>>()?;
 
     // `GROUP BY` makes this a count of groups, not of rows, so it has to be
     // wrapped rather than written as a bare `COUNT(*)`.
@@ -253,13 +256,14 @@ pub(super) async fn tag_counts(
     .bind(limit.max(0))
     .fetch_all(&db.pool)
     .await?;
-    Ok(rows
-        .iter()
-        .map(|r| TagCount {
-            tag: r.get("tag"),
-            packages: r.get("packages"),
+    rows.iter()
+        .map(|r| {
+            Ok(TagCount {
+                tag: r.try_get("tag")?,
+                packages: r.try_get("packages")?,
+            })
         })
-        .collect())
+        .collect()
 }
 
 /// Load every visible version for a set of lower-cased ids in `feed`,
@@ -326,9 +330,9 @@ pub(super) async fn load_groups(
         if let Some(mut packages) = by_id.remove(id) {
             packages.sort_by(|a, b| a.version.cmp(&b.version));
             groups.push(SearchGroup {
-                version_count: packages.len() as u64,
+                admitted_versions: packages.len() as u64,
                 packages,
-                total_downloads: totals.get(id).copied().unwrap_or(0),
+                id_downloads: totals.get(id).copied().unwrap_or(0),
             });
         }
     }
@@ -396,14 +400,7 @@ pub(super) async fn load_headlines(
                 Entry::Occupied(mut e) => {
                     let (head, head_normalized, count) = e.get_mut();
                     *count += 1;
-                    // A stable version beats any pre-release; otherwise the
-                    // higher one wins.
-                    let better = match (version.is_prerelease(), head.is_prerelease()) {
-                        (false, true) => true,
-                        (true, false) => false,
-                        _ => version > *head,
-                    };
-                    if better {
+                    if crate::database::headline_beats(&version, head) {
                         *head = version;
                         *head_normalized = normalized;
                     }
@@ -451,8 +448,8 @@ pub(super) async fn load_headlines(
         if let (Some(package), Some((_, _, count))) = (by_id.remove(id), heads.get(id)) {
             groups.push(SearchGroup {
                 packages: vec![package],
-                version_count: *count,
-                total_downloads: totals.get(id).copied().unwrap_or(0),
+                admitted_versions: *count,
+                id_downloads: totals.get(id).copied().unwrap_or(0),
             });
         }
     }

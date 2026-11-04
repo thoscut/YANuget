@@ -71,8 +71,18 @@ included) and then opens what the server would only open later:
 - the certificate names the `base_url` host and each of `allowed_hosts`
   (a warning for each it does not — clients connecting by that name refuse it);
 - each mirror's `ca_cert_path` holds at least one certificate;
-- feeds without a push key, and keys shorter than 32 characters, are
-  reported as warnings.
+- feeds without a push key, and keys (and `monitoring.token`) shorter than 32
+  characters, are reported as warnings;
+- `YANUGET_*` variables that are not a setting (a typo such as
+  `YANUGET_ADMIN_APIKEY` would otherwise be ignored without a word);
+- `[monitoring]` enabled without a token, which leaves `/metrics` and
+  `/health/status` open;
+- a preview key that repeats another key of the feed, `pending-only` without
+  `requires_approval`, and a feed's file types that are empty or can never
+  match;
+- a relative `data_dir`, `storage_path` or `database_path` is a warning: the
+  commands you run by hand (`backup`, `restore`, `feeds`) resolve it against
+  the directory they run in, and `restore` refuses it;
 - when the database can be read, versions it holds for a feed the
   configuration does not have (one renamed or taken out) are reported as a
   warning, with the [`yanuget feeds`](cli.md#yanuget-feeds) command that deals

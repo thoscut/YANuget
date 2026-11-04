@@ -535,7 +535,14 @@ fn the_state_survives_a_round_trip_and_refuses_another_schema() {
     let err = State::load(&path).unwrap_err().to_string();
     assert!(err.contains("schema 2"), "{err}");
     std::fs::write(&path, "{").unwrap();
-    assert!(State::load(&path).is_err());
+    // A broken state is told apart, with the parser's reason as its cause.
+    let err = State::load(&path).unwrap_err();
+    assert!(
+        matches!(err, sync::SyncError::BrokenState { .. }),
+        "{err:?}"
+    );
+    assert!(std::error::Error::source(&err).is_some());
+    assert!(yanuget_internalize::error_chain(&err).contains("EOF"));
 }
 
 #[test]
@@ -543,8 +550,9 @@ fn only_one_sync_holds_the_lock() {
     let dir = tempfile::tempdir().unwrap();
     let state = dir.path().join("sync.json");
     let held = sync::lock(&state).unwrap();
-    let err = sync::lock(&state).unwrap_err().to_string();
-    assert!(err.contains("another sync"), "{err}");
+    let err = sync::lock(&state).unwrap_err();
+    assert!(matches!(err, sync::SyncError::Locked { .. }), "{err:?}");
+    assert!(err.to_string().contains("another sync"), "{err}");
     drop(held);
     sync::lock(&state).unwrap();
 }
@@ -580,6 +588,14 @@ fn an_atomic_write_leaves_no_temporary_file_and_follows_no_link() {
             .file_type()
             .is_symlink());
         assert_eq!(std::fs::read(&linked).unwrap(), b"four");
+
+        // The file gets the permissions any new file gets here, not the
+        // owner-only ones of a temporary file: node_exporter reads it.
+        use std::os::unix::fs::PermissionsExt;
+        let plain = dir.path().join("plain");
+        std::fs::write(&plain, b"").unwrap();
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&path), mode(&plain));
     }
 }
 

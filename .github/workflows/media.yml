@@ -143,6 +143,11 @@ jobs:
             renders — review the diff as you would a UI change, because that is
             what it is.
 
+            GitHub starts no workflow for a pull request opened with the
+            workflow's own token, so this one has no checks yet: run CI on
+            `chore/refresh-media` (Actions → CI → Run workflow) and its
+            checks show here.
+
       - name: Say where the refreshed captures are
         env:
           REPO_URL: ${{ github.server_url }}/${{ github.repository }}

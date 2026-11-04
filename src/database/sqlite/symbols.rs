@@ -59,10 +59,13 @@ pub(super) async fn find_symbol(
     .bind(filename.to_lowercase())
     .fetch_optional(&db.pool)
     .await?;
-    Ok(row.map(|r| SymbolRef {
-        lower_id: r.get::<String, _>("lower_id"),
-        normalized_version: r.get::<String, _>("normalized_version"),
-    }))
+    row.map(|r| {
+        Ok(SymbolRef {
+            lower_id: r.try_get("lower_id")?,
+            normalized_version: r.try_get("normalized_version")?,
+        })
+    })
+    .transpose()
 }
 
 pub(super) async fn find_symbols(
@@ -78,13 +81,14 @@ pub(super) async fn find_symbols(
     .bind(version.normalized())
     .fetch_all(&db.pool)
     .await?;
-    Ok(rows
-        .iter()
-        .map(|r| SymbolKey {
-            key: r.get::<String, _>("ssqp_key"),
-            filename: r.get::<String, _>("filename"),
+    rows.iter()
+        .map(|r| {
+            Ok(SymbolKey {
+                key: r.try_get("ssqp_key")?,
+                filename: r.try_get("filename")?,
+            })
         })
-        .collect())
+        .collect()
 }
 
 pub(super) async fn delete_symbols(

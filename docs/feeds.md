@@ -145,10 +145,14 @@ out empty. The server logs a warning for each such name at startup, and
 With the server stopped, give the versions to the feed's new name:
 
 ```bash
-yanuget feeds rename prod production
+yanuget feeds rename prod production --keep-approval   # if production requires approval
 ```
 
-or, for a feed that is gone for good, remove them, and the packages no other
+A rename keeps each version's state, approvals included; for a target with
+`requires_approval` that takes `--keep-approval`, or `--hold-for-approval` to
+review everything again (see [`yanuget feeds`](cli.md#yanuget-feeds)).
+
+For a feed that is gone for good, remove its versions instead, and the packages no other
 feed holds:
 
 ```bash

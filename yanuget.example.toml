@@ -177,8 +177,9 @@ max_failed_auth = 30          # YANUGET_RATELIMIT_MAX_FAILED_AUTH
 # ---------------------------------------------------------------------------
 [monitoring]
 enabled = false               # YANUGET_MONITORING_ENABLED
-# When set, both endpoints require "Authorization: Bearer <token>".
-# token = "a-long-random-scrape-token"   # YANUGET_MONITORING_TOKEN
+# When set, both endpoints require "Authorization: Bearer <token>". A blank
+# token is an error rather than "no token".
+# token = "a-long-random-scrape-token"   # YANUGET_MONITORING_TOKEN or …_TOKEN_FILE
 
 # ---------------------------------------------------------------------------
 # Package retention — automatic pruning of old versions.
@@ -200,6 +201,9 @@ interval_hours = 24           # YANUGET_RETENTION_INTERVAL_HOURS — background 
 # keep_latest_stable = 10       # YANUGET_RETENTION_KEEP_LATEST_STABLE
 # keep_latest_prerelease = 5    # YANUGET_RETENTION_KEEP_LATEST_PRERELEASE
 # max_age_days = 180            # YANUGET_RETENTION_MAX_AGE_DAYS — days in this feed
+# Package-id prefixes retention never prunes, ignoring case; "Contoso." also
+# covers the bare id "Contoso".
+# exclude_id_prefixes = ["Contoso."]  # YANUGET_RETENTION_EXCLUDE_ID_PREFIXES (comma-separated)
 
 # ---------------------------------------------------------------------------
 # Attached files — disk images and archives a package's install script fetches
@@ -282,7 +286,8 @@ inbox_scan_secs = 30                # YANUGET_FILES_INBOX_SCAN_SECS
 #   # because your upstream really is on the private network.
 #   allow_private_upstream = false
 #   # Outbound proxy for upstream requests. Unset, the mirror connects directly:
-#   # HTTP(S)_PROXY in the environment is ignored.
+#   # HTTP(S)_PROXY in the environment is ignored. Through a proxy each host is
+#   # still resolved here and refused when private (see allow_private_upstream).
 #   # proxy = "http://proxy.internal:3128"
 #   # Extra CA certificates (PEM) for an upstream behind an internal CA. The
 #   # system store and the bundled Mozilla roots are trusted either way.

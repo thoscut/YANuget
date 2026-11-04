@@ -8,6 +8,8 @@
 //! files the server would only open later: the TLS certificate and key, and
 //! each mirror's CA bundle.
 
+use std::path::{Path, PathBuf};
+
 use crate::config::{Config, ResolvedFeed};
 
 /// What the check found, most serious first when printed.
@@ -67,12 +69,18 @@ pub fn check_loaded(config: &Config, report: &mut Report) {
         }
     }
     check_tls(config, report);
-    if config.monitoring.enabled && config.monitoring.token.is_none() {
-        report.warnings.push(
+    // What the router reads: a blank token is no token (and `validate`
+    // refuses it when the configuration is loaded).
+    match config.monitoring.token() {
+        None if config.monitoring.enabled => report.warnings.push(
             "monitoring is enabled without a token: anyone who can reach the server \
              reads /metrics and /health/status (feed names, mirror upstreams)"
                 .into(),
-        );
+        ),
+        Some(token) if token.chars().count() < MIN_KEY_CHARS => report.warnings.push(format!(
+            "monitoring.token is shorter than {MIN_KEY_CHARS} characters"
+        )),
+        _ => {}
     }
 
     if config.data_dir.exists() && !config.data_dir.is_dir() {
@@ -84,6 +92,39 @@ pub fn check_loaded(config: &Config, report: &mut Report) {
         report.notes.push(format!(
             "data_dir {} does not exist yet; the server creates it",
             config.data_dir.display()
+        ));
+    }
+    check_relative_paths(config, report);
+}
+
+/// Warn about a data path that depends on the directory a command runs in.
+/// The service finds it from its working directory, but `yanuget backup`,
+/// `restore` and `feeds` run by hand look in theirs, and `restore` refuses
+/// one outright.
+fn check_relative_paths(config: &Config, report: &mut Report) {
+    let relative = |path: &Path| !path.is_absolute();
+    let mut paths: Vec<(&str, PathBuf)> = Vec::new();
+    if relative(&config.data_dir) {
+        paths.push(("data_dir", config.data_dir.clone()));
+    }
+    // Set apart from `data_dir`; derived from it, it is covered above.
+    if let Some(p) = config.storage_path.as_ref().filter(|p| relative(p)) {
+        paths.push(("storage_path", p.clone()));
+    }
+    if let Some(p) = config
+        .database_path
+        .as_ref()
+        .map(PathBuf::from)
+        .filter(|p| relative(p))
+    {
+        paths.push(("database_path", p));
+    }
+    for (key, path) in paths {
+        report.warnings.push(format!(
+            "{key} {} is relative: the server and every command (`yanuget backup`, \
+             `restore`, `feeds`) resolve it against the directory they run in, and \
+             `restore` refuses it; set an absolute path",
+            path.display()
         ));
     }
 }
@@ -201,6 +242,14 @@ fn check_feed(feed: &ResolvedFeed, report: &mut Report) {
         }
     }
     if feed.mirror.enabled {
+        if feed.mirror.proxy.is_some() && !feed.mirror.allow_private_upstream {
+            report.warnings.push(format!(
+                "feed {name}: the mirror goes through a proxy, which resolves the upstream's \
+                 host names itself; the server resolves each one too and refuses private \
+                 addresses, but a DNS answer that changes in between gets past that, so \
+                 have the proxy refuse private destinations as well"
+            ));
+        }
         if let Some(ca) = &feed.mirror.ca_cert_path {
             match std::fs::read(ca) {
                 Err(e) => report.errors.push(format!(
@@ -379,8 +428,57 @@ mod tests {
         config.monitoring.enabled = true;
         let open = |r: &Report| r.warnings.iter().any(|w| w.contains("monitoring"));
         assert!(open(&checked(config.clone())));
+        // A blank token, as a template with an empty variable writes it, is
+        // no token: the router serves the endpoints to anyone.
+        config.monitoring.token = Some("  ".into());
+        assert!(open(&checked(config.clone())));
+        config.monitoring.token = Some("short".into());
+        let report = checked(config.clone());
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("monitoring.token is shorter")),
+            "{report:?}"
+        );
         config.monitoring.token = Some("t".repeat(32));
         assert!(!open(&checked(config)));
+    }
+
+    #[test]
+    fn relative_data_paths_are_warned_about() {
+        let about = |r: &Report, key: &str| {
+            r.warnings
+                .iter()
+                .filter(|w| w.starts_with(&format!("{key} ")) && w.contains("is relative"))
+                .count()
+        };
+        let mut config = Config {
+            tls_enabled: false,
+            data_dir: PathBuf::from("./data"),
+            ..Config::default()
+        };
+        let report = checked(config.clone());
+        assert!(report.is_ok(), "{report:?}");
+        assert_eq!(about(&report, "data_dir"), 1, "{report:?}");
+        assert_eq!(about(&report, "storage_path"), 0, "{report:?}");
+
+        let dir = tempfile::tempdir().unwrap();
+        config.data_dir = dir.path().to_path_buf();
+        config.storage_path = Some(PathBuf::from("packages"));
+        config.database_path = Some("db/yanuget.db".into());
+        let report = checked(config.clone());
+        assert_eq!(about(&report, "data_dir"), 0, "{report:?}");
+        assert_eq!(about(&report, "storage_path"), 1, "{report:?}");
+        assert_eq!(about(&report, "database_path"), 1, "{report:?}");
+
+        config.storage_path = Some(dir.path().join("packages"));
+        config.database_path = Some(dir.path().join("yanuget.db").display().to_string());
+        let report = checked(config);
+        assert!(
+            !report.warnings.iter().any(|w| w.contains("is relative")),
+            "{report:?}"
+        );
     }
 
     #[test]
@@ -424,6 +522,35 @@ mod tests {
             .iter()
             .any(|e| e.contains("mirror ca_cert_path")));
         assert!(report.errors.iter().any(|e| e.contains("TLS certificate")));
+    }
+
+    #[test]
+    fn a_mirror_behind_a_proxy_is_warned_about() {
+        let feed = |name: &str, allow_private_upstream: bool| FeedConfig {
+            name: name.into(),
+            mirror: crate::config::MirrorConfig {
+                enabled: true,
+                upstream: "https://upstream.example.com/v3/index.json".into(),
+                proxy: Some("http://proxy.internal:3128".into()),
+                allow_private_upstream,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let config = Config {
+            tls_enabled: false,
+            feeds: vec![feed("guarded", false), feed("private", true)],
+            ..Config::default()
+        };
+        let report = checked(config);
+        let proxied = |f: &str| {
+            report
+                .warnings
+                .iter()
+                .any(|w| w.starts_with(&format!("feed {f}: ")) && w.contains("proxy"))
+        };
+        assert!(proxied("guarded"), "{report:?}");
+        assert!(!proxied("private"), "{report:?}");
     }
 
     #[test]

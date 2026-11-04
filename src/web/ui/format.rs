@@ -26,6 +26,15 @@ pub(super) fn group_digits(n: i64) -> String {
     out
 }
 
+/// Package-id prefixes as one line, `None` when there are none.
+pub(super) fn id_prefix_list(prefixes: &[String]) -> String {
+    if prefixes.is_empty() {
+        "None".to_string()
+    } else {
+        prefixes.join(", ")
+    }
+}
+
 /// A key/value row with an escaped text value.
 pub(super) fn kv(label: &str, value: &str) -> String {
     kv_html(label, &escape_html(value))

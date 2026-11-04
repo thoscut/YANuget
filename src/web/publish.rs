@@ -11,11 +11,13 @@ use super::helpers::{
     check_id, content_length, detached, map_upload_err, parse_version, to_io_err,
 };
 use super::{AppState, FeedCounters};
+use crate::config::OverwriteMode;
 use crate::error::{Error, Result};
 use crate::indexing::{self, IndexOptions};
 use crate::retention::{self, RetentionPolicy};
+use crate::space::Reservation;
 use crate::storage::TempPath;
-use crate::streaming::{self, Reservation, StreamSummary};
+use crate::streaming::{self, StreamSummary};
 use crate::symbols;
 
 pub(super) async fn push_package(
@@ -31,12 +33,19 @@ pub(super) async fn push_package(
         // A push is self-describing: the manifest defines the identity.
         expect: None,
         reserved_elsewhere: state.feed.reserved_elsewhere.clone(),
-        other_license_policies: state
-            .feeds
-            .iter()
-            .filter(|f| f.name != state.feed.name)
-            .map(|f| (f.name.clone(), f.license_policy.clone()))
-            .collect(),
+        // Read only when a pending-only push replaces a build every feed
+        // holding it gets (see `indexing`): not copied for any other push.
+        other_license_policies: if state.feed.allow_overwrite == OverwriteMode::PendingOnly {
+            state
+                .feeds
+                .iter()
+                .filter(|f| f.name != state.feed.name)
+                .map(|f| (f.name.clone(), f.license_policy.clone()))
+                .collect()
+        } else {
+            Vec::new()
+        },
+        unlisted: false,
     };
     let state = state.clone();
     detached(async move {
@@ -97,9 +106,11 @@ async fn receive_push(state: &AppState, request: Request) -> Result<(TempPath, S
         .and_then(|v| v.to_str().ok())
         .is_some_and(|s| s.starts_with("multipart/"));
 
-    let reservation = state.reserve_disk_space(content_length(headers)).await?;
-    let (temp, mut file) = state.create_temp().await?;
+    let declared = content_length(headers);
     let limit = state.config.max_package_size_bytes;
+    check_declared_size(declared, limit, is_multipart)?;
+    let reservation = state.reserve_disk_space(declared).await?;
+    let (temp, mut file) = state.create_temp().await?;
 
     let summary =
         write_upload(request, &mut file, is_multipart, limit, state, &reservation).await?;
@@ -111,6 +122,32 @@ async fn receive_push(state: &AppState, request: Request) -> Result<(TempPath, S
     file.sync_all().await?;
     drop(file);
     Ok((temp, summary))
+}
+
+/// What a multipart push may add around the package: the boundaries and part
+/// headers, a few hundred bytes from any real client.
+const MULTIPART_OVERHEAD: u64 = 64 * 1024;
+
+/// Refuse a push whose `Content-Length` says it is over the package size
+/// limit (`413`) before anything is reserved or written: the reservation
+/// would otherwise promise that length to an upload the streaming cap is
+/// bound to stop, and keep it promised for as long as the client trickles.
+/// A multipart body may be [`MULTIPART_OVERHEAD`] longer than the package.
+fn check_declared_size(declared: Option<u64>, limit: Option<u64>, multipart: bool) -> Result<()> {
+    let (Some(size), Some(limit)) = (declared, limit) else {
+        return Ok(());
+    };
+    let allowed = if multipart {
+        limit.saturating_add(MULTIPART_OVERHEAD)
+    } else {
+        limit
+    };
+    if size > allowed {
+        return Err(Error::PayloadTooLarge(format!(
+            "the request is {size} bytes, over the {limit}-byte package size limit"
+        )));
+    }
+    Ok(())
 }
 
 /// Write the upload (raw body or the first multipart file field) to `file`.

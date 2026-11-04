@@ -116,6 +116,10 @@ pub struct UploadSession {
     /// The SHA-256 (hex) the finished file must have, if the client said.
     pub expected_sha256: Option<String>,
     pub expires: chrono::DateTime<chrono::Utc>,
+    /// Since when the upload has held the space it has still to receive: its
+    /// creation or the end of its last request. `None` while a request is
+    /// writing it, which holds that space itself.
+    pub held_since: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// How many packages of a feed carry one tag.
@@ -187,12 +191,25 @@ impl SearchSort {
 pub struct SearchGroup {
     pub packages: Vec<Package>,
     /// How many versions the search admitted. `packages.len()` unless only
-    /// the headline was loaded.
-    pub version_count: u64,
+    /// the headline was loaded. Read through [`Self::version_count`].
+    pub(crate) admitted_versions: u64,
     /// Downloads of every version of the id this feed serves, whether or not
     /// the search's filters (pre-release, SemVer2, listed) admitted it: the
-    /// package's total, as `totalDownloads` means on nuget.org.
-    pub total_downloads: u64,
+    /// package's total, as `totalDownloads` means on nuget.org. Read through
+    /// [`Self::total_downloads`].
+    pub(crate) id_downloads: u64,
+}
+
+/// Whether `candidate` headlines a package rather than `current`: a stable
+/// version beats any pre-release, and otherwise the higher one wins. The one
+/// rule behind [`SearchGroup::headline`] and the gallery's headline query, so
+/// the gallery and `/v3/search` never show different versions.
+pub fn headline_beats(candidate: &NuGetVersion, current: &NuGetVersion) -> bool {
+    match (candidate.is_prerelease(), current.is_prerelease()) {
+        (false, true) => true,
+        (true, false) => false,
+        _ => candidate > current,
+    }
 }
 
 impl SearchGroup {
@@ -213,24 +230,29 @@ impl SearchGroup {
     pub fn headline(&self) -> &Package {
         self.packages
             .iter()
-            .rev()
-            .find(|p| !p.is_prerelease())
-            .unwrap_or_else(|| self.latest())
+            .reduce(|head, p| {
+                if headline_beats(&p.version, &head.version) {
+                    p
+                } else {
+                    head
+                }
+            })
+            .expect("a search group always has at least one package")
     }
 
-    /// How many versions the search admitted (the `version_count` field);
+    /// How many versions the search admitted (`admitted_versions`);
     /// never less than the versions loaded, so a group built without it still
     /// counts.
     pub fn version_count(&self) -> u64 {
-        self.version_count.max(self.packages.len() as u64)
+        self.admitted_versions.max(self.packages.len() as u64)
     }
 
     /// Total downloads of the package, across all its versions in the feed
-    /// (the `total_downloads` field); never less than what the matching
+    /// (`id_downloads`); never less than what the matching
     /// versions alone add up to, so a group built without it still counts.
     pub fn total_downloads(&self) -> u64 {
         let shown: u64 = self.packages.iter().map(|p| p.downloads).sum();
-        self.total_downloads.max(shown)
+        self.id_downloads.max(shown)
     }
 }
 
@@ -250,6 +272,10 @@ pub struct Membership {
     pub normalized_version: String,
     /// Visible in search/registration (the NuGet "list" flag).
     pub listed: bool,
+    /// [`Self::listed`] was set by hand (an unlist or relist), so a mirror
+    /// leaves it as it is rather than following the upstream's listing
+    /// ([`PackageDatabase::follow_upstream_listing`]).
+    pub listing_set: bool,
     /// Admin enable flag; a disabled membership is withheld entirely.
     pub enabled: bool,
     /// Awaiting approval (release-ring gate / mirror approval). A pending
@@ -273,6 +299,7 @@ impl Membership {
             lower_id: package.lower_id(),
             normalized_version: package.normalized_version(),
             listed: true,
+            listing_set: false,
             enabled: true,
             pending: false,
             flagged: false,
@@ -537,6 +564,11 @@ pub trait PackageDatabase: Send + Sync {
         listed: bool,
     ) -> Result<bool>;
 
+    /// The versions of `id` in `feed` that follow the upstream's listing
+    /// (their listing was not set by hand), each normalized with whether it
+    /// is listed. Only these two columns, for a mirror's listing refresh.
+    async fn upstream_listed(&self, feed: &str, id: &str) -> Result<Vec<(String, bool)>>;
+
     /// Set the admin `enabled` flag for a membership. A disabled membership is
     /// withheld entirely. Returns `true` if a row was updated.
     async fn set_enabled(
@@ -683,11 +715,25 @@ pub trait PackageDatabase: Send + Sync {
 
     async fn create_upload(&self, upload: &UploadSession) -> Result<()>;
     async fn get_upload(&self, id: &str) -> Result<Option<UploadSession>>;
+    /// Record that `received` bytes of upload `id` have arrived, which
+    /// renews its hold on the space it has still to receive.
     async fn set_upload_received(&self, id: &str, received: u64) -> Result<()>;
+    /// Set since when upload `id` holds its space; `None` gives it up.
+    async fn set_upload_held(
+        &self,
+        id: &str,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<()>;
     async fn delete_upload(&self, id: &str) -> Result<()>;
     /// The bytes the uploads current at `now` have still to receive, over
-    /// every feed: space they were admitted with and have not used yet.
-    async fn outstanding_upload_bytes(&self, now: chrono::DateTime<chrono::Utc>) -> Result<u64>;
+    /// every feed, counting only those that have held their space since
+    /// `held_after` or later: space they were admitted with and have not
+    /// used yet. One idle for longer holds none until its next request.
+    async fn outstanding_upload_bytes(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+        held_after: chrono::DateTime<chrono::Utc>,
+    ) -> Result<u64>;
     /// How many uploads of `feed` are current (not expired) at `now`.
     async fn open_uploads(&self, feed: &str, now: chrono::DateTime<chrono::Utc>) -> Result<u64>;
     /// Uploads whose expiry has passed at `now`.
@@ -750,9 +796,10 @@ pub trait PackageDatabase: Send + Sync {
     /// memberships, tombstones and unfinished uploads, in one transaction.
     /// Refused with [`Error::BadRequest`](crate::error::Error::BadRequest)
     /// when `to` already holds one of `from`'s versions, since the two
-    /// memberships' states cannot both be kept. Returns how many memberships
-    /// moved.
-    async fn rename_feed(&self, from: &str, to: &str) -> Result<u64>;
+    /// memberships' states cannot both be kept. With `hold`, every version
+    /// moved arrives pending, to be approved again. Returns how many
+    /// memberships moved.
+    async fn rename_feed(&self, from: &str, to: &str, hold: bool) -> Result<u64>;
 
     /// Every version `feed` holds, in any state, as (lower-cased id,
     /// version).
@@ -772,6 +819,10 @@ pub struct StoredFeed {
     /// Of those, the ones no other feed holds: removing the feed's
     /// memberships frees their payload.
     pub exclusive: i64,
+    /// Of those, the ones pending approval.
+    pub pending: i64,
+    /// Of those, the ones an admin disabled.
+    pub disabled: i64,
     /// Versions deleted from it.
     pub tombstones: i64,
 }
@@ -833,4 +884,55 @@ pub fn approved_refusal(p: &Package, feeds: &[String]) -> String {
         p.normalized_version(),
         feeds.join(", ")
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn file(name: &str, sha256: &str) -> PackageFile {
+        PackageFile {
+            lower_id: "a".into(),
+            normalized_version: "1.0.0".into(),
+            name: name.into(),
+            sha256: sha256.into(),
+            size: 1,
+            uploaded: chrono::Utc::now(),
+            downloads: 0,
+        }
+    }
+
+    #[test]
+    fn the_files_fingerprint_is_of_names_and_contents_in_any_order() {
+        let (a, b) = (file("setup.exe", "aa"), file("base.wim", "bb"));
+        let both = files_fingerprint([&a, &b]);
+        assert_eq!(both, files_fingerprint([&b, &a]), "order does not count");
+        // A name is unique ignoring case, and digested so.
+        assert_eq!(
+            files_fingerprint([&file("Setup.EXE", "aa"), &b]),
+            both,
+            "case does not count"
+        );
+        // The same name with other bytes is another set of files.
+        assert_ne!(files_fingerprint([&file("setup.exe", "cc"), &b]), both);
+        // So is one file fewer, and no files is a digest of its own.
+        assert_ne!(files_fingerprint([&b]), both);
+        let none: [&PackageFile; 0] = [];
+        assert_ne!(files_fingerprint(none), files_fingerprint([&b]));
+        // The separators keep a name from running into a hash.
+        assert_ne!(
+            files_fingerprint([&file("ab", "c")]),
+            files_fingerprint([&file("a", "bc")])
+        );
+    }
+
+    #[test]
+    fn a_stable_version_headlines_over_any_pre_release() {
+        let v = |s: &str| NuGetVersion::parse(s).unwrap();
+        assert!(headline_beats(&v("1.0.0"), &v("2.0.0-beta")));
+        assert!(!headline_beats(&v("2.0.0-beta"), &v("1.0.0")));
+        assert!(headline_beats(&v("1.10.0"), &v("1.9.0")));
+        assert!(headline_beats(&v("0.2.0-alpha"), &v("0.1.0-beta")));
+        assert!(!headline_beats(&v("1.0.0"), &v("1.0.0")));
+    }
 }

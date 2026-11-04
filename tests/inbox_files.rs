@@ -144,7 +144,7 @@ struct Inbox {
     feed_extensions: std::collections::HashMap<String, Vec<String>>,
     feeds: Vec<String>,
     staging: PathBuf,
-    reserve: u64,
+    space: yanuget::space::SpaceGuard,
 }
 
 impl Inbox {
@@ -160,7 +160,7 @@ impl Inbox {
             feed_extensions: Default::default(),
             feeds: vec!["default".to_string()],
             staging: data.join("packages/.uploads"),
-            reserve: 0,
+            space: yanuget::space::SpaceGuard::new(data.join("packages/.uploads"), 0),
         }
     }
 
@@ -181,8 +181,8 @@ impl Inbox {
             max_file_size: None,
             feeds: &self.feeds,
             pending_only: &[],
-            staging: &self.staging,
-            min_free_disk_bytes: self.reserve,
+            reviewing: &[],
+            space: &self.space,
         }
         .scan()
         .await
@@ -268,7 +268,7 @@ async fn an_import_that_would_eat_the_disk_reserve_is_refused() {
     push(&server, build_nupkg("Drop.Pkg", "1.0.0")).await;
     let mut inbox = Inbox::new(&server).await;
     // No volume has this much free, so the copy must not start.
-    inbox.reserve = u64::MAX / 2;
+    inbox.space = yanuget::space::SpaceGuard::new(&inbox.staging, u64::MAX / 2);
     let dir = inbox.version_dir("Drop.Pkg", "1.0.0");
     std::fs::write(dir.join("base.wim"), b"image bytes").unwrap();
     std::fs::write(dir.join("base.wim.sha256"), sha256_hex(b"image bytes")).unwrap();
@@ -280,6 +280,37 @@ async fn an_import_that_would_eat_the_disk_reserve_is_refused() {
     assert!(staged(&server).is_empty(), "{:?}", staged(&server));
     let got = download(&server, "drop.pkg", "1.0.0", "base.wim").await;
     assert_eq!(got.status(), reqwest::StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn an_import_does_not_take_the_space_promised_to_uploads() {
+    let server = spawn().await;
+    push(&server, build_nupkg("Drop.Pkg", "1.0.0")).await;
+    let mut inbox = Inbox::new(&server).await;
+    inbox.space =
+        yanuget::space::SpaceGuard::new(&inbox.staging, 1).with_measure(|_| Ok(1_000_000));
+    // An upload in progress was promised all of it.
+    let upload = inbox.space.admit(Some(999_999)).await.unwrap();
+    let dir = inbox.version_dir("Drop.Pkg", "1.0.0");
+    std::fs::write(dir.join("base.wim"), b"image bytes").unwrap();
+    std::fs::write(dir.join("base.wim.sha256"), sha256_hex(b"image bytes")).unwrap();
+
+    assert_eq!(inbox.scan().await, ONE_FAILED);
+    assert!(dir.join("base.wim.error").exists());
+    assert!(staged(&server).is_empty(), "{:?}", staged(&server));
+
+    // Once the upload is done with it, the import goes through, and its own
+    // reservation is gone with it.
+    drop(upload);
+    std::fs::remove_file(dir.join("base.wim.error")).unwrap();
+    assert_eq!(
+        inbox.scan().await,
+        yanuget::inbox::ScanReport {
+            imported: 1,
+            failed: 0
+        }
+    );
+    assert_eq!(inbox.space.promised(), 0);
 }
 
 #[cfg(unix)]

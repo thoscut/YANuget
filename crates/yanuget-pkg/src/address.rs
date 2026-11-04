@@ -223,9 +223,78 @@ impl reqwest::dns::Resolve for GuardedResolver {
     }
 }
 
+/// Why [`check_resolved`] refused a host.
+#[cfg(feature = "net")]
+#[derive(Debug)]
+pub enum UnsafeHost {
+    /// It does not resolve here, so its address cannot be told.
+    Unresolvable(std::io::Error),
+    /// One of its addresses is private.
+    Private(IpAddr),
+}
+
+#[cfg(feature = "net")]
+impl std::fmt::Display for UnsafeHost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UnsafeHost::Unresolvable(e) => write!(
+                f,
+                "it cannot be resolved here to check its address ({e}); \
+                 behind a proxy every host is also resolved locally"
+            ),
+            UnsafeHost::Private(ip) => write!(f, "it resolves to the private address {ip}"),
+        }
+    }
+}
+
+/// Resolve the host of a URL a proxy will fetch, and refuse it when it does
+/// not resolve or any of its addresses is private.
+///
+/// A proxy resolves the names it is asked for itself, so [`GuardedResolver`]
+/// never sees them; this resolves each one here as well. The proxy resolves
+/// again, so a DNS answer that changes in between gets past it, and the proxy
+/// should refuse private destinations too. A literal address passes: classify
+/// it with [`is_private_host`]. `fixed` answers names without a lookup, as
+/// [`GuardedResolver::fixed`] does.
+#[cfg(feature = "net")]
+pub async fn check_resolved(host: &str, fixed: &[(String, IpAddr)]) -> Result<(), UnsafeHost> {
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    if bare.parse::<IpAddr>().is_ok() {
+        return Ok(());
+    }
+    let addrs: Vec<IpAddr> = match fixed.iter().find(|(n, _)| n.eq_ignore_ascii_case(bare)) {
+        Some((_, ip)) => vec![*ip],
+        None => tokio::net::lookup_host((bare, 0))
+            .await
+            .map_err(UnsafeHost::Unresolvable)?
+            .map(|a| a.ip())
+            .collect(),
+    };
+    match addrs.into_iter().find(|ip| is_private_ip_addr(*ip)) {
+        Some(ip) => Err(UnsafeHost::Private(ip)),
+        None => Ok(()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "net")]
+    #[tokio::test]
+    async fn a_proxied_host_is_resolved_here_and_refused_when_private() {
+        assert!(check_resolved("127.0.0.1", &[]).await.is_ok(), "literal");
+        assert!(matches!(
+            check_resolved("localhost", &[]).await,
+            Err(UnsafeHost::Private(_))
+        ));
+        let fixed = [("public.test".to_string(), ip("93.184.216.34"))];
+        assert!(check_resolved("PUBLIC.test", &fixed).await.is_ok());
+        assert!(matches!(
+            check_resolved("nothing.invalid", &[]).await,
+            Err(UnsafeHost::Unresolvable(_))
+        ));
+    }
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()

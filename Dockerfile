@@ -43,6 +43,12 @@ RUN set -eu; \
     rustup target add "$triple"; \
     echo "$triple" > /rust-target
 
+# `cargo auditable` embeds the dependency tree (crate names, versions,
+# sources) into the binary, so a scanner reading the image (`cargo audit bin`,
+# syft, trivy) sees exactly which crates it was built from. An exact version,
+# built from its lock: it runs inside the release build.
+RUN cargo install --locked cargo-auditable --version 0.7.7
+
 # Cache dependencies first. `build.rs` has to be present even for this dummy
 # build: it is what stages the embeddable documentation site into `OUT_DIR`, and
 # `src/web/docs.rs` does not compile without it.
@@ -53,7 +59,7 @@ COPY crates ./crates
 RUN mkdir src \
     && echo "fn main() {}" > src/main.rs \
     && echo "" > src/lib.rs \
-    && cargo build --release --locked --target "$(cat /rust-target)" 2>/dev/null || true
+    && cargo auditable build --release --locked --target "$(cat /rust-target)" 2>/dev/null || true
 RUN rm -rf src
 
 # Render the documentation so the real site is embedded rather than the
@@ -89,11 +95,11 @@ RUN set -eu; \
 # when the dependency build ran it, and it is what copies the site in.
 COPY src ./src
 RUN touch src/main.rs src/lib.rs build.rs \
-    && cargo build --release --locked --target "$(cat /rust-target)" \
+    && cargo auditable build --release --locked --target "$(cat /rust-target)" \
     && cp "target/$(cat /rust-target)/release/yanuget" /yanuget
 
 # Runtime stage
-FROM debian:trixie-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad AS runtime
+FROM debian:trixie-slim@sha256:f6b08b09a05725f9431502d3b5714f5c4576e82c1a84fa1debe0c24a7e0c3ec4 AS runtime
 
 LABEL org.opencontainers.image.title="YANuget" \
       org.opencontainers.image.description="Yet Another NuGet server — a fast, streaming NuGet v3 server in Rust" \

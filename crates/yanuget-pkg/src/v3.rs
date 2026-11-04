@@ -44,9 +44,16 @@ impl ServiceIndex {
             list.iter()
                 .filter(|r| r.has_type(t))
                 .find_map(|r| r.id.as_deref())
-                .and_then(|id| base.join(id).ok())
+                .and_then(|id| resolve_id(base, id))
         })
     }
+}
+
+/// An `@id` resolved against `base`, the URL of the document it is in (after
+/// any redirects), so a relative one works as well as an absolute one.
+/// `None` when it does not form a URL.
+pub fn resolve_id(base: &Url, id: &str) -> Option<Url> {
+    base.join(id).ok()
 }
 
 /// One resource of the service index.

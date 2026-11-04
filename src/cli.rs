@@ -278,6 +278,14 @@ enum FeedsCommand {
         /// Only say what would move.
         #[arg(long)]
         dry_run: bool,
+        /// Have every version moved approved again in the new feed: it
+        /// arrives pending.
+        #[arg(long, conflicts_with = "keep_approval")]
+        hold_for_approval: bool,
+        /// Keep the versions approved under the old name approved under the
+        /// new one, which `requires_approval` otherwise asks to confirm.
+        #[arg(long)]
+        keep_approval: bool,
     },
     /// Drop what the database holds for a feed that is no longer configured,
     /// and the packages, attached files and symbols only it held.
@@ -299,7 +307,9 @@ pub async fn run_feeds(config_path: Option<&str>, args: FeedsArgs) -> anyhow::Re
     let feeds = config.resolved_feeds()?;
     let configured = |name: &str| feeds.iter().any(|f| f.name == name);
     let (name, dry_run) = match &args.command {
-        FeedsCommand::Rename { from, to, dry_run } => {
+        FeedsCommand::Rename {
+            from, to, dry_run, ..
+        } => {
             if configured(from) {
                 bail!("{from:?} is a configured feed; rename it in the configuration first");
             }
@@ -326,10 +336,21 @@ pub async fn run_feeds(config_path: Option<&str>, args: FeedsArgs) -> anyhow::Re
         bail!("no database at {path}");
     }
     // A dry run only reads, so it may look at a database a server is using.
-    if !dry_run {
-        crate::refuse_while_serving(&config, "changing what it stores").await?;
-    }
-    let db = SqliteDatabase::connect(&path).await?;
+    // Otherwise the data lock is held to the end, so no server starts while
+    // this changes what it would serve.
+    let _data_lock = if dry_run {
+        None
+    } else {
+        crate::refuse_while_serving(&config, "changing what it stores").await?
+    };
+    // Read-only for a dry run, as `config check` opens it: opening it the
+    // way the server does would migrate it to this binary's schema, under a
+    // server of the release before that cannot open it again.
+    let db = if dry_run {
+        SqliteDatabase::open_read_only(&path).await?
+    } else {
+        SqliteDatabase::connect(&path).await?
+    };
     let Some(stored) = db
         .stored_feeds()
         .await?
@@ -340,7 +361,13 @@ pub async fn run_feeds(config_path: Option<&str>, args: FeedsArgs) -> anyhow::Re
     };
 
     match args.command {
-        FeedsCommand::Rename { from, to, .. } => {
+        FeedsCommand::Rename {
+            from,
+            to,
+            hold_for_approval,
+            keep_approval,
+            ..
+        } => {
             let shared = db.shared_versions(&from, &to).await?;
             if shared > 0 {
                 bail!(
@@ -348,13 +375,42 @@ pub async fn run_feeds(config_path: Option<&str>, args: FeedsArgs) -> anyhow::Re
                      {to:?} first, or remove {from:?} instead"
                 );
             }
+            // A rename keeps each version's state: the target's approval
+            // gate, license policy and reserved prefixes judge what enters a
+            // feed, and these versions entered it under its old name. But a
+            // slip of the hand (`staging` for `old-production`) would make
+            // what an ungated feed approved on arrival visible in a gated
+            // one, so there the approvals that come along are confirmed.
+            let gated = feeds.iter().any(|f| f.name == to && f.requires_approval);
+            let approved = if hold_for_approval {
+                0
+            } else {
+                stored.versions - stored.pending
+            };
             if dry_run {
                 println!(
-                    "Would move {} version(s) and {} deletion(s) from {from:?} to {to:?}.",
-                    stored.versions, stored.tombstones
+                    "Would move {} version(s) and {} deletion(s) from {from:?} to {to:?}: \
+                     {approved} approved, {} pending, {} of them disabled.",
+                    stored.versions,
+                    stored.tombstones,
+                    stored.versions - approved,
+                    stored.disabled
                 );
+                if gated && approved > 0 && !keep_approval {
+                    println!(
+                        "{to:?} requires approval: the real run needs --keep-approval to keep \
+                         them approved, or --hold-for-approval to have them approved again."
+                    );
+                }
             } else {
-                let moved = db.rename_feed(&from, &to).await?;
+                if gated && approved > 0 && !keep_approval {
+                    bail!(
+                        "{approved} version(s) are approved under {from:?}, and {to:?} requires \
+                         approval: pass --keep-approval to keep them approved (the feed was \
+                         only renamed), or --hold-for-approval to have them approved again"
+                    );
+                }
+                let moved = db.rename_feed(&from, &to, hold_for_approval).await?;
                 println!(
                     "Moved {moved} version(s) and {} deletion(s) from {from:?} to {to:?}.",
                     stored.tombstones

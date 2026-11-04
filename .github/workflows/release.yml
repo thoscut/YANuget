@@ -78,6 +78,9 @@ jobs:
         with:
           ref: refs/tags/${{ steps.tag.outputs.tag }}
           persist-credentials: false
+          # The whole history and its tags, for the `yanuget-pkg` version
+          # check below.
+          fetch-depth: 0
 
       - id: check
         shell: bash
@@ -100,6 +103,47 @@ jobs:
             exit 1
           fi
           echo "releasing $TAG ($sha) from Cargo.toml version $version"
+
+      # crates.io takes a version once. `yanuget-pkg` is versioned on its own,
+      # and the publish step skips it when crates.io has its version already,
+      # so a release that changed the crate without raising its version would
+      # publish `yanuget` against the old `yanuget-pkg`. Checked here, before
+      # anything is published, and only when publishing to crates.io is on.
+      - name: Check yanuget-pkg was bumped if it changed
+        if: vars.PUBLISH_TO_CRATES_IO == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          prev=$(git describe --tags --abbrev=0 --match 'v[0-9]*' HEAD^ 2>/dev/null || true)
+          if [ -z "$prev" ]; then
+            echo "no earlier release tag; nothing to compare"
+            exit 0
+          fi
+          if git diff --quiet "$prev" HEAD -- crates/yanuget-pkg; then
+            echo "yanuget-pkg unchanged since $prev"
+            exit 0
+          fi
+          now=$(sed -n 's/^version = "\(.*\)"$/\1/p' crates/yanuget-pkg/Cargo.toml | head -1)
+          before=$(git show "$prev:crates/yanuget-pkg/Cargo.toml" | sed -n 's/^version = "\(.*\)"$/\1/p' | head -1)
+          if [ "$now" != "$before" ]; then
+            echo "yanuget-pkg changed since $prev and went from $before to $now"
+            exit 0
+          fi
+          # Unchanged version: fine as long as crates.io does not have it yet.
+          status=$(curl -s -o /dev/null -w '%{http_code}' \
+            -A "yanuget release workflow (github.com/thoscut/yanuget)" \
+            "https://crates.io/api/v1/crates/yanuget-pkg/$now")
+          case "$status" in
+            404) echo "yanuget-pkg $now is not on crates.io yet" ;;
+            200)
+              echo "::error::crates/yanuget-pkg changed since $prev, but $now is on crates.io already; raise its version"
+              exit 1
+              ;;
+            *)
+              echo "::error::crates.io answered HTTP $status for yanuget-pkg $now; retry"
+              exit 1
+              ;;
+          esac
 
   # The whole CI workflow, run against the commit being released: tests on
   # stable and the MSRV, clippy, the Windows/macOS check, cargo audit and
@@ -162,6 +206,15 @@ jobs:
           sudo apt-get install -y "$LINKER_PACKAGE"
           echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
 
+      # `cargo auditable` embeds the dependency tree into each binary (see
+      # SECURITY.md), so `cargo audit bin` and other scanners can tell which
+      # crates a downloaded binary was built from. Exact version, like the
+      # audit tools in ci.yml; bump it by hand.
+      - name: Install cargo-auditable
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
+        with:
+          tool: cargo-auditable@0.7.7
+
       - name: Set up Python
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
@@ -188,7 +241,33 @@ jobs:
         shell: bash
         env:
           TARGET: ${{ matrix.target }}
-        run: cargo build --release --locked --target "$TARGET"
+        run: cargo auditable build --release --locked --target "$TARGET"
+
+      # A binary that links but does not start (a wrong cross linker, a
+      # missing runtime library) would otherwise reach users untried: nothing
+      # else runs the aarch64 Linux or the x86_64 macOS build. Each is started
+      # where it can be: natively, under Rosetta 2 on the arm64 macOS runner,
+      # or under QEMU user emulation with the cross toolchain's libraries.
+      - name: Smoke-test the binary
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          EXT: ${{ matrix.ext }}
+          VERSION: ${{ needs.guard.outputs.version }}
+        run: |
+          set -euo pipefail
+          bin="target/$TARGET/release/yanuget${EXT}"
+          case "$TARGET" in
+            aarch64-unknown-linux-gnu)
+              sudo apt-get install -y qemu-user
+              out=$(qemu-aarch64 -L /usr/aarch64-linux-gnu "$bin" --version) ;;
+            x86_64-apple-darwin)
+              out=$(arch -x86_64 "$bin" --version) ;;
+            *)
+              out=$("$bin" --version) ;;
+          esac
+          echo "$out"
+          [ "$out" = "yanuget $VERSION" ]
 
       - name: Package artifact
         shell: bash
@@ -222,6 +301,56 @@ jobs:
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: yanuget-${{ matrix.target }}
+          path: dist/*
+
+  # A CycloneDX software bill of materials for the release: every crate the
+  # workspace resolves for any target, with its version, source, checksum and
+  # license, read from Cargo.lock. It is attached to the GitHub Release and
+  # attested with the archives. Generated here, with a read-only token, so the
+  # tool never runs in a job that can publish.
+  sbom:
+    name: Software bill of materials
+    needs: guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.guard.outputs.sha }}
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+
+      - name: Install cargo-cyclonedx
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
+        with:
+          tool: cargo-cyclonedx@0.5.9
+
+      - name: Generate the SBOM
+        env:
+          TAG: ${{ needs.guard.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # `--target all`: the release ships five targets, and the bill
+          # covers what any of them may contain.
+          cargo cyclonedx --format json --spec-version 1.5 --target all \
+            --all-features --override-filename "yanuget-$TAG.cdx"
+          mkdir -p dist
+          mv "yanuget-$TAG.cdx.json" dist/
+          # Not empty, and about this release.
+          jq -e --arg v "${TAG#v}" \
+            '.metadata.component.name == "yanuget" and .metadata.component.version == $v and (.components | length) > 100' \
+            "dist/yanuget-$TAG.cdx.json" >/dev/null
+
+      - name: Upload the SBOM
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: yanuget-sbom
           path: dist/*
 
   # Publish a multi-arch container image to the GitHub Container Registry,
@@ -279,6 +408,23 @@ jobs:
             # starts handing people a release candidate.
             type=raw,value=latest,enable=${{ !contains(needs.guard.outputs.version, '-') }}
 
+      # CI starts the amd64 image of this commit, but nothing starts the arm64
+      # one, and the image pushed below is a build of its own. So each
+      # platform is built into the local image store and started first; the
+      # push then reuses the layers this builder already holds.
+      - name: Smoke-test the image on each platform
+        env:
+          VERSION: ${{ needs.guard.outputs.version }}
+        run: |
+          set -euo pipefail
+          for platform in linux/amd64 linux/arm64; do
+            docker buildx build --load --platform "$platform" \
+              --build-arg REQUIRE_DOCS=1 -t yanuget:smoke .
+            out=$(docker run --rm --platform "$platform" yanuget:smoke --version)
+            echo "$platform: $out"
+            [ "$out" = "yanuget $VERSION" ]
+          done
+
       # No `cache-from`/`cache-to`: the image is built from the pinned base
       # images and the lockfiles alone.
       - id: build
@@ -291,6 +437,10 @@ jobs:
           # placeholder — which is indistinguishable from success until someone
           # opens /docs.
           build-args: REQUIRE_DOCS=1
+          # BuildKit's SBOM attestation, pushed with the image: the Debian
+          # packages of the runtime layer, and the crates `cargo auditable`
+          # embedded in the binary.
+          sbom: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
 
@@ -316,7 +466,7 @@ jobs:
   # Collect all built artifacts, attest them and publish a GitHub Release.
   release:
     name: Publish GitHub Release
-    needs: [guard, ci, build]
+    needs: [guard, ci, build, sbom]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     environment: release
@@ -430,9 +580,15 @@ jobs:
           status=$(curl -s -o /dev/null -w '%{http_code}' \
             -A "yanuget release workflow (github.com/thoscut/yanuget)" \
             "https://crates.io/api/v1/crates/yanuget-pkg/$pkg")
-          if [ "$status" = "404" ]; then
-            cargo publish --locked -p yanuget-pkg
-          else
-            echo "yanuget-pkg $pkg is on crates.io already (HTTP $status)"
-          fi
+          # Only a definite answer decides: 200 means published, 404 means
+          # not yet. Anything else (a 403 for the user agent, a 429, a 5xx)
+          # stops here, before `yanuget` is published against a guess.
+          case "$status" in
+            200) echo "yanuget-pkg $pkg is on crates.io already" ;;
+            404) cargo publish --locked -p yanuget-pkg ;;
+            *)
+              echo "::error::crates.io answered HTTP $status for yanuget-pkg $pkg; retry the job"
+              exit 1
+              ;;
+          esac
           cargo publish --locked -p yanuget

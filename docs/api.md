@@ -369,9 +369,12 @@ DELETE /api/v2/files/{id}/{version}/{name}
 Both need the feed's push key in `X-NuGet-ApiKey`, **and** a push key must be
 configured: a feed left open for package pushes answers `403` rather than take
 multi-gigabyte files from anyone. The version must be in the feed (`404`).
-Under `allow_overwrite = "pending-only"` the files of a version approved in any
-feed stay as they are (`403`), unless the request also carries the feed's admin
-key as HTTP Basic credentials.
+Once a feed with `requires_approval` (or `allow_overwrite = "pending-only"`)
+has approved the version, its files stay as they are (`403`) from every feed
+holding it, unless the request also carries the admin key of each feed that
+approved it as HTTP Basic credentials. Under `pending-only` that holds for an
+approval in any feed. See
+[Attached files of an approved version](configuration.md#attached-files-of-an-approved-version).
 
 The name is 1–128 characters of `A-Z a-z 0-9 . _ -`, starts with a letter or
 digit, and has one of the feed's allowed extensions (`[feeds.files]`, else
@@ -411,8 +414,11 @@ The request that brings the last byte verifies the SHA-256 (discarding the
 upload on a mismatch, `400`) and attaches the file.
 
 Unfinished uploads expire after `[files].upload_expiry_hours` (`Upload-Expires`
-says when) and are swept. Until then each counts against `min_free_disk_bytes`
-with what it has still to receive, and a feed holds at most
+says when) and are swept. Each counts against `min_free_disk_bytes` with what
+it has still to receive, for an hour after it was created or its last `PATCH`
+ended: an upload a client abandoned without a `DELETE` does not keep other
+uploads out until it expires. Idle for longer, its next `PATCH` is checked
+again like a new upload of what is left. A feed holds at most
 `[files].max_open_uploads` of them (`429` for another). [`scripts/Send-YanugetFile.ps1`](https://github.com/thoscut/yanuget/blob/main/scripts/Send-YanugetFile.ps1)
 is a PowerShell 7 function that uploads resumably:
 
@@ -692,6 +698,16 @@ Gallery pages carry a `Content-Security-Policy` of `default-src 'none'` whose
 only permitted inline style and script are the two the server itself emits,
 pinned by SHA-256. The embedded documentation site sets its own, looser policy
 (mkdocs emits inline bootstrap code this crate does not control).
+
+## Compression
+
+JSON, HTML and text responses are compressed with gzip or brotli when the
+request's `Accept-Encoding` asks for one. Package, symbol and attached-file
+downloads, byte ranges and `application/octet-stream` never are: they are zips
+already, and a range has to address the stored bytes. A compressed response
+carries `Vary: Accept-Encoding` and its `ETag` turns weak (`W/"…"`). A request
+that refuses every encoding the server has (`Accept-Encoding: identity;q=0`
+without gzip or brotli) answers `406`.
 
 ## Error bodies
 

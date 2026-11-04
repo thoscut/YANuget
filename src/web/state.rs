@@ -2,10 +2,9 @@
 //! with, the cross-feed [`FeedMeta`] registry, and the cloneable [`AppState`]
 //! every handler receives.
 
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 
 use axum::http::{header, HeaderMap};
 
@@ -18,8 +17,8 @@ use crate::error::{Error, Result};
 use crate::mirror::{self, MirrorClient, MirrorOptions};
 use crate::nuget::UrlBuilder;
 use crate::retention;
+use crate::space::{Reservation, SpaceGuard};
 use crate::storage::{PackageStorage, TempPath};
-use crate::streaming::{Reservation, Reservations};
 use crate::version::NuGetVersion;
 
 /// The resolved, ready-to-serve context for a single feed: its identity, its
@@ -94,14 +93,18 @@ impl FeedContext {
 
     /// Build a feed's serving context. Mirrored downloads inherit the
     /// server-wide `max_package_size_bytes` unless the feed's mirror set a
-    /// tighter one of its own, and are held to `min_free_disk_bytes`.
-    fn from_resolved(feed: &ResolvedFeed, config: &Config) -> Result<Self> {
+    /// tighter one of its own, and are admitted by `space`, as uploads are.
+    fn from_resolved(
+        feed: &ResolvedFeed,
+        config: &Config,
+        space: &Arc<SpaceGuard>,
+    ) -> Result<Self> {
         // A mirror that cannot be built stops startup rather than quietly
         // serving the feed without it.
         let mut mirror = MirrorClient::try_from_config(&feed.mirror)?;
         if let Some(client) = mirror.as_mut() {
             client.set_default_size_limit(config.max_package_size_bytes);
-            client.set_min_free_disk_bytes(config.min_free_disk_bytes);
+            client.set_space(Arc::clone(space));
             client.set_feed_name(&feed.name);
         }
         Ok(Self {
@@ -168,6 +171,9 @@ pub struct FeedMeta {
     pub name: String,
     pub prefix: String,
     pub requires_approval: bool,
+    /// Under `pending-only` an approval here holds the files of the version
+    /// against changes from every feed (see `hosted::ApprovalGuard`).
+    pub allow_overwrite: OverwriteMode,
     /// The target feed's own license policy, so a promotion into it is held to
     /// the same rule a direct push would be.
     pub license_policy: LicensePolicyConfig,
@@ -183,6 +189,7 @@ impl FeedMeta {
             name: feed.name.clone(),
             prefix: feed.prefix.clone(),
             requires_approval: feed.requires_approval,
+            allow_overwrite: feed.allow_overwrite,
             license_policy: feed.license_policy.clone(),
             admin: AdminAuth::new(feed.admin_api_key.clone()),
         }
@@ -198,10 +205,10 @@ pub struct AppState {
     pub config: Arc<Config>,
     pub feed: Arc<FeedContext>,
     pub(super) feeds: Arc<Vec<FeedMeta>>,
-    pub(super) temp_dir: PathBuf,
-    /// The space promised to uploads in progress into `temp_dir`, shared by
-    /// every feed that writes there.
-    pub(super) reservations: Arc<Reservations>,
+    pub(super) temp_dir: Arc<Path>,
+    /// The admission of writes into `temp_dir`, shared by every feed, mirror
+    /// and the inbox that write there.
+    pub(super) space: Arc<SpaceGuard>,
 }
 
 impl AppState {
@@ -212,38 +219,52 @@ impl AppState {
         db: Arc<dyn PackageDatabase>,
         config: Arc<Config>,
     ) -> Result<Self> {
+        let space = Arc::new(SpaceGuard::for_store(&config, db.clone()));
+        Self::new_with_space(storage, db, config, space).await
+    }
+
+    /// [`Self::new`], admitting writes through `space`.
+    pub async fn new_with_space(
+        storage: Arc<dyn PackageStorage>,
+        db: Arc<dyn PackageDatabase>,
+        config: Arc<Config>,
+        space: Arc<SpaceGuard>,
+    ) -> Result<Self> {
         let feeds = config.resolved_feeds()?;
         // `resolved_feeds` with no `[[feeds]]` yields exactly the root feed.
         let resolved = feeds
             .into_iter()
             .next()
             .expect("at least one resolved feed");
-        Self::for_feed(storage, db, config, &resolved, Arc::new(Vec::new())).await
+        Self::for_feed(storage, db, config, &resolved, Arc::new(Vec::new()), space).await
     }
 
-    /// Construct state for one resolved feed.
+    /// Construct state for one resolved feed. Its uploads are staged in
+    /// `space`'s directory and admitted by it: every feed of a server shares
+    /// one (see [`SpaceGuard::for_store`]), so each sees what the others
+    /// promised.
     pub async fn for_feed(
         storage: Arc<dyn PackageStorage>,
         db: Arc<dyn PackageDatabase>,
         config: Arc<Config>,
         resolved: &ResolvedFeed,
         feeds: Arc<Vec<FeedMeta>>,
+        space: Arc<SpaceGuard>,
     ) -> Result<Self> {
         // Keep temp uploads on the same filesystem as storage so the final move
         // is an atomic rename rather than a multi-gigabyte copy.
-        let temp_dir = config.storage_path().join(".uploads");
+        let temp_dir = space.dir().to_path_buf();
         tokio::fs::create_dir_all(&temp_dir).await?;
         sweep_stale_uploads(&temp_dir).await;
-        let feed = Arc::new(FeedContext::from_resolved(resolved, &config)?);
-        let reservations = reservations_for(&temp_dir);
+        let feed = Arc::new(FeedContext::from_resolved(resolved, &config, &space)?);
         Ok(Self {
             storage,
             db,
             config,
             feed,
             feeds,
-            temp_dir,
-            reservations,
+            temp_dir: temp_dir.into(),
+            space,
         })
     }
 
@@ -281,74 +302,20 @@ impl AppState {
 
     /// Admit an upload of `incoming` bytes (when the client declared a size),
     /// or refuse it when it would leave the storage volume with less than
-    /// `min_free_disk_bytes` free. The returned reservation holds the bytes
-    /// until they are written or it is dropped (see [`Reservations`]).
-    ///
-    /// A full disk does not fail cleanly: the database, the temp file and every
-    /// other writer on the volume run out together, mid-write. Saying no up
-    /// front costs one `statvfs`. What is promised counts as used: the bytes
-    /// other uploads in progress declared and have not written, and what the
-    /// resumable uploads still open have yet to receive. With no declared size
-    /// (a chunked body) only the rest is checked; the size limit, the idle
-    /// timeout and [`Self::reserve_guard`] bound the body. When free space
-    /// cannot be measured the upload is let through, since a guard that fails
-    /// closed would take the feed down with it.
+    /// `min_free_disk_bytes` free (see [`SpaceGuard::admit`]).
     pub(super) async fn reserve_disk_space(&self, incoming: Option<u64>) -> Result<Reservation> {
-        let reservation = self.reservations.reserve(incoming.unwrap_or(0));
-        self.check_disk_space(incoming.unwrap_or(0)).await?;
-        Ok(reservation)
-    }
-
-    /// The check of [`Self::reserve_disk_space`] for more bytes of a resumable
-    /// upload, which its row already promises: an [offset](Reservations::offset)
-    /// for the request that writes them.
-    pub(super) async fn resume_disk_space(&self) -> Result<Reservation> {
-        let reservation = self.reservations.offset();
-        self.check_disk_space(0).await?;
-        Ok(reservation)
-    }
-
-    /// Whether the volume has room for everything promised, `incoming` (part
-    /// of it) included, and the reserve.
-    async fn check_disk_space(&self, incoming: u64) -> Result<()> {
-        let reserve = self.config.min_free_disk_bytes;
-        if reserve == 0 {
-            return Ok(());
-        }
-        let available = match fs4::available_space(&self.temp_dir) {
-            Ok(n) => n,
-            Err(e) => {
-                tracing::warn!(error = %e, "could not measure free disk space");
-                return Ok(());
-            }
-        };
-        let resumable = self.db.outstanding_upload_bytes(chrono::Utc::now()).await?;
-        let promised = (self.reservations.promised() as i128 + resumable as i128).max(0) as u64;
-        let others = promised.saturating_sub(incoming);
-        let needed = promised.max(incoming).saturating_add(reserve);
-        if available < needed {
-            return Err(Error::InsufficientStorage(format!(
-                "{available} bytes free on the storage volume, {needed} needed \
-                 (the upload, {others} promised to other uploads in progress, \
-                 and the configured reserve)"
-            )));
-        }
-        Ok(())
+        self.space.admit(incoming).await
     }
 
     /// `writer`, made to fail part-way once the storage volume drops below
-    /// `min_free_disk_bytes` (see [`streaming::DiskReserve`]): the check
-    /// [`Self::reserve_disk_space`] makes up front cannot see a body that
-    /// declared no size. What goes through is taken off `reservation`.
-    ///
-    /// [`streaming::DiskReserve`]: crate::streaming::DiskReserve
+    /// `min_free_disk_bytes` (see [`crate::space::DiskReserve`]). What goes
+    /// through is taken off `reservation`.
     pub(super) fn reserve_guard<'a, W>(
         &'a self,
         writer: &'a mut W,
         reservation: &'a Reservation,
-    ) -> crate::streaming::DiskReserve<'a, W> {
-        crate::streaming::DiskReserve::new(writer, &self.temp_dir, self.config.min_free_disk_bytes)
-            .counting(reservation)
+    ) -> crate::space::DiskReserve<'a, W> {
+        self.space.guard(writer, reservation)
     }
 
     /// Create a fresh temp file for an incoming upload, removed again when the
@@ -391,15 +358,25 @@ impl AppState {
     /// 404 to anyone without the key and a 200 with it, and a 404 does not
     /// count toward `max_failed_auth`: the key could be guessed at the
     /// request limiter's pace instead of the failed-authentication one. So a
-    /// request that carries a credential which is neither the feed's read
-    /// key nor its preview key is answered `401` (`SEC-28`).
+    /// request that offers a key where the preview key goes (see
+    /// [`crate::auth::offered_keys`]) which is none of the feed's keys is
+    /// answered `401` (`SEC-28`).
+    ///
+    /// Only that: a client that sends the feed's push key with every request,
+    /// a `Bearer` token a gateway adds, or the admin's Basic credentials is
+    /// not guessing, and a `401` for each missing version would count it
+    /// toward `max_failed_auth` until its address is locked out (`SEC-37`).
     pub(super) fn download_miss(&self, headers: &HeaderMap) -> Error {
-        let credential = headers.contains_key(header::AUTHORIZATION)
-            || headers.contains_key(crate::auth::API_KEY_HEADER);
-        if self.feed.preview_auth.is_enabled()
-            && credential
-            && !self.feed.preview_auth.presented(headers)
-            && !self.feed.read_auth.presented(headers)
+        let feed = &self.feed;
+        let guessed = || {
+            crate::auth::offered_keys(headers)
+                .iter()
+                .any(|k| !feed.auth.is_key(k) && !feed.admin.is_key(k))
+        };
+        if feed.preview_auth.is_enabled()
+            && !feed.preview_auth.presented(headers)
+            && !feed.read_auth.presented(headers)
+            && guessed()
         {
             Error::Unauthorized
         } else {
@@ -503,18 +480,6 @@ impl AppState {
             tracing::warn!(feed = %self.feed(), id, version = %version.normalized(), error = %e, "mirror fetch failed");
         }
     }
-}
-
-/// The [`Reservations`] of the uploads directory `temp_dir`: one for every
-/// feed state built on it, since the feeds share the volume.
-fn reservations_for(temp_dir: &Path) -> Arc<Reservations> {
-    static ALL: LazyLock<std::sync::Mutex<HashMap<PathBuf, Arc<Reservations>>>> =
-        LazyLock::new(Default::default);
-    ALL.lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .entry(temp_dir.to_path_buf())
-        .or_default()
-        .clone()
 }
 
 /// Delete upload temp files left over from a previous run.

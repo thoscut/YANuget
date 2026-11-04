@@ -230,16 +230,37 @@ struct Script {
     content: Vec<u8>,
 }
 
-/// Every one of [`SCRIPTS`] the package carries, in any folder, with its
-/// content. At least one must be a `chocolateyInstall.ps1`, for the prelude
-/// to be loaded from.
-fn package_scripts(nupkg: &Path) -> Result<Vec<Script>, PreludeError> {
-    let mut archive = open_archive(nupkg)?;
-    let mut found = Vec::new();
-    for i in 0..archive.len() {
-        let Some(name) = entry_name(&archive, i)? else {
-            continue;
-        };
+/// One of [`SCRIPTS`] among a package's entries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ScriptEntry {
+    /// The entry's index in the archive.
+    pub index: usize,
+    /// The entry, as the package names it.
+    pub name: String,
+    /// What the package's own is renamed to behind a loader; which of
+    /// [`SCRIPTS`] it is.
+    pub upstream: &'static str,
+}
+
+/// What [`find_scripts`] found in a package.
+#[derive(Debug)]
+pub(crate) struct FoundScripts {
+    /// Every one of [`SCRIPTS`], in any folder, ordered by entry name
+    /// (lower case, `/` for `\`), so the order never depends on the ZIP's.
+    pub scripts: Vec<ScriptEntry>,
+    /// Entries under the names the prelude adds (`internalizer/…`, the
+    /// `*.upstream.ps1` names), in the same order.
+    pub reserved: Vec<String>,
+}
+
+/// The search for Chocolatey's scripts that the prelude and the override's
+/// replacement script share, over a package's entries by index and name
+/// ([`entry_names`]): an entry is one of [`SCRIPTS`] when its file name is,
+/// whatever the case and folder.
+pub(crate) fn find_scripts(entries: Vec<(usize, String)>) -> FoundScripts {
+    let mut scripts = Vec::new();
+    let mut reserved = Vec::new();
+    for (i, name) in entries {
         let lower = name.to_ascii_lowercase().replace('\\', "/");
         let (_, file) = split(&lower);
         if lower.starts_with("internalizer/")
@@ -247,31 +268,68 @@ fn package_scripts(nupkg: &Path) -> Result<Vec<Script>, PreludeError> {
                 .iter()
                 .any(|(_, upstream)| file == upstream.to_ascii_lowercase())
         {
-            return Err(PreludeError::Package(format!(
-                "the package has an entry {name}, which the prelude would replace"
-            )));
-        }
-        if let Some((_, upstream)) = SCRIPTS
+            reserved.push((lower, name));
+        } else if let Some((_, upstream)) = SCRIPTS
             .iter()
             .find(|(script, _)| file == script.to_ascii_lowercase())
         {
-            found.push((i, name, *upstream));
+            scripts.push((
+                lower,
+                ScriptEntry {
+                    index: i,
+                    name,
+                    upstream,
+                },
+            ));
         }
     }
-    if !found
-        .iter()
-        .any(|(_, _, upstream)| *upstream == UPSTREAM_SCRIPT)
-    {
+    scripts.sort_by(|a, b| a.0.cmp(&b.0));
+    reserved.sort();
+    FoundScripts {
+        scripts: scripts.into_iter().map(|(_, s)| s).collect(),
+        reserved: reserved.into_iter().map(|(_, n)| n).collect(),
+    }
+}
+
+/// The package's entries by index and name, for [`find_scripts`].
+pub(crate) fn entry_names(nupkg: &Path) -> Result<Vec<(usize, String)>, yanuget_pkg::Error> {
+    let archive = open_archive(nupkg)?;
+    let mut names = Vec::with_capacity(archive.len());
+    for i in 0..archive.len() {
+        if let Some(name) = entry_name(&archive, i)? {
+            names.push((i, name));
+        }
+    }
+    Ok(names)
+}
+
+/// Every one of [`SCRIPTS`] the package carries, in any folder, with its
+/// content. At least one must be a `chocolateyInstall.ps1`, for the prelude
+/// to be loaded from.
+fn package_scripts(nupkg: &Path) -> Result<Vec<Script>, PreludeError> {
+    let found = find_scripts(entry_names(nupkg)?);
+    let mut archive = open_archive(nupkg)?;
+    if let Some(name) = found.reserved.first() {
+        return Err(PreludeError::Package(format!(
+            "the package has an entry {name}, which the prelude would replace"
+        )));
+    }
+    if !found.scripts.iter().any(|s| s.upstream == UPSTREAM_SCRIPT) {
         return Err(PreludeError::Package(
             "files were attached, but the package has no chocolateyInstall.ps1 to load the \
              prelude from"
                 .into(),
         ));
     }
-    let mut scripts = Vec::with_capacity(found.len());
-    for (i, name, upstream) in found {
+    let mut scripts = Vec::with_capacity(found.scripts.len());
+    for ScriptEntry {
+        index,
+        name,
+        upstream,
+    } in found.scripts
+    {
         let file = archive
-            .by_index(i)
+            .by_index(index)
             .map_err(|e| yanuget_pkg::Error::InvalidPackage(format!("{name}: {e}")))?;
         let mut content = Vec::new();
         file.take(MAX_SCRIPT_BYTES + 1)
@@ -396,6 +454,63 @@ mod tests {
         // The prelude takes apart what is not a download.
         assert!(TEMPLATE.contains("function __Yanuget-IsLocal"));
         assert!(!TEMPLATE.contains("(https?|ftps?)://"));
+    }
+
+    /// `MNT-25`: the scripts come in name order, whatever the ZIP's, and an
+    /// entry under a name the prelude adds is set apart.
+    #[test]
+    fn scripts_are_found_in_name_order() {
+        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).enumerate().collect();
+        let found = find_scripts(names(&[
+            "tools/chocolateyUninstall.ps1",
+            "tools\\ChocolateyInstall.ps1",
+            "a/chocolateyinstall.PS1",
+            "tools/other.ps1",
+            "tools/chocolateyInstall.upstream.ps1",
+            "Internalizer/x",
+        ]));
+        let got: Vec<_> = found
+            .scripts
+            .iter()
+            .map(|s| (s.index, s.name.as_str(), s.upstream))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (2, "a/chocolateyinstall.PS1", UPSTREAM_SCRIPT),
+                (1, "tools\\ChocolateyInstall.ps1", UPSTREAM_SCRIPT),
+                (
+                    0,
+                    "tools/chocolateyUninstall.ps1",
+                    "chocolateyUninstall.upstream.ps1"
+                ),
+            ]
+        );
+        assert_eq!(
+            found.reserved,
+            ["Internalizer/x", "tools/chocolateyInstall.upstream.ps1"]
+        );
+    }
+
+    /// `SEC-35`, `SEC-39`: what `tests/prelude.rs` runs where `pwsh` is,
+    /// in the template wherever it is not.
+    #[test]
+    fn the_template_refuses_what_reaches_another_machine() {
+        // The provider's prefix comes off before the path is judged, and a
+        // drive is asked whether it is a network one.
+        assert!(TEMPLATE.contains("$Path.IndexOf('::')"));
+        assert!(TEMPLATE.contains(r"'^(Microsoft\.PowerShell\.Core\\)?FileSystem$'"));
+        assert!(TEMPLATE.contains("[System.IO.DriveType]::Network"));
+        assert!(TEMPLATE.contains("$drive.DisplayRoot"));
+        // The pin holds under --ignore-checksums: the variable Chocolatey
+        // skips its check by is taken away while a helper runs, and put
+        // back once it is done.
+        assert!(TEMPLATE.contains("Remove-Item -Path Env:ChocolateyIgnoreChecksums"));
+        assert!(TEMPLATE.contains("`$__yanugetIgnored = __Yanuget-Enforce `$__yanugetExpect"));
+        assert!(TEMPLATE.contains("`$__yanugetExpect `$__yanugetIgnored"));
+        // A feed URL from the client must be http or https.
+        assert!(TEMPLATE.contains("$uri.Scheme -ne 'http' -and $uri.Scheme -ne 'https'"));
+        assert!(TEMPLATE.is_ascii());
     }
 
     #[test]

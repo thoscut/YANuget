@@ -332,11 +332,11 @@ fn parse_line(line: &[u8], closure: &[(&str, &NuGetVersion)]) -> Result<Call, St
     })
 }
 
-/// Control characters (C0, DEL, C1) and the bidirectional controls that make
-/// text read differently from what it is.
+/// Control characters, the bidirectional controls and the invisible format
+/// characters that make text read differently from what it is: the same
+/// rule the server reveals them by on the approve page.
 pub(crate) fn is_forbidden(c: char) -> bool {
-    c.is_control()
-        || matches!(c, '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+    yanuget_pkg::text::is_hidden(c)
 }
 
 /// At most 64 characters of untrusted text, for a message.
@@ -511,6 +511,10 @@ mod tests {
             (
                 json!({"fileFullPath": "C:\\a\u{202E}exe.txt"}),
                 "control character U+202E",
+            ),
+            (
+                json!({"fileFullPath": "C:\\setup\u{200B}.exe"}),
+                "control character U+200B",
             ),
             (
                 json!({"package": "evil"}),

@@ -97,6 +97,10 @@ struct Behaviour {
     /// these (lower id, version) pairs are unlisted.
     registration: bool,
     unlisted: std::collections::BTreeSet<(String, String)>,
+    /// Write catalog and registration page `@id`s relative to their index,
+    /// and redirect each registration index to another path, where its page
+    /// is not inlined.
+    relative_ids: bool,
 }
 
 struct UpstreamState {
@@ -302,7 +306,14 @@ fn respond(state: &UpstreamState, uri: &Uri) -> Response {
     }
     if path == "/catalog/index.json" {
         let pages: Vec<serde_json::Value> = (0..behaviour.packages.len())
-            .map(|i| serde_json::json!({"@id": format!("{base}/catalog/page{i}.json")}))
+            .map(|i| {
+                let id = if behaviour.relative_ids {
+                    format!("page{i}.json")
+                } else {
+                    format!("{base}/catalog/page{i}.json")
+                };
+                serde_json::json!({ "@id": id })
+            })
             .collect();
         return axum::Json(serde_json::json!({ "items": pages })).into_response();
     }
@@ -322,22 +333,47 @@ fn respond(state: &UpstreamState, uri: &Uri) -> Response {
         }))
         .into_response();
     }
+    let leaves = |id: &str| -> Option<Vec<serde_json::Value>> {
+        let versions = behaviour.packages.get(id)?;
+        Some(
+            versions
+                .iter()
+                .map(|(v, _)| {
+                    let listed = !behaviour
+                        .unlisted
+                        .contains(&(id.to_string(), v.to_lowercase()));
+                    serde_json::json!({"catalogEntry": {"id": id, "version": v, "listed": listed}})
+                })
+                .collect(),
+        )
+    };
+    if let Some(rest) = path.strip_prefix("/hive/") {
+        let doc = match rest.split_once('/') {
+            Some((id, "index.json")) if leaves(id).is_some() => {
+                serde_json::json!({"count": 1, "items": [{"@id": "page.json"}]})
+            }
+            Some((id, "page.json")) => match leaves(id) {
+                Some(items) => serde_json::json!({ "items": items }),
+                None => return StatusCode::NOT_FOUND.into_response(),
+            },
+            _ => return StatusCode::NOT_FOUND.into_response(),
+        };
+        return axum::Json(doc).into_response();
+    }
     if let Some(id) = path
         .strip_prefix("/registration/")
         .and_then(|p| p.strip_suffix("/index.json"))
     {
-        let Some(versions) = behaviour.packages.get(id) else {
+        if behaviour.relative_ids {
+            return (
+                StatusCode::FOUND,
+                [("location", format!("{base}/hive/{id}/index.json"))],
+            )
+                .into_response();
+        }
+        let Some(leaves) = leaves(id) else {
             return StatusCode::NOT_FOUND.into_response();
         };
-        let leaves: Vec<serde_json::Value> = versions
-            .iter()
-            .map(|(v, _)| {
-                let listed = !behaviour
-                    .unlisted
-                    .contains(&(id.to_string(), v.to_lowercase()));
-                serde_json::json!({"catalogEntry": {"id": id, "version": v, "listed": listed}})
-            })
-            .collect();
         let json = serde_json::to_vec(&serde_json::json!({
             "count": 1,
             "items": [{"@id": format!("{base}/registration/{id}/index.json#page"), "items": leaves}]
@@ -522,12 +558,20 @@ async fn spawn_mirror_with(
             .map(FeedMeta::from_resolved)
             .collect::<Vec<_>>(),
     );
+    let space = Arc::new(yanuget::space::SpaceGuard::for_store(&config, db.clone()));
     let mut states = Vec::new();
     for f in &feeds {
         states.push(
-            AppState::for_feed(storage.clone(), db.clone(), config.clone(), f, meta.clone())
-                .await
-                .unwrap(),
+            AppState::for_feed(
+                storage.clone(),
+                db.clone(),
+                config.clone(),
+                f,
+                meta.clone(),
+                space.clone(),
+            )
+            .await
+            .unwrap(),
         );
     }
     let app = web::build_app(states);
@@ -787,6 +831,38 @@ async fn a_download_that_would_eat_the_disk_reserve_is_refused() {
         .download_nupkg("big.pkg", "1.0.0", &dest)
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn a_download_does_not_take_the_space_promised_to_uploads() {
+    let upstream = Upstream::start().await;
+    upstream.publish("Big.Pkg", "1.0.0");
+    let dir = tempfile::tempdir().unwrap();
+    let space =
+        Arc::new(yanuget::space::SpaceGuard::new(dir.path(), 1).with_measure(|_| Ok(10_000_000)));
+    let mut client = yanuget::mirror::MirrorClient::from_config(&mirror_config(&upstream)).unwrap();
+    client.set_space(space.clone());
+    let dest = dir.path().join("big.nupkg");
+
+    // A push in progress was promised all of the volume.
+    let push = space.admit(Some(9_999_999)).await.unwrap();
+    let err = client
+        .download_nupkg("big.pkg", "1.0.0", &dest)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, yanuget::Error::InsufficientStorage(_)),
+        "{err}"
+    );
+    assert!(!dest.exists(), "nothing may be written");
+
+    drop(push);
+    client
+        .download_nupkg("big.pkg", "1.0.0", &dest)
+        .await
+        .unwrap();
+    // What the download reserved went with it.
+    assert_eq!(space.promised(), 0);
 }
 
 #[tokio::test]
@@ -1278,6 +1354,42 @@ async fn migrate_falls_back_to_the_catalog_when_search_fails() {
     assert_eq!(summary.imported, 3, "{:?}", summary.failures);
 }
 
+/// Catalog page `@id`s relative to the catalog index resolve against it
+/// (MNT-07); each used to be fetched as given and failed.
+#[tokio::test]
+async fn relative_catalog_pages_are_resolved_against_the_index() {
+    let upstream = three_packages().await;
+    upstream.behave(|b| {
+        b.search_fails = true;
+        b.catalog = true;
+        b.relative_ids = true;
+    });
+    let summary = local_feed().await.migrate(&upstream).await;
+    assert_eq!(summary.imported, 3, "{:?}", summary.failures);
+    assert_eq!(summary.failed_discovery, 0, "{:?}", summary.failures);
+}
+
+/// A registration index that redirects: its relative page `@id`s resolve
+/// against where it was served from, not where it was asked for (MNT-07).
+#[tokio::test]
+async fn registration_pages_resolve_against_the_redirected_index() {
+    let upstream = Upstream::start().await;
+    upstream.publish("Moved.Pkg", "1.0.0");
+    upstream.publish("Moved.Pkg", "2.0.0");
+    upstream.behave(|b| {
+        b.registration = true;
+        b.relative_ids = true;
+        b.unlisted.insert(("moved.pkg".into(), "1.0.0".into()));
+    });
+    let local = local_feed().await;
+    local
+        .mirror(&upstream, "Moved.Pkg", MirrorOptions::default())
+        .await;
+    assert_eq!(upstream.hits("/hive/moved.pkg/page.json"), 1);
+    assert!(!local.listed("moved.pkg", "1.0.0").await);
+    assert!(local.listed("moved.pkg", "2.0.0").await);
+}
+
 #[tokio::test]
 async fn a_catalog_page_that_fails_makes_the_migration_incomplete() {
     // Its ids are missing from the copy; the run used to exit 0 regardless.
@@ -1552,4 +1664,132 @@ async fn a_listing_set_by_hand_is_not_undone_by_a_refresh() {
     local.mirror(&upstream, "Curated.Pkg", options).await;
     assert!(local.listed("curated.pkg", "1.0.0").await);
     assert!(!local.listed("curated.pkg", "2.0.0").await);
+}
+
+/// A version unlisted by hand in one mirror feed and copied (or moved, or
+/// promoted) into another arrives with the mark, as the admin page's transfer
+/// builds it, so the target's refresh leaves it unlisted (COR-38, TEST-14).
+#[tokio::test]
+async fn a_copied_version_unlisted_by_hand_stays_unlisted_in_the_target_mirror() {
+    let upstream = Upstream::start().await;
+    upstream.publish("Copied.Pkg", "1.0.0");
+    upstream.behave(|b| b.registration = true);
+    let local = local_feed().await;
+    let options = MirrorOptions::default();
+    local.mirror(&upstream, "Copied.Pkg", options.clone()).await;
+    let v = NuGetVersion::parse("1.0.0").unwrap();
+    assert!(local
+        .db
+        .set_listed("mirror", "copied.pkg", &v, false)
+        .await
+        .unwrap());
+
+    let here = local.membership("copied.pkg", "1.0.0").await.unwrap();
+    local
+        .db
+        .add_membership(&Membership {
+            feed: "target".into(),
+            ..here
+        })
+        .await
+        .unwrap();
+    let client = yanuget::mirror::MirrorClient::from_config(&mirror_config(&upstream)).unwrap();
+    yanuget::mirror::ensure_package(
+        &client,
+        &local.storage,
+        &local.db,
+        "target",
+        &local.temp,
+        "Copied.Pkg",
+        &options,
+    )
+    .await
+    .unwrap();
+    let there = local
+        .db
+        .get_membership("target", "copied.pkg", &v)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(there.listing_set);
+    assert!(!there.listed, "the target's refresh must not relist it");
+}
+
+/// A version the upstream has unlisted is indexed unlisted, not listed until
+/// the end of the fetch: the registration is read once, before the first
+/// download, and serves the versions and the reconciliation alike (COR-39,
+/// PERF-13).
+#[tokio::test]
+async fn a_refresh_reads_the_registration_once_before_downloading() {
+    let upstream = Upstream::start().await;
+    for v in ["1.0.0", "2.0.0", "3.0.0"] {
+        upstream.publish("Early.Pkg", v);
+    }
+    upstream.behave(|b| {
+        b.registration = true;
+        b.unlisted.insert(("early.pkg".into(), "3.0.0".into()));
+    });
+    let local = local_feed().await;
+    assert_eq!(
+        local
+            .mirror(&upstream, "Early.Pkg", MirrorOptions::default())
+            .await,
+        3
+    );
+    let paths: Vec<String> = upstream.seen().into_iter().map(|s| s.path).collect();
+    let registration = |p: &String| p.starts_with("/registration/");
+    assert_eq!(
+        paths.iter().filter(|p| registration(p)).count(),
+        1,
+        "{paths:?}"
+    );
+    let first_download = paths.iter().position(|p| p.ends_with(".nupkg")).unwrap();
+    assert!(
+        paths[..first_download].iter().any(registration),
+        "{paths:?}"
+    );
+    let m = local.membership("early.pkg", "3.0.0").await.unwrap();
+    assert!(!m.listed);
+    assert!(!m.listing_set, "the upstream's, not a hand-set listing");
+    assert!(local.listed("early.pkg", "2.0.0").await);
+}
+
+/// Read-through fetches of several versions share one registration read
+/// within `refresh_secs`, instead of one each (PERF-13).
+#[tokio::test]
+async fn read_through_versions_share_one_registration_read() {
+    let upstream = Upstream::start().await;
+    for v in ["1.0.0", "2.0.0", "3.0.0"] {
+        upstream.publish("Shared.Pkg", v);
+    }
+    upstream.behave(|b| {
+        b.registration = true;
+        b.unlisted.insert(("shared.pkg".into(), "1.0.0".into()));
+    });
+    let local = local_feed().await;
+    let client = yanuget::mirror::MirrorClient::from_config(&mirror_config(&upstream)).unwrap();
+    let options = MirrorOptions::default();
+    let target = yanuget::mirror::MirrorTarget {
+        client: &client,
+        storage: &local.storage,
+        db: &local.db,
+        feed: "mirror",
+        temp_dir: &local.temp,
+        options: &options,
+    };
+    for v in ["1.0.0", "2.0.0", "3.0.0"] {
+        let version = NuGetVersion::parse(v).unwrap();
+        assert_eq!(
+            target.ensure_version("Shared.Pkg", &version).await.unwrap(),
+            1
+        );
+    }
+    let registrations = upstream
+        .seen()
+        .iter()
+        .filter(|s| s.path.starts_with("/registration/"))
+        .count();
+    assert_eq!(registrations, 1);
+    assert!(!local.listed("shared.pkg", "1.0.0").await);
+    assert!(local.listed("shared.pkg", "3.0.0").await);
 }

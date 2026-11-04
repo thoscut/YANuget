@@ -74,6 +74,29 @@ connections, lets requests in progress and background work finish for up to ten
 seconds, then exits. A transfer still running after that is cut off; an upload
 cut off this way is discarded, never stored half-written.
 
+### Offline commands and a running server
+
+`restore`, `feeds rename` and `feeds remove` write to the database and the
+package store behind a server's back, outside the locks it takes, so they
+refuse while one uses the data. Two checks:
+
+- A running server holds a lock on `<database_path>.lock` (`yanuget.db.lock`
+  in `data_dir` by default) until it exits. The commands take the same lock
+  for as long as they work, so a server started meanwhile refuses to start
+  too, and so does a second server on the same data. It is an advisory lock
+  (`flock` on Unix, `LockFileEx` on Windows) that the system releases when a
+  process ends, so a crash leaves nothing to clean up. It covers a server in
+  another container that mounts the same volume, or one that does not answer
+  on loopback. On a file system that does not support locks, such as some
+  network mounts, a warning says so and only the second check is left.
+- The command asks the configured port on this machine (`/health/ready`
+  through loopback) and refuses when anything answers. That also catches a
+  server of a release before this lock.
+
+A `--dry-run` of `feeds rename` or `feeds remove` takes neither: it opens the
+database read-only, as `config check` does, and does not migrate it, so it can
+look at the database of a server of another release.
+
 ## `yanuget migrate`
 
 Copies every package from another NuGet v3 server into a local feed, with live
@@ -89,7 +112,7 @@ All options, authentication and resumption are described in
 
 ## `yanuget healthcheck`
 
-Requests the readiness endpoint (`/health`) of the server on this machine, using
+Requests the readiness endpoint (`/health/ready`) of the server on this machine, using
 the port and scheme from the configuration, and exits `0` if it answers `200`
 and `1` otherwise. It does not verify the certificate (it talks to its own
 process over loopback) and ignores proxy settings. The container image uses it
@@ -141,7 +164,7 @@ serves them; the server warns about them at startup, and so does
 `config check`. These commands deal with them:
 
 ```text
-yanuget feeds rename <old> <new> [--dry-run]
+yanuget feeds rename <old> <new> [--dry-run] [--keep-approval | --hold-for-approval]
 yanuget feeds remove <name> [--dry-run] [--yes]
 ```
 
@@ -150,17 +173,38 @@ yanuget feeds remove <name> [--dry-run] [--yes]
   deleted from it, and resumable uploads in progress. `<new>` must be a
   configured feed and `<old>` must not be. It refuses when both hold the same
   version; delete it from one of them first.
+
+  A rename is not a push or a promotion: `<new>`'s `requires_approval`,
+  license policy and `reserved_id_prefixes` are not applied to the versions
+  it moves, which keep the state they had. So that a slip (`staging` typed
+  for `old-production`) cannot make what an ungated feed approved on arrival
+  visible in a gated one, a rename into a feed with `requires_approval` that
+  would carry approved versions needs `--keep-approval` (the feed was only
+  renamed) or `--hold-for-approval` (every version moved arrives pending, to
+  be approved again). `--dry-run` says how many are approved, pending and
+  disabled.
 - `remove` drops everything recorded under `<name>`, which must not be
   configured, and, as retention does, deletes the packages, attached files and
   symbols of versions no other feed holds. It cannot be undone and needs
   `--yes`.
 
 With `--dry-run`, either command only prints what it would do. Otherwise both
-refuse while a server answers on the configured port: stop it first, run the
-command, then start it again.
+refuse while a server uses the data: stop it first, run the command, then
+start it again; see [Offline commands and a running server](#offline-commands-and-a-running-server).
 
 ```bash
 systemctl stop yanuget
 sudo -u yanuget yanuget --config /etc/yanuget/yanuget.toml feeds rename prod production
 systemctl start yanuget
+```
+
+In a container, `docker compose exec` is refused because the server is
+running in it. Stop the service and run the command in a one-off container on
+the same volume, as for [restore](backup.md#in-a-container); stop it first, because in a
+one-off container the check finds no server:
+
+```bash
+docker compose stop yanuget
+docker compose run --rm --no-deps yanuget feeds rename prod production
+docker compose start yanuget
 ```

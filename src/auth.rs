@@ -50,6 +50,12 @@ impl ApiKeyAuth {
         ok
     }
 
+    /// Whether `key` is one of the configured keys. Unlike [`Self::check`],
+    /// false while none is configured.
+    pub fn is_key(&self, key: &str) -> bool {
+        self.is_enabled() && self.check(Some(key))
+    }
+
     /// Convenience: validate the key carried in request headers.
     pub fn check_headers(&self, headers: &HeaderMap) -> bool {
         let presented = headers
@@ -132,6 +138,13 @@ impl AdminAuth {
     /// Whether the admin area is configured at all.
     pub fn is_enabled(&self) -> bool {
         self.expected.is_some()
+    }
+
+    /// Whether `key` is the admin key.
+    pub fn is_key(&self, key: &str) -> bool {
+        self.expected
+            .as_deref()
+            .is_some_and(|expected| constant_time_eq(key.as_bytes(), expected.as_bytes()))
     }
 
     /// Validate the `Authorization: Basic …` header against the admin key.
@@ -316,6 +329,26 @@ fn basic_password(value: &str) -> Option<String> {
     creds
         .split_once(':')
         .map(|(_, pass)| pass.trim().to_string())
+}
+
+/// The secrets a request offers where a read or preview key goes: the
+/// `X-NuGet-ApiKey` header and the password of HTTP Basic credentials, each
+/// trimmed, blank ones left out. Another scheme (`Bearer`, say, which a
+/// gateway in front may add) offers none.
+pub fn offered_keys(headers: &HeaderMap) -> Vec<String> {
+    let header = headers
+        .get(API_KEY_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim().to_string());
+    let basic = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(basic_password);
+    header
+        .into_iter()
+        .chain(basic)
+        .filter(|k| !k.is_empty())
+        .collect()
 }
 
 /// Whether the request carries `Authorization: Bearer <expected>`.

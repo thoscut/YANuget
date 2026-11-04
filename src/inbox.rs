@@ -32,6 +32,7 @@
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::Path;
+use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -39,6 +40,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use crate::config::FilesConfig;
 use crate::database::PackageDatabase;
 use crate::error::{Error, Result};
+use crate::space::{Reservation, SpaceGuard};
 use crate::storage::{PackageStorage, TempPath};
 use crate::version::NuGetVersion;
 use crate::web::hosted::{attach_to, Attached, Target};
@@ -65,11 +67,14 @@ pub struct Inbox<'a> {
     /// The feeds under `allow_overwrite = "pending-only"`: a file dropped for
     /// one of them is not attached to a version some feed has approved.
     pub pending_only: &'a [String],
-    /// The server's private staging directory (the store's `.uploads`).
-    pub staging: &'a Path,
-    /// Free space an import must leave on the staging volume
-    /// (`min_free_disk_bytes`); 0 checks nothing.
-    pub min_free_disk_bytes: u64,
+    /// The feeds that review what they serve (`requires_approval` or
+    /// `pending-only`): a file dropped for any feed is not attached to a
+    /// version one of them has approved, as a push key could not either.
+    pub reviewing: &'a [String],
+    /// The admission of writes into the server's private staging directory
+    /// (the store's `.uploads`), shared with its uploads and mirrors: an
+    /// import is held to `min_free_disk_bytes` and reserves its size there.
+    pub space: &'a SpaceGuard,
 }
 
 /// Refuse an inbox inside the package store: the importer removes files from
@@ -87,105 +92,172 @@ pub fn check_location(inbox: &Path, storage: &Path) -> Result<()> {
     Ok(())
 }
 
+/// A file whose checksum file has arrived, found by [`candidates`].
+#[derive(Debug, Clone)]
+struct Candidate {
+    feed: String,
+    id: String,
+    /// The version directory's name, as found.
+    version: String,
+    v: NuGetVersion,
+    name: String,
+}
+
+impl Candidate {
+    /// Its version directory, opened again from the inbox root without
+    /// following links.
+    fn open_dir(&self, inbox: &Path) -> std::io::Result<dir::InboxDir> {
+        dir::InboxDir::open_root(inbox)?
+            .open_dir(&self.feed)?
+            .open_dir(&self.id)?
+            .open_dir(&self.version)
+    }
+}
+
+/// Run `f` on the blocking pool: everything that touches the inbox is an
+/// `openat`, `readdir` or `fstatat`, which on a network filesystem can stall
+/// the async worker that would otherwise run it.
+async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Result<T> {
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| Error::Io(e.into()))
+}
+
+/// Every file in the inbox at `root` that is waiting to be imported into one
+/// of `feeds`: its checksum file is there, and no report of an earlier
+/// failure is.
+fn candidates(root: &Path, feeds: &[String]) -> std::io::Result<Vec<Candidate>> {
+    let root = dir::InboxDir::open_root(root)?;
+    let mut found = Vec::new();
+    // Directories are held open only along the current path, so however
+    // many the uploader creates, a walk holds four handles at most.
+    for feed in root.names() {
+        if !feeds.contains(&feed) {
+            continue;
+        }
+        let Ok(feed_dir) = root.open_dir(&feed) else {
+            continue;
+        };
+        for id in feed_dir.names() {
+            if crate::validation::validate_package_id(&id).is_err() {
+                continue;
+            }
+            let Ok(id_dir) = feed_dir.open_dir(&id) else {
+                continue;
+            };
+            for version in id_dir.names() {
+                let Ok(v) = NuGetVersion::parse(&version) else {
+                    continue;
+                };
+                let Ok(version_dir) = id_dir.open_dir(&version) else {
+                    continue;
+                };
+                for entry in version_dir.names() {
+                    let Some(name) = entry.strip_suffix(".sha256") else {
+                        continue;
+                    };
+                    // Waiting for the file, or for someone to read why it
+                    // failed. A report is a regular file; a directory of
+                    // that name is left alone too. Anything else there (a
+                    // link, most likely) is not a report, and is replaced
+                    // by one if this import fails.
+                    if version_dir.kind(name) != dir::Kind::File
+                        || matches!(
+                            version_dir.kind(&format!("{name}.error")),
+                            dir::Kind::File | dir::Kind::Dir
+                        )
+                    {
+                        continue;
+                    }
+                    found.push(Candidate {
+                        feed: feed.clone(),
+                        id: id.clone(),
+                        version: version.clone(),
+                        v: v.clone(),
+                        name: name.to_string(),
+                    });
+                }
+            }
+        }
+    }
+    Ok(found)
+}
+
 impl Inbox<'_> {
     /// Import every file whose checksum file has arrived.
+    ///
+    /// The inbox is walked, and each file opened and checked, on the blocking
+    /// pool; only the copy into staging and the attach run here.
     pub async fn scan(&self) -> ScanReport {
         let mut report = ScanReport::default();
-        let root = match dir::InboxDir::open_root(self.dir) {
-            Ok(root) => root,
+        let (root, feeds) = (self.dir.to_path_buf(), self.feeds.to_vec());
+        let found = match blocking(move || candidates(&root, &feeds)).await {
+            Ok(Ok(found)) => found,
+            Ok(Err(e)) => {
+                tracing::warn!(inbox = %self.dir.display(), error = %e, "cannot open the file inbox");
+                return report;
+            }
             Err(e) => {
                 tracing::warn!(inbox = %self.dir.display(), error = %e, "cannot open the file inbox");
                 return report;
             }
         };
-        // Directories are held open only along the current path, so however
-        // many the uploader creates, a scan holds four handles at most.
-        for feed in root.names() {
-            if !self.feeds.contains(&feed) {
-                continue;
-            }
-            let Ok(feed_dir) = root.open_dir(&feed) else {
+        for c in found {
+            let (root, opening) = (self.dir.to_path_buf(), c.clone());
+            // Gone, or swapped for a link, since it was found: skipped, as
+            // the walk skips one.
+            let Ok(Ok(dir)) = blocking(move || opening.open_dir(&root)).await else {
                 continue;
             };
-            for id in feed_dir.names() {
-                if crate::validation::validate_package_id(&id).is_err() {
-                    continue;
-                }
-                let Ok(id_dir) = feed_dir.open_dir(&id) else {
-                    continue;
-                };
-                for version in id_dir.names() {
-                    let Ok(v) = NuGetVersion::parse(&version) else {
-                        continue;
-                    };
-                    let Ok(version_dir) = id_dir.open_dir(&version) else {
-                        continue;
-                    };
-                    for entry in version_dir.names() {
-                        let Some(name) = entry.strip_suffix(".sha256") else {
-                            continue;
-                        };
-                        let error = format!("{name}.error");
-                        // Waiting for the file, or for someone to read why it
-                        // failed. A report is a regular file; a directory of
-                        // that name is left alone too. Anything else there (a
-                        // link, most likely) is not a report, and is replaced
-                        // by one if this import fails.
-                        if version_dir.kind(name) != dir::Kind::File
-                            || matches!(version_dir.kind(&error), dir::Kind::File | dir::Kind::Dir)
-                        {
-                            continue;
-                        }
-                        match self.import(&feed, &id, &v, name, &version_dir).await {
-                            Ok(()) => report.imported += 1,
-                            Err(e) => {
-                                report.failed += 1;
-                                tracing::warn!(%feed, %id, version = %v.normalized(), %name, error = %e, "inbox import failed");
-                                write_report(&version_dir, &error, &e);
-                            }
-                        }
-                    }
+            let dir = Arc::new(dir);
+            match self.import(&c, &dir).await {
+                Ok(()) => report.imported += 1,
+                Err(e) => {
+                    report.failed += 1;
+                    let (feed, id, name) = (&c.feed, &c.id, &c.name);
+                    tracing::warn!(%feed, %id, version = %c.v.normalized(), %name, error = %e, "inbox import failed");
+                    let error = format!("{name}.error");
+                    let _ = blocking(move || write_report(&dir, &error, &e)).await;
                 }
             }
         }
         report
     }
 
-    async fn import(
-        &self,
-        feed: &str,
-        id: &str,
-        v: &NuGetVersion,
-        name: &str,
-        dir: &dir::InboxDir,
-    ) -> Result<()> {
+    async fn import(&self, c: &Candidate, dir: &Arc<dir::InboxDir>) -> Result<()> {
+        let (feed, id, v, name) = (c.feed.as_str(), c.id.as_str(), &c.v, c.name.as_str());
         let allowed = self
             .feed_extensions
             .get(feed)
             .unwrap_or(&self.files.allowed_extensions);
         crate::validation::validate_file_name(name, allowed)?;
         let marker = format!("{name}.sha256");
-        let expected = read_marker(open_regular(dir, &marker)?)?;
-        if !self.db.exists(feed, id, v).await? {
-            return Err(Error::PackageNotFound);
-        }
 
         // One handle, opened without following links and checked through
         // itself, is all that is read from here on.
-        let source = open_regular(dir, name)?;
-        let meta = source.metadata()?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            // Another name for the same inode is another way to change it,
-            // and a link to a file the uploader could not otherwise read.
-            if meta.nlink() != 1 {
-                return Err(Error::BadRequest(format!(
-                    "{name} has other hard links; upload it as a file of its own"
-                )));
+        let (opened, file, checksum) = (Arc::clone(dir), name.to_string(), marker.clone());
+        let (expected, source, size) = blocking(move || -> Result<_> {
+            let expected = read_marker(open_regular(&opened, &checksum)?)?;
+            let source = open_regular(&opened, &file)?;
+            let meta = source.metadata()?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                // Another name for the same inode is another way to change
+                // it, and a link to a file the uploader could not otherwise
+                // read.
+                if meta.nlink() != 1 {
+                    return Err(Error::BadRequest(format!(
+                        "{file} has other hard links; upload it as a file of its own"
+                    )));
+                }
             }
+            Ok((expected, source, meta.len()))
+        })
+        .await??;
+        if !self.db.exists(feed, id, v).await? {
+            return Err(Error::PackageNotFound);
         }
-        let size = meta.len();
         if let Some(limit) = self.max_file_size {
             if size > limit {
                 return Err(Error::PayloadTooLarge(format!(
@@ -196,17 +268,18 @@ impl Inbox<'_> {
 
         // Out of the uploader's reach first, then verified: a copy only the
         // server can write, removed on any way out of here but the store.
-        tokio::fs::create_dir_all(self.staging).await?;
+        let staging = self.space.dir();
+        tokio::fs::create_dir_all(staging).await?;
         // The copy needs the file's size again on the store's volume, and the
-        // uploader's quota is not the server's: held to the same reserve as a
-        // push, so an inbox full of images cannot fill the disk the database
-        // lives on.
-        ensure_disk_space(self.staging, size, self.min_free_disk_bytes)?;
-        let staged = TempPath::new(
-            self.staging
-                .join(format!("inbox-{}.tmp", uuid::Uuid::new_v4().simple())),
-        );
-        let (copied, actual) = copy_hashed(source, staged.path(), size).await?;
+        // uploader's quota is not the server's: admitted like a push, so an
+        // inbox full of images cannot fill the disk the database lives on,
+        // nor take the space promised to the uploads in progress.
+        let reservation = self.space.admit(Some(size)).await?;
+        let staged =
+            TempPath::new(staging.join(format!("inbox-{}.tmp", uuid::Uuid::new_v4().simple())));
+        let (copied, actual) =
+            copy_hashed(source, staged.path(), size, self.space, &reservation).await?;
+        drop(reservation);
         if actual != expected {
             // Not the hash itself: whatever the file is, the report says only
             // that it is not what the checksum file promised.
@@ -219,6 +292,7 @@ impl Inbox<'_> {
             db: self.db,
             feed,
             keep_approved: self.pending_only.iter().any(|f| f == feed),
+            reviewing: self.reviewing,
         };
         // Already attached with exactly these bytes counts as done too.
         let (Attached::New(_) | Attached::Same(_)) = attach_to(
@@ -231,8 +305,12 @@ impl Inbox<'_> {
             copied,
         )
         .await?;
-        let _ = dir.remove(name);
-        let _ = dir.remove(&marker);
+        let (done, file) = (dir.clone(), name.to_string());
+        let _ = blocking(move || {
+            let _ = done.remove(&file);
+            let _ = done.remove(&marker);
+        })
+        .await;
         tracing::info!(%feed, %id, version = %v.normalized(), %name, size = copied, "imported file from the inbox");
         Ok(())
     }
@@ -283,30 +361,6 @@ fn write_report(dir: &dir::InboxDir, report: &str, e: &Error) {
     }
 }
 
-/// Refuse a copy of `incoming` bytes that would leave `dir`'s volume with
-/// less than `reserve` free. Unmeasurable free space lets the import through,
-/// as it does a push: a guard that fails closed would stop every import.
-fn ensure_disk_space(dir: &Path, incoming: u64, reserve: u64) -> Result<()> {
-    if reserve == 0 {
-        return Ok(());
-    }
-    let available = match fs4::available_space(dir) {
-        Ok(n) => n,
-        Err(e) => {
-            tracing::warn!(error = %e, "could not measure free disk space");
-            return Ok(());
-        }
-    };
-    let needed = incoming.saturating_add(reserve);
-    if available < needed {
-        return Err(Error::InsufficientStorage(format!(
-            "{available} bytes free on the storage volume, {needed} needed \
-             (the file plus the configured reserve)"
-        )));
-    }
-    Ok(())
-}
-
 /// The SHA-256 a checksum file names: its first word, 64 hex digits, as
 /// `sha256sum` writes it (`<hex>  <name>`).
 fn read_marker(file: std::fs::File) -> Result<String> {
@@ -336,10 +390,18 @@ fn parse_marker(raw: &str) -> Result<String> {
 /// Copy the first `len` bytes of `from` to a new file at `to`, hashing them on
 /// the way, and sync it. `len` is the size the file had when it was opened: an
 /// uploader still appending cannot keep the scanner copying forever. Returns
-/// how many bytes were copied and their SHA-256.
-async fn copy_hashed(from: std::fs::File, to: &Path, len: u64) -> Result<(u64, String)> {
+/// how many bytes were copied and their SHA-256. The copy is written through
+/// `space`, which takes it off `reservation`.
+async fn copy_hashed(
+    from: std::fs::File,
+    to: &Path,
+    len: u64,
+    space: &SpaceGuard,
+    reservation: &Reservation,
+) -> Result<(u64, String)> {
     let mut src = tokio::fs::File::from_std(from).take(len);
-    let mut dst = tokio::fs::File::create_new(to).await?;
+    let mut file = tokio::fs::File::create_new(to).await?;
+    let mut dst = space.guard(&mut file, reservation);
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 256 * 1024];
     let mut copied = 0u64;
@@ -352,7 +414,8 @@ async fn copy_hashed(from: std::fs::File, to: &Path, len: u64) -> Result<(u64, S
         dst.write_all(&buf[..n]).await?;
         copied += n as u64;
     }
-    dst.sync_all().await?;
+    drop(dst);
+    file.sync_all().await?;
     Ok((copied, hex::encode(hasher.finalize())))
 }
 

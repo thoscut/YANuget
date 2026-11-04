@@ -142,7 +142,7 @@ impl Publisher {
             .build()
             .map_err(|e| PublishError::Feed(format!("cannot build an HTTP client: {e}")))?;
         let target = Target::new(config)
-            .map_err(|e| PublishError::Feed(e.to_string()))?
+            .map_err(|e| PublishError::Feed(crate::error_chain(&e)))?
             .expect("target.url is set");
         Ok(Publisher {
             client,

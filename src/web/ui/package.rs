@@ -9,6 +9,7 @@ use crate::database::PackageFile;
 use crate::models::Package;
 use crate::models::PackageType;
 use crate::nuget::UrlBuilder;
+use std::fmt::Write as _;
 
 /// What the package page shows about the selected version besides its
 /// metadata.
@@ -54,7 +55,8 @@ pub fn detail_page(
         } else {
             ("", "")
         };
-        versions.push_str(&format!(
+        let _ = write!(
+            versions,
             "<li{li}><span><a href=\"{href}\"{current}>{dv}</a>{badges}</span>\
              <span class=\"muted\">{dls} download{ds}</span></li>",
             href =
@@ -63,7 +65,7 @@ pub fn detail_page(
             badges = status_badges(p),
             dls = group_digits(p.downloads as i64),
             ds = plural(p.downloads as i64),
-        ));
+        );
     }
     versions.push_str("</ul>");
 
@@ -74,10 +76,11 @@ pub fn detail_page(
         escape_html(&urls.package_download(&lower, &version))
     );
     if admin {
-        manage.push_str(&format!(
+        let _ = write!(
+            manage,
             "<a href=\"{}\">Manage versions</a>",
             escape_html(&urls.app(&format!("/admin/packages/{}", enc_path(&lower))))
-        ));
+        );
     }
     let manage = format!("<div class=\"acts\">{manage}</div>");
     let desc = if selected.description.trim().is_empty() {
@@ -168,7 +171,8 @@ fn render_files(urls: &UrlBuilder, p: &Package, files: &[PackageFile]) -> String
     );
     for f in files {
         let url = urls.file_download(&lower, &version, &f.name);
-        list.push_str(&format!(
+        let _ = write!(
+            list,
             "<li><div><a class=\"id\" href=\"{href}\">{name}</a> \
              <span class=\"muted\">{size}</span></div>\
              <div class=\"sha\"><span class=\"muted\">SHA-256</span> <code>{sha}</code></div></li>",
@@ -176,14 +180,15 @@ fn render_files(urls: &UrlBuilder, p: &Package, files: &[PackageFile]) -> String
             name = escape_html(&f.name),
             size = human_size(f.size),
             sha = escape_html(&f.sha256),
-        ));
-        script.push_str(&format!(
+        );
+        let _ = write!(
+            script,
             "\n$file = Join-Path $dir '{name}'\n\
              Start-BitsTransfer -Source '{url}' -Destination $file\n\
              Get-ChecksumValid -File $file -Checksum '{sha}' -ChecksumType sha256",
             name = f.name,
             sha = f.sha256,
-        ));
+        );
     }
     list.push_str("</ul>");
     format!(
@@ -238,13 +243,14 @@ fn render_install(urls: &UrlBuilder, p: &Package, primary_client: &str) -> Strin
     let mut out = String::new();
     for (i, (label, cmd)) in snippets.drain(..).enumerate() {
         let cls = if i == 0 { " class=\"primary\"" } else { "" };
-        out.push_str(&format!(
+        let _ = write!(
+            out,
             "<div{cls}><h3>{label}</h3><div class=\"snip\">\
              <button type=\"button\" class=\"copy\" aria-label=\"Copy the {label} command\" \
              hidden>Copy</button>\
              <pre><code>{cmd}</code></pre></div></div>",
             cmd = command_html(&cmd),
-        ));
+        );
     }
     out
 }
@@ -311,10 +317,11 @@ fn render_fields(p: &Package) -> String {
         out.push_str(&field("Type", &escape_html(&types)));
     }
     if !p.authors.is_empty() {
-        out.push_str(&format!(
+        let _ = write!(
+            out,
             "<div class=\"wide\"><dt>Authors</dt><dd>{}</dd></div>",
             escape_html(&p.authors.join(", "))
-        ));
+        );
     }
     out
 }
@@ -357,21 +364,22 @@ fn render_dependencies(urls: &UrlBuilder, p: &Package) -> String {
             .target_framework
             .as_deref()
             .unwrap_or("All frameworks");
-        out.push_str(&format!("<h3 class=\"tfm\">{}</h3>", escape_html(tfm)));
+        let _ = write!(out, "<h3 class=\"tfm\">{}</h3>", escape_html(tfm));
         if group.dependencies.is_empty() {
             out.push_str("<p class=\"muted\">No dependencies</p>");
             continue;
         }
         out.push_str("<table class=\"deps\">");
         for d in &group.dependencies {
-            out.push_str(&format!(
+            let _ = write!(
+                out,
                 "<tr><td><a href=\"{href}\">{id}</a></td><td class=\"muted\">{range}</td></tr>",
                 href = escape_html(
                     &urls.app(&format!("/packages/{}", enc_path(&d.id.to_lowercase())))
                 ),
                 id = escape_html(&d.id),
                 range = escape_html(d.version_range.as_deref().unwrap_or("")),
-            ));
+            );
         }
         out.push_str("</table>");
     }
@@ -453,11 +461,12 @@ pub(super) fn render_tags(urls: &UrlBuilder, tags: &[String]) -> String {
     // Tags are capped when a package is pushed; this bounds what rows stored
     // before that cap can put on a page.
     for t in tags.iter().take(MAX_RENDERED_TAGS) {
-        out.push_str(&format!(
+        let _ = write!(
+            out,
             "<a class=\"tag\" href=\"{}\">{}</a>",
             tag_href(urls, t),
             escape_html(t)
-        ));
+        );
     }
     out.push_str("</div>");
     out

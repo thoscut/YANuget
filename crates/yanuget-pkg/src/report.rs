@@ -207,6 +207,46 @@ impl Report {
     pub fn files(&self) -> impl Iterator<Item = &str> {
         self.downloads.iter().filter_map(|d| d.file.as_deref())
     }
+
+    /// The report for showing to a person: every text in it with the
+    /// characters that hide or reorder text written out
+    /// ([`crate::text::reveal`]). The report is the package's, so a URL or
+    /// warning could otherwise read differently from what it is.
+    pub fn revealed(&self) -> Report {
+        fn s(v: &mut String) {
+            if let std::borrow::Cow::Owned(r) = crate::text::reveal(v) {
+                *v = r;
+            }
+        }
+        fn o(v: &mut Option<String>) {
+            if let Some(v) = v {
+                s(v);
+            }
+        }
+        let mut r = self.clone();
+        s(&mut r.package.id);
+        s(&mut r.package.version);
+        r.reasons.iter_mut().for_each(s);
+        s(&mut r.upstream.source);
+        o(&mut r.upstream.sha512);
+        if let Some(env) = &mut r.environment {
+            o(&mut env.image_sha256);
+            o(&mut env.chocolatey_version);
+            o(&mut env.tool_version);
+        }
+        for d in &mut r.downloads {
+            s(&mut d.url);
+            o(&mut d.helper);
+            o(&mut d.file);
+            o(&mut d.sha256);
+            o(&mut d.checksum.algorithm);
+        }
+        r.warnings.iter_mut().for_each(s);
+        r.overrides.iter_mut().for_each(s);
+        o(&mut r.prelude);
+        o(&mut r.generated_at);
+        r
+    }
 }
 
 #[cfg(test)]
@@ -232,6 +272,28 @@ mod tests {
         "prelude": "tools/internalizer-prelude.ps1",
         "generated_at": "2026-10-01T12:00:00Z"
     }"#;
+
+    #[test]
+    fn a_revealed_report_shows_its_hidden_characters() {
+        let mut r = Report::from_slice(FULL.as_bytes()).unwrap();
+        r.downloads[0].url = "https://example.com/setup\u{202E}fdp.exe".into();
+        r.downloads[0].file = Some("a\u{200B}.exe".into());
+        r.warnings.push("tool\u{2066}.zip\u{2069}".into());
+        r.reasons.push("x\u{7}".into());
+        r.package.id = "7zip\u{200D}.install".into();
+        let shown = r.revealed();
+        assert_eq!(
+            shown.downloads[0].url,
+            "https://example.com/setup[U+202E]fdp.exe"
+        );
+        assert_eq!(shown.downloads[0].file.as_deref(), Some("a[U+200B].exe"));
+        assert_eq!(shown.warnings.last().unwrap(), "tool[U+2066].zip[U+2069]");
+        assert_eq!(shown.reasons, ["x[U+0007]"]);
+        assert_eq!(shown.package.id, "7zip[U+200D].install");
+        // What has none is left as it is.
+        assert_eq!(shown.downloads[1], r.downloads[1]);
+        assert_eq!(shown.upstream, r.upstream);
+    }
 
     #[test]
     fn a_full_report_round_trips() {

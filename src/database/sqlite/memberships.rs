@@ -72,16 +72,21 @@ pub(super) async fn get_membership(
     .bind(version.normalized())
     .fetch_optional(&db.pool)
     .await?;
-    Ok(row.map(|r| Membership {
-        feed: r.get("feed"),
-        lower_id: r.get("lower_id"),
-        normalized_version: r.get("normalized_version"),
-        listed: r.get::<i64, _>("listed") != 0,
-        enabled: r.get::<i64, _>("enabled") != 0,
-        pending: r.get::<i64, _>("pending") != 0,
-        flagged: r.get::<i64, _>("flagged") != 0,
-        flag_reason: r.get("flag_reason"),
-        pinned: r.get::<i64, _>("pinned") != 0,
+    let Some(r) = row else {
+        return Ok(None);
+    };
+    let flag = |name: &str| -> Result<bool> { Ok(r.try_get::<i64, _>(name)? != 0) };
+    Ok(Some(Membership {
+        feed: r.try_get("feed")?,
+        lower_id: r.try_get("lower_id")?,
+        normalized_version: r.try_get("normalized_version")?,
+        listed: flag("listed")?,
+        listing_set: flag("listing_set")?,
+        enabled: flag("enabled")?,
+        pending: flag("pending")?,
+        flagged: flag("flagged")?,
+        flag_reason: r.try_get("flag_reason")?,
+        pinned: flag("pinned")?,
     }))
 }
 
@@ -158,6 +163,25 @@ pub(super) async fn follow_upstream_listing(
     .execute(&db.pool)
     .await?;
     Ok(result.rows_affected() > 0)
+}
+
+pub(super) async fn upstream_listed(
+    db: &SqliteDatabase,
+    feed: &str,
+    id: &str,
+) -> Result<Vec<(String, bool)>> {
+    let rows: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT normalized_version, listed FROM feed_packages \
+         WHERE feed = ?1 AND lower_id = ?2 AND listing_set = 0",
+    )
+    .bind(feed)
+    .bind(canonical_id(id))
+    .fetch_all(&db.pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(version, listed)| (version, listed != 0))
+        .collect())
 }
 
 pub(super) async fn set_enabled(
@@ -283,8 +307,8 @@ pub(super) async fn insert_membership(conn: &mut SqliteConnection, m: &Membershi
     let result = sqlx::query(
         r#"INSERT INTO feed_packages
                (feed, lower_id, normalized_version, listed, enabled, pending,
-                flagged, flag_reason, added, downloads, pinned)
-           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10)"#,
+                flagged, flag_reason, added, downloads, pinned, listing_set)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10, ?11)"#,
     )
     .bind(&m.feed)
     .bind(canonical_id(&m.lower_id))
@@ -296,6 +320,7 @@ pub(super) async fn insert_membership(conn: &mut SqliteConnection, m: &Membershi
     .bind(&m.flag_reason)
     .bind(Utc::now().to_rfc3339())
     .bind(i64::from(m.pinned))
+    .bind(i64::from(m.listing_set))
     .execute(&mut *conn)
     .await;
     match result {
@@ -308,6 +333,7 @@ pub(super) async fn insert_membership(conn: &mut SqliteConnection, m: &Membershi
 pub(super) async fn stored_feeds(db: &SqliteDatabase) -> Result<Vec<StoredFeed>> {
     let rows = sqlx::query(
         "SELECT name, SUM(versions) AS versions, SUM(exclusive) AS exclusive, \
+                SUM(pending) AS pending, SUM(disabled) AS disabled, \
                 SUM(tombstones) AS tombstones \
          FROM ( \
              SELECT fp.feed AS name, COUNT(*) AS versions, \
@@ -315,10 +341,11 @@ pub(super) async fn stored_feeds(db: &SqliteDatabase) -> Result<Vec<StoredFeed>>
                         WHERE o.lower_id = fp.lower_id \
                           AND o.normalized_version = fp.normalized_version \
                           AND o.feed <> fp.feed)) AS exclusive, \
+                    SUM(fp.pending <> 0) AS pending, SUM(fp.enabled = 0) AS disabled, \
                     0 AS tombstones \
              FROM feed_packages fp GROUP BY fp.feed \
              UNION ALL \
-             SELECT feed, 0, 0, COUNT(*) FROM tombstones GROUP BY feed \
+             SELECT feed, 0, 0, 0, 0, COUNT(*) FROM tombstones GROUP BY feed \
          ) GROUP BY name ORDER BY name",
     )
     .fetch_all(&db.pool)
@@ -329,6 +356,8 @@ pub(super) async fn stored_feeds(db: &SqliteDatabase) -> Result<Vec<StoredFeed>>
                 name: r.try_get("name")?,
                 versions: r.try_get("versions")?,
                 exclusive: r.try_get("exclusive")?,
+                pending: r.try_get("pending")?,
+                disabled: r.try_get("disabled")?,
                 tombstones: r.try_get("tombstones")?,
             })
         })
@@ -347,7 +376,12 @@ pub(super) async fn shared_versions(conn: &mut SqliteConnection, a: &str, b: &st
     .await?)
 }
 
-pub(super) async fn rename_feed(db: &SqliteDatabase, from: &str, to: &str) -> Result<u64> {
+pub(super) async fn rename_feed(
+    db: &SqliteDatabase,
+    from: &str,
+    to: &str,
+    hold: bool,
+) -> Result<u64> {
     let mut tx = db.write_tx().await?;
     // Checked inside the transaction, so nothing lands in between.
     let shared = shared_versions(&mut tx, from, to).await?;
@@ -356,12 +390,15 @@ pub(super) async fn rename_feed(db: &SqliteDatabase, from: &str, to: &str) -> Re
             "{shared} version(s) are in both {from:?} and {to:?}; remove them from one first"
         )));
     }
-    let moved = sqlx::query("UPDATE feed_packages SET feed = ?2 WHERE feed = ?1")
-        .bind(from)
-        .bind(to)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
+    let moved = sqlx::query(
+        "UPDATE feed_packages SET feed = ?2, pending = (pending OR ?3) WHERE feed = ?1",
+    )
+    .bind(from)
+    .bind(to)
+    .bind(hold)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
     // A version deleted from both keeps one tombstone. One deleted only from
     // the new name but held under the old is held now, which a membership
     // and a tombstone together never say.
@@ -612,14 +649,17 @@ mod tests {
             received: 0,
             expected_sha256: None,
             expires: Utc::now(),
+            held_since: None,
         })
         .await
         .unwrap();
 
-        assert_eq!(db.rename_feed("old", "new").await.unwrap(), 1);
+        assert_eq!(db.rename_feed("old", "new", false).await.unwrap(), 1);
         // The state comes along.
         let moved = db.get_membership("new", "moved.pkg", &a.version).await;
-        assert!(!moved.unwrap().unwrap().enabled);
+        let moved = moved.unwrap().unwrap();
+        assert!(!moved.enabled);
+        assert!(!moved.pending);
         assert!(!db.exists("old", "moved.pkg", &a.version).await.unwrap());
         assert!(db
             .is_tombstoned("new", "moved.pkg", &b.version)
@@ -650,9 +690,40 @@ mod tests {
         db.add_to_feed("new", &p).await.unwrap();
         assert_eq!(db.shared_versions("old", "new").await.unwrap(), 1);
         assert!(matches!(
-            db.rename_feed("old", "new").await,
+            db.rename_feed("old", "new", false).await,
             Err(Error::BadRequest(_))
         ));
         assert!(db.exists("old", "both.pkg", &p.version).await.unwrap());
+    }
+
+    /// `SEC-38`: held for approval, every version moved arrives pending, and
+    /// only those; what the target held before is left as it was.
+    #[tokio::test]
+    async fn a_rename_can_hold_what_it_moves_for_approval() {
+        let db = SqliteDatabase::in_memory().await.unwrap();
+        let (a, b, c) = (
+            sample("Held.Pkg", "1.0.0"),
+            sample("Held.Pkg", "2.0.0"),
+            sample("Kept.Pkg", "1.0.0"),
+        );
+        db.add_to_feed("old", &a).await.unwrap();
+        db.add_to_feed("old", &b).await.unwrap();
+        db.set_enabled("old", "held.pkg", &b.version, false)
+            .await
+            .unwrap();
+        db.add_to_feed("new", &c).await.unwrap();
+        let stored = db.stored_feeds().await.unwrap();
+        let old = stored.iter().find(|f| f.name == "old").unwrap();
+        assert_eq!((old.versions, old.pending, old.disabled), (2, 0, 1));
+
+        assert_eq!(db.rename_feed("old", "new", true).await.unwrap(), 2);
+        for v in [&a.version, &b.version] {
+            let m = db.get_membership("new", "held.pkg", v).await.unwrap();
+            assert!(m.unwrap().pending, "{v}");
+        }
+        let kept = db.get_membership("new", "kept.pkg", &c.version).await;
+        assert!(!kept.unwrap().unwrap().pending);
+        let stored = db.stored_feeds().await.unwrap();
+        assert_eq!(stored[0].pending, 2, "{stored:?}");
     }
 }

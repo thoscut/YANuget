@@ -3,6 +3,7 @@
 //! download URL), or from the flat container when a feed has no registration.
 
 use reqwest::Url;
+use yanuget_pkg::fetch::with_slash;
 use yanuget_pkg::v3::{
     PackageVersions, RegistrationIndex, RegistrationLeaf, RegistrationPage, ServiceIndex,
 };
@@ -44,14 +45,6 @@ pub fn resources(index: &ServiceIndex, base: &Url) -> Result<Resources, Upstream
         ));
     }
     Ok(resources)
-}
-
-fn with_slash(mut url: Url) -> Url {
-    if !url.path().ends_with('/') {
-        let path = format!("{}/", url.path());
-        url.set_path(&path);
-    }
-    url
 }
 
 pub fn registration_url(base: &Url, id: &str) -> Result<Url, UpstreamError> {
@@ -119,9 +112,9 @@ pub fn leaf(
     base: &Url,
     flat: Option<&Url>,
 ) -> Result<Option<PackageInfo>, UpstreamError> {
-    let Some(entry) = &leaf.catalog_entry else {
-        return Ok(None);
-    };
+    // The catalog entry, or the leaf's own fields for a server that puts
+    // them there: the same leaf the server's mirror reads.
+    let entry = leaf.entry();
     let Some(id) = entry.id.as_deref() else {
         return Ok(None);
     };
@@ -165,7 +158,7 @@ pub fn leaf(
     Ok(Some(PackageInfo {
         id: id.to_string(),
         version,
-        listed: entry.listed.unwrap_or(true),
+        listed: entry.is_listed(),
         hash,
         size: entry.package_size,
         dependencies,
@@ -229,6 +222,25 @@ mod tests {
         );
         assert!(resources(&read(json!({"resources": []})), &base).is_err());
         assert!(resources(&read(json!({})), &base).is_err());
+    }
+
+    /// A leaf without a `catalogEntry` is read from its own fields, as the
+    /// server's mirror reads it, and a `published` date in 1900 means
+    /// unlisted there too (MNT-21).
+    #[test]
+    fn a_leaf_without_a_catalog_entry_is_read_from_its_own_fields() {
+        let base = Url::parse("https://feed.example/v3/registration/git/index.json").unwrap();
+        let flat = Url::parse("https://feed.example/v3/flat/").unwrap();
+        let l: RegistrationLeaf = read(json!({
+            "id": "Git", "version": "2.51.0", "published": "1900-01-01T00:00:00Z"
+        }));
+        let info = leaf(&l, "git", &base, Some(&flat)).unwrap().unwrap();
+        assert_eq!(info.version.normalized(), "2.51.0");
+        assert!(!info.listed);
+        assert_eq!(
+            info.download_url.as_str(),
+            "https://feed.example/v3/flat/git/2.51.0/git.2.51.0.nupkg"
+        );
     }
 
     #[test]

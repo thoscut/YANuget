@@ -6,7 +6,7 @@
 //! # overrides/git.install.toml
 //! versions = "[2.51,)"              # the versions it applies to; all without
 //! package_parameters = "/NoShellIntegration"
-//! script = "git.install.ps1"        # replaces chocolateyInstall.ps1
+//! script = "git.install.ps1"        # replaces every chocolateyInstall.ps1
 //!
 //! [[download]]                      # a download the capture misses
 //! url = "https://example.com/extra.cab"
@@ -33,6 +33,7 @@ use yanuget_pkg::{NuGetVersion, VersionRange};
 
 use crate::assess::Wanted;
 use crate::capture::{Checksum, ChecksumType};
+use crate::prelude::{entry_names, find_scripts};
 use crate::report::Draft;
 
 /// The largest replacement script taken.
@@ -43,8 +44,17 @@ const MAX_PARAMETER_CHARS: usize = 4096;
 
 /// Why the overrides cannot be used.
 #[derive(Debug, thiserror::Error)]
-#[error("{0}")]
-pub struct OverrideError(pub String);
+pub enum OverrideError {
+    #[error("overrides_dir {}", dir.display())]
+    ReadDir {
+        dir: std::path::PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    /// Files that do not parse or check out, each with why, sorted.
+    #[error("{}", .0.join("; "))]
+    Invalid(Vec<String>),
+}
 
 /// An override file as written.
 #[derive(Debug, Deserialize)]
@@ -86,7 +96,8 @@ pub struct Override {
     pub skip: Option<String>,
     /// Passed to the install as `--params` when the package is the root.
     pub package_parameters: Option<String>,
-    /// A replacement for `chocolateyInstall.ps1`: its file name and content.
+    /// A replacement for every `chocolateyInstall.ps1`: its file name and
+    /// content.
     pub script: Option<(String, Vec<u8>)>,
     /// Downloads the capture misses.
     pub downloads: Vec<Extra>,
@@ -126,14 +137,15 @@ impl Overrides {
     /// that does not parse or check out fails the whole set, so a run never
     /// goes ahead with an override silently left out.
     pub fn load(dir: &Path) -> Result<Self, OverrideError> {
-        let entries = std::fs::read_dir(dir)
-            .map_err(|e| OverrideError(format!("overrides_dir {}: {e}", dir.display())))?;
+        let read_dir = |source| OverrideError::ReadDir {
+            dir: dir.to_path_buf(),
+            source,
+        };
+        let entries = std::fs::read_dir(dir).map_err(read_dir)?;
         let mut by_id = BTreeMap::new();
         let mut errors = Vec::new();
         for entry in entries {
-            let path = entry
-                .map_err(|e| OverrideError(format!("overrides_dir {}: {e}", dir.display())))?
-                .path();
+            let path = entry.map_err(read_dir)?.path();
             let Some(id) = path
                 .file_name()
                 .and_then(|n| n.to_str())
@@ -161,7 +173,7 @@ impl Overrides {
             Ok(Overrides { by_id })
         } else {
             errors.sort();
-            Err(OverrideError(errors.join("; ")))
+            Err(OverrideError::Invalid(errors))
         }
     }
 
@@ -333,8 +345,11 @@ const INSTALL_SCRIPT: &str = "tools/chocolateyInstall.ps1";
 
 /// Write the package at `nupkg` to `out` with its `chocolateyInstall.ps1`
 /// replaced by `script`, so the capture runs the override's script and the
-/// feed gets it. The package's own entry keeps its name; a package without
-/// one gets `tools/chocolateyInstall.ps1`.
+/// feed gets it. Every `chocolateyInstall.ps1` the package has, in whatever
+/// folder, is replaced and keeps its name (`prelude::find_scripts`,
+/// the search the prelude wraps them by): which one Chocolatey runs depends
+/// on how it walks the extracted package, so whichever it is runs the
+/// override's. A package without one gets `tools/chocolateyInstall.ps1`.
 pub async fn with_script(
     nupkg: &Path,
     out: &Path,
@@ -342,26 +357,20 @@ pub async fn with_script(
 ) -> Result<(), yanuget_pkg::Error> {
     let (nupkg, out) = (nupkg.to_path_buf(), out.to_path_buf());
     tokio::task::spawn_blocking(move || {
-        let archive = yanuget_pkg::nupkg::open_archive(&nupkg)?;
-        let mut existing = None;
-        for i in 0..archive.len() {
-            if let Some(name) = yanuget_pkg::nupkg::entry_name(&archive, i)? {
-                let file = name.rsplit(['/', '\\']).next().unwrap_or(&name);
-                if file.eq_ignore_ascii_case("chocolateyInstall.ps1") {
-                    existing = Some(name);
-                    break;
-                }
-            }
+        let mut names: Vec<String> = find_scripts(entry_names(&nupkg)?)
+            .scripts
+            .into_iter()
+            .filter(|s| s.upstream == crate::prelude::UPSTREAM_SCRIPT)
+            .map(|s| s.name)
+            .collect();
+        if names.is_empty() {
+            names.push(INSTALL_SCRIPT.to_string());
         }
-        drop(archive);
-        let name = existing.unwrap_or_else(|| INSTALL_SCRIPT.to_string());
-        yanuget_pkg::rewrite::rewrite_blocking(
-            &nupkg,
-            &out,
-            &yanuget_pkg::rewrite::Rewrite::new()
-                .put(name, yanuget_pkg::rewrite::Source::Bytes(script)),
-        )
-        .map(|_| ())
+        let mut plan = yanuget_pkg::rewrite::Rewrite::new();
+        for name in names {
+            plan = plan.put(name, yanuget_pkg::rewrite::Source::Bytes(script.clone()));
+        }
+        yanuget_pkg::rewrite::rewrite_blocking(&nupkg, &out, &plan).map(|_| ())
     })
     .await
     .map_err(|e| yanuget_pkg::Error::Task(format!("script replacement panicked: {e}")))?
