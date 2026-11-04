@@ -12,6 +12,8 @@ expected to change incompatibly at any version.
 
 ## [Unreleased]
 
+## [0.10.0] — 2026-11-04
+
 **Upgrading:** the database is migrated on first start to schema version 10,
 which records when a resumable upload last held its space. Afterwards 0.9.0
 refuses to open it, so take a `yanuget backup` first and go back with
@@ -96,6 +98,8 @@ server on the same data refuses to start, and so do `restore` and
   failed syncs name the underlying I/O, TOML, JSON or HTTP error.
 - The internalizer writes its sync state and metrics through `tempfile`.
 - The server uses sha2 0.11 like the internalizer.
+- Dependencies: `rustix` 1.1.6 and `zip` 9.2.0; the runtime image's
+  `debian:trixie-slim` digest and `taiki-e/install-action` 2.88.0 in CI.
 - Release binaries, in the archives and in the image, are built with
   `cargo auditable` and carry their dependency tree (`cargo audit bin` reads
   it); each GitHub Release attaches a CycloneDX SBOM,
@@ -1060,7 +1064,8 @@ Beyond the defaults:
 - Symbol downloads require read authorisation and resolve to a package the
   requester is allowed to see.
 
-[Unreleased]: https://github.com/thoscut/yanuget/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/thoscut/yanuget/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/thoscut/yanuget/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/thoscut/yanuget/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/thoscut/yanuget/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/thoscut/yanuget/compare/v0.6.0...v0.7.0

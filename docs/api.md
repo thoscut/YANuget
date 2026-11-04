@@ -632,7 +632,7 @@ states are always current.
 ```json
 {
   "status": "degraded",
-  "version": "0.9.0",
+  "version": "0.10.0",
   "uptime_seconds": 86400,
   "database": "ok",
   "feeds": [
