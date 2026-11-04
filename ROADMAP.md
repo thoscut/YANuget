@@ -919,7 +919,8 @@ A proposal on top of 0.7.0, in the order the items depend on each other.
 | --- | --- | --- |
 | YANuget 0.8.0 | `INT-01`–`INT-05`, `INT-30`, `INT-32` | Released 2026-10-20, together with the fixes from the review of 2026-10-19, some of which need attention when upgrading (see CHANGELOG.md). |
 | YANuget 0.9.0 | review fixes of 2026-10-19 and 2026-10-27 | Released 2026-10-28, schema 9. |
-| YANuget, after 0.9.0 | `INT-31`, the server side of `INT-21`, the fixes of 2026-11-03 (schema 10) | The rest of what the tool needs. `INT-31` waits on the security review of its token design. |
+| YANuget 0.10.0 | review fixes of 2026-11-03, `retention.exclude_id_prefixes` | Prepared 2026-11-04, schema 10. |
+| YANuget, after 0.10.0 | `INT-31`, the server side of `INT-21` | The rest of what the tool needs. `INT-31` waits on the security review of its token design. |
 | internalizer 0.1.0 | `INT-10`–`INT-22` | KVM backend; needs YANuget 0.8.0, and the release with `INT-31` for read-gated feeds. |
 | internalizer 0.2.0 | `INT-23`–`INT-28` | Needs nothing beyond YANuget 0.8.0. |
 | internalizer 0.3.0 | `INT-29` | Optional. |

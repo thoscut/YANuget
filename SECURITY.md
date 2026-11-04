@@ -6,8 +6,8 @@ YANuget is pre-1.0. Only the latest released version receives security fixes.
 
 | Version | Supported |
 | --- | --- |
-| 0.9.x | ✅ |
-| < 0.9 | ❌ |
+| 0.10.x | ✅ |
+| < 0.10 | ❌ |
 
 The table is for the server, `yanuget`, and the `yanuget-pkg` library it is
 built with, which is fixed in the same releases. The internalizer has no
@@ -174,7 +174,7 @@ repository's release workflow run for a tag; do not use it.
 
 ### What a release is built from
 
-From the release after 0.9.0 on, each GitHub Release carries
+From 0.10.0 on, each GitHub Release carries
 `yanuget-vX.Y.Z.cdx.json`, a CycloneDX software bill of materials of every
 crate the workspace resolves for any of its targets (name, version, source,
 checksum, license). It is listed in `SHA256SUMS` and attested like the
