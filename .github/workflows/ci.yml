@@ -241,7 +241,7 @@ jobs:
       # differently would turn CI red with no change here. Dependabot does not
       # see these; bump them by hand.
       - name: Install cargo-audit and cargo-deny
-        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
+        uses: taiki-e/install-action@1919c4a95903d2c33e4a221102edca87309fc14b # v2.89.0
         with:
           tool: cargo-audit@0.22.2,cargo-deny@0.20.2
 
@@ -265,7 +265,7 @@ jobs:
       # The release attaches this bill of materials; generating it here finds
       # a tool or metadata problem on the pull request rather than at tag time.
       - name: Install cargo-cyclonedx
-        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
+        uses: taiki-e/install-action@1919c4a95903d2c33e4a221102edca87309fc14b # v2.89.0
         with:
           tool: cargo-cyclonedx@0.5.9
 
@@ -310,7 +310,7 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-coverage-${{ steps.toolchain.outputs.cachekey }}-
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
+        uses: taiki-e/install-action@1919c4a95903d2c33e4a221102edca87309fc14b # v2.89.0
         with:
           tool: cargo-llvm-cov@0.9.1
 
