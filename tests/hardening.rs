@@ -225,7 +225,12 @@ async fn admin_actions_require_a_csrf_token() {
         .text()
         .await
         .unwrap();
-    assert!(page.contains(&admin_csrf(ADMIN_KEY)));
+    // The token carries the second it was issued, so compare by checking it
+    // rather than against a fresh one, which differs once the clock ticks.
+    let marker = "<input type=\"hidden\" name=\"_csrf\" value=\"";
+    let start = page.find(marker).expect("the page has a CSRF field") + marker.len();
+    let token = &page[start..start + page[start..].find('"').unwrap()];
+    assert!(yanuget::auth::AdminAuth::new(Some(ADMIN_KEY.to_string())).check_csrf(Some(token)));
 }
 
 #[tokio::test]
