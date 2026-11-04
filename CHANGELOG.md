@@ -98,7 +98,7 @@ server on the same data refuses to start, and so do `restore` and
   failed syncs name the underlying I/O, TOML, JSON or HTTP error.
 - The internalizer writes its sync state and metrics through `tempfile`.
 - The server uses sha2 0.11 like the internalizer.
-- Dependencies: `rustix` 1.1.6 and `zip` 9.2.0; the runtime image's
+- Dependencies: `rustix` 1.1.6, `zip` 9.2.1 and `sha2` 0.11.1; the runtime image's
   `debian:trixie-slim` digest and `taiki-e/install-action` 2.88.0 in CI.
 - Release binaries, in the archives and in the image, are built with
   `cargo auditable` and carry their dependency tree (`cargo audit bin` reads
