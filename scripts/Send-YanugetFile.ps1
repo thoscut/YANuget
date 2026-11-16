@@ -1,8 +1,8 @@
 # Upload a file to a package version, resumably (tus 1.0.0). PowerShell 7+.
 # Re-run with -Resume <url> after an interruption to continue where it stopped.
 #
-# The push key goes out on every request, so the function is strict about where
-# it sends it:
+# The push key goes out on every request (and with -AdminKey the admin key
+# too), so the function is strict about where it sends them:
 #   - the feed must be https; -AllowHttp is for a local test server only;
 #   - the upload URL the server hands back (and any -Resume URL) must be on the
 #     same scheme, host and port as -Feed, so a hostile or misconfigured
@@ -11,6 +11,15 @@
 # The key is read from -ApiKey as a SecureString, else from the
 # YANUGET_API_KEY environment variable, else prompted for — never as a plain
 # string on the command line, where it would end up in the shell history.
+#
+# -AdminKey is for a version that a feed with `requires_approval` (or
+# `pending-only`) has approved: the server keeps its files as they were
+# approved and answers the push key alone with 403. The admin key of the feeds
+# that approved it, sent along as HTTP Basic credentials, sets that aside, and
+# the server logs the change. It is only ever taken from the parameter, never
+# from the environment or a prompt: changing what was approved should be asked
+# for each time, not happen because a variable was still set. One request
+# carries one admin key, so it works where the approving feeds share theirs.
 function Send-YanugetFile {
     param(
         [Parameter(Mandatory)] [string] $Feed,      # e.g. https://nuget.example.com
@@ -18,6 +27,7 @@ function Send-YanugetFile {
         [Parameter(Mandatory)] [string] $Version,
         [Parameter(Mandatory)] [string] $Path,
         [SecureString] $ApiKey,
+        [SecureString] $AdminKey,
         [string] $Resume,
         [long] $ChunkSize = 64MB,
         [switch] $AllowHttp
@@ -27,7 +37,7 @@ function Send-YanugetFile {
     if ($feedUri.Scheme -ne 'https' -and -not ($AllowHttp -and $feedUri.Scheme -eq 'http')) {
         throw "Refusing to send the API key to $Feed over $($feedUri.Scheme); use https (or -AllowHttp for a local test server)."
     }
-    # Only accept an upload URL on the origin the key was meant for.
+    # Only accept an upload URL on the origin the keys were meant for.
     $sameOrigin = {
         param([Uri] $u)
         $u.IsAbsoluteUri -and $u.Scheme -eq $feedUri.Scheme -and
@@ -44,6 +54,16 @@ function Send-YanugetFile {
     $headers = @{ 'Tus-Resumable' = '1.0.0'; 'X-NuGet-ApiKey' = $key }
     $web = @{ MaximumRedirection = 0 }
     $b64 = { param($s) [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($s)) }
+    if ($AdminKey) {
+        # On every request, like the push key: the server checks the approval
+        # when the upload is created and again when its last byte arrives.
+        # It reads the password and ignores the user name. Set as a header:
+        # -Credential on its own is only sent once the server asks with a
+        # 401, and this server answers 403 without asking.
+        $admin = [Net.NetworkCredential]::new('', $AdminKey).Password
+        $basic = & $b64 "admin:$admin"
+        $headers['Authorization'] = "Basic $basic"
+    }
     $length = (Get-Item $Path).Length
     $url = $Resume
     if (-not $url) {

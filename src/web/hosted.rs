@@ -205,7 +205,9 @@ async fn version_in_feed(state: &AppState, id: &str, v: &NuGetVersion) -> Result
 /// (`requires_approval`, or `allow_overwrite = "pending-only"`) holds the
 /// files whatever the requesting feed's own `allow_overwrite`, and only the
 /// admin key of that feed sets it aside: one feed's admin key is no say over
-/// another's approval.
+/// another's approval. A version approved in two such feeds with different
+/// admin keys takes both: one as the Basic password, the other in an
+/// `X-YANuget-Admin-Key` header (see [`crate::auth::offered_admin_keys`]).
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ApprovalGuard {
     /// Every approval counts, not only those of `reviewing` feeds: the
@@ -218,7 +220,23 @@ pub(crate) struct ApprovalGuard {
     admin_of: Vec<String>,
     /// The feed the request came in on.
     feed: String,
+    /// How many of the admin keys the request offered are no feed's (nor
+    /// any other key of this feed's): a refusal then counts each as a
+    /// failed guess (see [`Self::refusal`]).
+    guesses: u32,
+    /// The request offered more admin keys than it could need (see
+    /// [`ADMIN_KEYS_PER_REQUEST`]); none of them was compared, and
+    /// [`check_not_approved`] refuses it.
+    too_many: bool,
 }
+
+/// The most admin keys a request may offer at the file endpoints, unless
+/// more feeds review what they serve: then one for each of them and one for
+/// this feed. Each wrong key counts as a failed guess, but without a bound
+/// one request near the end of the budget would still compare as many
+/// candidates as hyper lets headers through, some 95 over HTTP/1 and 270
+/// over HTTP/2 (`SEC-55`).
+const ADMIN_KEYS_PER_REQUEST: usize = 8;
 
 impl ApprovalGuard {
     /// The guard for a request on `state`'s feed, with its credentials.
@@ -236,20 +254,63 @@ impl ApprovalGuard {
         if reviews(own.requires_approval, own.allow_overwrite) {
             reviewing.push(own.name.clone());
         }
+        let mut offered = crate::auth::offered_admin_keys(headers);
+        // One key for each feed whose approval may hold the files, and this
+        // feed's: more is no legitimate request, so nothing is compared.
+        let too_many = offered.len() > ADMIN_KEYS_PER_REQUEST.max(reviewing.len() + 1);
+        if too_many {
+            offered.clear();
+        }
+        let opens = |admin: &crate::auth::AdminAuth| offered.iter().any(|k| admin.is_key(k));
         let mut admin_of: Vec<String> = state
             .feeds
             .iter()
-            .filter(|m| m.name != own.name && m.admin.check_headers(headers))
+            .filter(|m| m.name != own.name && opens(&m.admin))
             .map(|m| m.name.clone())
             .collect();
-        if own.admin.check_headers(headers) {
+        if opens(&own.admin) {
             admin_of.push(own.name.clone());
         }
+        // A client may send this feed's read key (or its push key) as Basic
+        // credentials out of habit; that is no guess at an admin key.
+        let known = |k: &str| {
+            own.admin.is_key(k)
+                || state.feeds.iter().any(|m| m.admin.is_key(k))
+                || own.auth.is_key(k)
+                || own.read_auth.is_key(k)
+                || own.preview_auth.is_key(k)
+        };
         Self {
             any: own.allow_overwrite == OverwriteMode::PendingOnly,
             reviewing,
             admin_of,
             feed: own.name.clone(),
+            guesses: offered
+                .iter()
+                .filter(|k| !known(k))
+                .count()
+                .try_into()
+                .unwrap_or(u32::MAX),
+            too_many,
+        }
+    }
+
+    /// The answer to a request this guard's approvals refused with `error`:
+    /// when it offered admin keys that are none, marked as that many failed
+    /// authentications ([`crate::ratelimit::FailedAuth`]), so that guessing
+    /// an admin key here is held to `rate_limit.max_failed_auth` like
+    /// guessing it at `/admin`, one key per failure however many headers
+    /// carry them. Any other error is passed on as it is.
+    fn refusal(&self, error: Error) -> Result<Response> {
+        match error {
+            Error::Forbidden(_) if self.guesses > 0 => {
+                let mut response = error.into_response();
+                response
+                    .extensions_mut()
+                    .insert(crate::ratelimit::FailedAuth(self.guesses));
+                Ok(response)
+            }
+            error => Err(error),
         }
     }
 
@@ -288,6 +349,13 @@ async fn check_not_approved(
     v: &NuGetVersion,
     guard: &ApprovalGuard,
 ) -> Result<Vec<String>> {
+    if guard.too_many {
+        return Err(Error::BadRequest(format!(
+            "too many admin keys: the Basic password and the {} headers offer more \
+             than one for each feed whose approval could hold these files",
+            crate::auth::ADMIN_KEY_HEADER
+        )));
+    }
     let approved: Vec<String> = db
         .approved_in(id, v)
         .await?
@@ -304,6 +372,17 @@ async fn check_not_approved(
         .collect();
     if missing.is_empty() {
         return Ok(approved);
+    }
+    // Which feeds still lack their key would tell a guesser which of the
+    // keys offered beside a wrong one was right.
+    if guard.guesses > 0 {
+        return Err(Error::Forbidden(format!(
+            "{id} {} is approved in {}, and an approved version keeps its files as they \
+             were approved; changing them takes the admin key of each, and a key \
+             offered is none",
+            v.normalized(),
+            approved.join(", "),
+        )));
     }
     Err(Error::Forbidden(format!(
         "{id} {} is approved in {}, and an approved version keeps its files as they \
@@ -590,7 +669,9 @@ pub(super) async fn put(
     version_in_feed(&state, &id, &v).await?;
     // Before the body, not to take gigabytes in vain; again when attaching.
     let guard = ApprovalGuard::for_request(&state, &headers);
-    check_not_approved(state.db.as_ref(), &id, &v, &guard).await?;
+    if let Err(e) = check_not_approved(state.db.as_ref(), &id, &v, &guard).await {
+        return guard.refusal(e);
+    }
     let expected = headers
         .get("x-checksum-sha256")
         .and_then(|h| h.to_str().ok())
@@ -625,9 +706,10 @@ pub(super) async fn put(
         )));
     }
     let finished = Finished { temp, sha256, size };
-    let (status, file) = match attach(&state, &id, &v, &name, finished, guard).await? {
-        Attached::New(f) => (StatusCode::CREATED, f),
-        Attached::Same(f) => (StatusCode::OK, f),
+    let (status, file) = match attach(&state, &id, &v, &name, finished, guard.clone()).await {
+        Ok(Attached::New(f)) => (StatusCode::CREATED, f),
+        Ok(Attached::Same(f)) => (StatusCode::OK, f),
+        Err(e) => return guard.refusal(e),
     };
     Ok((status, Json(attached_json(&state, &headers, &file))).into_response())
 }
@@ -636,19 +718,15 @@ pub(super) async fn delete(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path((id, version, name)): Path<(String, String, String)>,
-) -> Result<StatusCode> {
+) -> Result<Response> {
     check_id(&id)?;
     authorize_upload(&state, &headers)?;
     let v = parse_version(&version)?;
-    detach(
-        &state,
-        &id,
-        &v,
-        &name,
-        ApprovalGuard::for_request(&state, &headers),
-    )
-    .await?;
-    Ok(StatusCode::NO_CONTENT)
+    let guard = ApprovalGuard::for_request(&state, &headers);
+    match detach(&state, &id, &v, &name, guard.clone()).await {
+        Ok(()) => Ok(StatusCode::NO_CONTENT.into_response()),
+        Err(e) => guard.refusal(e),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -803,13 +881,10 @@ pub(super) async fn tus_create(
     crate::validation::validate_file_name(name, &state.feed.allowed_extensions)?;
     let expected = meta.get("sha256").map(|s| parse_sha256(s)).transpose()?;
     version_in_feed(&state, id, &v).await?;
-    check_not_approved(
-        state.db.as_ref(),
-        id,
-        &v,
-        &ApprovalGuard::for_request(&state, &headers),
-    )
-    .await?;
+    let guard = ApprovalGuard::for_request(&state, &headers);
+    if let Err(e) = check_not_approved(state.db.as_ref(), id, &v, &guard).await {
+        return guard.refusal(e);
+    }
     if state.db.get_file(id, &v, name).await?.is_some() {
         return Err(Error::Conflict(format!(
             "{id} {} already has a file named {name}",
@@ -818,8 +893,8 @@ pub(super) async fn tus_create(
     }
     check_size(&state, Some(length))?;
 
-    // One creation at a time, so concurrent ones cannot all pass the count,
-    // or the space check, before any of their rows exist.
+    // One creation at a time, so concurrent ones cannot all pass the count
+    // before any of their rows exist.
     static CREATING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     let _creating = CREATING.lock().await;
     let limit = state.config.files.max_open_uploads;
@@ -829,8 +904,10 @@ pub(super) async fn tus_create(
              finish or delete one, or wait for one to expire"
         )));
     }
-    // Held until the row exists, which promises the space from then on.
-    let _reservation = state.reserve_disk_space(Some(length)).await?;
+    // Held until the row exists, which promises the space from then on. It
+    // counts towards the feed's share from the start: a request of the same
+    // feed that checks the share before the row exists sees it there.
+    let _reservation = state.reserve_resumable(length).await?;
 
     let upload = uuid::Uuid::new_v4().simple().to_string();
     tokio::fs::File::create(part_path(&state, &upload)).await?;
@@ -857,6 +934,46 @@ pub(super) async fn tus_create(
             .header(header::LOCATION, location)
             .header("upload-expires", http_date(expires)),
     )
+}
+
+/// How far back an upload's hold on its space reaches: one that has held
+/// since before this holds nothing any more.
+pub(super) fn hold_cutoff() -> chrono::DateTime<Utc> {
+    Utc::now() - chrono::Duration::from_std(crate::space::RESUMABLE_HOLD).unwrap_or_default()
+}
+
+/// The hold an upload of `length` bytes has after a request that brought
+/// `written` of them ended at `now`, when it held since `held_since` before.
+///
+/// A hold is bought with bytes, not with requests. The upload's pace is the
+/// part of `length` due in each hold period for it to arrive within `expiry`
+/// (`upload_expiry_hours`), and each request moves the start of the hold on
+/// by as much of [`RESUMABLE_HOLD`] as its bytes are of that pace. An upload
+/// that keeps that pace holds its space throughout, and one that is faster
+/// holds it from `now`. One that trickles — a byte an hour — lets the hold
+/// run out as if it had sent nothing, and is admitted afresh by its next
+/// request: it cannot keep space promised for days with a few bytes. A hold
+/// that has run out starts again from nothing.
+///
+/// [`RESUMABLE_HOLD`]: crate::space::RESUMABLE_HOLD
+fn renewed_hold(
+    held_since: Option<chrono::DateTime<Utc>>,
+    written: u64,
+    length: u64,
+    expiry: std::time::Duration,
+    now: chrono::DateTime<Utc>,
+) -> Option<chrono::DateTime<Utc>> {
+    if written == 0 {
+        return held_since;
+    }
+    let hold = crate::space::RESUMABLE_HOLD;
+    let periods = (expiry.as_secs() / hold.as_secs().max(1)).max(1);
+    let pace = length.div_ceil(periods).max(1);
+    let hold_ms = hold.as_millis();
+    let bought = (u128::from(written) * hold_ms / u128::from(pace)).min(hold_ms) as i64;
+    let lapsed = now - chrono::Duration::milliseconds(hold_ms as i64);
+    let from = held_since.filter(|t| *t >= lapsed).unwrap_or(lapsed);
+    Some((from + chrono::Duration::milliseconds(bought)).min(now))
 }
 
 /// The upload `upload` of this feed, still current.
@@ -967,10 +1084,21 @@ pub(super) async fn tus_patch(
     // is still to come itself, like a new upload, and the row stops promising
     // it until the request ends: promised here first, then given up there,
     // then checked, so it is never counted twice in a check, nor missed.
+    // While the request runs the bytes count towards the feed's share too.
     let rest = s.length - s.received;
-    let reservation = state.space.reserve(rest);
+    let reservation = state
+        .space
+        .reserve(rest)
+        .counted_in(&state.feed.resumable.promised);
     state.db.set_upload_held(&upload, None).await?;
-    if let Err(e) = state.space.check(rest).await {
+    // An upload that still holds its space was admitted to the feed's share
+    // with it. One that let its hold lapse comes back like a new one.
+    let lapsed = s.held_since.is_none_or(|since| since < hold_cutoff());
+    let admitted = async {
+        let share = if lapsed { state.share().await? } else { None };
+        state.space.check_with(rest, share).await
+    };
+    if let Err(e) = admitted.await {
         // Refused: the upload keeps whatever hold it had.
         let _ = state.db.set_upload_held(&upload, s.held_since).await;
         return Err(e);
@@ -1012,11 +1140,21 @@ pub(super) async fn tus_patch(
     // Should the row then not be updated, the two disagree and the next
     // request rebuilds the hash from the file.
     *hashing = Some(h);
-    // The row holds what is left again from now (and so this request's
-    // reservation can go): counted twice for a moment rather than not at
-    // all. Should the update fail, the upload holds nothing until its next
-    // request, which is admitted afresh.
-    let recorded = state.db.set_upload_received(&upload, received).await;
+    // The row holds what is left again (and so this request's reservation
+    // can go): counted twice for a moment rather than not at all. For how
+    // long depends on what the request brought (see `renewed_hold`): one
+    // that brought nothing leaves the hold as old as it found it, and one
+    // that brought a few bytes renews it by little more. Otherwise a `PATCH`
+    // an hour would keep space promised to an upload that never arrives, for
+    // as long as the upload may stay open. Should the update fail, the upload
+    // holds nothing until its next request, which is admitted afresh.
+    let expiry =
+        std::time::Duration::from_secs(state.config.files.upload_expiry_hours.min(24 * 365) * 3600);
+    let held_since = renewed_hold(s.held_since, written, s.length, expiry, Utc::now());
+    let recorded = state
+        .db
+        .set_upload_received(&upload, received, held_since)
+        .await;
     drop(reservation);
     recorded?;
     if let Err(e) = streamed {
@@ -1035,15 +1173,18 @@ pub(super) async fn tus_patch(
         };
         let (task_state, task_session) = (state.clone(), s.clone());
         let guard = ApprovalGuard::for_request(&state, &headers);
-        detached(finish(
+        let finished = detached(finish(
             task_state,
             task_session,
             part,
             h.hasher,
             finishing,
-            guard,
+            guard.clone(),
         ))
-        .await?;
+        .await;
+        if let Err(e) = finished {
+            return guard.refusal(e);
+        }
     }
     built(
         tus_response(StatusCode::NO_CONTENT)
@@ -1183,6 +1324,46 @@ mod tests {
         assert_eq!(meta["filename"], "base.wim");
         assert_eq!(meta["empty"], "");
         assert!(parse_metadata("id !!notbase64!!").is_err());
+    }
+
+    #[test]
+    fn a_hold_is_bought_with_bytes_at_the_uploads_pace() {
+        let now = Utc::now();
+        let hour = chrono::Duration::hours(1);
+        let expiry = std::time::Duration::from_secs(72 * 3600);
+        // 72 hold periods: 1000 bytes an hour arrive in time.
+        let length = 72_000;
+        let renew = |since, written| renewed_hold(since, written, length, expiry, now);
+
+        // Nothing brought, nothing renewed.
+        let half_an_hour_ago = now - hour / 2;
+        assert_eq!(renew(Some(half_an_hour_ago), 0), Some(half_an_hour_ago));
+        assert_eq!(renew(None, 0), None);
+        // An hour's pace renews it in full, and more never runs ahead of now.
+        assert_eq!(renew(Some(half_an_hour_ago), 1000), Some(now));
+        assert_eq!(renew(Some(half_an_hour_ago), 10_000), Some(now));
+        // Half of it buys half an hour on top of what was left.
+        assert_eq!(renew(Some(now - hour * 3 / 4), 500), Some(now - hour / 4));
+        // A byte buys a few seconds: a byte an hour lets the hold run out.
+        let trickled = renew(Some(now - hour + chrono::Duration::minutes(1)), 1).unwrap();
+        assert!(
+            trickled < now - hour + chrono::Duration::minutes(2),
+            "{trickled}"
+        );
+        // A hold that ran out starts again from nothing, not from where it was.
+        let lapsed = renew(Some(now - hour * 5), 1).unwrap();
+        assert!(lapsed < hold_cutoff_at(now) + chrono::Duration::seconds(5));
+        assert!(lapsed >= hold_cutoff_at(now));
+        // An upload too small to split still renews in full.
+        assert_eq!(renewed_hold(None, 1, 1, expiry, now), Some(now));
+        assert_eq!(
+            renewed_hold(Some(now), 1, 10, std::time::Duration::ZERO, now),
+            Some(now)
+        );
+    }
+
+    fn hold_cutoff_at(now: chrono::DateTime<Utc>) -> chrono::DateTime<Utc> {
+        now - chrono::Duration::from_std(crate::space::RESUMABLE_HOLD).unwrap()
     }
 
     #[test]

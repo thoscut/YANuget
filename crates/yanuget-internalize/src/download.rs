@@ -52,7 +52,7 @@ pub enum DownloadError {
     /// The host answered something other than the file.
     #[error("{0}")]
     Status(String),
-    #[error("download cache: {0}")]
+    #[error("download cache")]
     Io(#[from] std::io::Error),
 }
 
@@ -336,13 +336,16 @@ impl Downloader {
                 }
             };
             let Some(e) = broke else { break };
+            // The cause is what says why ("connection reset by peer"); the
+            // URL is in the text already, redacted.
+            let cause = crate::error_chain(&e.without_url());
             if attempt > self.resume_attempts {
                 return Err(UpstreamError::Http(format!(
-                    "{shown} broke off after {written} bytes, {attempt} times: {e}"
+                    "{shown} broke off after {written} bytes, {attempt} times: {cause}"
                 ))
                 .into());
             }
-            tracing::info!(url = %shown, written, error = %e, "a download broke off; resuming");
+            tracing::info!(url = %shown, written, error = %cause, "a download broke off; resuming");
             tokio::time::sleep(self.http.backoff(attempt)).await;
         }
         file.flush().await?;

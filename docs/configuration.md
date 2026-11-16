@@ -27,7 +27,7 @@ A fully commented template lives in
 | `gallery_page_size` | `YANUGET_GALLERY_PAGE_SIZE` | int | `20` | Packages per gallery page (`?take=` overrides, up to 100 or this size, whichever is larger). |
 | `max_package_size_bytes` | `YANUGET_MAX_PACKAGE_SIZE_BYTES` | int | *(unlimited)* | Upload cap; streamed either way. A push whose `Content-Length` is over it (allowing 64 KiB for multipart boundaries) is refused with `413` before anything is written or reserved. |
 | `upload_idle_timeout_secs` | `YANUGET_UPLOAD_IDLE_TIMEOUT_SECS` | int | `300` | Abort an upload after this long without a byte arriving (`408`). Only silence counts; a slow transfer is never cut off. `0` waits forever. |
-| `min_free_disk_bytes` | `YANUGET_MIN_FREE_DISK_BYTES` | int | `2147483648` (2 GiB) | Refuse an upload (`507`) that would leave less than this free on the storage volume. Checked against the declared size when there is one, counting the space promised to the uploads still in progress (what they declared and have not written yet, resumable ones included) as used, and again every 64 MiB while a body streams in, so an upload without a `Content-Length` is held to it too; a resumable upload is checked again on every `PATCH`. Mirror fetches and inbox imports are admitted the same way, against the upstream's `Content-Length` or the file's size: they reserve that space too, and see what uploads were promised. `yanuget migrate` downloads are held to the reserve. `0` turns the check off. |
+| `min_free_disk_bytes` | `YANUGET_MIN_FREE_DISK_BYTES` | int | `2147483648` (2 GiB) | Refuse an upload (`507`) that would leave less than this free on the storage volume. Checked against the declared size when there is one, counting the space promised to the uploads still in progress (what they declared and have not written yet, resumable ones included) as used, and again every 64 MiB while a body streams in, so an upload without a `Content-Length` is held to it too; a resumable upload is checked again on every `PATCH`. Mirror fetches and inbox imports are admitted the same way, against the upstream's `Content-Length` or the file's size: they reserve that space too, and see what uploads were promised. `yanuget migrate` admits its downloads the same way, through one guard for the whole run, which also counts what the resumable uploads of a server running beside it hold. `0` turns the check off. |
 | `max_connections` | `YANUGET_MAX_CONNECTIONS` | int | `4096` | Concurrent connections accepted; one over the cap is closed at once. `0` is unlimited. |
 | `allow_overwrite` | `YANUGET_ALLOW_OVERWRITE` | bool \| string | `false` | Re-push an existing version: `false`, `true`, `"prerelease-only"` (overwrite pre-releases only), or `"pending-only"` (replace a version only while it is pending in every feed that holds it; see below). |
 | `hard_delete_enabled` | `YANUGET_HARD_DELETE_ENABLED` | bool | `false` | DELETE removes vs. unlists. |
@@ -124,8 +124,14 @@ volume, raise the limit or disable it and rely on a reverse proxy.
 Failed authentication has a separate, much smaller budget: a `401` to a
 request that carried a credential (`X-NuGet-ApiKey` or `Authorization`) counts
 against `max_failed_auth`, and once that is spent the client's credentialed
-requests are answered `429` until the window rolls over. A `401` to a request
-*without* credentials is the challenge a NuGet client waits for before it
+requests are answered `429` until the window rolls over. A `403` to a file or
+upload request that offered an admin key (Basic password or
+`X-YANuget-Admin-Key`) that is no feed's counts as a failed authentication
+too. Behind a reverse proxy that asks for a Basic login of its own and passes
+`Authorization` on (nginx does by default), that password is such a key on
+every file or upload request refused with `403`; list the proxy in
+[`trusted_proxies`](#trusted-proxies), or all its clients share one budget,
+and one retrying in a loop locks the others out with `429`. A `401` to a request *without* credentials is the challenge a NuGet client waits for before it
 sends its key, and is not counted. YANuget also warns at startup about any
 push, read or admin key shorter than 32 characters: the limiter bounds online
 guessing, a long random key makes it pointless.
@@ -343,8 +349,9 @@ wherever their version goes, retention included.
 | `files.enabled` | `YANUGET_FILES_ENABLED` | bool | `true` | Accept and serve attached files. |
 | `files.max_file_size_bytes` | `YANUGET_FILES_MAX_FILE_SIZE_BYTES` | int | *(`max_package_size_bytes`)* | Largest file accepted; unset falls back to the package limit, and both unset is unlimited. |
 | `files.allowed_extensions` | `YANUGET_FILES_ALLOWED_EXTENSIONS` | string[] | `wim, swm, esd, iso, vhd, vhdx, zip, 7z, cab` | Accepted file types (env: comma-separated). |
-| `files.upload_expiry_hours` | `YANUGET_FILES_UPLOAD_EXPIRY_HOURS` | int | `72` | How long an unfinished resumable upload is kept. It holds the space it has still to receive against `min_free_disk_bytes` only for an hour after it was created or its last `PATCH` ended; idle for longer, its next `PATCH` is admitted again like a new upload of what is left (`507` when that no longer fits). |
+| `files.upload_expiry_hours` | `YANUGET_FILES_UPLOAD_EXPIRY_HOURS` | int | `72` | How long an unfinished resumable upload is kept. It holds the space it has still to receive against `min_free_disk_bytes` for an hour after it was created. After that, each `PATCH` renews the hold by as much of the hour as its bytes are of the upload's pace: its length divided by `upload_expiry_hours`, what it must bring each hour to arrive in time. An upload that keeps that pace holds its space throughout; one that sends nothing or trickles (a byte an hour) lets the hold run out, and its next `PATCH` is admitted again like a new upload of what is left (`507` when that no longer fits). |
 | `files.max_open_uploads` | `YANUGET_FILES_MAX_OPEN_UPLOADS` | int | `32` | How many unfinished resumable uploads one feed may hold at once; another is refused with `429` until one finishes, is deleted or expires. `0` is no limit. |
+| `files.max_upload_space_percent` | `YANUGET_FILES_MAX_UPLOAD_SPACE_PERCENT` | int | `80` | The most of the storage volume's free space (what is free above `min_free_disk_bytes`) that the feeds of one push key may promise together to uploads that have not arrived, in percent. Feeds count together when they accept a common push key, directly or through another feed; a feed without keys of its own takes the global ones, so with one global key all such feeds are one group, and feeds without any push key are one group too. Counted are the unfinished resumable uploads that still hold their space, the `PATCH` requests being written, and pushes and `PUT …/files` in progress with their declared `Content-Length`. A resumable upload's `POST` that would take the group past it is refused with `507`, and so is the `PATCH` of an upload whose hold has lapsed; an upload that still holds its space goes on. A push or `PUT` is refused when, beside what the group has promised already, it would take the group past the share; alone it is held to the volume only, so a single file larger than the share still goes in one `PUT`. A single resumable upload larger than the share is refused: with 120 GiB free, the 2 GiB reserve and nothing else open on the group, the default lets a resumable upload be at most 94.4 GiB (see [Free space](large-packages.md#free-space)). The rest stays for other push keys, mirror downloads and the inbox, so one push key cannot promise the whole volume to uploads that never arrive. Because the grouping is transitive, a push key valid only for feed `c` can, through a feed `d` that accepts it beside another key, use up the share that feed `e` is measured against too: every upload to `e` is then refused with `507` while the volume still has room for other groups. Give a feed that two teams share a key of its own if that matters. `0` or `100` is no cap, and none applies while `min_free_disk_bytes` is `0`. |
 | `files.inbox_dir` | `YANUGET_FILES_INBOX_DIR` | path | *(off)* | The SSH inbox (below). |
 | `files.inbox_scan_secs` | `YANUGET_FILES_INBOX_SCAN_SECS` | int | `30` | How often the inbox is scanned (at least 5). |
 
@@ -613,6 +620,22 @@ feed's own `allow_overwrite`:
   admin page. The admin key of the feed the request comes in on is not
   enough when another feed approved the version. Such a change is logged as
   a warning that names those feeds.
+- A request may carry several admin keys: one as the password of its Basic
+  credentials, each further one in an `X-YANuget-Admin-Key` header (repeat
+  the header, one key per header). The header is read by the file and upload
+  endpoints only; it is no login to `/admin`. So when two feeds that review
+  have both approved a version and have different admin keys, a request with
+  both keys changes its files, for example `curl -u admin:$INTAKE_ADMIN -H
+  "X-YANuget-Admin-Key: $PROD_ADMIN" -H "X-NuGet-ApiKey: $PUSH_KEY" -X DELETE
+  …/api/v2/files/…`. Neither feed's admin page can, since a browser sends one
+  password; there the `403` names the other feed. `Send-YanugetFile.ps1
+  -AdminKey` sends one key.
+- Each admin key offered here that is no feed's counts against
+  [`rate_limit.max_failed_auth`](#rate-limiting) like a `401`, though the
+  answer is `403`. A request may offer at most eight admin keys, or one per
+  feed that reviews what it serves and one more where that is larger; more
+  is `400` before any is compared. When a wrong key was offered, the `403`
+  does not say which feeds' keys are still missing.
 - While the version is still pending everywhere that reviews, and in feeds
   that approve on arrival, the push key attaches and deletes as before.
 - The file inbox holds no credentials: for a feed with `requires_approval` or
@@ -740,8 +763,12 @@ responses also carry a `Strict-Transport-Security` header (one year).
   as long for its first bytes (TLS handshake included), and at most
   `max_connections` connections are open at once, so clients that open
   sockets and send nothing, or trickle bytes, cannot hold them indefinitely.
-  An idle HTTP/2 connection is pinged every 60 seconds and closed when a ping
-  goes unanswered for 20. (Request bodies are
+  One HTTP/2 connection may have at most 32 requests open at once; further
+  ones wait for one to end. An idle HTTP/2 connection is pinged every 60
+  seconds and closed when a ping goes unanswered for 20; a client that
+  answers pings keeps it open, and there is no limit per client, so a server
+  reachable from an untrusted network belongs behind a reverse proxy that
+  limits connections per client. (Request bodies are
   bounded by `upload_idle_timeout_secs` instead.) On shutdown, in-flight
   requests get 10 seconds, on plain HTTP as on HTTPS, and background work (a
   retention sweep, an inbox scan) is allowed to finish within the same
@@ -770,7 +797,10 @@ responses also carry a `Strict-Transport-Security` header (one year).
 ## Reverse proxy
 
 When hosting large packages, configure the proxy not to buffer and not to impose
-a small body limit. Example nginx snippet:
+a small body limit. The snippet below passes plain HTTP to YANuget, so it needs
+`tls_enabled = false` (see [TLS](#tls)): with the default, YANuget expects
+HTTPS on its port and nginx answers every request with `502`. Example nginx
+snippet:
 
 ```nginx
 location / {

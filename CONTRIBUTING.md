@@ -150,8 +150,8 @@ Branch off `main` and open the pull request against `main`.
 
 | Path | What lives there |
 | --- | --- |
-| `crates/yanuget-pkg/` | Package handling with no web or database dependency, shared with tools that build packages for the server: versions (`version.rs`) and version ranges (`range.rs`), manifest parsing (`nuspec.rs`), seek-based archive reading (`nupkg.rs`), and the upstream address policy (`address.rs`). The server re-exports these modules under their old paths (`yanuget::version`, …). |
-| `crates/yanuget-internalize/` | The Chocolatey internalizer (`yanuget-internalize`), unreleased: command line, configuration and its check, the upstream client for v2 and v3 feeds with its download cache (`upstream/`), and the `Sandbox` trait with a fake for tests (`sandbox/fake.rs`). Reaches the server only over HTTP, with a push key. |
+| `crates/yanuget-pkg/` | Package handling with no web or database dependency, shared with tools that build or fetch packages for the server: versions and version ranges, manifest parsing, seek-based archive reading and rewriting, the upstream address policy and fetch helpers, the v3 documents an upstream serves, and the internalizer report. The module list is in [docs/architecture.md](docs/architecture.md#module-map). The server re-exports `version`, `range`, `nuspec`, `nupkg` and `report` under its own name (`yanuget::version`, …). |
+| `crates/yanuget-internalize/` | The Chocolatey internalizer (`yanuget-internalize`), unreleased: see [its README](crates/yanuget-internalize/README.md) for what exists so far. Reaches the server only over HTTP, with a push key. |
 | `src/streaming.rs` | Bounded-memory copy-to-disk with incremental SHA-512 |
 | `src/storage/` | `PackageStorage` trait and the filesystem backend |
 | `src/database/` | `PackageDatabase` trait and the SQLite backend, one module per table group under `sqlite/` |

@@ -159,6 +159,13 @@ pub fn settings_page(urls: &UrlBuilder, config: &Config, feed: &crate::web::Feed
                 n => n.to_string(),
             },
         ));
+        files.push_str(&kv(
+            "Free space uploads may hold, per push key",
+            &match fc.max_upload_space_percent {
+                0 | 100.. => "Unlimited".to_string(),
+                n => format!("{n} %"),
+            },
+        ));
         // Whether there is an inbox, not where: the path is infrastructure.
         files.push_str(&kv(
             "SSH inbox",

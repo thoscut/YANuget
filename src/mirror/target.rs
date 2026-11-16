@@ -1,6 +1,6 @@
 //! Filling a feed from the upstream: fetching versions and indexing them.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
@@ -167,6 +167,46 @@ impl MirrorTarget<'_> {
                     .is_none_or(|until| *until <= now)
             },
         )
+    }
+
+    /// What [`Self::wanted`] asks about one version, read for all versions
+    /// of `lower_id` at once: a listing refresh goes through every upstream
+    /// version, and two queries for each is two hundred round trips for a
+    /// package that is already here in full. `None`, logged, when the
+    /// database cannot be read, and then nothing is wanted.
+    pub(super) async fn unwanted(&self, lower_id: &str) -> Option<Unwanted> {
+        let (db, feed) = (self.db, self.feed);
+        let read = async {
+            Ok::<_, Error>((
+                db.held_versions(feed, lower_id).await?,
+                db.tombstoned_versions(feed, lower_id).await?,
+            ))
+        };
+        let (held, tombstoned) = match read.await {
+            Ok(sets) => sets,
+            Err(e) => {
+                tracing::warn!(%feed, id = %lower_id, error = %e, "could not read which versions the feed holds; mirroring none");
+                return None;
+            }
+        };
+        let now = Instant::now();
+        let bad = self.client.tracker.with(
+            &MirrorClient::key(feed, lower_id),
+            self.client.refresh,
+            |state| {
+                state
+                    .bad_versions
+                    .iter()
+                    .filter(|(_, until)| **until > now)
+                    .map(|(version, _)| version.clone())
+                    .collect()
+            },
+        );
+        Some(Unwanted {
+            held,
+            tombstoned,
+            bad,
+        })
     }
 
     fn remember_bad(&self, lower_id: &str, version: &NuGetVersion) {
@@ -337,6 +377,25 @@ impl MirrorTarget<'_> {
     }
 }
 
+/// The versions of one package a listing refresh must not fetch: those the
+/// feed holds, those deleted from it, and those that just failed.
+pub(super) struct Unwanted {
+    /// Normalized, as the database stores them.
+    held: HashSet<String>,
+    tombstoned: HashSet<String>,
+    /// Normalized and lower-cased, as the tracker keeps them.
+    bad: HashSet<String>,
+}
+
+impl Unwanted {
+    pub(super) fn wants(&self, version: &NuGetVersion) -> bool {
+        let normalized = version.normalized();
+        !self.held.contains(&normalized)
+            && !self.tombstoned.contains(&normalized)
+            && !self.bad.contains(&normalized.to_lowercase())
+    }
+}
+
 /// How fetching one version went.
 pub(super) enum Fetched {
     Mirrored,
@@ -344,4 +403,30 @@ pub(super) enum Fetched {
     NotMirrored,
     /// The download failed; the caller decides how loudly.
     DownloadFailed(Error),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_refresh_fetches_only_what_the_feed_lacks_and_may_have() {
+        let set = |versions: &[&str]| versions.iter().map(|v| v.to_string()).collect();
+        let unwanted = Unwanted {
+            held: set(&["1.0.0", "2.0.0-beta"]),
+            tombstoned: set(&["1.1.0"]),
+            bad: set(&["1.2.0-rc.1"]),
+        };
+        let wants = |raw: &str| unwanted.wants(&NuGetVersion::parse(raw).unwrap());
+        assert!(wants("3.0.0"));
+        // Held, deleted on purpose, or just failed.
+        assert!(!wants("1.0.0"));
+        assert!(!wants("1.1.0"));
+        assert!(!wants("1.2.0-rc.1"));
+        // Versions are compared normalized, as each lookup did, however the
+        // upstream spells them.
+        assert!(!wants("1.0"));
+        assert!(!wants("2.0.0-Beta"));
+        assert!(!wants("1.2.0-RC.1"));
+    }
 }

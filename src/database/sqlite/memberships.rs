@@ -165,6 +165,21 @@ pub(super) async fn follow_upstream_listing(
     Ok(result.rows_affected() > 0)
 }
 
+pub(super) async fn held_versions(
+    db: &SqliteDatabase,
+    feed: &str,
+    id: &str,
+) -> Result<std::collections::HashSet<String>> {
+    let rows: Vec<String> = sqlx::query_scalar(
+        "SELECT normalized_version FROM feed_packages WHERE feed = ?1 AND lower_id = ?2",
+    )
+    .bind(feed)
+    .bind(canonical_id(id))
+    .fetch_all(&db.pool)
+    .await?;
+    Ok(rows.into_iter().collect())
+}
+
 pub(super) async fn upstream_listed(
     db: &SqliteDatabase,
     feed: &str,
@@ -536,6 +551,52 @@ mod tests {
         assert_eq!(n, 2);
         assert!(!db.is_servable(FEED, "batch.pkg", &a.version).await.unwrap());
         assert!(!db.is_servable(FEED, "batch.pkg", &b.version).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn the_versions_a_feed_holds_are_read_at_once() {
+        let db = SqliteDatabase::in_memory().await.unwrap();
+        let v = |s: &str| NuGetVersion::parse(s).unwrap();
+        for version in ["1.0.0", "1.1.0", "2.0.0-rc.1"] {
+            db.add_to_feed(FEED, &sample("Held.Pkg", version))
+                .await
+                .unwrap();
+        }
+        // Held in any state: an unlisted, a disabled and a pending version
+        // are all there, and must not be fetched again.
+        db.set_listed(FEED, "held.pkg", &v("1.0.0"), false)
+            .await
+            .unwrap();
+        db.set_enabled(FEED, "held.pkg", &v("1.1.0"), false)
+            .await
+            .unwrap();
+        let waiting = sample("Held.Pkg", "3.0.0");
+        db.upsert_package_data(&waiting).await.unwrap();
+        db.add_membership(&Membership {
+            pending: true,
+            ..Membership::active(FEED, &waiting)
+        })
+        .await
+        .unwrap();
+        db.add_to_feed("other", &sample("Held.Pkg", "9.0.0"))
+            .await
+            .unwrap();
+        db.add_to_feed(FEED, &sample("Held.Other", "8.0.0"))
+            .await
+            .unwrap();
+
+        let held = db.held_versions(FEED, "HELD.PKG").await.unwrap();
+        let expected = ["1.0.0", "1.1.0", "2.0.0-rc.1", "3.0.0"].map(String::from);
+        assert_eq!(held, expected.into_iter().collect());
+        // Exactly the versions `exists` says yes to, as it names them.
+        for version in ["1.0.0", "1.1.0", "2.0.0-rc.1", "3.0.0", "8.0.0", "9.0.0"] {
+            assert_eq!(
+                held.contains(&v(version).normalized()),
+                db.exists(FEED, "held.pkg", &v(version)).await.unwrap(),
+                "{version}"
+            );
+        }
+        assert!(db.held_versions(FEED, "never").await.unwrap().is_empty());
     }
 
     #[tokio::test]

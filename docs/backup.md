@@ -65,15 +65,24 @@ at a different moment from the database can miss a package either way.
    first backup hashes everything it copies, which reads the store a second
    time.)
 4. **Put the snapshot in place**, remove files the server no longer has, copy
-   the TLS pair, and write `backup.json`.
+   the TLS pair, and write `backup.json`. A file the snapshot references stays
+   even when the live store has lost it: a repeated backup keeps the copy an
+   earlier run made, counts it as backed up rather than missing, and logs a
+   warning naming it.
 
-A file still missing after three passes is missing from the live store too,
+A file still missing after three passes, and with no copy from an earlier
+run in the backup, is missing from the live store too,
 or its bytes there do not match the database. The backup completes, lists it
 under `missing` in `backup.json`, and prints a warning: it is a faithful copy
 of a server that has a problem, not a backup that hides one.
 
 Resumable uploads that were unfinished at backup time are not included; a
 client resuming one after a restore starts it over.
+
+The backup directory should be writable only by the user `yanuget backup`
+runs as: the backup does not follow links it finds there, and makes its
+database snapshot in a private directory of its own, but it cannot guard
+against someone else swapping directories in it while a run is under way.
 
 ### What it does not include
 
@@ -213,9 +222,12 @@ docker compose run --rm --no-deps yanuget restore --force /backup
 docker compose start yanuget
 ```
 
-Stop the service first even though the restore would refuse a running server:
-it looks for one on its own loopback address, and in a one-off container there
-is none to find. Leave out `--force` when restoring into a new, empty volume.
+Stop the service first. From 0.10.0 on the restore refuses while a server
+holds the [data lock](cli.md#offline-commands-and-a-running-server) on the
+volume, but an older release's image, the one you use to roll back an upgrade,
+only looks for a server on its own loopback address, and in a one-off
+container there is none to find. Leave out `--force` when restoring into a
+new, empty volume.
 
 Without Compose, the same with `docker run`, passing the configuration the
 server uses (its `-e`, `--env-file` and `YANUGET_CONFIG` mount) as well:

@@ -22,7 +22,6 @@ async-trait = "0.1"
 clap = { version = "4", features = ["derive", "env"] }
 base64 = "0.23"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
-flate2 = "1"
 futures-util = "0.3"
 hex = "0.4"
 md-5 = "0.11"

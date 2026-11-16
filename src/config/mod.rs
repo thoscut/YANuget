@@ -983,6 +983,25 @@ mod tests {
     }
 
     #[test]
+    fn the_upload_space_share_is_a_percentage() {
+        assert_eq!(Config::default().files.max_upload_space_percent, 80);
+        for ok in [0, 1, 80, 100] {
+            let toml = format!("[files]\nmax_upload_space_percent = {ok}\n");
+            let c: Config = toml::from_str(&toml).unwrap();
+            c.validate().unwrap();
+        }
+        let c: Config = toml::from_str("[files]\nmax_upload_space_percent = 101\n").unwrap();
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("files.max_upload_space_percent"), "{err}");
+
+        // The environment is held to the same rule.
+        let c = with_env(&[("YANUGET_FILES_MAX_UPLOAD_SPACE_PERCENT", "50")]).unwrap();
+        assert_eq!(c.files.max_upload_space_percent, 50);
+        assert!(with_env(&[("YANUGET_FILES_MAX_UPLOAD_SPACE_PERCENT", "150")]).is_err());
+        assert!(with_env(&[("YANUGET_FILES_MAX_UPLOAD_SPACE_PERCENT", "half")]).is_err());
+    }
+
+    #[test]
     fn a_blank_monitoring_token_in_the_file_is_an_error() {
         // As for `YANUGET_MONITORING_TOKEN`: a template with an empty
         // variable must not open /metrics without a word.

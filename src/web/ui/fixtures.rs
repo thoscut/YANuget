@@ -108,6 +108,7 @@ pub(super) fn feed_ctx(api: Option<&str>, admin: Option<&str>) -> crate::web::Fe
         allowed_extensions: crate::config::FilesConfig::default().allowed_extensions,
         cleanup: Default::default(),
         counters: Default::default(),
+        resumable: Default::default(),
     }
 }
 

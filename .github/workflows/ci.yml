@@ -118,7 +118,18 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features --locked
 
+      # The prelude's end-to-end test runs the generated PowerShell with
+      # `pwsh`, which the Ubuntu image ships, and skips itself where there is
+      # none. Here a missing `pwsh` fails it instead
+      # (`YANUGET_REQUIRE_PWSH`): otherwise the image dropping PowerShell
+      # would leave every check green with no prelude code run. The version
+      # step says up front which one ran, or that there is none.
+      - name: PowerShell for the prelude test
+        run: pwsh -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'
+
       - name: Test
+        env:
+          YANUGET_REQUIRE_PWSH: "1"
         run: cargo test --workspace --all-features --locked
 
       # On crates.io `yanuget-pkg` comes without its `net` feature, which the
@@ -177,6 +188,8 @@ jobs:
       # with 1.89, so this is the compiler the image ships, and a behaviour
       # difference between it and stable would otherwise go unnoticed.
       - name: Test against MSRV
+        env:
+          YANUGET_REQUIRE_PWSH: "1"
         run: cargo +1.89.0 test --workspace --all-targets --all-features --locked
 
   # The release binaries are also built for Windows and macOS, and the code
@@ -241,35 +254,98 @@ jobs:
       # differently would turn CI red with no change here. Dependabot does not
       # see these; bump them by hand.
       - name: Install cargo-audit and cargo-deny
+        id: tools
         uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: cargo-audit@0.22.2,cargo-deny@0.20.2
 
-      # RUSTSEC-2023-0071 (rsa, Marvin attack) has no fixed release and reaches
-      # the lockfile only via sqlx-mysql, an optional driver this sqlite-only
-      # build never compiles. Verified rather than assumed: `cargo tree -i rsa
-      # -e normal` finds nothing, so the crate is in `Cargo.lock` and not in the
-      # binary. Ignored deliberately; revisit if a fix ships.
       # `--deny yanked`: cargo-audit only warns about a yanked crate in the
       # lockfile, and a yank is often how a broken or compromised release is
       # withdrawn, so it fails the job like an advisory does.
+      #
+      # RUSTSEC-2026-0459 (bundled SQLite before 3.54.0 returns uninitialized
+      # page-cache memory when a database is opened with a crafted sibling
+      # `-wal` of another page size) is fixed in libsqlite3-sys 0.39, which no
+      # sqlx release accepts yet (0.8 pins ^0.30, 0.9 caps it below 0.38).
+      # YANuget opens only its own database in `data_dir` and its snapshot in
+      # a backup directory; `restore` copies just the backup's `yanuget.db`
+      # and deletes any `-wal` next to the live file before opening it, and
+      # `backup` opens its snapshot only in a private directory of its own.
+      # Writing a `-wal` there already needs write
+      # access to the data directory, which owns the server anyway. Ignored,
+      # as decided by the maintainer on 2026-11-16, until sqlx allows
+      # libsqlite3-sys >= 0.39 (ROADMAP `DEP-14`).
       - name: Audit dependencies for known vulnerabilities
-        run: cargo audit --deny yanked --ignore RUSTSEC-2023-0071
+        run: cargo audit --deny yanked --ignore RUSTSEC-2026-0459
+
+      # The ignore of RUSTSEC-2026-0459 has to go once an sqlx release
+      # accepts libsqlite3-sys >= 0.39, and nothing else would say so:
+      # Dependabot proposes no sqlx 0.9 (dependabot.yml), and the audit is
+      # green while the ignore stands. So the weekly run asks the registry. A
+      # scratch crate that wants sqlx and libsqlite3-sys >= 0.39 together
+      # resolves only when such a release exists (the two cannot both link
+      # SQLite in different versions), and then this step fails and says
+      # what to do. Pull requests skip it: the answer does not depend on them.
+      # So does a release (`inputs.ref` set): called from release.yml,
+      # `github.event_name` is the caller's event, and a release started by
+      # hand is `workflow_dispatch` too. A fix arriving upstream must not stop
+      # an urgent release; the weekly run reports it.
+      - name: Is an sqlx release with the fix for RUSTSEC-2026-0459 out?
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' && !inputs.ref && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') }}
+        run: |
+          set -euo pipefail
+          probe="$RUNNER_TEMP/sqlx-probe"
+          mkdir -p "$probe/src"
+          touch "$probe/src/lib.rs"
+          cat > "$probe/Cargo.toml" <<'EOF'
+          [package]
+          name = "sqlx-probe"
+          version = "0.0.0"
+          edition = "2021"
+          publish = false
+
+          [dependencies]
+          sqlx = { version = ">=0.8", default-features = false, features = ["sqlite"] }
+          libsqlite3-sys = ">=0.39"
+
+          [workspace]
+          EOF
+          if cargo generate-lockfile --manifest-path "$probe/Cargo.toml" 2>"$probe/err"; then
+            found=$(awk '/^name = "(sqlx-sqlite|libsqlite3-sys)"$/ { n = $3; getline; print n, $3 }' "$probe/Cargo.lock" | tr -d '"' | paste -sd ' ')
+            echo "::error::An sqlx release accepts libsqlite3-sys >= 0.39 ($found). Update sqlx, then drop --ignore RUSTSEC-2026-0459 and close ROADMAP DEP-14."
+            exit 1
+          elif grep -q 'failed to select a version' "$probe/err"; then
+            echo "No sqlx release accepts libsqlite3-sys >= 0.39 yet; the ignore of RUSTSEC-2026-0459 stays (ROADMAP DEP-14)."
+          else
+            # Not an answer (the registry did not respond): say so, red.
+            cat "$probe/err"
+            exit 1
+          fi
 
       # Licenses, sources and duplicate crates, as set out in deny.toml. A
       # dependency under a license nobody has looked at, or from a git
       # repository or another registry, fails here rather than in a release.
+      #
+      # This and the bill of materials below run after a failed audit too
+      # (`!cancelled()` instead of the default `success()`): an advisory stays
+      # red until someone fixes or ignores it, and a pull request merged in
+      # that time would otherwise bring in a license or source nobody
+      # checked. The failed audit step still fails the job.
       - name: Check licenses and sources
+        if: ${{ !cancelled() && steps.tools.outcome == 'success' }}
         run: cargo deny check licenses bans sources
 
       # The release attaches this bill of materials; generating it here finds
       # a tool or metadata problem on the pull request rather than at tag time.
       - name: Install cargo-cyclonedx
+        id: cyclonedx
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
         uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: cargo-cyclonedx@0.5.9
 
       - name: Generate the software bill of materials
+        if: ${{ !cancelled() && steps.cyclonedx.outcome == 'success' }}
         run: |
           set -euo pipefail
           cargo cyclonedx --format json --spec-version 1.5 --target all \

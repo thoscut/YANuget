@@ -221,8 +221,24 @@ pub struct Throttle {
 /// challenge a NuGet client waits for before it sends its key — a restore
 /// against a read-gated feed produces one per package — and must not count.
 fn carries_credential(headers: &HeaderMap) -> bool {
-    headers.contains_key(header::AUTHORIZATION) || headers.contains_key(crate::auth::API_KEY_HEADER)
+    headers.contains_key(header::AUTHORIZATION)
+        || headers.contains_key(crate::auth::API_KEY_HEADER)
+        || headers.contains_key(crate::auth::ADMIN_KEY_HEADER)
 }
+
+/// A response extension saying that the request presented this many
+/// credentials that are wrong, though the answer is not a `401`: [`enforce`]
+/// counts each against the failed-auth budget all the same.
+///
+/// A refusal to change the files of an approved version is a `403` (the
+/// push key was right, and the message names the feeds whose admin key is
+/// missing), but the admin keys it was offered may be guesses. Counted only
+/// by its status, such guesses had the general budget (by default over 300
+/// times as large), and each one was compared with the admin key of every
+/// feed. Counted once per request, each of the many admin keys one request
+/// can offer would be a guess for free (`SEC-55`).
+#[derive(Debug, Clone, Copy)]
+pub struct FailedAuth(pub u32);
 
 fn too_many(window_secs: u64) -> Response {
     (
@@ -258,8 +274,15 @@ pub async fn enforce(State(throttle): State<Throttle>, req: Request, next: Next)
     }
     let response = next.run(req).await;
     if let Some(failures) = failures {
-        if response.status() == StatusCode::UNAUTHORIZED {
-            failures.check(ip);
+        let failed = match response.extensions().get::<FailedAuth>() {
+            Some(FailedAuth(n)) => *n,
+            None => u32::from(response.status() == StatusCode::UNAUTHORIZED),
+        };
+        // Past the budget the rest would change nothing.
+        for _ in 0..failed {
+            if !failures.check(ip) {
+                break;
+            }
         }
     }
     response

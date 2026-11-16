@@ -1,5 +1,6 @@
-//! The `admin` and `config` sub-commands: thin argument handling over
-//! [`yanuget::admin_client`] and [`yanuget::config_check`].
+//! The `admin`, `config` and `feeds` sub-commands: thin argument handling
+//! over [`yanuget::admin_client`], [`yanuget::config_check`] and the
+//! database's feed maintenance.
 
 use std::path::PathBuf;
 

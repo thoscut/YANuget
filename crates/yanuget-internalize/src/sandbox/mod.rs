@@ -70,7 +70,7 @@ pub enum SandboxError {
     /// is an exit code in [`RawCapture`]).
     #[error("sandbox failed: {0}")]
     Failed(String),
-    #[error("sandbox I/O error: {0}")]
+    #[error("sandbox I/O error")]
     Io(#[from] std::io::Error),
 }
 
@@ -122,7 +122,9 @@ pub async fn job(
         };
         // Apart from where the publish writes its own rewrite.
         let dir = work_dir.join("override");
-        tokio::fs::create_dir_all(&dir).await?;
+        tokio::fs::create_dir_all(&dir).await.map_err(|e| {
+            crate::io_context(|| format!("cannot create {}", dir.display()))(e.into())
+        })?;
         let out = dir.join(format!(
             "{}.{}.nupkg",
             id.to_ascii_lowercase(),

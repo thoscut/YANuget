@@ -10,10 +10,10 @@ requests can reference them, and ticked off rather than deleted when they land.
 ## Open items
 
 Everything still open across this file and the project's working threads, as
-of 2026-11-03 (after the review of that day). The entries further down hold
+of 2026-11-16 (0.10.0 is the latest release). The entries further down hold
 the detail; this list is the index.
 
-**Server, after 0.9.0** ([Target releases](#target-releases))
+**Server, after 0.10.0** ([Target releases](#target-releases))
 
 - `INT-31` Attached files on read-gated feeds: the premise holds (Chocolatey's
   helpers never send source credentials); a security review of the token
@@ -38,6 +38,36 @@ the detail; this list is the index.
 - `INT-33` internalization requests, if the open question about it is
   answered for it.
 
+**From the review of 2026-11-16** ([below](#review-of-2026-11-16))
+
+- `SEC-44` open resumable uploads in the admin area, `SEC-45` a deadline or
+  minimum rate for upload bodies, `SEC-46` entry names NuGet rewrites on
+  extraction, `SEC-47` aliases that shadow the prelude's wrappers.
+- `TEST-19` one harness for all integration tests, `TEST-20` the PowerShell
+  upload script run in CI, `MNT-32` the four files above 1000 lines.
+- Round 2: `SEC-52` the self-signed certificate, `SEC-53` connection limits
+  per client, `COR-49` the internalizer's sync and failed entries, `COR-50`
+  several admin keys on the admin page and in the upload script, `COR-51`
+  one symbol row per version, `PERF-21` the gallery's package page,
+  `MNT-35` the internalizer's partial cache files, `MNT-37` the name of
+  `files.max_upload_space_percent`, `CI-23` tests on Windows and macOS,
+  `CI-24` new recordings in `media.yml`, `DEP-22` a `config check` warning
+  for the port in `base_url`, `DEP-23` the reason for a `507` to the client,
+  `MNT-36` small things.
+- Round 3: `SEC-56` the upload share per push key rather than per group,
+  `SEC-57` race-free writes into the backup directory, `MNT-39` rules the
+  three fix rounds left in two places, `TEST-32` the migration tests behind
+  a proxy, `DEP-25` a checksum check before skipping a crate on crates.io.
+
+**Dependencies**
+
+- `DEP-14` Drop the `cargo audit` ignore for `RUSTSEC-2026-0459` (bundled
+  SQLite before 3.54.0, crafted `-wal` next to a database) once an sqlx
+  release accepts `libsqlite3-sys` 0.39 or later: 0.8 pins `^0.30`, 0.9.0
+  caps it below 0.38. The reasoning for the ignore is next to it in
+  `.github/workflows/ci.yml`; the server opens only its own database and its backup snapshot, and deletes
+  any `-wal` next to either before opening it.
+
 **Features under discussion**
 
 - Markdown readmes on the package page; see [Features](#features).
@@ -45,9 +75,10 @@ the detail; this list is the index.
 **For the repository owner**
 
 - The settings under [For the repository owner](#for-the-repository-owner),
-  checked on 2026-11-03: the `release` environment exists; there is no tag
-  ruleset for `v*` yet, and neither `yanuget` nor `yanuget-pkg` is on
-  crates.io.
+  checked on 2026-11-16: there is no tag ruleset for `v*` yet, and neither
+  `yanuget` nor `yanuget-pkg` is on crates.io. The `release` environment
+  exists (the 0.10.0 release ran in it); its restriction to `v*` tags was
+  last looked at on 2026-11-03.
 - An open question from the review of 2026-09-30: move its `SEC-…` findings
   from this public file (now `reviews/2026-09-30.md`) into a private security
   advisory? Every one of them is fixed and released since 0.6.0.
@@ -55,24 +86,235 @@ the detail; this list is the index.
   license for the golden images (needed before `INT-13` ships) and the
   release scheme for the tool.
 
+## Review of 2026-11-16
+
+A multi-expert review of `main` at 0.10.0 (`09867bc`) in three rounds, each
+by the same five reviewers as on 2026-11-03, each followed by its fixes. The
+changelog's *Unreleased* section describes the fixes for operators. Open
+boxes are what the review left for later.
+
+### Round 1
+
+- [x] **`cargo audit` was red.** `RUSTSEC-2026-0538`
+  (`quinn-udp`) is fixed by 0.5.16; `RUSTSEC-2026-0459` (bundled SQLite) is
+  ignored with its reasoning until sqlx allows the fix, see `DEP-14` in the
+  index.
+- [x] **`SEC-41` An empty `PATCH` an hour kept a resumable upload's hold on
+  the free space.** *Done:* only a `PATCH` that brings bytes renews it, and
+  `files.max_upload_space_percent` (default 80) caps what one feed's
+  unfinished uploads hold together, requests in flight included.
+- [ ] **`SEC-44` Open resumable uploads cannot be seen or deleted in the
+  admin area.** Only the feed's push key (`DELETE`) removes one. Needs a
+  query, a table with a CSRF-guarded action, and care with the write slot.
+- [ ] **`SEC-45` No deadline or minimum rate for an upload body.** A push
+  with a large `Content-Length` and no `max_package_size_bytes` keeps its
+  reservation for as long as it trickles (only `upload_idle_timeout_secs`
+  per chunk). A fixed deadline hurts large legitimate uploads; a rate has to
+  fit the size.
+- [x] **`SEC-42` The internalizer did not percent-decode entry names,** so a
+  script under `tools/chocolateyInstall%2Eps1` would have run without the
+  prelude. *Done:* scripts and reserved names are found by the extracted
+  name; archives whose entries collide once decoded are refused.
+- [ ] **`SEC-46` Other names NuGet rewrites on extraction.** A leading `/`
+  is stripped (read in NuGet.Client's `CopyFiles`); `.`/`..` segments,
+  doubled slashes and trailing dots or spaces are unverified. Refuse
+  non-canonical entry names once a prelude is needed.
+- [x] **`SEC-43` The prelude passed over a helper that was not a function.**
+  *Done:* it stops the install when the helper exists in another form.
+- [ ] **`SEC-47` An alias named like a helper would win over the prelude's
+  wrapper function.** Unverified: check on a client with
+  `chocolatey.extension`, which may define such aliases.
+- [x] **`COR-44` `migrate` listed a version before unlisting it.** *Done:*
+  indexed unlisted in one write, without `listing_set`.
+- [x] **`PERF-15` to `PERF-17`** narrow queries for the flat container and
+  registration, two queries per mirror refresh, expired upstream listings
+  dropped.
+- [x] **`MNT-29` `migrate` bypassed the shared `SpaceGuard`.** *Done:* one
+  guard per run.
+- [x] **`MNT-30` Errors printed their cause twice; three copies of
+  `error_chain`.** *Done:* one in `yanuget-pkg`.
+- [x] **`MNT-31` Stale upload files were swept once per feed.** *Done:* once
+  per start.
+- [ ] **`MNT-32` Four files are still above 1000 lines** (`web/hosted.rs`,
+  `web/ui/admin.rs`, `web/admin.rs`, `main.rs`).
+- [x] **`CI-21` A red audit skipped `cargo deny` and the SBOM.** *Done:*
+  they run regardless; the job still fails.
+- [x] **`TEST-17`, `TEST-18`** the data lock tested against the real binary;
+  the license policies of other holding feeds tested end to end.
+- [ ] **`TEST-19` Seven test files keep a harness of their own** next to
+  `tests/common/`; a change to `AppState` has to be made in each.
+- [ ] **`TEST-20` `scripts/Send-YanugetFile.ps1` has never been run by CI,**
+  `-AdminKey` included. A `pwsh` step against the test server would do it.
+- [x] **`DEP-15`, `DEP-16`, `DOC-20` to `DOC-24`** the 0.10.0 upgrade note,
+  `-AdminKey` for the upload script, troubleshooting, the one-off container,
+  the module tree, this file and the `config check` list.
+
+### Round 2
+
+A second pass over the branch with round 1's fixes (`cebd152`): each
+reviewer checked those fixes first, then read what round 1 had left out.
+The fixes held (852 tests three times, 15 mutations caught); three findings
+were medium.
+
+- [x] **`SEC-48` The share from `SEC-41` could be sidestepped:** a byte an
+  hour renewed the hold, a global push key gave every feed a share of its
+  own, and pushes and `PUT`s did not count. *Done:* a hold is renewed by as
+  much of the hour as its bytes are of the upload's pace; the share is per
+  group of feeds that accept a common push key; pushes and `PUT`s in progress
+  count. What is left is `SEC-45`: a single request that trickles.
+- [x] **`COR-46` A repeated backup deleted the last copy of a file the live
+  store had lost,** and reported nothing missing. *Done:* a file the
+  snapshot references stays in the backup; one missing in both is reported.
+- [x] **`TEST-21`, `TEST-22` The tests that start the binary inherited
+  `YANUGET_*` and `RUST_LOG`.** *Done:* one helper starts it with a clean
+  environment.
+- [x] **`COR-45` Two approving feeds with different admin keys left a
+  version's files unchangeable.** *Done:* further keys in
+  `X-YANuget-Admin-Key` headers; every approving feed's key is still needed.
+- [ ] **`COR-50` The admin page and `Send-YanugetFile.ps1 -AdminKey` still
+  send one admin key.** A browser sends one Basic password.
+- [x] **`COR-47` A symbol key went with the first version that stored it.**
+  *Done:* it is handed to another version of the package whose symbol
+  package holds the same PDB.
+- [ ] **`COR-51` One symbol row per version.** The clean fix: the key, file
+  and version as the primary key, the file deleted with its last row, and a
+  download allowed when any owner is servable in the feed. Today a feed
+  that lacks the owning version, or has it disabled or pending, answers
+  `404`. Also a `symbol_package_path` getter on `PackageStorage`.
+- [x] **`COR-48`** a version listed twice upstream is downloaded once.
+- [ ] **`COR-49` The internalizer's `sync` marks a failed entry approved** once
+  the feed serves the version, and drops its reasons; missing attachments
+  are never delivered. Matters once the pipeline is wired (`INT-15`).
+- [x] **`SEC-49` (partly) 32 HTTP/2 streams per connection** instead of 200.
+- [ ] **`SEC-53` Connections per client.** A cap per IP (/64 for IPv6) in
+  the acceptor, an idle limit for HTTP/2 connections without streams (hyper
+  has none), and an idle limit for response bodies.
+- [x] **`SEC-50`** a root `.nuspec` that moves in or out of the root once
+  percent-decoded is refused. **`SEC-51`** a wrong admin key at the file and
+  upload endpoints counts as a failed authentication.
+- [ ] **`SEC-52` The self-signed certificate** is valid from 1975 to 4096, has
+  no extended key usage, is never renewed, and its key is in every backup.
+- [x] **`DEP-17`** `backup` deletes a `-wal` next to its snapshot before
+  opening it, so the reasoning for the `DEP-14` ignore holds there too
+  (since `SEC-54` the snapshot lives in a private directory).
+- [x] **`PERF-18` (retention), `PERF-19`, `PERF-20`, `MNT-33`, the
+  internalizer's I/O context, `MNT-34` unused dependencies and sqlx's default
+  features.**
+- [ ] **`MNT-36` Small things** (Info): the doc comment "Resolve once the
+  shutdown signal …" sits over `spawn_file_tasks` (`src/main.rs`);
+  `normalized.to_lowercase()` is redundant in `src/mirror/target.rs`; the
+  internalizer's `cached` (`download.rs`) reads with `tokio::fs` and a 64 KiB
+  buffer.
+- [ ] **`PERF-21` The gallery's package page** loads every version as a full
+  row and lists them without a limit.
+- [ ] **`MNT-35` The internalizer's cache keeps partial files** (up to 8 GiB)
+  after an aborted process. Matters from `INT-15`.
+- [ ] **`MNT-37` `files.max_upload_space_percent` now covers pushes too;**
+  rename it, with an alias for the old name.
+- [x] **`TEST-23` to `TEST-29`, `CI-22`/`DEP-21`** the pwsh test fails without
+  pwsh in CI; tests for the tus hash after a restart, the expiry sweep, copy
+  and move under a license policy, backup with files and symbols, the
+  internalizer's redirect and resolver, SIGTERM, `admin` and `backup`; a
+  weekly check that tells when `DEP-14` can go.
+- [ ] **`CI-23` Windows and macOS get `cargo check` only,** and the release
+  smoke test runs `--version` only.
+- [ ] **`CI-24` `media.yml` misses a new recording** (`git diff --quiet` does
+  not see untracked files).
+- [x] **`DEP-18` to `DEP-20`, `DOC-25` to `DOC-30`** the Compose example's
+  port, commands run by hand and `secrets.env`, the upload script in the
+  release archives, free space in `large-packages.md`, the upgrade note, the
+  architecture page, the README, `SECURITY.md` and the help texts.
+- [ ] **`DEP-22` `config check` could warn** when the port in `base_url`
+  differs from the listening port and no proxy is trusted.
+- [ ] **`DEP-23` A `507` tells the client only "internal server error";** the
+  reason (the reserve or the share) is in the server log only.
+
+### Round 3
+
+The last pass, over `d387a37`, with a view to releasing the branch as
+0.11.0. All five reviewers found it releasable once the medium finding was
+fixed and the changelog cleaned up; the version number and the `## [0.11.0]`
+heading are the maintainer's call at release time.
+
+- [x] **`COR-52` (also `PERF-22`) Handing a symbol over was expensive:** every
+  delete of a version with symbols extracted and verified the same-named
+  PDBs of every other version, under the locks and, with `prune_on_push`,
+  inside the push. *Done:* candidates are filtered by name, length and CRC-32
+  from the zip directory, each symbol package is listed once per delete, and
+  nothing is written out.
+- [x] **`COR-53`, `MNT-38` Races around the handover.** *Done:* a symbol push
+  keeps its keys until its symbol package is stored, a delete releases each
+  key with its file, and a version being changed is passed over
+  (`try_lock_version`). A symbol whose only candidate is locked at that
+  moment is deleted, as before `COR-47`.
+- [x] **`COR-54` A kept backup copy was checked by size only.** *Done:* kept
+  copies are hashed, and one with the wrong bytes is reported and kept.
+- [x] **`SEC-54` `backup` followed links in its destination.** *Done:* fresh
+  temp names, no links followed under `packages/` and `tls/`, the snapshot in
+  a private directory.
+- [ ] **`SEC-57` Fully race-free writes into the backup directory:** `openat`
+  with `O_NOFOLLOW` relative to the open directory, as the inbox does, and a
+  warning when the directory is writable by group or others. Today someone
+  who swaps directories during a run is not covered.
+- [x] **`SEC-55` Many `X-YANuget-Admin-Key` headers counted as one failed
+  guess.** *Done:* each wrong key counts, at most eight (or one per reviewing
+  feed and one more) per request, and the `403` no longer tells which key
+  was right.
+- [ ] **`SEC-56` The upload share belongs to the connected group of feeds
+  that share a push key,** so a key valid only for `c` can fill the share of
+  `{c, d, e}` and block uploads to `e`, which it cannot push to. Counting
+  each upload against the key that admitted it fixes this: `uploads` records
+  that key (a hash, or its index in the deduplicated key list), `SpaceGuard`
+  keeps one in-flight pool per key, and a request with key k is measured
+  against what k's uploads hold across all feeds that accept k. This needs a
+  new column in `uploads`, so it waits for a release that migrates the
+  schema anyway. Until then `config check` could warn when one feed joins
+  two otherwise separate key groups. Documented under
+  `files.max_upload_space_percent`.
+- [x] **`PERF-23`** the share check reads the whole group in one query.
+- [ ] **`MNT-39` Rules left in two places by the fix rounds:** the hold limit
+  computed three times, "servable" twice, two `ID_CHUNK` constants (200 and
+  400), two ways to strip the URL from a reqwest error,
+  `find_all_versions_of` called by tests only, `zip` listed twice in
+  `yanuget-pkg`.
+- [x] **`TEST-30` (partly), `TEST-31`, the rest of `TEST-27`** one test client
+  without a proxy, the binary started without proxy variables, the SEC-51
+  exception tested, the internalizer's redirect check tested through its
+  caller.
+- [ ] **`TEST-32` The migration tests fail behind a proxy** whose `NO_PROXY`
+  does not cover loopback: `MirrorClient::for_migration` takes the
+  environment's proxy on purpose. Taking none for a loopback upstream would
+  fix it.
+- [x] **`DOC-31` to `DOC-35`, the rest of `DOC-28`, `DEP-24` (partly)** the
+  changelog merged and its library list complete, the example configuration,
+  `SECURITY.md`, the `yanuget-pkg` README, a release step for the crates'
+  versions; the release job downloads only `yanuget-*` artifacts and checks
+  they are all there, and the weekly `DEP-14` check cannot block a release.
+- [ ] **`DEP-25` The `crates-io` job skips a crate whose version is already
+  published** without comparing checksums, so a changed `yanuget-pkg` under
+  an old version would go unnoticed.
+
 ## Review of 2026-11-03
 
 A multi-expert review of `main` at 0.9.0 (`544e2f0`): architecture and
 correctness, security, Rust code, tests and CI, operations and
-documentation. Every finding was fixed with it, with tests. The changelog's *Unreleased* section describes them
-for operators.
+documentation. Every finding was fixed with it, with tests, and released as
+0.10.0 on 2026-11-04. The changelog's 0.10.0 section describes them for
+operators.
 
 ### Security and integrity
 
-- [x] **`SEC-32` One resumable upload could hold all free space.** A tus
+- [x] **`SEC-32` (also `COR-41`) One resumable upload could hold all free
+  space.** A tus
   session without a size cap reserved its whole `Upload-Length` until it
   expired (72 h), and a push reserved its `Content-Length` unchecked: either
   blocked every push on the volume with `507`. *Done:* a push over
   `max_package_size_bytes` is `413` before it reserves; a resumable upload
   holds its space for an hour after its last request (`uploads.held_since`,
   schema 10); the log says what holds the space.
-- [x] **`SEC-33` Files of an approved version were protected only under
-  `pending-only`,** and a source feed's admin key could always change them.
+- [x] **`SEC-33` (also `COR-40`) Files of an approved version were protected
+  only under `pending-only`,** and a source feed's admin key could always
+  change them.
   *Done:* an approval in a feed that reviews what it serves
   (`requires_approval` or `pending-only`) holds the files against the push
   key of every feed and the inbox; only the admin key of each approving feed
@@ -312,7 +554,11 @@ These need settings no commit can change; the release workflow expects them
 
 Exercised by the 0.7.0 release: build provenance for the archives and the
 image, and the image's cosign signature (`cosign verify` from SECURITY.md
-passes with cosign 3; see `DOC-09`). Not yet exercised: crates.io trusted
+passes with cosign 3; see `DOC-09`). Exercised by the 0.10.0 release for the
+first time: the CycloneDX SBOM attached to the release and attested with the
+archives, the `cargo auditable` builds, the image's BuildKit SBOM
+attestation, and the version check of every binary and image platform before
+anything is published (`CI-04`, `CI-17`). Not yet exercised: crates.io trusted
 publishing (`PUBLISH_TO_CRATES_IO` is unset), and
 `scripts/Send-YanugetFile.ps1`, which was reviewed but not run.
 
@@ -903,8 +1149,8 @@ packages whose downloads go through Chocolatey's helpers.
   The answer decides whether KVM can be the default for every operator, and is
   needed before `INT-13` ships in a release.
 - **Requests on the server or in the watch list?** `INT-33` needs a schema
-  migration (step 11 in `src/database/sqlite/schema.rs`; the next release
-  takes step 10), after which older
+  migration (step 11 in `src/database/sqlite/schema.rs`; 0.10.0 took step
+  10), after which older
   builds refuse the database (`check_known`), and it widens `PackageDatabase`
   for every future backend. The watch list of `INT-27`, kept in a reviewed
   repository, covers the same need without touching the server; what is lost
@@ -919,7 +1165,7 @@ A proposal on top of 0.7.0, in the order the items depend on each other.
 | --- | --- | --- |
 | YANuget 0.8.0 | `INT-01`–`INT-05`, `INT-30`, `INT-32` | Released 2026-10-20, together with the fixes from the review of 2026-10-19, some of which need attention when upgrading (see CHANGELOG.md). |
 | YANuget 0.9.0 | review fixes of 2026-10-19 and 2026-10-27 | Released 2026-10-28, schema 9. |
-| YANuget 0.10.0 | review fixes of 2026-11-03, `retention.exclude_id_prefixes` | Prepared 2026-11-04, schema 10. |
+| YANuget 0.10.0 | review fixes of 2026-11-03, `retention.exclude_id_prefixes` | Released 2026-11-04, schema 10. |
 | YANuget, after 0.10.0 | `INT-31`, the server side of `INT-21` | The rest of what the tool needs. `INT-31` waits on the security review of its token design. |
 | internalizer 0.1.0 | `INT-10`–`INT-22` | KVM backend; needs YANuget 0.8.0, and the release with `INT-31` for read-gated feeds. |
 | internalizer 0.2.0 | `INT-23`–`INT-28` | Needs nothing beyond YANuget 0.8.0. |

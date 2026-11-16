@@ -60,11 +60,10 @@ pub struct MirrorClient {
     /// Deadline for one whole `.nupkg` download. `None` leaves only the read
     /// timeout, which bounds how long the upstream may go silent.
     download_deadline: Option<Duration>,
-    /// Free space a download must leave on the volume (`min_free_disk_bytes`),
-    /// when no [`space`](Self::set_space) is shared with the server's uploads.
-    min_free_disk_bytes: u64,
-    /// The admission of downloads, shared with the server's uploads.
-    space: Option<std::sync::Arc<crate::space::SpaceGuard>>,
+    /// The admission of downloads: the guard of the directory they are
+    /// written to, shared with whatever else writes there (see
+    /// [`Self::set_space`]). Until one is set, a guard that checks nothing.
+    space: std::sync::Arc<crate::space::SpaceGuard>,
     /// How long a package's upstream version list is trusted (`refresh_secs`).
     refresh: Duration,
     resources: OnceCell<MirrorResources>,

@@ -73,6 +73,23 @@ incompatibly at any version.
    add a fresh empty `## [Unreleased]`, and update the two link definitions at
    the bottom of the file.
 
+   Then make sure the section opens with an **Upgrading:** paragraph: whether
+   the schema changes (and so whether the previous release can still open the
+   database), and everything under *Security*, *Changed* and *Fixed* that makes
+   a working setup behave differently after the upgrade — a request refused
+   that was admitted, a setting that now stops startup — with the setting
+   that restores the old behaviour where there is one. Such changes are
+   usually written up under *Security*, which is how 0.10.0's upgrade note
+   first left two of them out.
+
+   Merge entries that a later fix in the same cycle superseded. The section
+   becomes the release notes word for word, and two entries on one mechanism
+   read as two rules, the first of which never shipped. Write each entry
+   against the previous release, not against the state in between. List the
+   breaking changes to the library API of `yanuget` and the changes to
+   `yanuget-pkg` too: `git diff vPREV -- src/ crates/yanuget-pkg/src` and
+   every `pub` item or trait method that it adds, removes or changes.
+
 4. **Check what has already been released.**
 
    ```bash
@@ -87,12 +104,42 @@ incompatibly at any version.
    `cargo build` so `Cargo.lock` records the new version too. Commit both, and
    update the supported-versions table in `SECURITY.md`.
 
+   Decide the version of `yanuget-pkg` on purpose, too. If
+   `git diff vPREV -- crates/yanuget-pkg` is not empty and the crate is on
+   crates.io, bump `version` in `crates/yanuget-pkg/Cargo.toml` (the patch
+   for fixes and additions, the minor for a break) and raise the
+   `yanuget-pkg` requirement in `Cargo.toml` and in
+   `crates/yanuget-internalize/Cargo.toml` to it: both call what the
+   workspace copy has, and a lockfile still on the old `yanuget-pkg` would
+   not build them. The `crates-io` job skips a version crates.io already
+   has; `guard` refuses such a release while `PUBLISH_TO_CRATES_IO` is on,
+   but raises nothing itself, and with publishing off nothing checks it. A
+   crate never published yet can keep its version. `yanuget-internalize`
+   has `publish = false` and `0.0.0` until its first release; once it has
+   one, the same goes for it.
+
    The release workflow refuses to build if the tag does not equal
    `v` + the `Cargo.toml` version, or if the changelog has no section for it.
 
 6. **Check the dependency audit.** `cargo audit` runs in CI; a release is a
    reasonable moment to also run `cargo update` on a branch and see whether
    anything wants upgrading.
+
+   CI stays green for an advisory it ignores, so go through each ignore by
+   hand: is the advisory still unfixable, and does the reason written next to
+   it still hold? Look the fix up yourself rather than waiting for a
+   Dependabot pull request: Dependabot ignores some releases on purpose (sqlx
+   0.9, which needs a newer Rust than the MSRV), and a fix that arrives only
+   there never shows up as one. Drop an ignore that is no longer needed, and
+   bring the *Known advisories* table in [SECURITY.md](SECURITY.md#known-advisories)
+   and the changelog's *Security* section in line with what is left.
+
+7. **Bring `ROADMAP.md` up to the release.** In its *Open items* index, set
+   the date and move the server heading to *after X.Y.Z*; in the
+   [Target releases](ROADMAP.md#target-releases) table, mark the row
+   *Released YYYY-MM-DD* with its schema version; and replace what still says
+   *Unreleased* or *the next release* about work that ships now. Without
+   this step the index was a release behind after both 0.9.0 and 0.10.0.
 
 ## Tagging
 
@@ -113,7 +160,7 @@ existing tag points at.
 | --- | --- |
 | `guard` | Refuses the release unless the tag exists, the run started from it, and the tag, `Cargo.toml` and `CHANGELOG.md` agree. Every later job builds the commit it resolved. |
 | `ci` | Runs the whole CI workflow (`ci.yml`) on the commit `guard` resolved, with a read-only token, no secrets and no caches. `image`, `release` and `crates-io` wait for it. |
-| `build` | Compiles for five targets (Linux x86-64/aarch64, macOS x86-64/aarch64, Windows x86-64) with the rendered docs embedded, and packages each with the README, licence, changelog and example config, plus the systemd unit and its `sysusers.d` file on Linux. Built with `cargo auditable`, so each binary embeds its dependency tree. Each binary has to print its version first (aarch64 Linux under QEMU, x86-64 macOS under Rosetta 2). Read-only token, no caches. |
+| `build` | Compiles for five targets (Linux x86-64/aarch64, macOS x86-64/aarch64, Windows x86-64) with the rendered docs embedded, and packages each with the README, licence, changelog, example config and `Send-YanugetFile.ps1`, plus the systemd unit and its `sysusers.d` file on Linux. Built with `cargo auditable`, so each binary embeds its dependency tree. Each binary has to print its version first (aarch64 Linux under QEMU, x86-64 macOS under Rosetta 2). Read-only token, no caches. |
 | `sbom` | Writes the CycloneDX bill of materials `yanuget-vX.Y.Z.cdx.json` from `Cargo.lock` (every target), with a read-only token; `release` attaches and attests it with the archives. |
 | `image` | Builds and starts the image on each platform, then publishes `ghcr.io/thoscut/yanuget` for `linux/amd64` and `linux/arm64`, tagged `X.Y.Z`, `X.Y` and `latest`; attests its build provenance, pushes a BuildKit SBOM attestation, and signs it with cosign (keyless). |
 | `release` | Attests the provenance of every archive, the SBOM and `SHA256SUMS`, and attaches them to a GitHub Release whose notes are the changelog section for this version. |

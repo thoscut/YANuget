@@ -19,8 +19,10 @@
 //! the wrong size the whole pass runs again: a fresh snapshot, and a copy that
 //! only moves what changed, which takes seconds. The files this run copied
 //! are hashed too, since an overwrite can keep the size; the ones it skipped
-//! were already there before the snapshot. A file still wrong after that is
-//! wrong in the live store too, and is reported, not hidden.
+//! were already there before the snapshot. So are the referenced files the
+//! live store no longer has: the backup's copy is from some earlier run, and
+//! the version may have been overwritten since. A file still wrong after that
+//! is wrong in the live store too, and is reported, not hidden.
 //!
 //! Re-running into the same directory is incremental, like `rsync`: a stored
 //! file is never rewritten in place (the store renames new content over the
@@ -28,7 +30,17 @@
 //! Every file is copied to a temp name, synced and renamed, so the backup never
 //! holds a partial file, and files that left the live store are removed only
 //! after the new snapshot is in place: an interrupted run leaves the previous
-//! snapshot with a superset of its files, and no manifest.
+//! snapshot with a superset of its files, and no manifest. A file the new
+//! snapshot references is never removed: when the live store has lost it, the
+//! backup's copy from an earlier run is the last one there is. It is kept,
+//! and logged, rather than deleted after the check had counted it present.
+//!
+//! Nothing in the backup directory is written through a link: temp files
+//! are created anew under fresh names, a directory link is refused, and the
+//! snapshot is made and checked in a directory only this user can enter.
+//! That holds against links left there, not against someone swapping
+//! directories while a run is under way; the directory should be writable
+//! by the user `backup` runs as and nobody else.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -94,6 +106,9 @@ pub struct BackupSummary {
     pub copied_bytes: u64,
     /// Files removed from the backup because the live store no longer has them.
     pub removed: u64,
+    /// Files the snapshot references that the live store no longer has, kept
+    /// from an earlier run's copy: relative to the package store.
+    pub kept: Vec<String>,
     /// Snapshot-and-copy passes it took.
     pub attempts: usize,
 }
@@ -151,15 +166,17 @@ pub async fn backup(
 
     // From here until the end the directory is not a backup.
     remove_if_present(&dest.join(MANIFEST))?;
+    remove_stale_temps(dest)?;
 
     let progress = progress_bar(draw);
     let packages = dest.join(PACKAGES);
-    let snapshot = dest.join(format!("{DATABASE}{TEMP_SUFFIX}"));
+    let private = PrivateDir::create(dest)?;
+    let snapshot = private.path.join(DATABASE);
     let (mut copied, mut copied_bytes) = (0, 0);
     // Every file any pass copied: the ones whose content is new to the backup.
     let mut fresh = HashSet::new();
     let mut attempts = 0;
-    let (tree, missing, created) = loop {
+    let (tree, Checked { missing, present }, created) = loop {
         attempts += 1;
         progress.set_message(format!("pass {attempts}: snapshotting the database"));
         let created = chrono::Utc::now();
@@ -169,7 +186,14 @@ pub async fn backup(
         let tree = {
             let (src, dst, bar) = (config.storage_path(), packages.clone(), progress.clone());
             tokio::task::spawn_blocking(move || {
-                copy_tree(&src, &dst, &SCRATCH_DIRS, Existing::KeepUnchanged, &bar)
+                copy_tree(
+                    &src,
+                    &dst,
+                    &SCRATCH_DIRS,
+                    Existing::KeepUnchanged,
+                    Links::Refuse,
+                    &bar,
+                )
             })
             .await??
         };
@@ -178,12 +202,12 @@ pub async fn backup(
         fresh.extend(tree.fresh.iter().cloned());
 
         progress.set_message(format!("pass {attempts}: checking the copy"));
-        let missing = verify(&snapshot, &packages, &fresh).await?;
-        if missing.is_empty() || attempts == ATTEMPTS {
-            break (tree, missing, created);
+        let checked = check(&snapshot, &packages, &fresh, Some(&tree.seen)).await?;
+        if checked.missing.is_empty() || attempts == ATTEMPTS {
+            break (tree, checked, created);
         }
         tracing::info!(
-            missing = missing.len(),
+            missing = checked.missing.len(),
             "files changed while copying; taking a fresh snapshot"
         );
     };
@@ -191,11 +215,34 @@ pub async fn backup(
     let stats = finish_snapshot(&snapshot).await?;
     std::fs::rename(&snapshot, dest.join(DATABASE))?;
     sync_dir(dest);
+    drop(private);
 
+    // What the check found present stays, whether or not the live store
+    // still has it: the check ran before this, and a file it counted must
+    // not go afterwards.
+    let mut kept: Vec<String> = present
+        .difference(&tree.seen)
+        .map(|rel| rel.to_string_lossy().into_owned())
+        .collect();
+    kept.sort();
+    let kept_bytes: u64 = kept
+        .iter()
+        .filter_map(|rel| std::fs::metadata(packages.join(rel)).ok())
+        .map(|m| m.len())
+        .sum();
+    if !kept.is_empty() {
+        tracing::warn!(
+            files = kept.len(),
+            first = %kept[0],
+            "the live store lacks files its database references; the backup keeps \
+             its copies from an earlier run"
+        );
+    }
     progress.set_message("removing files the live store no longer has");
     let removed = {
-        let (dst, seen) = (packages.clone(), tree.seen);
-        tokio::task::spawn_blocking(move || prune(&dst, &seen)).await??
+        let (dst, mut keep) = (packages.clone(), tree.seen);
+        keep.extend(present);
+        tokio::task::spawn_blocking(move || prune(&dst, &keep)).await??
     };
 
     let live_tls = config.data_dir.join(TLS);
@@ -203,7 +250,14 @@ pub async fn backup(
     if tls {
         let (src, dst, bar) = (live_tls, dest.join(TLS), progress.clone());
         let t = tokio::task::spawn_blocking(move || {
-            copy_tree(&src, &dst, &[], Existing::KeepUnchanged, &bar)
+            copy_tree(
+                &src,
+                &dst,
+                &[],
+                Existing::KeepUnchanged,
+                Links::Refuse,
+                &bar,
+            )
         })
         .await??;
         let dst = dest.join(TLS);
@@ -218,8 +272,8 @@ pub async fn backup(
         yanuget_version: env!("CARGO_PKG_VERSION").to_string(),
         created,
         packages: stats,
-        files: tree.files,
-        bytes: tree.bytes,
+        files: tree.files + kept.len() as u64,
+        bytes: tree.bytes + kept_bytes,
         missing,
         tls,
     };
@@ -229,6 +283,7 @@ pub async fn backup(
         copied,
         copied_bytes,
         removed,
+        kept,
         attempts,
     })
 }
@@ -280,8 +335,10 @@ pub async fn restore(
     progress.set_message("copying the package store");
     let tree = {
         let (from, to, bar) = (src.join(PACKAGES), storage.clone(), progress.clone());
-        tokio::task::spawn_blocking(move || copy_tree(&from, &to, &[], Existing::Replace, &bar))
-            .await??
+        tokio::task::spawn_blocking(move || {
+            copy_tree(&from, &to, &[], Existing::Replace, Links::Follow, &bar)
+        })
+        .await??
     };
     let removed = {
         let (to, seen) = (storage.clone(), tree.seen);
@@ -289,8 +346,10 @@ pub async fn restore(
     };
     if manifest.tls {
         let (from, to, bar) = (src.join(TLS), config.data_dir.join(TLS), progress.clone());
-        tokio::task::spawn_blocking(move || copy_tree(&from, &to, &[], Existing::Replace, &bar))
-            .await??;
+        tokio::task::spawn_blocking(move || {
+            copy_tree(&from, &to, &[], Existing::Replace, Links::Follow, &bar)
+        })
+        .await??;
     }
     progress.finish_and_clear();
 
@@ -301,9 +360,7 @@ pub async fn restore(
     copy_file(&backup_db, &staged)?;
     // A write-ahead log left by the old database would be replayed into the
     // restored one on the next open, corrupting it.
-    for suffix in ["-wal", "-shm", "-journal"] {
-        remove_if_present(&with_suffix(&live_db, suffix))?;
-    }
+    remove_sidecars(&live_db)?;
     std::fs::rename(&staged, &live_db)?;
     if let Some(parent) = live_db.parent() {
         sync_dir(parent);
@@ -422,31 +479,109 @@ pub fn read_manifest(dir: &Path) -> anyhow::Result<Manifest> {
     Ok(manifest)
 }
 
+/// Write the manifest through a temp file of a fresh name, created anew:
+/// with a fixed name, a link planted there (to the live database, say) would
+/// be followed and its target overwritten with the manifest (`SEC-54`).
 fn write_manifest(dest: &Path, manifest: &Manifest) -> anyhow::Result<()> {
-    let staged = dest.join(format!("{MANIFEST}{TEMP_SUFFIX}"));
-    {
+    let staged = dest.join(format!(
+        "{MANIFEST}.{}{TEMP_SUFFIX}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let written = (|| -> anyhow::Result<()> {
         use std::io::Write;
-        let mut file = std::fs::File::create(&staged)?;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staged)?;
         file.write_all(serde_json::to_string_pretty(manifest)?.as_bytes())?;
         file.sync_all()?;
+        Ok(std::fs::rename(&staged, dest.join(MANIFEST))?)
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&staged);
     }
-    std::fs::rename(&staged, dest.join(MANIFEST))?;
+    written?;
     sync_dir(dest);
     Ok(())
 }
 
 /// Hold an exclusive lock on the backup directory, so two runs into the same
-/// directory (a cron job overlapping a slow one) cannot interleave.
+/// directory (a cron job overlapping a slow one) cannot interleave. A link
+/// in the lock file's place is not followed, which would create or lock a
+/// file elsewhere.
 fn lock(dest: &Path) -> anyhow::Result<std::fs::File> {
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(dest.join(".backup.lock"))?;
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).truncate(false).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32);
+    }
+    let path = dest.join(".backup.lock");
+    let file = options
+        .open(&path)
+        .with_context(|| format!("opening {}", path.display()))?;
     if fs4::FileExt::try_lock(&file).is_err() {
         bail!("another `yanuget backup` is writing to {}", dest.display());
     }
     Ok(file)
+}
+
+/// Remove what an interrupted run left at the top of the backup directory:
+/// temp files and private directories. Removing a link removes the link.
+fn remove_stale_temps(dest: &Path) -> anyhow::Result<()> {
+    for entry in std::fs::read_dir(dest)? {
+        let entry = entry?;
+        if !entry.file_name().to_string_lossy().ends_with(TEMP_SUFFIX) {
+            continue;
+        }
+        let path = entry.path();
+        if entry.file_type()?.is_dir() {
+            remove_dir_if_present(&path)?;
+        } else {
+            remove_if_present(&path)?;
+        }
+    }
+    Ok(())
+}
+
+/// A directory of a fresh name in the backup directory that only this user
+/// can enter, removed again when dropped. The snapshot is taken, checked and
+/// finished in it: beside a snapshot in the backup directory itself, which
+/// may be a share others write to, a `-journal` or `-wal` could be laid down
+/// again after it was removed, and SQLite would replay it into what it reads;
+/// and a link laid where the snapshot is about to be written would be
+/// followed (`SEC-54`).
+struct PrivateDir {
+    path: PathBuf,
+}
+
+impl PrivateDir {
+    fn create(dest: &Path) -> anyhow::Result<Self> {
+        let path = dest.join(format!(
+            ".snapshot.{}{TEMP_SUFFIX}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        #[cfg_attr(not(unix), allow(unused_mut))]
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        // `mkdir` neither follows a link in its place nor accepts an
+        // existing directory.
+        builder
+            .create(&path)
+            .with_context(|| format!("creating {}", path.display()))?;
+        Ok(Self { path })
+    }
+}
+
+impl Drop for PrivateDir {
+    fn drop(&mut self) {
+        let _ = remove_dir_if_present(&self.path);
+    }
 }
 
 // --- the database ---
@@ -457,6 +592,7 @@ fn lock(dest: &Path) -> anyhow::Result<std::fs::File> {
 /// however many writes the server makes meanwhile, and does not block them.
 async fn snapshot_database(live: &Path, to: &Path) -> anyhow::Result<()> {
     remove_if_present(to)?;
+    remove_sidecars(to)?;
     let mut conn = SqliteConnectOptions::new()
         .filename(live)
         .create_if_missing(false)
@@ -474,7 +610,13 @@ async fn snapshot_database(live: &Path, to: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Open the snapshot in the backup directory. That directory is often a
+/// share other systems write to, and SQLite replays a `-wal` or hot
+/// `-journal` it finds beside a database into what it reads, so whatever lies
+/// there is removed first, as `restore` does beside the live database. The
+/// snapshot is a single file whenever no connection to it is open.
 async fn open_snapshot(path: &Path) -> anyhow::Result<SqliteConnection> {
+    remove_sidecars(path)?;
     SqliteConnectOptions::new()
         .filename(path)
         .create_if_missing(false)
@@ -527,6 +669,18 @@ struct Expected {
     digest: Option<Digest>,
 }
 
+/// What [`check`] found.
+struct Checked {
+    /// See [`verify`].
+    missing: Vec<String>,
+    /// Every file the snapshot references that `store` holds at the
+    /// recorded size, relative to it. A copy kept from an earlier run that
+    /// fails its hash is among them as well as in `missing`: what it holds
+    /// is not what the snapshot names, but it may be the last copy of
+    /// anything there is.
+    present: HashSet<PathBuf>,
+}
+
 /// Every file the snapshot at `db` references that `store` lacks, or holds
 /// with a size other than the one recorded, as a path relative to `store`.
 /// The files in `hash` (relative to `store`) must also have the recorded
@@ -541,6 +695,21 @@ pub async fn verify(
     store: &Path,
     hash: &HashSet<PathBuf>,
 ) -> anyhow::Result<Vec<String>> {
+    Ok(check(db, store, hash, None).await?.missing)
+}
+
+/// [`verify`], and which referenced files it found in place. With `live`,
+/// the files the live store had in this pass (relative to `store`), every
+/// referenced file outside it is hashed too: the store's copy of it comes
+/// from an earlier run, and the version may have been overwritten since
+/// with one of the same size (`COR-54`). Normally there are none, so an
+/// incremental run stays one.
+async fn check(
+    db: &Path,
+    store: &Path,
+    hash: &HashSet<PathBuf>,
+    live: Option<&HashSet<PathBuf>>,
+) -> anyhow::Result<Checked> {
     let mut conn = open_snapshot(db).await?;
     let mut expected: Vec<Expected> = Vec::new();
     for row in sqlx::query(
@@ -593,25 +762,33 @@ pub async fn verify(
     }
     conn.close().await?;
 
-    let (store, hash) = (store.to_path_buf(), hash.clone());
+    let (store, hash, live) = (store.to_path_buf(), hash.clone(), live.cloned());
     Ok(tokio::task::spawn_blocking(move || {
-        expected
-            .into_iter()
-            .filter(|e| {
-                let path = store.join(&e.rel);
-                let sized = std::fs::metadata(&path)
-                    .is_ok_and(|m| m.is_file() && e.size.is_none_or(|s| s == m.len()));
-                // A file of the wrong size is not read at all.
-                !sized
-                    || match &e.digest {
-                        Some(digest) if hash.contains(Path::new(&e.rel)) => {
-                            !has_digest(&path, digest)
-                        }
-                        _ => false,
-                    }
-            })
-            .map(|e| e.rel)
-            .collect()
+        let mut out = Checked {
+            missing: Vec::new(),
+            present: HashSet::new(),
+        };
+        for e in expected {
+            let path = store.join(&e.rel);
+            // A link in the backup is no copy, whatever it points at.
+            let sized = std::fs::symlink_metadata(&path)
+                .is_ok_and(|m| m.is_file() && e.size.is_none_or(|s| s == m.len()));
+            let rel = Path::new(&e.rel);
+            let hashed = hash.contains(rel) || live.as_ref().is_some_and(|l| !l.contains(rel));
+            // A file of the wrong size is not read at all.
+            let good = sized
+                && match &e.digest {
+                    Some(digest) if hashed => has_digest(&path, digest),
+                    _ => true,
+                };
+            if sized {
+                out.present.insert(PathBuf::from(&e.rel));
+            }
+            if !good {
+                out.missing.push(e.rel);
+            }
+        }
+        out
     })
     .await?)
 }
@@ -660,17 +837,53 @@ enum Existing {
     Replace,
 }
 
+/// Whether [`copy_tree`] writes through a directory link it finds in `dst`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Links {
+    /// Refuse to: `dst` is in a backup directory, which may be a share
+    /// others write to, and a link planted under it would put files (whose
+    /// names and contents a push key chooses) wherever it points (`SEC-54`).
+    /// `dst` itself is checked as well.
+    Refuse,
+    /// Follow it: `dst` is the server's own store, and a link there is the
+    /// operator's.
+    Follow,
+}
+
+/// Create the directory `path` unless it exists, refusing a link in its
+/// place. Its parent must exist.
+fn real_dir(path: &Path) -> anyhow::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_dir() => Ok(()),
+        Ok(meta) if meta.file_type().is_symlink() => bail!(
+            "{} is a symbolic link; a backup does not write through links in its \
+             destination",
+            path.display()
+        ),
+        Ok(_) => bail!("{} is not a directory", path.display()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir(path).with_context(|| format!("creating {}", path.display()))
+        }
+        Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
 /// Make every regular file under `src` exist under `dst` with the same
 /// content, skipping the top-level directories in `skip` and any temp file.
-/// What happens to a file already in `dst` is up to `existing`. Removes
-/// nothing; see [`prune`].
+/// What happens to a file already in `dst` is up to `existing`, and to a
+/// directory link there up to `links`. Removes nothing; see [`prune`].
 fn copy_tree(
     src: &Path,
     dst: &Path,
     skip: &[&str],
     existing: Existing,
+    links: Links,
     progress: &ProgressBar,
 ) -> anyhow::Result<TreeCopy> {
+    let make_dir = |path: &Path| match links {
+        Links::Refuse => real_dir(path),
+        Links::Follow => Ok(std::fs::create_dir_all(path)?),
+    };
     let mut out = TreeCopy {
         seen: HashSet::new(),
         fresh: HashSet::new(),
@@ -682,7 +895,7 @@ fn copy_tree(
     if !src.is_dir() {
         return Ok(out);
     }
-    std::fs::create_dir_all(dst)?;
+    make_dir(dst)?;
     let mut stack = vec![PathBuf::new()];
     while let Some(rel) = stack.pop() {
         let entries = match std::fs::read_dir(src.join(&rel)) {
@@ -701,7 +914,7 @@ fn copy_tree(
                 if rel.as_os_str().is_empty() && skip.iter().any(|s| name == *s) {
                     continue;
                 }
-                std::fs::create_dir_all(dst.join(&child))?;
+                make_dir(&dst.join(&child))?;
                 stack.push(child);
                 continue;
             }
@@ -748,16 +961,32 @@ fn same_file(meta: &std::fs::Metadata, to: &Path) -> bool {
 }
 
 /// Copy `from` to `to` through a synced temp file and a rename, keeping the
-/// modification time so the next run recognizes it.
+/// modification time so the next run recognizes it, and the permissions.
+///
+/// The temp file has a fresh name and is created anew, so a link in its
+/// place is never followed (`SEC-54`); the rename replaces a link at `to`
+/// rather than writing through it.
 fn copy_file(from: &Path, to: &Path) -> anyhow::Result<()> {
     let staged = with_suffix(
         to,
         &format!(".{}{TEMP_SUFFIX}", uuid::Uuid::new_v4().simple()),
     );
     let result = (|| -> std::io::Result<()> {
-        std::fs::copy(from, &staged)?;
-        let file = std::fs::OpenOptions::new().write(true).open(&staged)?;
-        file.set_modified(std::fs::metadata(from)?.modified()?)?;
+        let mut source = std::fs::File::open(from)?;
+        let meta = source.metadata()?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        // Nobody else's until it has the source's permissions: it may be a
+        // TLS key.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&staged)?;
+        std::io::copy(&mut source, &mut file)?;
+        file.set_modified(meta.modified()?)?;
+        file.set_permissions(meta.permissions())?;
         file.sync_all()?;
         std::fs::rename(&staged, to)
     })();
@@ -842,6 +1071,14 @@ fn remove_if_present(path: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Remove the journal files SQLite may keep beside the database at `db`.
+fn remove_sidecars(db: &Path) -> std::io::Result<()> {
+    for suffix in ["-wal", "-shm", "-journal"] {
+        remove_if_present(&with_suffix(db, suffix))?;
+    }
+    Ok(())
+}
+
 fn remove_dir_if_present(path: &Path) -> std::io::Result<()> {
     match std::fs::remove_dir_all(path) {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
@@ -888,6 +1125,7 @@ mod tests {
             dst.path(),
             &SCRATCH_DIRS,
             Existing::KeepUnchanged,
+            Links::Refuse,
             &bar,
         )
         .unwrap();
@@ -905,6 +1143,7 @@ mod tests {
             dst.path(),
             &SCRATCH_DIRS,
             Existing::KeepUnchanged,
+            Links::Refuse,
             &bar,
         )
         .unwrap();
@@ -918,10 +1157,26 @@ mod tests {
         let file = src.path().join("a/1.0.0/a.1.0.0.nupkg");
         touch(&file, b"old");
         let bar = ProgressBar::hidden();
-        copy_tree(src.path(), dst.path(), &[], Existing::KeepUnchanged, &bar).unwrap();
+        copy_tree(
+            src.path(),
+            dst.path(),
+            &[],
+            Existing::KeepUnchanged,
+            Links::Refuse,
+            &bar,
+        )
+        .unwrap();
 
         touch(&file, b"newer content");
-        let again = copy_tree(src.path(), dst.path(), &[], Existing::KeepUnchanged, &bar).unwrap();
+        let again = copy_tree(
+            src.path(),
+            dst.path(),
+            &[],
+            Existing::KeepUnchanged,
+            Links::Refuse,
+            &bar,
+        )
+        .unwrap();
         assert_eq!(again.copied, 1);
         assert_eq!(
             std::fs::read(dst.path().join("a/1.0.0/a.1.0.0.nupkg")).unwrap(),
@@ -938,6 +1193,94 @@ mod tests {
         assert_eq!(prune(dir.path(), &keep).unwrap(), 1);
         assert!(dir.path().join("a/1.0.0/a.1.0.0.nupkg").exists());
         assert!(!dir.path().join("b").exists());
+    }
+
+    /// `DEP-17`: SQLite replays a `-wal` it finds beside a database into what
+    /// it reads, and the backup directory is not the server's to trust. A
+    /// log planted beside the snapshot while the store is copied must not
+    /// reach the check (or the backup it turns into).
+    #[tokio::test]
+    async fn a_log_planted_beside_the_snapshot_is_not_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = dir.path().join("snapshot.db");
+        let store = dir.path().join("packages");
+        std::fs::create_dir_all(&store).unwrap();
+        let mut conn = SqliteConnectOptions::new()
+            .filename(&snapshot)
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Delete)
+            .connect()
+            .await
+            .unwrap();
+        for table in [
+            "CREATE TABLE packages (lower_id TEXT, normalized_version TEXT, \
+             package_size INTEGER, package_hash TEXT, package_hash_algorithm TEXT)",
+            "CREATE TABLE package_files (sha256 TEXT, size INTEGER)",
+            "CREATE TABLE symbols (ssqp_key TEXT, filename TEXT)",
+        ] {
+            sqlx::query(table).execute(&mut conn).await.unwrap();
+        }
+        conn.close().await.unwrap();
+
+        // A log that adds a row, written against a byte-identical copy and
+        // taken before that copy checkpoints it.
+        let twin = dir.path().join("twin.db");
+        std::fs::copy(&snapshot, &twin).unwrap();
+        let mut writer = SqliteConnectOptions::new()
+            .filename(&twin)
+            .journal_mode(SqliteJournalMode::Wal)
+            .pragma("wal_autocheckpoint", "0")
+            .connect()
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO packages VALUES ('planted', '1.0.0', 1, 'x', 'SHA512')")
+            .execute(&mut writer)
+            .await
+            .unwrap();
+        std::fs::copy(with_suffix(&twin, "-wal"), with_suffix(&snapshot, "-wal")).unwrap();
+        writer.close().await.unwrap();
+        std::fs::write(with_suffix(&snapshot, "-shm"), b"stale").unwrap();
+
+        let missing = verify(&snapshot, &store, &HashSet::new()).await.unwrap();
+        assert!(missing.is_empty(), "the planted log was read: {missing:?}");
+        for suffix in ["-wal", "-shm", "-journal"] {
+            assert!(!with_suffix(&snapshot, suffix).exists(), "{suffix} is left");
+        }
+    }
+
+    /// `SEC-54`: the snapshot is taken in a directory nobody else can
+    /// enter, so nothing can be laid beside it, and that goes again.
+    #[cfg(unix)]
+    #[test]
+    fn the_snapshot_directory_is_private_and_goes_when_dropped() {
+        use std::os::unix::fs::PermissionsExt;
+        let dest = tempfile::tempdir().unwrap();
+        let private = PrivateDir::create(dest.path()).unwrap();
+        let mode = std::fs::metadata(&private.path)
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700);
+        assert!(is_temp(private.path.file_name().unwrap()));
+        let path = private.path.clone();
+        drop(private);
+        assert!(!path.exists());
+    }
+
+    /// A copy keeps the source's permissions, and a temp file never has
+    /// looser ones on the way: the TLS key is copied this way.
+    #[cfg(unix)]
+    #[test]
+    fn a_copy_keeps_the_permissions_of_its_source() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let (from, to) = (dir.path().join("key.pem"), dir.path().join("copy.pem"));
+        std::fs::write(&from, b"secret").unwrap();
+        std::fs::set_permissions(&from, std::fs::Permissions::from_mode(0o600)).unwrap();
+        copy_file(&from, &to).unwrap();
+        let mode = std::fs::metadata(&to).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        assert_eq!(std::fs::read(&to).unwrap(), b"secret");
     }
 
     #[test]

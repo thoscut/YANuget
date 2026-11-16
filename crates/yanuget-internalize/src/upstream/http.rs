@@ -161,9 +161,12 @@ impl HttpClient {
                 hosts: options.allowed_private_hosts.clone(),
             }));
         }
-        let client = builder
-            .build()
-            .map_err(|e| invalid(format!("cannot build the HTTP client: {e}")))?;
+        let client = builder.build().map_err(|e| {
+            invalid(format!(
+                "cannot build the HTTP client: {}",
+                crate::error_chain(&e)
+            ))
+        })?;
         Ok(HttpClient {
             client,
             label,
@@ -357,35 +360,13 @@ impl HttpClient {
                 UpstreamError::Http(format!(
                     "{label} {what} {}: {}",
                     redact(&current),
-                    chain(&e)
+                    crate::error_chain(&e)
                 ))
             })?;
             if !resp.status().is_redirection() {
                 return Ok(resp);
             }
-            let location = resp
-                .headers()
-                .get(LOCATION)
-                .and_then(|v| v.to_str().ok())
-                .ok_or_else(|| {
-                    UpstreamError::Invalid(format!(
-                        "{label} {what} {} answered {} without a usable Location",
-                        redact(&current),
-                        resp.status()
-                    ))
-                })?;
-            let next = current.join(location).map_err(|e| {
-                UpstreamError::Invalid(format!(
-                    "{label} {what} {} redirected to an invalid URL: {e}",
-                    redact(&current)
-                ))
-            })?;
-            if current.scheme() == "https" && next.scheme() == "http" {
-                return Err(UpstreamError::Refused(format!(
-                    "{label} {what} {} redirected from https to http; refusing the downgrade",
-                    redact(&current)
-                )));
-            }
+            let next = redirect_target(label, what, &current, resp.status(), resp.headers())?;
             self.vet(&next, what).await?;
             current = next;
         }
@@ -406,6 +387,49 @@ impl HttpClient {
             tracing::info!("the {} answers again", self.label);
         }
     }
+}
+
+/// Where a redirect from `current` (answered `status` with `headers`) leads:
+/// its `Location` against `current`, refused when the hop gives up TLS.
+///
+/// Its own function, so the refusal is tested on the path every redirect of
+/// [`HttpClient::send`] takes, which a test cannot reach with an https
+/// upstream short of a TLS server the client trusts.
+fn redirect_target(
+    label: &str,
+    what: &str,
+    current: &Url,
+    status: StatusCode,
+    headers: &HeaderMap,
+) -> Result<Url, UpstreamError> {
+    let location = headers
+        .get(LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| {
+            UpstreamError::Invalid(format!(
+                "{label} {what} {} answered {status} without a usable Location",
+                redact(current)
+            ))
+        })?;
+    let next = current.join(location).map_err(|e| {
+        UpstreamError::Invalid(format!(
+            "{label} {what} {} redirected to an invalid URL: {e}",
+            redact(current)
+        ))
+    })?;
+    if is_downgrade(current, &next) {
+        return Err(UpstreamError::Refused(format!(
+            "{label} {what} {} redirected from https to http; refusing the downgrade",
+            redact(current)
+        )));
+    }
+    Ok(next)
+}
+
+/// Whether a redirect from `current` to `next` gives up TLS: the credentials
+/// on the next hop, and what it answers, would travel in the clear.
+fn is_downgrade(current: &Url, next: &Url) -> bool {
+    current.scheme() == "https" && next.scheme() == "http"
 }
 
 /// Whether `host` is on an allow-list of host names, compared without case.
@@ -483,17 +507,116 @@ fn credentials(config: &UpstreamConfig) -> Result<HeaderMap, String> {
     Ok(headers)
 }
 
-/// An error with its causes, which is where reqwest says what went wrong.
-fn chain(e: &dyn std::error::Error) -> String {
-    let mut s = e.to_string();
-    let mut source = e.source();
-    while let Some(cause) = source {
-        let c = cause.to_string();
-        if !s.contains(&c) {
-            s.push_str(": ");
-            s.push_str(&c);
-        }
-        source = cause.source();
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+
+    fn url(s: &str) -> Url {
+        Url::parse(s).unwrap()
     }
-    s
+
+    /// `TEST-27`: a redirect may change the host or stay on plain http, but
+    /// never step down from https to http.
+    #[test]
+    fn a_redirect_from_https_to_http_is_a_downgrade() {
+        let https = url("https://feed.example/v3/index.json");
+        let http = url("http://feed.example/v3/index.json");
+        assert!(is_downgrade(&https, &http));
+        assert!(is_downgrade(&https, &url("http://cdn.example/a.nupkg")));
+        assert!(!is_downgrade(&https, &url("https://cdn.example/a.nupkg")));
+        assert!(!is_downgrade(&http, &https));
+        assert!(!is_downgrade(&http, &url("http://cdn.example/a.nupkg")));
+    }
+
+    /// `TEST-27`: what `send` makes of each redirect it gets. A hop to http
+    /// from an https upstream is refused before anything is sent there, and
+    /// says why; every other hop is the `Location` against the current URL.
+    #[test]
+    fn a_redirect_is_followed_unless_it_gives_up_tls() {
+        let to = |current: &str, location: Option<&str>| {
+            let mut headers = HeaderMap::new();
+            if let Some(location) = location {
+                headers.insert(LOCATION, HeaderValue::from_str(location).unwrap());
+            }
+            redirect_target(
+                "upstream",
+                "package",
+                &url(current),
+                StatusCode::FOUND,
+                &headers,
+            )
+        };
+        let https = "https://feed.example/v3/a.nupkg";
+
+        match to(https, Some("http://cdn.example/a.nupkg")) {
+            Err(UpstreamError::Refused(m)) => {
+                assert!(m.contains("from https to http"), "{m}");
+                assert!(m.contains("https://feed.example/v3/a.nupkg"), "{m}");
+            }
+            other => panic!("a downgrade was not refused: {other:?}"),
+        }
+        assert!(matches!(
+            to(https, Some("http://feed.example/v3/a.nupkg")),
+            Err(UpstreamError::Refused(_))
+        ));
+
+        for (location, next) in [
+            ("https://cdn.example/a.nupkg", "https://cdn.example/a.nupkg"),
+            ("/blob/a.nupkg", "https://feed.example/blob/a.nupkg"),
+            ("//cdn.example/a.nupkg", "https://cdn.example/a.nupkg"),
+        ] {
+            assert_eq!(to(https, Some(location)).unwrap().as_str(), next);
+        }
+        assert_eq!(
+            to("http://feed.example/a", Some("http://cdn.example/a"))
+                .unwrap()
+                .as_str(),
+            "http://cdn.example/a"
+        );
+        assert!(matches!(to(https, None), Err(UpstreamError::Invalid(_))));
+    }
+
+    fn allow_listed(hosts: &[&str]) -> AllowListed {
+        AllowListed {
+            guarded: GuardedResolver {
+                proxy_host: None,
+                fixed: Vec::new(),
+                hint: None,
+            },
+            hosts: hosts.iter().map(|h| h.to_string()).collect(),
+        }
+    }
+
+    async fn resolve(
+        resolver: &AllowListed,
+        name: &str,
+    ) -> Result<Vec<std::net::SocketAddr>, String> {
+        use reqwest::dns::Resolve;
+        let name = reqwest::dns::Name::from_str(name).unwrap();
+        resolver
+            .resolve(name)
+            .await
+            .map(Iterator::collect)
+            .map_err(|e| e.to_string())
+    }
+
+    /// `TEST-27`: without `allow_private_hosts`, every name goes through the
+    /// guarded resolver, which refuses one that resolves to a private address
+    /// (here `localhost`). A name on the list is resolved as it is, and only
+    /// that name: the list is no way around the filter for the others.
+    #[tokio::test]
+    async fn only_the_allowed_private_hosts_resolve_to_private_addresses() {
+        let refused = resolve(&allow_listed(&[]), "localhost").await;
+        assert!(refused.is_err(), "{refused:?}");
+        let refused = resolve(&allow_listed(&["build.internal"]), "localhost").await;
+        assert!(refused.is_err(), "{refused:?}");
+
+        // Compared without case, as host names are.
+        let allowed = resolve(&allow_listed(&["LocalHost"]), "localhost")
+            .await
+            .unwrap();
+        assert!(!allowed.is_empty());
+        assert!(allowed.iter().all(|a| a.ip().is_loopback()), "{allowed:?}");
+    }
 }

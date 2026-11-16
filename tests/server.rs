@@ -115,7 +115,7 @@ async fn graceful_shutdown_stops_the_server() {
     });
 
     let base = format!("http://{addr}");
-    let client = reqwest::Client::new();
+    let client = common::client();
     assert!(client
         .get(format!("{base}/health"))
         .send()
@@ -129,11 +129,81 @@ async fn graceful_shutdown_stops_the_server() {
     server.await.unwrap();
 
     // The listener is closed: new connections are refused.
-    let after = reqwest::Client::new()
-        .get(format!("{base}/health"))
-        .send()
-        .await;
+    let after = common::client().get(format!("{base}/health")).send().await;
     assert!(after.is_err());
+}
+
+/// `TEST-28`: the real server ends on SIGTERM, the way a service manager or a
+/// container runtime stops it: soon, with exit 0, and with the data lock let
+/// go. The test above exercises axum's shutdown; `main` wires its own signal
+/// handling, deadline and background work, which only the binary runs.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_server_stops_on_sigterm() {
+    let data = tempfile::tempdir().unwrap();
+    let server = common::binary::start_server(data.path(), &[]).await;
+    let ready = common::client()
+        .get(server.url("/health/ready"))
+        .send()
+        .await
+        .unwrap();
+    assert!(ready.status().is_success());
+
+    // Idle, it has nothing to wait for.
+    let status = server.terminate(std::time::Duration::from_secs(5)).await;
+    assert!(status.success(), "{status}");
+    let db = data
+        .path()
+        .join("yanuget.db")
+        .to_string_lossy()
+        .into_owned();
+    let lock = yanuget::data_lock::DataLock::try_acquire(&db).unwrap();
+    assert!(lock.is_some(), "the data lock is still held after the exit");
+}
+
+/// A push still arriving when SIGTERM comes holds the stop up for the grace
+/// period, and no longer: the server then closes the connection and exits 0
+/// rather than waiting on a client that may never finish.
+#[cfg(unix)]
+#[tokio::test]
+async fn sigterm_waits_for_an_unfinished_request_only_for_the_grace_period() {
+    use tokio::io::AsyncWriteExt;
+
+    let data = tempfile::tempdir().unwrap();
+    let command =
+        common::binary::server_command_with(data.path(), &format!("api_key = '{API_KEY}'\n"));
+    let server = common::binary::start(command).await;
+    let mut upload = tokio::net::TcpStream::connect((Ipv4Addr::LOCALHOST, server.port))
+        .await
+        .unwrap();
+    // The head and the first bytes of a body that never comes in full.
+    let head = format!(
+        "PUT /api/v2/package HTTP/1.1\r\nHost: 127.0.0.1\r\nX-NuGet-ApiKey: {API_KEY}\r\n\
+         Content-Type: multipart/form-data; boundary=b\r\nContent-Length: 1000000\r\n\r\n\
+         --b\r\nContent-Disposition: form-data; name=\"package\"; filename=\"a.nupkg\"\r\n\r\nPK"
+    );
+    upload.write_all(head.as_bytes()).await.unwrap();
+    upload.flush().await.unwrap();
+    // Once a second request is answered, the first is being read.
+    let ready = common::client()
+        .get(server.url("/health/ready"))
+        .send()
+        .await
+        .unwrap();
+    assert!(ready.status().is_success());
+
+    let started = std::time::Instant::now();
+    let grace = yanuget::server::SHUTDOWN_GRACE;
+    let status = server
+        .terminate(grace + std::time::Duration::from_secs(20))
+        .await;
+    assert!(status.success(), "{status}");
+    let took = started.elapsed();
+    assert!(
+        took >= grace - std::time::Duration::from_secs(1),
+        "it stopped after {took:?}, without waiting for the request"
+    );
+    drop(upload);
 }
 
 // ---------------------------------------------------------------------------

@@ -7,6 +7,7 @@
 //! the (potentially 25 GiB+) package body. The blocking ZIP work runs on a
 //! dedicated thread via [`tokio::task::spawn_blocking`].
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
@@ -71,7 +72,20 @@ fn read_archive_blocking(path: &Path) -> Result<ArchiveContents, Error> {
         };
         let normalized = normalize_entry(&name);
         // The nuspec is a root-level `*.nuspec` (no directory separators).
-        if normalized.ends_with(".nuspec") && !normalized.contains('/') {
+        // NuGet asks that of the percent-decoded name ([`extracted_name`]), so
+        // `x%2Fa.nuspec` is in a folder to it and `b%2Enuspec` is a manifest.
+        // An entry that is the manifest in one reading but not in the other
+        // would have this server check one identity and the client restore
+        // another, so it is refused rather than resolved either way.
+        let is_root_nuspec = |n: &str| n.ends_with(".nuspec") && !n.contains('/');
+        let root = is_root_nuspec(&normalized);
+        if root != is_root_nuspec(&normalize_entry(&extracted_name(&name))) {
+            return Err(Error::InvalidPackage(format!(
+                "archive entry {name} is a root .nuspec only once percent-decoded, or only \
+                 before; NuGet would read another manifest than this server, so it is refused"
+            )));
+        }
+        if root {
             // NuGet refuses a package with more than one; picking one of them
             // would be guessing which identity the client sees.
             if nuspec_index.replace(i).is_some() {
@@ -352,8 +366,71 @@ fn extract_file_blocking(
     Ok(Some(buf))
 }
 
+/// An entry's name as lookups compare it: `/` for `\`, ASCII lower case. The
+/// spelling stays the archive's; [`extracted_name`] is what a client makes of
+/// it.
 pub fn normalize_entry(name: &str) -> String {
     name.replace('\\', "/").to_ascii_lowercase()
+}
+
+/// The name NuGet extracts the entry `name` under.
+///
+/// An entry name is an OPC part name: `nuget pack` percent-encodes what a
+/// part name may not hold (`tools/My%20Tool.exe`), and NuGet's package reader
+/// undoes that with `Uri.UnescapeDataString` before it writes the file. Every
+/// `%XX` becomes its byte, bytes that are no UTF-8 stay as the archive spells
+/// them, nothing else is decoded (`+` stays `+`), and it happens once
+/// (`%2541` is `%41`).
+///
+/// A part name never escapes a letter, a digit, `.`, `-`, `_`, `~`, `/` or
+/// `\` (ECMA-376 part 2, M1.7 and M1.8), but a ZIP holds whatever name its
+/// writer chose, and NuGet decodes those as well:
+/// `tools/chocolateyInstall%2Eps1` lands on disk as
+/// `tools/chocolateyInstall.ps1`. Whatever decides by an entry's name what a
+/// client will do with it has to ask for this name, not the archive's.
+pub fn extracted_name(name: &str) -> Cow<'_, str> {
+    if !name.contains('%') {
+        return Cow::Borrowed(name);
+    }
+    let bytes = name.as_bytes();
+    let escaped = |at: usize| {
+        let hex = |b: &u8| (*b as char).to_digit(16);
+        match (bytes.get(at), bytes.get(at + 1), bytes.get(at + 2)) {
+            (Some(b'%'), Some(high), Some(low)) => Some((hex(high)? << 4 | hex(low)?) as u8),
+            _ => None,
+        }
+    };
+    let mut out = String::with_capacity(name.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        // A run of escapes is decoded as one piece: a character may take
+        // several of them.
+        let mut run = Vec::new();
+        while let Some(byte) = escaped(at + 3 * run.len()) {
+            run.push(byte);
+        }
+        if run.is_empty() {
+            // Plain text up to the next `%`, or a `%` that begins no escape.
+            let next = match name[at..].find('%') {
+                Some(0) => at + 1,
+                Some(n) => at + n,
+                None => name.len(),
+            };
+            out.push_str(&name[at..next]);
+            at = next;
+            continue;
+        }
+        let mut done = 0;
+        for chunk in run.utf8_chunks() {
+            out.push_str(chunk.valid());
+            done += chunk.valid().len();
+            let kept = chunk.invalid().len();
+            out.push_str(&name[at + 3 * done..at + 3 * (done + kept)]);
+            done += kept;
+        }
+        at += 3 * run.len();
+    }
+    Cow::Owned(out)
 }
 
 /// How far back from the end of the file to look for the end-of-central-directory
@@ -583,29 +660,31 @@ fn reject_duplicate_entries(records: u64, unique: usize) -> Result<(), Error> {
     Ok(())
 }
 
-/// Reject an archive with two file entries whose names differ only in case or
-/// in `\\` against `/`.
+/// Reject an archive with two file entries whose names differ only in case,
+/// in `\\` against `/`, or in percent-encoding.
 ///
 /// Everything here looks entries up by [`normalize_entry`], and NuGet extracts
 /// onto case-insensitive file systems, so such names mean one file. Kept, they
 /// let `x/a.pdb`, `X/A.pdb` and `x\\a.pdb` count once against a cap yet be
 /// extracted many times, and let a readme or icon lookup take a
-/// different one of them than a client would. Directory entries (a name
-/// ending in `/`) carry no data and are not compared.
+/// different one of them than a client would. NuGet percent-decodes a name
+/// before it writes the file ([`extracted_name`]), so `x/a%2Epdb` is that
+/// file once more, and `x%2Fa.pdb` as well. Directory entries (a name ending
+/// in `/`) carry no data and are not compared.
 fn reject_colliding_entries(archive: &zip::ZipArchive<File>) -> Result<(), Error> {
     let mut seen = HashSet::with_capacity(archive.len());
     for i in 0..archive.len() {
         let Some(name) = entry_name(archive, i)? else {
             continue;
         };
-        let normalized = normalize_entry(&name);
-        if normalized.ends_with('/') {
+        if name.ends_with(['/', '\\']) {
             continue;
         }
-        if !seen.insert(normalized) {
+        if !seen.insert(normalize_entry(&extracted_name(&name))) {
             return Err(Error::InvalidPackage(format!(
-                "archive names {name} more than once (differing only in case or path \
-                 separators); they would extract to the same file, so it is refused"
+                "archive names {name} more than once (differing only in case, path \
+                 separators or percent-encoding); they would extract to the same file, so \
+                 it is refused"
             )));
         }
     }
@@ -935,6 +1014,33 @@ mod tests {
         assert_eq!(files_in(out.path()), 0, "partial output left behind");
     }
 
+    /// `SEC-50`: NuGet finds the manifest by the percent-decoded name, so an
+    /// entry that is the root `.nuspec` in only one reading would have the
+    /// server and the client read different manifests.
+    #[tokio::test]
+    async fn a_manifest_that_percent_decoding_moves_in_or_out_of_the_root_is_refused() {
+        let (good, evil) = (manifest("Good.Id"), manifest("Evil.Id"));
+        for entries in [
+            // Server: `x%2fgood.nuspec`; client: `evil.nuspec`.
+            [("x%2Fgood.nuspec", &good), ("evil%2Enuspec", &evil)],
+            // Two manifests for the client, one for the server.
+            [("good.nuspec", &good), ("evil%2Enuspec", &evil)],
+            // The manifest to the server; to the client, a file in folder `x`.
+            [("x%5Cgood.nuspec", &good), ("lib/x.dll", &evil)],
+        ] {
+            let entries: Vec<(&str, &[u8])> =
+                entries.iter().map(|(n, b)| (*n, b.as_slice())).collect();
+            refused(
+                read_bytes(&zip_with_entries(&entries)).await,
+                "only once percent-decoded",
+            );
+        }
+        // Encoded characters that leave it at the root are a manifest either way.
+        let bytes = zip_with_entries(&[("My%20Pkg.nuspec", &good), ("lib/x.dll", b"MZ")]);
+        let contents = read_bytes(&bytes).await.unwrap();
+        assert!(contents.nuspec_xml.contains("Good.Id"));
+    }
+
     #[tokio::test]
     async fn two_root_manifests_are_refused() {
         let (a, b) = (manifest("First.Id"), manifest("Second.Id"));
@@ -1009,6 +1115,74 @@ mod tests {
                     .unwrap_err();
             assert!(err.to_string().contains("differing only in case"), "{err}");
         }
+    }
+
+    /// `SEC-42`: the name a client extracts an entry under, as
+    /// `Uri.UnescapeDataString` decodes it.
+    #[test]
+    fn an_entry_is_extracted_under_its_percent_decoded_name() {
+        for (name, extracted) in [
+            ("tools/setup.exe", "tools/setup.exe"),
+            ("tools/My%20Tool.exe", "tools/My Tool.exe"),
+            (
+                "tools/chocolateyInstall%2Eps1",
+                "tools/chocolateyInstall.ps1",
+            ),
+            (
+                "tools/%63hocolateyinstall.ps1",
+                "tools/chocolateyinstall.ps1",
+            ),
+            ("internalizer%2fprelude.ps1", "internalizer/prelude.ps1"),
+            ("internalizer%5Cprelude.ps1", "internalizer\\prelude.ps1"),
+            // Once, and nothing but `%XX`.
+            ("a%252Eb+c", "a%2Eb+c"),
+            ("100%", "100%"),
+            ("a%2", "a%2"),
+            ("a%zzb%2Ec", "a%zzb.c"),
+            ("%%41", "%A"),
+            // A character of several bytes; what is no UTF-8 stays as written.
+            ("caf%C3%A9.txt", "café.txt"),
+            ("caf%c3%a9%2Etxt", "café.txt"),
+            ("a%C3.txt", "a%C3.txt"),
+            ("a%ff%2Eb%C3", "a%ff.b%C3"),
+            ("a%C0%AEb", "a%C0%AEb"),
+            ("café%2Etxt", "café.txt"),
+        ] {
+            assert_eq!(extracted_name(name), extracted, "{name}");
+        }
+    }
+
+    /// `SEC-42`: NuGet decodes a name before it writes the file, so an
+    /// encoded spelling of an entry is that entry once more.
+    #[tokio::test]
+    async fn rejects_entry_names_that_collide_once_percent_decoded() {
+        let only = manifest("Only.Id");
+        for (one, other) in [
+            (
+                "tools/chocolateyInstall.ps1",
+                "tools/chocolateyInstall%2Eps1",
+            ),
+            (
+                "tools/chocolateyInstall.ps1",
+                "TOOLS%2FchocolateyInstall.ps1",
+            ),
+            ("internalizer/prelude.ps1", "internalizer%5cprelude.ps1"),
+            ("tools/My Tool.exe", "tools/My%20Tool.exe"),
+            ("tools/a%2Eb", "tools/a%2eB"),
+        ] {
+            let bytes = zip_with_entries(&[("P.nuspec", &only), (one, b"1"), (other, b"2")]);
+            refused(read_bytes(&bytes).await, "percent-encoding");
+        }
+        // An encoded name alone is a package like any other, and so are two
+        // that decode to different files.
+        let bytes = zip_with_entries(&[
+            ("P.nuspec", &only),
+            ("tools/My%20Tool.exe", b"1"),
+            ("tools/My%2520Tool.exe", b"2"),
+            ("tools/My+Tool.exe", b"3"),
+        ]);
+        let contents = read_bytes(&bytes).await.unwrap();
+        assert!(contents.contains("tools/My%20Tool.exe"));
     }
 
     /// Directory entries hold no data, so two spellings of one folder are not a

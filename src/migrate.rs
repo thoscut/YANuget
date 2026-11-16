@@ -17,6 +17,7 @@
 //! ETA plus a byte counter with transfer rate — via [`indicatif`].
 
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures::stream::{self, StreamExt};
@@ -29,6 +30,7 @@ use crate::database::PackageDatabase;
 use crate::error::{Error, Result};
 use crate::indexing::{self, IndexOptions};
 use crate::mirror::MirrorClient;
+use crate::space::SpaceGuard;
 use crate::storage::PackageStorage;
 use crate::version::NuGetVersion;
 
@@ -47,9 +49,6 @@ pub struct MigrateOptions {
     pub dry_run: bool,
     /// Suppress the human-facing header/summary prints (used by tests).
     pub quiet: bool,
-    /// Free space each download must leave on the storage volume (the
-    /// server's `min_free_disk_bytes`); 0 checks nothing.
-    pub min_free_disk_bytes: u64,
 }
 
 impl Default for MigrateOptions {
@@ -60,7 +59,6 @@ impl Default for MigrateOptions {
             overwrite: OverwriteMode::Disabled,
             dry_run: false,
             quiet: false,
-            min_free_disk_bytes: 0,
         }
     }
 }
@@ -155,6 +153,9 @@ struct Outcome {
 /// indexing pipeline can move each download into place with an atomic rename;
 /// callers pass a subdirectory of the storage root. `draw` controls where the
 /// progress bars render — pass [`ProgressDrawTarget::hidden`] in tests.
+///
+/// The downloads keep no free space in reserve: a reserve belongs to the
+/// run's [`SpaceGuard`], which [`run_with_space`] takes.
 pub async fn run(
     storage: &dyn PackageStorage,
     db: &dyn PackageDatabase,
@@ -164,6 +165,27 @@ pub async fn run(
     opts: MigrateOptions,
     draw: ProgressDrawTarget,
 ) -> Result<MigrateSummary> {
+    let space = Arc::new(SpaceGuard::new(temp_dir, 0));
+    run_with_space(storage, db, feed, source, opts, draw, space).await
+}
+
+/// [`run`], downloading into `space`'s directory and admitted by it.
+///
+/// One guard for the whole run: the downloads run `concurrency` at a time,
+/// and each has to see what the others were promised. With a guard of its
+/// own each would check the same free space, pass, and together they would
+/// write several times what was checked.
+pub async fn run_with_space(
+    storage: &dyn PackageStorage,
+    db: &dyn PackageDatabase,
+    feed: &ResolvedFeed,
+    source: MirrorConfig,
+    opts: MigrateOptions,
+    draw: ProgressDrawTarget,
+    space: Arc<SpaceGuard>,
+) -> Result<MigrateSummary> {
+    let temp_dir = space.dir().to_path_buf();
+    let temp_dir = temp_dir.as_path();
     let started = Instant::now();
     let concurrency = opts.concurrency.max(1);
     let skip_existing = matches!(opts.overwrite, OverwriteMode::Disabled);
@@ -173,7 +195,7 @@ pub async fn run(
     // whole transfer failed everything the source could not send within
     // `timeout_secs`: at ~2 MiB/s and the default 60 s, anything past ~120 MB.
     let mut client = MirrorClient::for_migration(&source)?;
-    client.set_min_free_disk_bytes(opts.min_free_disk_bytes);
+    client.set_space(space);
 
     if !opts.quiet {
         println!(
@@ -310,6 +332,7 @@ pub async fn run(
         // A migration overwrites with `Enabled` or not at all, never
         // `pending-only`, which is the only mode that reads these.
         other_license_policies: Vec::new(),
+        // Set per item in `migrate_one` as well: as the source lists it.
         unlisted: false,
     };
 
@@ -507,11 +530,19 @@ impl Target<'_> {
         // asked the source for, so a rogue source cannot slip a different
         // package into the target feed under a name that is already trusted
         // there.
+        //
+        // A version the source has unlisted is indexed unlisted, in the write
+        // that adds it, as the mirror does: listed first and unlisted in a
+        // second write, it was visible in between, stayed listed for good
+        // when that write failed (the next run skips what the feed has), and
+        // counted as unlisted by hand, so a mirror on the same feed never
+        // followed the source's listing for it again.
         let index_opts = IndexOptions {
             expect: Some(indexing::ExpectedIdentity {
                 id: item.lower_id.clone(),
                 version: item.version.clone(),
             }),
+            unlisted: item.unlisted,
             ..self.index_opts.clone()
         };
 
@@ -528,24 +559,18 @@ impl Target<'_> {
         .await
         {
             Ok(_) => {
-                let mut unlisted = false;
                 if item.unlisted {
-                    match self
-                        .db
-                        .set_listed(self.feed, &item.lower_id, &item.version, false)
-                        .await
-                    {
-                        Ok(_) => unlisted = true,
-                        Err(e) => {
-                            return failed(
-                                format!("imported, but could not unlist it as the source has: {e}"),
-                                bytes,
-                            )
-                        }
+                    if let Err(e) = self.unlist_overwritten(item).await {
+                        return failed(
+                            format!("imported, but could not unlist it as the source has: {e}"),
+                            bytes,
+                        );
                     }
                 }
                 Outcome {
-                    kind: OutcomeKind::Imported { unlisted },
+                    kind: OutcomeKind::Imported {
+                        unlisted: item.unlisted,
+                    },
                     bytes,
                 }
             }
@@ -573,6 +598,27 @@ impl Target<'_> {
             ),
             Err(e) => failed(e.to_string(), bytes),
         }
+    }
+}
+
+impl Target<'_> {
+    /// Unlist a version that an overwrite left listed. A version new to the
+    /// feed was indexed as the source lists it; an overwrite keeps the
+    /// listing the version had here (see `indexing`), so only there is a
+    /// second write needed. It is the operator's `--overwrite` deciding, and
+    /// recorded as set by hand like any other unlist.
+    async fn unlist_overwritten(&self, item: &WorkItem) -> Result<()> {
+        let listed = self
+            .db
+            .get_membership(self.feed, &item.lower_id, &item.version)
+            .await?
+            .is_some_and(|m| m.listed);
+        if listed {
+            self.db
+                .set_listed(self.feed, &item.lower_id, &item.version, false)
+                .await?;
+        }
+        Ok(())
     }
 }
 

@@ -181,8 +181,10 @@ impl MirrorClient {
                 0 => None,
                 secs => Some(Duration::from_secs(secs)),
             },
-            min_free_disk_bytes: 0,
-            space: None,
+            // No reserve, so nothing is measured or refused: a client used
+            // on its own (a test, a one-off listing) has no volume to guard.
+            // Whoever downloads in earnest sets the guard of its directory.
+            space: std::sync::Arc::new(crate::space::SpaceGuard::new("", 0)),
             refresh: Duration::from_secs(config.refresh_secs),
             resources: OnceCell::new(),
             tracker: Tracker::default(),
@@ -203,22 +205,19 @@ impl MirrorClient {
         self.download_deadline = deadline;
     }
 
-    /// Refuse a download that would leave less than `reserve` bytes free on
-    /// the volume it is written to — the server's `min_free_disk_bytes`.
+    /// Admit downloads through `space`, the guard of the directory they are
+    /// written to: a download that would leave less than its reserve free is
+    /// refused, and one admitted reserves the length the upstream declared,
+    /// as an upload does, counting what is promised to everything else the
+    /// guard admits. In the server that is the guard its uploads go through.
     ///
-    /// A push is held to that reserve; a mirror fetch, which an anonymous read
-    /// starts, was not, and could fill the volume the database lives on.
-    pub fn set_min_free_disk_bytes(&mut self, reserve: u64) {
-        self.min_free_disk_bytes = reserve;
-    }
-
-    /// Admit downloads through `space` — the guard the server's uploads go
-    /// through — instead of checking the reserve alone: a download then
-    /// reserves the length the upstream declared, as an upload does, and
-    /// counts what is promised to the uploads in progress. Downloads must be
-    /// written to `space`'s volume.
+    /// A push is held to the reserve; a mirror fetch, which an anonymous read
+    /// starts, must be too, or it could fill the volume the database lives
+    /// on. There is one way to say so, and it is this one: a reserve given to
+    /// the client alone used to build a guard per download, none of which saw
+    /// what the others had promised.
     pub fn set_space(&mut self, space: std::sync::Arc<crate::space::SpaceGuard>) {
-        self.space = Some(space);
+        self.space = space;
     }
 
     /// Reject an upstream-supplied resource URL that we should not fetch.
@@ -618,20 +617,7 @@ fn request_error(url: &reqwest::Url, e: reqwest::Error) -> Error {
     ))
 }
 
-/// An error's message followed by each distinct cause's.
-pub(super) fn error_chain(e: &dyn std::error::Error) -> String {
-    let mut out = e.to_string();
-    let mut source = e.source();
-    while let Some(cause) = source {
-        let msg = cause.to_string();
-        if !out.contains(&msg) {
-            out.push_str(": ");
-            out.push_str(&msg);
-        }
-        source = cause.source();
-    }
-    out
-}
+pub(super) use yanuget_pkg::error::error_chain;
 
 /// A URL as it may appear in a log line or on screen: without userinfo, and
 /// with any query replaced, since both are where feeds put credentials

@@ -27,6 +27,10 @@ pub(super) const BAD_VERSION_RETRY: Duration = Duration::from_secs(15 * 60);
 /// upstream request.
 const MAX_TRACKED: usize = 10_000;
 
+/// The shortest time between two sweeps of stale listings, however short
+/// `refresh_secs` is: a sweep walks every tracked package.
+const LISTING_SWEEP_MIN: Duration = Duration::from_secs(60);
+
 /// Consecutive upstream failures, and when asking again is allowed.
 #[derive(Debug, Default)]
 pub(super) struct Backoff {
@@ -68,7 +72,9 @@ pub(super) struct IdState {
     /// The upstream's listing of the package as last read, and when. A
     /// refresh reads it anew; the version fetches of read-through requests in
     /// between share it, so a restore missing several versions reads the
-    /// registration once rather than once per version.
+    /// registration once rather than once per version. Kept for
+    /// `refresh_secs` and then dropped (see [`Tracker::with`]): it holds
+    /// every upstream version of the package, and nobody reads an old one.
     pub(super) listing: Option<(Instant, Listing)>,
 }
 
@@ -77,6 +83,17 @@ pub(super) struct IdState {
 pub(super) type Listing = Arc<HashMap<String, bool>>;
 
 impl IdState {
+    /// Let go of a listing read `refresh` or longer ago.
+    fn drop_stale_listing(&mut self, now: Instant, refresh: Duration) {
+        if self
+            .listing
+            .as_ref()
+            .is_some_and(|(at, _)| now.duration_since(*at) >= refresh)
+        {
+            self.listing = None;
+        }
+    }
+
     /// Whether nothing about this package needs remembering any more.
     fn is_idle(&self, now: Instant, refresh: Duration) -> bool {
         self.inflight.is_none()
@@ -98,6 +115,8 @@ pub(super) struct Tracker {
     /// The service index itself failing: backs off every package at once.
     upstream: StdMutex<Backoff>,
     next_fetch: std::sync::atomic::AtomicU64,
+    /// When the stale listings of every package were last dropped.
+    listings_swept: StdMutex<Option<Instant>>,
 }
 
 /// Either this request fetches, or it waits for the one that already is.
@@ -146,7 +165,17 @@ impl Tracker {
         refresh: Duration,
         f: impl FnOnce(&mut IdState) -> T,
     ) -> T {
-        let now = Instant::now();
+        self.with_at(key, refresh, Instant::now(), f)
+    }
+
+    /// [`Self::with`] at the time `now`.
+    fn with_at<T>(
+        &self,
+        key: &(String, String),
+        refresh: Duration,
+        now: Instant,
+        f: impl FnOnce(&mut IdState) -> T,
+    ) -> T {
         let mut ids = self.lock();
         if !ids.contains_key(key) && ids.len() >= MAX_TRACKED {
             ids.retain(|_, s| !s.is_idle(now, refresh));
@@ -162,9 +191,43 @@ impl Tracker {
                 }
             }
         }
+        self.sweep_listings(&mut ids, now, refresh);
         let state = ids.entry(key.clone()).or_default();
         state.touched = Some(now);
+        // Also here, so that no caller is handed one the sweep has not
+        // reached yet.
+        state.drop_stale_listing(now, refresh);
         f(state)
+    }
+
+    /// Drop the cached upstream listings that are older than `refresh`, of
+    /// every package, once per `refresh` (and not more often than every
+    /// [`LISTING_SWEEP_MIN`]).
+    ///
+    /// A listing is a map of all upstream versions of a package. One that
+    /// has expired is never read again, but the entry it sits in stays until
+    /// the tracker is full, [`MAX_TRACKED`] packages later: on a mirror of
+    /// many large packages that is tens of megabytes held for nothing. A
+    /// package nobody asks for again is never looked up either, so its
+    /// listing has to be found from here.
+    fn sweep_listings(
+        &self,
+        ids: &mut HashMap<(String, String), IdState>,
+        now: Instant,
+        refresh: Duration,
+    ) {
+        let mut swept = self
+            .listings_swept
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let every = refresh.max(LISTING_SWEEP_MIN);
+        if swept.is_some_and(|at| now.duration_since(at) < every) {
+            return;
+        }
+        *swept = Some(now);
+        for state in ids.values_mut() {
+            state.drop_stale_listing(now, refresh);
+        }
     }
 
     /// Take this package's fetch, or join the one in progress.
@@ -256,6 +319,37 @@ mod tests {
             });
         }
         assert!(tracker.lock().len() <= MAX_TRACKED);
+    }
+
+    #[test]
+    fn a_listing_is_dropped_once_it_is_older_than_the_refresh() {
+        let tracker = Tracker::default();
+        let refresh = Duration::from_secs(600);
+        let listing = || -> Listing { Arc::new(HashMap::from([("1.0.0".to_string(), true)])) };
+        let key = |id: &str| ("feed".to_string(), id.to_string());
+        let (old, forgotten, new) = (key("old"), key("forgotten"), key("new"));
+        let start = Instant::now();
+        let later = start + refresh * 2;
+        for (key, read) in [(&old, start), (&forgotten, start), (&new, later)] {
+            tracker.with_at(key, refresh, start, |s| s.listing = Some((read, listing())));
+        }
+        let cached = |key: &(String, String)| tracker.lock()[key].listing.is_some();
+        // Within `refresh`, a listing serves.
+        assert!(tracker.with_at(&old, refresh, start + refresh / 2, |s| s.listing.is_some()));
+
+        // Past it, whoever asks about the package finds none (the sweep is
+        // not due here: only the lookup itself can have dropped it)…
+        *tracker.listings_swept.lock().unwrap() = Some(later);
+        assert!(tracker.with_at(&old, refresh, later, |s| s.listing.is_none()));
+        // …and one nobody asks about again goes with the next sweep, whatever
+        // package is looked up then.
+        assert!(cached(&forgotten));
+        *tracker.listings_swept.lock().unwrap() = Some(start);
+        tracker.with_at(&new, refresh, later, |_| ());
+        assert!(!cached(&forgotten));
+        assert!(cached(&new), "one read since is kept");
+        // What else is remembered about the package stays.
+        assert!(tracker.lock().contains_key(&forgotten));
     }
 
     #[test]

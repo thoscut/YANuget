@@ -594,7 +594,10 @@ pub async fn sync(
                     summary.lines.push(Line {
                         watch: w.clone(),
                         version: None,
-                        action: Action::Error(format!("cannot ask the upstream: {e}")),
+                        action: Action::Error(format!(
+                            "cannot ask the upstream: {}",
+                            crate::error_chain(&e)
+                        )),
                         reasons: Vec::new(),
                     });
                 }

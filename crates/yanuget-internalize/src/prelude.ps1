@@ -249,7 +249,17 @@ foreach ($__yanugetHelper in @(
         'Install-ChocolateyVsixPackage', 'Install-ChocolateyPowershellCommand')) {
     $__yanugetCmd = Get-Command -Name $__yanugetHelper -Module chocolateyInstaller `
         -CommandType Function -ErrorAction SilentlyContinue
-    if ($null -eq $__yanugetCmd) { continue }
+    if ($null -eq $__yanugetCmd) {
+        # A Chocolatey without this helper has nothing for the package to
+        # call. One that has it as anything but a function of
+        # chocolateyInstaller (a compiled cmdlet, another module's function)
+        # would run it unwrapped: to the internet, and without the pin.
+        if ($null -ne (Get-Command -Name $__yanugetHelper -ErrorAction SilentlyContinue)) {
+            throw ("yanuget: cannot wrap $__yanugetHelper of this Chocolatey version: " +
+                'it is not a function of the chocolateyInstaller module.')
+        }
+        continue
+    }
     $__yanugetBody = [System.Management.Automation.ProxyCommand]::Create(
         (New-Object System.Management.Automation.CommandMetadata $__yanugetCmd))
     $__yanugetPlain = "GetCommand('$__yanugetHelper',"

@@ -12,7 +12,8 @@
 //! (`choco uninstall --skip-powershell` gets past it). Every copy of these
 //! scripts in the package is wrapped, not only the first: which one
 //! Chocolatey runs depends on how it walks the extracted folder, not on the
-//! entry order.
+//! entry order. They are found by the names they are extracted under, and a
+//! package that spells one with percent-encoding is refused (`find_scripts`).
 //!
 //! The prelude wraps Chocolatey's download helpers in proxy commands, made on
 //! the client from the helpers it has, so a call binds exactly as it does
@@ -27,7 +28,7 @@ use std::path::{Path, PathBuf};
 
 use reqwest::Url;
 use sha2::{Digest, Sha256};
-use yanuget_pkg::nupkg::{entry_name, open_archive};
+use yanuget_pkg::nupkg::{entry_name, extracted_name, normalize_entry, open_archive};
 use yanuget_pkg::report::Download;
 use yanuget_pkg::rewrite::Source;
 use yanuget_pkg::NuGetVersion;
@@ -91,11 +92,18 @@ pub async fn build(
         return Ok(None);
     };
     let nupkg: PathBuf = nupkg.to_path_buf();
-    let scripts = tokio::task::spawn_blocking(move || package_scripts(&nupkg))
-        .await
-        .map_err(|e| {
-            yanuget_pkg::Error::Task(format!("reading the package scripts panicked: {e}"))
-        })??;
+    let scripts = tokio::task::spawn_blocking(move || {
+        package_scripts(&nupkg).map_err(|e| match e {
+            PreludeError::Pkg(e) => PreludeError::Pkg(crate::io_context(|| {
+                format!("cannot read the package {}", nupkg.display())
+            })(e)),
+            e => e,
+        })
+    })
+    .await
+    .map_err(|e| {
+        yanuget_pkg::Error::Task(format!("reading the package scripts panicked: {e}"))
+    })??;
     let mut entries = vec![(
         PRELUDE_PATH.to_string(),
         Source::Bytes(prelude.into_bytes()),
@@ -251,43 +259,83 @@ pub(crate) struct FoundScripts {
     /// Entries under the names the prelude adds (`internalizer/…`, the
     /// `*.upstream.ps1` names), in the same order.
     pub reserved: Vec<String>,
+    /// Entries that are extracted as one of [`SCRIPTS`] without being named
+    /// as one (`tools/chocolateyInstall%2Eps1`), in the same order.
+    /// Chocolatey runs them like any other, but a loader for one would have
+    /// to go where the archive's spelling does not say, and no well-formed
+    /// package has such a name. Nothing here wraps or replaces them: a
+    /// package with one is refused.
+    pub encoded: Vec<ScriptEntry>,
+}
+
+/// What an entry is to the prelude, by its name in lower case with `/` for
+/// `\`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Role {
+    /// Under a name the prelude adds.
+    Reserved,
+    /// One of [`SCRIPTS`], with the name its own is renamed to.
+    Script(&'static str),
+    Other,
+}
+
+fn role(lower: &str) -> Role {
+    let (_, file) = split(lower);
+    let is = |name: &str| file == name.to_ascii_lowercase();
+    if lower.starts_with("internalizer/") || SCRIPTS.iter().any(|(_, upstream)| is(upstream)) {
+        return Role::Reserved;
+    }
+    match SCRIPTS.iter().find(|(script, _)| is(script)) {
+        Some((_, upstream)) => Role::Script(upstream),
+        None => Role::Other,
+    }
 }
 
 /// The search for Chocolatey's scripts that the prelude and the override's
 /// replacement script share, over a package's entries by index and name
 /// ([`entry_names`]): an entry is one of [`SCRIPTS`] when its file name is,
 /// whatever the case and folder.
+///
+/// What counts is the name the client extracts the entry under
+/// ([`extracted_name`]), since that is where Chocolatey looks for its
+/// scripts: `tools/chocolateyInstall%2Eps1` is an install script on disk,
+/// and `internalizer%2Fprelude.ps1` lands on the prelude (`SEC-42`).
 pub(crate) fn find_scripts(entries: Vec<(usize, String)>) -> FoundScripts {
     let mut scripts = Vec::new();
     let mut reserved = Vec::new();
-    for (i, name) in entries {
-        let lower = name.to_ascii_lowercase().replace('\\', "/");
-        let (_, file) = split(&lower);
-        if lower.starts_with("internalizer/")
-            || SCRIPTS
-                .iter()
-                .any(|(_, upstream)| file == upstream.to_ascii_lowercase())
-        {
-            reserved.push((lower, name));
-        } else if let Some((_, upstream)) = SCRIPTS
-            .iter()
-            .find(|(script, _)| file == script.to_ascii_lowercase())
-        {
-            scripts.push((
-                lower,
-                ScriptEntry {
-                    index: i,
-                    name,
-                    upstream,
-                },
-            ));
+    let mut encoded = Vec::new();
+    for (index, name) in entries {
+        let lower = normalize_entry(&name);
+        let written = role(&lower);
+        match role(&normalize_entry(&extracted_name(&name))) {
+            Role::Other if written != Role::Reserved => {}
+            Role::Script(upstream) if written != Role::Reserved => {
+                let found = if written == Role::Script(upstream) {
+                    &mut scripts
+                } else {
+                    &mut encoded
+                };
+                found.push((
+                    lower,
+                    ScriptEntry {
+                        index,
+                        name,
+                        upstream,
+                    },
+                ));
+            }
+            _ => reserved.push((lower, name)),
         }
     }
-    scripts.sort_by(|a, b| a.0.cmp(&b.0));
+    let in_order = |mut found: Vec<(String, ScriptEntry)>| -> Vec<ScriptEntry> {
+        found.sort_by(|a, b| a.0.cmp(&b.0));
+        found.into_iter().map(|(_, s)| s).collect()
+    };
     reserved.sort();
     FoundScripts {
-        scripts: scripts.into_iter().map(|(_, s)| s).collect(),
+        scripts: in_order(scripts),
         reserved: reserved.into_iter().map(|(_, n)| n).collect(),
+        encoded: in_order(encoded),
     }
 }
 
@@ -312,6 +360,22 @@ fn package_scripts(nupkg: &Path) -> Result<Vec<Script>, PreludeError> {
     if let Some(name) = found.reserved.first() {
         return Err(PreludeError::Package(format!(
             "the package has an entry {name}, which the prelude would replace"
+        )));
+    }
+    // The package's own script goes beside its loader under a name the
+    // rewrite adds, and the loader counts the folders up to the prelude: both
+    // go by the entry's name, which has to be the one it is extracted under.
+    if let Some(name) = found
+        .encoded
+        .iter()
+        .chain(&found.scripts)
+        .map(|s| &s.name)
+        .find(|name| extracted_name(name) != **name)
+    {
+        return Err(PreludeError::Package(format!(
+            "the package has an entry {name}, which is extracted as {}; the prelude cannot \
+             go in front of a script under a percent-encoded name",
+            extracted_name(name)
         )));
     }
     if !found.scripts.iter().any(|s| s.upstream == UPSTREAM_SCRIPT) {
@@ -490,6 +554,70 @@ mod tests {
             found.reserved,
             ["Internalizer/x", "tools/chocolateyInstall.upstream.ps1"]
         );
+        assert!(found.encoded.is_empty());
+    }
+
+    /// `SEC-42`: Chocolatey looks for its scripts where the package was
+    /// extracted, and an entry is extracted under its percent-decoded name.
+    #[test]
+    fn scripts_are_found_by_the_name_they_are_extracted_under() {
+        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).enumerate().collect();
+        let found = find_scripts(names(&[
+            "tools/chocolateyInstall%2Eps1",
+            "tools%2FchocolateyUninstall.ps1",
+            "%63hocolateyBeforeModify.ps1",
+            "internalizer%2Fprelude.ps1",
+            "Internalizer%5Cx",
+            "tools/chocolateyInstall%2Eupstream.ps1",
+            "tools/My%20Tool.exe",
+            "my%20tools/chocolateyInstall.ps1",
+            // Decoded once: this one is extracted as `...%2Eps1`, no script.
+            "tools/chocolateyInstall%252Eps1",
+        ]));
+        let got = |found: &[ScriptEntry]| -> Vec<(usize, String, &'static str)> {
+            found
+                .iter()
+                .map(|s| (s.index, s.name.clone(), s.upstream))
+                .collect()
+        };
+        assert_eq!(
+            got(&found.encoded),
+            [
+                (
+                    2,
+                    "%63hocolateyBeforeModify.ps1".to_string(),
+                    "chocolateyBeforeModify.upstream.ps1"
+                ),
+                (
+                    1,
+                    "tools%2FchocolateyUninstall.ps1".to_string(),
+                    "chocolateyUninstall.upstream.ps1"
+                ),
+                (
+                    0,
+                    "tools/chocolateyInstall%2Eps1".to_string(),
+                    UPSTREAM_SCRIPT
+                ),
+            ]
+        );
+        // Named as a script in the archive too: found as before, whatever
+        // its folder is called.
+        assert_eq!(
+            got(&found.scripts),
+            [(
+                7,
+                "my%20tools/chocolateyInstall.ps1".to_string(),
+                UPSTREAM_SCRIPT
+            )]
+        );
+        assert_eq!(
+            found.reserved,
+            [
+                "internalizer%2Fprelude.ps1",
+                "Internalizer%5Cx",
+                "tools/chocolateyInstall%2Eupstream.ps1",
+            ]
+        );
     }
 
     /// `SEC-35`, `SEC-39`: what `tests/prelude.rs` runs where `pwsh` is,
@@ -511,6 +639,41 @@ mod tests {
         // A feed URL from the client must be http or https.
         assert!(TEMPLATE.contains("$uri.Scheme -ne 'http' -and $uri.Scheme -ne 'https'"));
         assert!(TEMPLATE.is_ascii());
+    }
+
+    /// `SEC-43`: a helper the client has, but not as a function of
+    /// `chocolateyInstaller`, would run unwrapped; the prelude stops there
+    /// instead of passing it over. `tests/prelude.rs` runs it where `pwsh`
+    /// is.
+    #[test]
+    fn the_template_stops_at_a_helper_it_cannot_wrap() {
+        let wrapped = "$__yanugetCmd = Get-Command -Name $__yanugetHelper \
+                       -Module chocolateyInstaller `\n        \
+                       -CommandType Function -ErrorAction SilentlyContinue\n    \
+                       if ($null -eq $__yanugetCmd) {\n";
+        // Whatever line endings the checkout gave the file.
+        let template = TEMPLATE.replace("\r\n", "\n");
+        let at = template.find(wrapped).expect("the search for the helper");
+        // What follows a helper that was not found, up to the next one.
+        let missing = &template[at + wrapped.len()..];
+        let missing = &missing[..missing
+            .find("\n        continue\n    }\n")
+            .expect("continue")];
+        let probe = "if ($null -ne (Get-Command -Name $__yanugetHelper \
+                     -ErrorAction SilentlyContinue)) {\n";
+        let refusal =
+            "throw (\"yanuget: cannot wrap $__yanugetHelper of this Chocolatey version: \"";
+        let (probe, refusal) = (missing.find(probe), missing.find(refusal));
+        assert!(probe.is_some() && probe < refusal, "{missing}");
+        // The refusal is the first thing there, so nothing passes it by.
+        assert_eq!(
+            missing.lines().find(|l| !l.trim_start().starts_with('#')),
+            Some(
+                "        if ($null -ne (Get-Command -Name $__yanugetHelper \
+                 -ErrorAction SilentlyContinue)) {"
+            ),
+            "{missing}"
+        );
     }
 
     #[test]

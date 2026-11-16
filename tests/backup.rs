@@ -1,6 +1,8 @@
 //! `yanuget backup` and `yanuget restore` end to end: a backup taken from a
 //! running server restores into a server that serves the same packages.
 
+mod common;
+
 use std::io::{Cursor, Write};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::Path;
@@ -100,24 +102,44 @@ fn build_nupkg(id: &str, version: &str) -> Vec<u8> {
 }
 
 async fn push(base: &str, id: &str, version: &str) {
-    let status = reqwest::Client::new()
-        .put(format!("{base}/api/v2/package"))
+    put(base, "/api/v2/package", build_nupkg(id, version)).await;
+}
+
+/// PUT `body` to `path` with the push key, which must succeed.
+async fn put(base: &str, path: &str, body: Vec<u8>) {
+    let status = common::client()
+        .put(format!("{base}{path}"))
         .header("X-NuGet-ApiKey", API_KEY)
-        .body(build_nupkg(id, version))
+        .body(body)
         .send()
         .await
         .unwrap()
         .status();
-    assert!(status.is_success(), "push {id} {version}: {status}");
+    assert!(status.is_success(), "PUT {path}: {status}");
+}
+
+/// GET `path`, and the body when it succeeds.
+async fn get(base: &str, path: &str) -> Option<Vec<u8>> {
+    let resp = common::client()
+        .get(format!("{base}{path}"))
+        .send()
+        .await
+        .unwrap();
+    if !resp.status().is_success() {
+        return None;
+    }
+    Some(resp.bytes().await.unwrap().to_vec())
 }
 
 async fn download(base: &str, id: &str, version: &str) -> Option<Vec<u8>> {
     let lower = id.to_ascii_lowercase();
-    let resp = reqwest::get(format!(
-        "{base}/v3/package/{lower}/{version}/{lower}.{version}.nupkg"
-    ))
-    .await
-    .unwrap();
+    let resp = common::client()
+        .get(format!(
+            "{base}/v3/package/{lower}/{version}/{lower}.{version}.nupkg"
+        ))
+        .send()
+        .await
+        .unwrap();
     resp.status()
         .is_success()
         .then_some(resp.bytes().await.unwrap().to_vec())
@@ -441,4 +463,280 @@ async fn a_forced_restore_replaces_a_file_damaged_in_place() {
             .unwrap();
     assert!(summary.copied > 0);
     assert_eq!(std::fs::read(&file).unwrap(), good);
+}
+
+/// `COR-46`: a run into an existing backup used to check the copy before it
+/// pruned it. A file the live store had lost passed the check on the earlier
+/// run's copy, the prune then deleted that copy, and the manifest said
+/// nothing was missing. The copy is the last one there is, so it stays.
+#[tokio::test]
+async fn a_second_run_keeps_the_last_copy_of_a_file_the_live_store_lost() {
+    let live = tempfile::tempdir().unwrap();
+    let base = serve(config_for(live.path())).await;
+    push(&base, "Alpha", "1.0.0").await;
+    push(&base, "Beta", "1.0.0").await;
+    let backups = tempfile::tempdir().unwrap();
+    let first = yanuget::backup::backup(&config_for(live.path()), backups.path(), hidden())
+        .await
+        .unwrap();
+    assert!(first.manifest.missing.is_empty());
+
+    let rel = "beta/1.0.0/beta.1.0.0.nupkg";
+    let beta = download(&base, "Beta", "1.0.0").await.unwrap();
+    std::fs::remove_file(live.path().join("packages").join(rel)).unwrap();
+
+    let second = yanuget::backup::backup(&config_for(live.path()), backups.path(), hidden())
+        .await
+        .unwrap();
+    let copy = backups.path().join("packages").join(rel);
+    assert!(copy.is_file(), "the last copy was pruned");
+    assert!(
+        second.manifest.missing.is_empty(),
+        "{:?}",
+        second.manifest.missing
+    );
+    assert_eq!(second.kept, [rel]);
+    assert_eq!(second.attempts, 1);
+    assert_eq!(second.manifest.files, first.manifest.files);
+
+    // The backup restores a server that has the version, file and all.
+    let restored = tempfile::tempdir().unwrap();
+    yanuget::backup::restore(
+        &config_for(restored.path()),
+        backups.path(),
+        false,
+        hidden(),
+    )
+    .await
+    .unwrap();
+    let base2 = serve(config_for(restored.path())).await;
+    assert_eq!(download(&base2, "Beta", "1.0.0").await, Some(beta));
+
+    // Gone from the backup as well, it is reported.
+    std::fs::remove_file(&copy).unwrap();
+    let third = yanuget::backup::backup(&config_for(live.path()), backups.path(), hidden())
+        .await
+        .unwrap();
+    assert_eq!(third.manifest.missing, [rel]);
+    assert!(third.kept.is_empty());
+}
+
+/// `COR-54`: a copy the backup keeps because the live store lost the file is
+/// from an earlier run, and the version may have been overwritten since with
+/// a build of the same size. It is hashed, and reported when it holds the old
+/// build's bytes; it is kept all the same, being the last copy there is.
+#[tokio::test]
+async fn a_kept_copy_of_an_overwritten_build_is_hashed_and_reported() {
+    let config = |dir: &Path| Config {
+        allow_overwrite: yanuget::config::OverwriteMode::Enabled,
+        ..config_for(dir)
+    };
+    // Stored, not deflated: two payloads of one length make two builds of
+    // one size.
+    let build = |payload: u8| {
+        let mut cursor = Cursor::new(Vec::new());
+        {
+            let mut zip = zip::ZipWriter::new(&mut cursor);
+            let opts = SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored)
+                .last_modified_time(zip::DateTime::default());
+            zip.start_file("Alpha.nuspec", opts).unwrap();
+            zip.write_all(
+                br#"<?xml version="1.0"?>
+<package xmlns="http://schemas.microsoft.com/packaging/2013/05/nuspec.xsd">
+  <metadata>
+    <id>Alpha</id>
+    <version>1.0.0</version>
+    <authors>Test Author</authors>
+    <description>A backup test package.</description>
+  </metadata>
+</package>"#,
+            )
+            .unwrap();
+            zip.start_file("lib/net8.0/Lib.dll", opts).unwrap();
+            zip.write_all(&[payload; 64]).unwrap();
+            zip.finish().unwrap();
+        }
+        cursor.into_inner()
+    };
+    let (old, new) = (build(b'a'), build(b'b'));
+    assert_eq!(old.len(), new.len());
+    let live = tempfile::tempdir().unwrap();
+    let base = serve(config(live.path())).await;
+    put(&base, "/api/v2/package", old.clone()).await;
+    let backups = tempfile::tempdir().unwrap();
+    let first = yanuget::backup::backup(&config(live.path()), backups.path(), hidden())
+        .await
+        .unwrap();
+    assert!(first.manifest.missing.is_empty());
+
+    // Overwritten, then lost from the live store before the next run.
+    put(&base, "/api/v2/package", new).await;
+    let rel = "alpha/1.0.0/alpha.1.0.0.nupkg";
+    std::fs::remove_file(live.path().join("packages").join(rel)).unwrap();
+
+    let second = yanuget::backup::backup(&config(live.path()), backups.path(), hidden())
+        .await
+        .unwrap();
+    assert_eq!(second.manifest.missing, [rel]);
+    assert_eq!(second.kept, [rel]);
+    let copy = backups.path().join("packages").join(rel);
+    assert_eq!(
+        std::fs::read(copy).unwrap(),
+        old,
+        "the last copy was pruned"
+    );
+}
+
+/// `SEC-54`: the backup directory may be a share others write to. A link
+/// laid where `backup` stages the manifest, or in place of its lock file, is
+/// not followed: whatever it points at stays as it was.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_backup_does_not_write_through_links_to_files_in_its_destination() {
+    let live = tempfile::tempdir().unwrap();
+    let base = serve(config_for(live.path())).await;
+    push(&base, "Alpha", "1.0.0").await;
+    let outside = tempfile::tempdir().unwrap();
+    let victim = outside.path().join("victim.db");
+    std::fs::write(&victim, b"precious").unwrap();
+
+    let backups = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(&victim, backups.path().join("backup.json.backup-tmp")).unwrap();
+    let summary = yanuget::backup::backup(&config_for(live.path()), backups.path(), hidden())
+        .await
+        .unwrap();
+    assert!(summary.manifest.missing.is_empty());
+    assert_eq!(std::fs::read(&victim).unwrap(), b"precious");
+    yanuget::backup::read_manifest(backups.path()).unwrap();
+    // Nothing of the run is left at the top but the backup itself.
+    let mut names: Vec<String> = std::fs::read_dir(backups.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        [".backup.lock", "backup.json", "packages", "yanuget.db"]
+    );
+
+    // A lock file that is a link to a file not yet there is not created.
+    let elsewhere = outside.path().join("created");
+    let lock = backups.path().join(".backup.lock");
+    std::fs::remove_file(&lock).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, &lock).unwrap();
+    yanuget::backup::backup(&config_for(live.path()), backups.path(), hidden())
+        .await
+        .unwrap_err();
+    assert!(!elsewhere.exists(), "the lock file's link was followed");
+}
+
+/// `SEC-54`: a directory link under `packages/`, or in its place, would put
+/// the files of the package store (whose names and bytes a push key picks)
+/// wherever it points. The backup refuses it and writes nothing there.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_backup_does_not_write_through_directory_links_in_its_destination() {
+    let live = tempfile::tempdir().unwrap();
+    let base = serve(config_for(live.path())).await;
+    push(&base, "Alpha", "1.0.0").await;
+    let backups = tempfile::tempdir().unwrap();
+    yanuget::backup::backup(&config_for(live.path()), backups.path(), hidden())
+        .await
+        .unwrap();
+    push(&base, "Alpha", "2.0.0").await;
+
+    let outside = tempfile::tempdir().unwrap();
+    let alpha = backups.path().join("packages/alpha");
+    std::fs::remove_dir_all(&alpha).unwrap();
+    std::os::unix::fs::symlink(outside.path(), &alpha).unwrap();
+    let err = yanuget::backup::backup(&config_for(live.path()), backups.path(), hidden())
+        .await
+        .unwrap_err();
+    assert!(format!("{err:#}").contains("symbolic link"), "{err:#}");
+    assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+
+    // The same for `packages/` itself.
+    let packages = backups.path().join("packages");
+    std::fs::remove_dir_all(&packages).unwrap();
+    std::os::unix::fs::symlink(outside.path(), &packages).unwrap();
+    let err = yanuget::backup::backup(&config_for(live.path()), backups.path(), hidden())
+        .await
+        .unwrap_err();
+    assert!(format!("{err:#}").contains("symbolic link"), "{err:#}");
+    assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+}
+
+/// `TEST-26`: the check builds the paths of attached files and symbols on its
+/// own, apart from the store. A backup of both restores into a server that
+/// serves them, and one that is gone from the live store is reported.
+#[tokio::test]
+async fn attached_files_and_symbols_are_backed_up_checked_and_restored() {
+    let live = tempfile::tempdir().unwrap();
+    let base = serve(config_for(live.path())).await;
+    let pdb = common::build_portable_pdb(&[7; 16]);
+    let key = yanuget::pdb::portable_pdb_signature(&pdb).unwrap();
+    put(
+        &base,
+        "/api/v2/package",
+        common::build_nupkg_for_pdb("Sym.Lib", "1.0.0", "sym.lib.pdb", &pdb),
+    )
+    .await;
+    put(
+        &base,
+        "/api/v2/symbol",
+        common::build_snupkg("Sym.Lib", "1.0.0", "sym.lib.pdb", &pdb),
+    )
+    .await;
+    push(&base, "Img.Pkg", "1.0.0").await;
+    let image = common::image_bytes(1);
+    put(&base, "/api/v2/files/Img.Pkg/1.0.0/base.wim", image.clone()).await;
+    let (symbol_path, file_path) = (
+        format!("/download/symbols/sym.lib.pdb/{key}/sym.lib.pdb"),
+        "/files/img.pkg/1.0.0/base.wim",
+    );
+    assert_eq!(get(&base, &symbol_path).await.as_deref(), Some(&pdb[..]));
+
+    let backups = tempfile::tempdir().unwrap();
+    let summary = yanuget::backup::backup(&config_for(live.path()), backups.path(), hidden())
+        .await
+        .unwrap();
+    assert!(
+        summary.manifest.missing.is_empty(),
+        "{:?}",
+        summary.manifest.missing
+    );
+
+    let restored = tempfile::tempdir().unwrap();
+    yanuget::backup::restore(
+        &config_for(restored.path()),
+        backups.path(),
+        false,
+        hidden(),
+    )
+    .await
+    .unwrap();
+    let base2 = serve(config_for(restored.path())).await;
+    assert_eq!(get(&base2, file_path).await, Some(image.clone()));
+    assert_eq!(get(&base2, &symbol_path).await, Some(pdb));
+
+    // Taken from the live store, each is reported by a backup into a new
+    // directory, under the path the store keeps it at.
+    let sha = common::sha256_hex(&image);
+    let blob = format!(".blobs/sha256/{}/{sha}", &sha[..2]);
+    let symbol = format!(".symbols/{}/sym.lib.pdb", key.to_ascii_lowercase());
+    for rel in [&blob, &symbol] {
+        let path = live.path().join("packages").join(rel);
+        assert!(path.is_file(), "{rel} is not where the store keeps it");
+        std::fs::remove_file(path).unwrap();
+    }
+    let fresh = tempfile::tempdir().unwrap();
+    let summary = yanuget::backup::backup(&config_for(live.path()), fresh.path(), hidden())
+        .await
+        .unwrap();
+    let mut missing = summary.manifest.missing.clone();
+    missing.sort();
+    let mut want = vec![blob, symbol];
+    want.sort();
+    assert_eq!(missing, want);
 }

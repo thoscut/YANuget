@@ -52,7 +52,8 @@ enum Command {
     /// Work with the configuration without starting the server.
     Config(cli::ConfigArgs),
     /// Deal with what the database still holds for a feed that was renamed
-    /// or taken out of the configuration. The server must be stopped.
+    /// or taken out of the configuration. The server must be stopped, except
+    /// for a --dry-run.
     Feeds(cli::FeedsArgs),
 }
 
@@ -250,6 +251,8 @@ async fn run_server(config_path: Option<&str>) -> anyhow::Result<()> {
     // feed's uploads, its mirror's downloads and the inbox's imports see
     // what the others promised.
     let space = Arc::new(yanuget::space::SpaceGuard::for_store(&config, db.clone()));
+    // Once, before any feed serves: every feed stages into this directory.
+    web::sweep_stale_uploads(space.dir()).await;
     for feed in &feeds {
         let state = AppState::for_feed(
             storage.clone(),
@@ -326,6 +329,7 @@ async fn run_server(config_path: Option<&str>) -> anyhow::Result<()> {
                 // seconds). Saturating keeps an absurd value meaning "never".
                 let period = Duration::from_secs(interval.saturating_mul(3600));
                 let mut tick = tokio::time::interval(period);
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 loop {
                     tokio::select! {
                         _ = tick.tick() => {}
@@ -373,6 +377,7 @@ async fn run_server(config_path: Option<&str>) -> anyhow::Result<()> {
         let mut shutdown = shutdown_rx.clone();
         background.push(tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(24 * 3600));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tokio::select! {
                     _ = tick.tick() => {}
@@ -722,7 +727,7 @@ async fn run_migrate(config_path: Option<&str>, args: MigrateArgs) -> anyhow::Re
     })?;
 
     let storage = FilesystemStorage::new(config.storage_path()).await?;
-    let db = SqliteDatabase::connect(&config.database_path()).await?;
+    let db = Arc::new(SqliteDatabase::connect(&config.database_path()).await?);
 
     // Temp files must share the package store's filesystem so indexing can move
     // each download into place with an atomic rename. Each run gets its own
@@ -749,17 +754,24 @@ async fn run_migrate(config_path: Option<&str>, args: MigrateArgs) -> anyhow::Re
         },
         dry_run: args.dry_run,
         quiet: false,
-        min_free_disk_bytes: config.min_free_disk_bytes,
     };
+    // One admission for every download of the run, held to the server's
+    // reserve. A server may be running beside it: what that one's writes in
+    // progress were promised is in its memory and out of reach, but what its
+    // resumable uploads hold is in the database, and counts here too.
+    let space = Arc::new(
+        yanuget::space::SpaceGuard::new(&temp_dir, config.min_free_disk_bytes)
+            .with_resumable(db.clone()),
+    );
 
-    let summary = yanuget::migrate::run(
+    let summary = yanuget::migrate::run_with_space(
         &storage,
-        &db,
+        db.as_ref(),
         feed,
-        &temp_dir,
         source,
         opts,
         indicatif::ProgressDrawTarget::stderr(),
+        space,
     )
     .await;
 
@@ -885,6 +897,7 @@ fn spawn_file_tasks(
         let mut shutdown = shutdown.clone();
         tasks.push(tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(15 * 60));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tokio::select! {
                     _ = tick.tick() => { web::sweep_expired_uploads(db.as_ref(), &staging).await; }
@@ -933,6 +946,10 @@ fn spawn_file_tasks(
     tasks.push(tokio::spawn(async move {
         let period = Duration::from_secs(config.files.inbox_scan_secs.max(5));
         let mut tick = tokio::time::interval(period);
+        // A scan runs to the end, and an import in it copies and hashes the
+        // whole file. The default `Burst` would follow a long one with every
+        // tick it missed, back to back.
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 _ = tick.tick() => {}

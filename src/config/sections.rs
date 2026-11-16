@@ -286,6 +286,13 @@ pub struct FilesConfig {
     /// How many unfinished resumable uploads one feed may hold at once; 0
     /// is no limit. Each holds a partial file and the space it declared.
     pub max_open_uploads: u64,
+    /// The most of the storage volume's free space (what is free above
+    /// `min_free_disk_bytes`) that the feeds of one push key may promise
+    /// together to uploads that have not arrived (resumable uploads, and
+    /// pushes and `PUT`s in progress), in percent; 0 or 100 is no cap. Space
+    /// is promised to an upload before any of it arrives, so without a cap
+    /// one push key could promise all of it away from every other key.
+    pub max_upload_space_percent: u8,
     /// A directory scanned for files dropped over SSH (`scp`, `sftp`,
     /// `rsync`). Unset turns the inbox off.
     pub inbox_dir: Option<PathBuf>,
@@ -305,6 +312,7 @@ impl Default for FilesConfig {
             .to_vec(),
             upload_expiry_hours: 72,
             max_open_uploads: 32,
+            max_upload_space_percent: 80,
             inbox_dir: None,
             inbox_scan_secs: 30,
         }

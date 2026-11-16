@@ -1,29 +1,88 @@
 # Architecture
 
-YANuget is a single Rust crate (library + binary) organized into focused modules
-separated by trait boundaries. The design priorities are: **bounded memory**
+The YANuget server is a single Rust crate (library + binary) organized into
+focused modules separated by trait boundaries; the package handling it shares
+with its tools lives in a second crate, `yanuget-pkg`. The design priorities are: **bounded memory**
 (see [large-packages.md](large-packages.md)), **testability** (pure logic split
 from I/O), and **swappable backends** (storage and database behind traits).
 
 ## Module map
 
+The workspace holds three crates. The server is the root crate; what it shares
+with tools that build or fetch packages is `yanuget-pkg`, which depends on no
+web framework and no database.
+
+```
+crates/
+├── yanuget-pkg/         Package handling shared by the server and its tools
+│   └── src/
+│       ├── version.rs   NuGetVersion: parse / normalize / order / SemVer2
+│       ├── range.rs     Version ranges, as a .nuspec dependency writes them
+│       ├── nuspec.rs    Event-based .nuspec XML parser
+│       ├── nupkg.rs     Seek-based ZIP reader (nuspec + targeted entry extraction)
+│       ├── rewrite.rs   Rewriting a .nupkg: replace, add or remove entries
+│       ├── models.rs    What a .nuspec declares: Dependency, DependencyGroup, ...
+│       ├── v3.rs        The v3 documents an upstream serves, read leniently
+│       ├── address.rs   Which hosts and addresses an upstream fetch must not
+│       │                reach (the DNS resolver behind feature `net`)
+│       ├── fetch.rs     Upstream fetch helpers: redacted URLs, capped decoding
+│       ├── files.rs     The rule for names of attached files
+│       ├── report.rs    The internalizer report a package carries
+│       ├── text.rs      Characters that make untrusted text read differently
+│       └── error.rs     The crate's own Error
+└── yanuget-internalize/ The Chocolatey internalizer, a separate binary that
+                         reaches the server only over HTTP (see its README)
+```
+
+The server re-exports `version`, `range`, `nuspec`, `nupkg` and `report` under
+its own name (`yanuget::version`, …), which is how the flows below refer to
+them.
+
 ```
 src/
 ├── lib.rs            Crate root; re-exports
-├── main.rs           Binary: config load, wiring, background tasks, graceful shutdown
+├── main.rs           Binary: config load, wiring, background tasks, graceful
+│                     shutdown; the backup, restore, migrate and healthcheck
+│                     commands
+├── cli.rs            The `admin`, `config` and `feeds` sub-commands
 ├── error.rs          Error enum + IntoResponse (HTTP status mapping)
-├── version.rs        NuGetVersion: parse / normalize / order / SemVer2
-├── models.rs         Domain types: Package, Dependency, DependencyGroup, ...
+├── models.rs         The stored Package; re-exports the manifest types
 ├── validation.rs     Package-id rules
-├── nuspec.rs         Event-based .nuspec XML parser
-├── nupkg.rs          Seek-based ZIP reader (nuspec + targeted entry extraction)
 ├── streaming.rs      Bounded copy-to-disk with incremental SHA-512
-├── config.rs         Layered config (defaults < TOML < env); feeds, mirror, policy
+├── space.rs          SpaceGuard: free space and the bytes promised to writes in
+│                     progress, one guard for uploads, mirror downloads,
+│                     inbox imports and `migrate`; the share of it the
+│                     feeds of one push key may promise to uploads
+├── config/           Layered config (defaults < TOML < env)
+│   ├── mod.rs        Config, loading, resolved paths
+│   ├── env.rs        The `YANUGET_*` overlay, and the names nothing reads
+│   ├── feeds.rs      Feeds, their mirror and license policy, and how they
+│   │                 resolve against the server-wide settings
+│   ├── sections.rs   Overwrite policy, retention, rate limit, monitoring, files
+│   └── validate.rs   Checks on a loaded configuration, feed names and prefixes
+├── config_check.rs   `yanuget config check`: what the server would stop on, or
+│                     start with and then fail at
 ├── auth.rs           Constant-time API-key / read / admin checks
 ├── indexing.rs       Upload→validate→policy→store→membership pipeline (with rollback)
 ├── policy.rs         Offline license allow/deny evaluation (pure)
-├── mirror.rs         Upstream read-through mirroring (V3 feed → local feed)
+├── mirror/           Upstream read-through mirroring (V3 feed → local feed)
+│   ├── mod.rs        The mirror of one feed and its entry points
+│   ├── client.rs     The HTTP client: vetting and sending requests, redaction
+│   ├── upstream.rs   Reading the upstream's documents and downloads
+│   ├── listing.rs    A package's upstream version list; following its listing
+│   ├── target.rs     Filling the feed: fetching versions and indexing them
+│   ├── tracker.rs    Per-package fetch state, back-off, running fetches
+│   └── health.rs     Whether the upstream answers, and the probe behind it
 ├── migrate.rs        `yanuget migrate`: bulk import of a whole source server
+├── inbox.rs          The SSH inbox: files dropped by scp/sftp/rsync, attached
+│                     to versions
+├── backup.rs         `yanuget backup` / `restore`: a consistent copy taken
+│                     while the server runs, and the way back
+├── data_lock.rs      Cross-process advisory lock on `<database_path>.lock`:
+│                     one server on the data, and no offline command beside it
+├── feed_data.rs      Versions left under a feed the configuration no longer
+│                     has; what `yanuget feeds rename/remove` act on
+├── admin_client.rs   HTTP client for a running server's /admin (`yanuget admin`)
 ├── pdb.rs            Portable PDB parsing → SSQP symbol key, PDB checksum
 ├── pe.rs             PE debug-directory reader (ties a PDB to its assembly)
 ├── symbols.rs        `.snupkg` ingest: extract PDBs, index by symbol key
@@ -60,6 +119,7 @@ src/
     ├── admin.rs      Admin area: auth gate, CSRF check, version actions, bulk,
     │                 copy/move/promote, retention
     ├── hosted.rs     Files attached to versions; resumable (tus) uploads
+    ├── monitoring.rs `/metrics` (Prometheus text) and `/health/status` (JSON)
     ├── forms.rs      Form-body and lenient query-value parsing
     ├── helpers.rs    check_id / parse_version, header helpers, detached()
     ├── files.rs      Range-aware streaming file responses
@@ -124,8 +184,11 @@ or trigger is a new step, never an edit to an old one.
 
 ```
 GET /v3/index.json                → nuget::service_index(UrlBuilder)
-GET /v3/package/{id}/index.json   → db.find_versions → nuget::flat_container_index
-GET /v3/registration/{id}/...     → db.find_versions → nuget::registration_index
+GET /v3/package/{id}/index.json   → db.version_keys  → nuget::flat_container_index
+GET /v3/registration/{id}/index.json
+                                  → db.version_keys  → db.find_versions_in → nuget::registration_index
+                                    (paged: the version list alone → nuget::registration_index_paged)
+GET /v3/registration/{id}/page/…  → db.version_keys  → db.find_versions_in → nuget::registration_page
 GET /v3/search?q=...              → db.search        → nuget::search_response
 GET /v3/package/{id}/{v}/{f}.nupkg→ storage.get_package → files::serve_local_file (Range)
 ```
@@ -155,3 +218,8 @@ workspace of many crates. This keeps build times and cognitive overhead low
 while the trait boundaries still give clean seams. If a backend grows large
 (e.g. an S3 store with its own deps), it can be promoted to its own crate behind
 the existing trait with no API churn.
+
+`yanuget-pkg` is the one part that was split off, because another program
+needs it: the internalizer reads, rewrites and names packages by the same
+rules as the server, and must not pull in the server to do so. The server
+re-exports its modules under their old paths, so nothing else moved.

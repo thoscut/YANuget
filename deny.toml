@@ -1,8 +1,8 @@
 # cargo-deny policy, checked in CI (`cargo deny check licenses bans sources`).
 #
 # Advisories are left to `cargo audit`, which runs next to it and carries the
-# one deliberate ignore with its reasoning; two lists of exceptions for the
-# same thing would drift apart.
+# one deliberate ignore (RUSTSEC-2026-0459) with its reasoning; two lists of
+# exceptions for the same thing would drift apart.
 
 [graph]
 # The shipped binary is built for these; a dependency that only appears on

@@ -229,17 +229,7 @@ impl MirrorClient {
         }
         // The same admission as a push: the declared length is promised for
         // the rest of the download, and the reserve is watched while it runs.
-        let standalone;
-        let space = match &self.space {
-            Some(space) => space.as_ref(),
-            None => {
-                standalone = crate::space::SpaceGuard::new(
-                    dest.parent().unwrap_or(dest),
-                    self.min_free_disk_bytes,
-                );
-                &standalone
-            }
-        };
+        let space = self.space.as_ref();
         let reservation = space.admit(resp.content_length()).await?;
         let mut file = tokio::fs::File::create(dest).await?;
         let stream = resp.bytes_stream().map(|r| {

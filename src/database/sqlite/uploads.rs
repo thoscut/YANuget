@@ -5,7 +5,7 @@ use sqlx::sqlite::SqliteRow;
 use sqlx::Row;
 
 use crate::database::{canonical_id, UploadSession};
-use crate::error::Result;
+use crate::error::{Error, Result};
 
 use super::{parse_time, SqliteDatabase};
 
@@ -43,11 +43,12 @@ pub(super) async fn set_upload_received(
     db: &SqliteDatabase,
     id: &str,
     received: u64,
+    held_since: Option<DateTime<Utc>>,
 ) -> Result<()> {
     sqlx::query("UPDATE uploads SET received = ?2, held_since = ?3 WHERE id = ?1")
         .bind(id)
         .bind(received as i64)
-        .bind(Utc::now().to_rfc3339())
+        .bind(held_since.map(|t| t.to_rfc3339()))
         .execute(&db.pool)
         .await?;
     Ok(())
@@ -87,6 +88,29 @@ pub(super) async fn outstanding_upload_bytes(
         "SELECT COALESCE(SUM(MAX(length - received, 0)), 0) FROM uploads \
          WHERE expires >= ?1 AND held_since >= ?2",
     )
+    .bind(now.to_rfc3339())
+    .bind(held_after.to_rfc3339())
+    .fetch_one(&db.pool)
+    .await?;
+    Ok(left.max(0) as u64)
+}
+
+pub(super) async fn feeds_upload_bytes(
+    db: &SqliteDatabase,
+    feeds: &[String],
+    now: DateTime<Utc>,
+    held_after: DateTime<Utc>,
+) -> Result<u64> {
+    // The same uploads as above, of some feeds. The list goes in as one JSON
+    // array, so that a group of any size is one statement and one query.
+    let feeds = serde_json::to_string(feeds)
+        .map_err(|e| Error::Other(anyhow::anyhow!("could not encode the feed list: {e}")))?;
+    let left: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(MAX(length - received, 0)), 0) FROM uploads \
+         WHERE feed IN (SELECT value FROM json_each(?1)) \
+           AND expires >= ?2 AND held_since >= ?3",
+    )
+    .bind(feeds)
     .bind(now.to_rfc3339())
     .bind(held_after.to_rfc3339())
     .fetch_one(&db.pool)
@@ -204,14 +228,18 @@ mod tests {
         db.create_upload(&upload("half", FEED, 1000, now + Duration::hours(1)))
             .await
             .unwrap();
-        db.set_upload_received("half", 400).await.unwrap();
+        db.set_upload_received("half", 400, Some(now))
+            .await
+            .unwrap();
         assert_eq!(
             db.outstanding_upload_bytes(now, recently()).await.unwrap(),
             600
         );
         // A row that somehow received more than its length promises nothing,
         // rather than taking off what others promised.
-        db.set_upload_received("half", 1200).await.unwrap();
+        db.set_upload_received("half", 1200, Some(now))
+            .await
+            .unwrap();
         assert_eq!(
             db.outstanding_upload_bytes(now, recently()).await.unwrap(),
             0
@@ -239,6 +267,23 @@ mod tests {
             db.outstanding_upload_bytes(now, recently()).await.unwrap(),
             600
         );
+        // What each feed holds of that, for its share of the volume.
+        let db = &db;
+        let held = |feeds: &'static [&'static str]| {
+            let feeds: Vec<String> = feeds.iter().map(|f| f.to_string()).collect();
+            async move { db.feeds_upload_bytes(&feeds, now, recently()).await }
+        };
+        assert_eq!(held(&["team"]).await.unwrap(), 300);
+        assert_eq!(held(&["prod"]).await.unwrap(), 300);
+        assert_eq!(held(&["other"]).await.unwrap(), 0);
+        assert_eq!(held(&["team", "prod", "other"]).await.unwrap(), 600);
+        assert_eq!(held(&[]).await.unwrap(), 0);
+        // An upload being written, or idle, holds none of its feed's share.
+        db.set_upload_held("a", None).await.unwrap();
+        db.set_upload_held("b", Some(now - Duration::hours(2)))
+            .await
+            .unwrap();
+        assert_eq!(held(&["team"]).await.unwrap(), 0);
     }
 
     #[tokio::test]
@@ -269,12 +314,24 @@ mod tests {
             db.get_upload("busy").await.unwrap().unwrap().held_since,
             None
         );
-        db.set_upload_received("idle", 100).await.unwrap();
+        db.set_upload_received("idle", 100, Some(Utc::now()))
+            .await
+            .unwrap();
         assert_eq!(
             db.outstanding_upload_bytes(now, recently()).await.unwrap(),
             900
         );
         let held = db.get_upload("idle").await.unwrap().unwrap().held_since;
         assert!(held.is_some_and(|t| t > recently()), "{held:?}");
+
+        // Recording what arrived does not renew a hold by itself: the caller
+        // says since when the upload holds, and an old time stays old.
+        db.set_upload_received("idle", 100, idle.held_since)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.outstanding_upload_bytes(now, recently()).await.unwrap(),
+            0
+        );
     }
 }

@@ -43,12 +43,12 @@ pub enum PublishError {
     /// The feed refused, or could not be reached.
     #[error("{0}")]
     Feed(String),
-    #[error("cannot rewrite the package: {0}")]
+    #[error("cannot rewrite the package")]
     Rewrite(#[from] yanuget_pkg::Error),
     /// The report is larger than YANuget reads (`MAX_REPORT_BYTES`).
     #[error("{0}")]
     Report(String),
-    #[error("work directory: {0}")]
+    #[error("work directory")]
     Io(#[from] std::io::Error),
 }
 
@@ -140,7 +140,12 @@ impl Publisher {
             // A push key goes to the feed and nowhere else.
             .redirect(reqwest::redirect::Policy::none())
             .build()
-            .map_err(|e| PublishError::Feed(format!("cannot build an HTTP client: {e}")))?;
+            .map_err(|e| {
+                PublishError::Feed(format!(
+                    "cannot build an HTTP client: {}",
+                    crate::error_chain(&e)
+                ))
+            })?;
         let target = Target::new(config)
             .map_err(|e| PublishError::Feed(crate::error_chain(&e)))?
             .expect("target.url is set");
@@ -274,7 +279,7 @@ impl Publisher {
             for file in release.files {
                 match self.attach(&package.id, &package.version, file).await {
                     Ok(how) => published.attached.push((file.name.clone(), how)),
-                    Err(e) => published.errors.push(e.to_string()),
+                    Err(e) => published.errors.push(crate::error_chain(&e)),
                 }
             }
         }
@@ -378,7 +383,11 @@ impl Publisher {
             Ok(Some(_)) => Visibility::Withheld,
             Ok(None) => Visibility::Unknown,
             Err(e) => {
-                tracing::warn!(%id, error = %e, "cannot tell whether the feed serves the version");
+                tracing::warn!(
+                    %id,
+                    error = %crate::error_chain(&e),
+                    "cannot tell whether the feed serves the version"
+                );
                 Visibility::Unknown
             }
         }

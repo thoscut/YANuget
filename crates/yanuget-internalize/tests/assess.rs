@@ -178,3 +178,41 @@ async fn a_capture_becomes_reports_and_files() {
     assert_eq!(doc["outcome"], "failed");
     assert_eq!(doc["packages"].as_array().unwrap().len(), 4);
 }
+
+/// `MNT-30`: a download that fails for the cache's sake gives the reason
+/// with its cause, once.
+#[tokio::test]
+async fn a_cache_that_cannot_be_used_is_the_reason() {
+    let base = host().await;
+    let v = NuGetVersion::parse("1.0.0").unwrap();
+    let closure = [("app", &v)];
+    let mut drafts = [draft("app", "1.0.0")];
+    let capture = RawCapture {
+        exit_code: Some(0),
+        calls: call("app", &format!("{base}/dl/tool.zip"), "").into_bytes(),
+        ..RawCapture::default()
+    };
+    let wanted = assess(Ok(capture), &closure, &mut drafts, 60, &Overrides::none());
+    assert_eq!(wanted[0].len(), 1);
+
+    // A file where the cache's folder goes.
+    let cache = tempfile::tempdir().unwrap();
+    std::fs::write(cache.path().join("files"), b"in the way").unwrap();
+    let cause = std::fs::create_dir_all(cache.path().join("files"))
+        .unwrap_err()
+        .to_string();
+    let downloader = Downloader::new(
+        &DownloadsConfig {
+            allow_private_hosts: vec!["127.0.0.1".into()],
+            timeout_secs: 5,
+            ..DownloadsConfig::default()
+        },
+        cache.path(),
+    )
+    .unwrap();
+    let files = fetch(wanted, &mut drafts, &downloader, &["zip".to_string()], 1).await;
+    assert!(files[0].is_empty());
+    let report = drafts[0].finish(report::now());
+    assert_eq!(report.status, Status::Failed);
+    assert_eq!(report.reasons, [format!("download cache: {cause}")]);
+}

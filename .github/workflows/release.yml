@@ -286,6 +286,12 @@ jobs:
           # exactly as given.
           cp "target/$TARGET/release/$bin" "staging/$name/"
           cp README.md LICENSE CHANGELOG.md yanuget.example.toml "staging/$name/"
+          # The resumable upload client, in every archive: it runs wherever
+          # PowerShell 7 does, and the copy that matches this server's
+          # protocol is this one, not whatever `main` has by then. The
+          # offline docs point here, since an isolated network cannot reach
+          # GitHub (see docs/api.md#resumable-upload-tus).
+          cp scripts/Send-YanugetFile.ps1 "staging/$name/"
           # The hardened service unit and its system user, next to the binary
           # they run (see docs/deployment.md#systemd).
           if [[ "$TARGET" == *-linux-* ]]; then
@@ -480,15 +486,38 @@ jobs:
           ref: ${{ needs.guard.outputs.sha }}
           persist-credentials: false
 
+      # Only this workflow's own artifacts: the archives (`yanuget-<target>`)
+      # and the SBOM (`yanuget-sbom`). The `ci` job runs ci.yml in this same
+      # run, and anything it uploads would otherwise land in `dist/` and be
+      # published and attested with the release; today its one upload
+      # (coverage) is skipped for a release, but that is a condition in
+      # another file.
       - name: Download artifacts
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: dist
+          pattern: yanuget-*
           merge-multiple: true
 
+      # One archive per target of `build`'s matrix (keep the two lists in
+      # step) and the SBOM, or nothing is published:
+      # an artifact renamed so the pattern above no longer matches it would
+      # otherwise drop out of the release, SHA256SUMS and the attestation
+      # without an error.
       - name: Generate checksums
         working-directory: dist
-        run: sha256sum yanuget-* > SHA256SUMS
+        shell: bash
+        env:
+          TAG: ${{ needs.guard.outputs.tag }}
+        run: |
+          set -euo pipefail
+          for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu \
+              x86_64-apple-darwin aarch64-apple-darwin; do
+            test -f "yanuget-$TAG-$target.tar.gz"
+          done
+          test -f "yanuget-$TAG-x86_64-pc-windows-msvc.zip"
+          test -f "yanuget-$TAG.cdx.json"
+          sha256sum yanuget-* > SHA256SUMS
 
       # Signed build provenance for every archive and the checksum file,
       # verifiable with `gh attestation verify` (see RELEASING.md). It is

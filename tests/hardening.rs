@@ -661,7 +661,7 @@ async fn http2_clients_are_given_this_servers_urls_not_localhost() {
     // hands an HTTP/2 client absolute package URLs pointing at `localhost` —
     // every restore over HTTP/2 then fails.
     let server = spawn().await;
-    let h2 = reqwest::Client::builder()
+    let h2 = common::client_builder()
         .http2_prior_knowledge()
         .build()
         .unwrap();

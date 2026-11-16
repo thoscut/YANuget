@@ -117,8 +117,8 @@ pub struct UploadSession {
     pub expected_sha256: Option<String>,
     pub expires: chrono::DateTime<chrono::Utc>,
     /// Since when the upload has held the space it has still to receive: its
-    /// creation or the end of its last request. `None` while a request is
-    /// writing it, which holds that space itself.
+    /// creation or the end of its last request that brought bytes. `None`
+    /// while a request is writing it, which holds that space itself.
     pub held_since: Option<chrono::DateTime<chrono::Utc>>,
 }
 
@@ -387,6 +387,17 @@ impl AdminOverview {
     }
 }
 
+/// One servable version of a package, without the rest of its row: what the
+/// documents that only list versions are built from (the flat container, a
+/// paged registration index, the version enumeration).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VersionKey {
+    pub version: NuGetVersion,
+    /// Whether SemVer1 clients must not be shown it. Not derivable from the
+    /// version alone: a SemVer2 dependency range makes a package SemVer2.
+    pub is_semver2: bool,
+}
+
 /// A package version together with its membership state in one feed. Returned by
 /// admin/retention listings that must see pending, disabled and flagged rows.
 #[derive(Debug, Clone)]
@@ -400,6 +411,23 @@ pub struct FeedVersion {
     /// When the version entered this feed: pushed, promoted, copied, moved or
     /// mirrored in, or last overwritten. Not `package.published`, which is
     /// global and older for a version promoted later.
+    pub added: chrono::DateTime<chrono::Utc>,
+}
+
+/// A version as retention decides about it: the few columns of a
+/// [`FeedVersion`] a plan reads, without building the whole [`Package`]
+/// (metadata JSON, description, release notes) for every version of a feed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetentionVersion {
+    /// The id as published.
+    pub id: String,
+    pub version: NuGetVersion,
+    pub package_size: u64,
+    /// The membership's: disabled in this feed.
+    pub enabled: bool,
+    pub pending: bool,
+    pub pinned: bool,
+    /// As [`FeedVersion::added`].
     pub added: chrono::DateTime<chrono::Utc>,
 }
 
@@ -543,6 +571,28 @@ pub trait PackageDatabase: Send + Sync {
         include_unlisted: bool,
     ) -> Result<Vec<Package>>;
 
+    /// The servable versions of `id` in `feed`, sorted ascending:
+    /// [`Self::find_versions`] without the rows. A restore asks for a
+    /// package's version list for every package in its graph, and building
+    /// each version's whole row (four JSON columns among them) to read one
+    /// string off it is most of what that costs.
+    async fn version_keys(
+        &self,
+        feed: &str,
+        id: &str,
+        include_unlisted: bool,
+    ) -> Result<Vec<VersionKey>>;
+
+    /// The servable versions of `id` in `feed` among `versions` (normalized),
+    /// listed or not, in full and sorted ascending: one registration page's
+    /// worth of rows rather than the whole package's.
+    async fn find_versions_in(
+        &self,
+        feed: &str,
+        id: &str,
+        versions: &[String],
+    ) -> Result<Vec<Package>>;
+
     /// Set the listed flag for a membership by hand (an unlist or relist), so
     /// a mirror no longer follows its upstream's listing for it. Returns
     /// `true` if a row was updated.
@@ -568,6 +618,15 @@ pub trait PackageDatabase: Send + Sync {
     /// (their listing was not set by hand), each normalized with whether it
     /// is listed. Only these two columns, for a mirror's listing refresh.
     async fn upstream_listed(&self, feed: &str, id: &str) -> Result<Vec<(String, bool)>>;
+
+    /// The normalized versions of `id` that `feed` holds, in any state: for a
+    /// mirror refresh, which asks about every upstream version at once
+    /// instead of [`Self::exists`] for each.
+    async fn held_versions(
+        &self,
+        feed: &str,
+        id: &str,
+    ) -> Result<std::collections::HashSet<String>>;
 
     /// Set the admin `enabled` flag for a membership. A disabled membership is
     /// withheld entirely. Returns `true` if a row was updated.
@@ -612,6 +671,11 @@ pub trait PackageDatabase: Send + Sync {
     /// few statements rather than one per id. Grouped by id in no particular
     /// order, each id's versions ascending.
     async fn find_all_versions_of(&self, feed: &str, ids: &[String]) -> Result<Vec<FeedVersion>>;
+
+    /// [`Self::find_all_versions_of`] narrowed to what retention reads, for a
+    /// sweep or preview that visits every version of a feed. Same order.
+    async fn retention_versions(&self, feed: &str, ids: &[String])
+        -> Result<Vec<RetentionVersion>>;
 
     /// For every version of the given ids (lower-cased): how many feeds hold
     /// it and how many bytes of attached files it has. What deleting it would
@@ -703,6 +767,10 @@ pub trait PackageDatabase: Send + Sync {
     /// How many attached files, across all versions, reference a blob.
     async fn blob_references(&self, sha256: &str) -> Result<i64>;
 
+    /// Every blob at least one attached file references, in one statement:
+    /// what a sweep over the whole store asks rather than counting each blob.
+    async fn referenced_blobs(&self) -> Result<std::collections::HashSet<String>>;
+
     /// Count one download of a file.
     async fn increment_file_downloads(
         &self,
@@ -715,9 +783,16 @@ pub trait PackageDatabase: Send + Sync {
 
     async fn create_upload(&self, upload: &UploadSession) -> Result<()>;
     async fn get_upload(&self, id: &str) -> Result<Option<UploadSession>>;
-    /// Record that `received` bytes of upload `id` have arrived, which
-    /// renews its hold on the space it has still to receive.
-    async fn set_upload_received(&self, id: &str, received: u64) -> Result<()>;
+    /// Record that `received` bytes of upload `id` have arrived, and since
+    /// when it holds the space it has still to receive: now for a request
+    /// that brought bytes, the time it held from before for one that did
+    /// not, so that requests without progress do not keep a hold alive.
+    async fn set_upload_received(
+        &self,
+        id: &str,
+        received: u64,
+        held_since: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<()>;
     /// Set since when upload `id` holds its space; `None` gives it up.
     async fn set_upload_held(
         &self,
@@ -734,6 +809,15 @@ pub trait PackageDatabase: Send + Sync {
         now: chrono::DateTime<chrono::Utc>,
         held_after: chrono::DateTime<chrono::Utc>,
     ) -> Result<u64>;
+    /// [`Self::outstanding_upload_bytes`] of the uploads of `feeds`: what
+    /// they hold between their requests, for the share of the volume those
+    /// feeds have together.
+    async fn feeds_upload_bytes(
+        &self,
+        feeds: &[String],
+        now: chrono::DateTime<chrono::Utc>,
+        held_after: chrono::DateTime<chrono::Utc>,
+    ) -> Result<u64>;
     /// How many uploads of `feed` are current (not expired) at `now`.
     async fn open_uploads(&self, feed: &str, now: chrono::DateTime<chrono::Utc>) -> Result<u64>;
     /// Uploads whose expiry has passed at `now`.
@@ -747,8 +831,9 @@ pub trait PackageDatabase: Send + Sync {
     /// Claim a symbol-file mapping: its SSQP `key`/`filename` and the owning
     /// package version (for serving and for cleanup on delete/retention).
     /// Returns `true` when this call created it. An existing mapping is never
-    /// changed — a key belongs to whichever version claimed it first — so
-    /// `false` means someone else holds it.
+    /// changed — a key belongs to whichever version claimed it first, until
+    /// that version is deleted ([`Self::hand_over_symbol`]) — so `false`
+    /// means someone else holds it.
     async fn add_symbol(
         &self,
         key: &str,
@@ -771,6 +856,22 @@ pub trait PackageDatabase: Send + Sync {
     /// were removed.
     async fn delete_symbols(&self, id: &str, version: &NuGetVersion) -> Result<u64>;
 
+    /// Move a symbol mapping from version `from` of `id` to version `to` of
+    /// the same id, when `from` still holds it. The only change a mapping
+    /// ever sees: the version that claimed a key is going, and `to` pushed
+    /// the same bytes (see `symbols::Successors`). Returns `true` if it moved.
+    async fn hand_over_symbol(
+        &self,
+        key: &str,
+        filename: &str,
+        id: &str,
+        from: &NuGetVersion,
+        to: &NuGetVersion,
+    ) -> Result<bool>;
+
+    /// Every version of `id` with global data, in any feed or none, ascending.
+    async fn stored_versions(&self, id: &str) -> Result<Vec<NuGetVersion>>;
+
     // --- tombstones (per feed) ---
 
     /// Record that a version was deliberately removed from `feed` (deleted,
@@ -779,6 +880,14 @@ pub trait PackageDatabase: Send + Sync {
 
     /// Whether a version was removed from `feed` and not pushed again since.
     async fn is_tombstoned(&self, feed: &str, id: &str, version: &NuGetVersion) -> Result<bool>;
+
+    /// The normalized versions of `id` deleted from `feed`
+    /// ([`Self::is_tombstoned`] for each of them, in one read).
+    async fn tombstoned_versions(
+        &self,
+        feed: &str,
+        id: &str,
+    ) -> Result<std::collections::HashSet<String>>;
 
     /// Forget a tombstone: a push of the version brings it back on purpose.
     async fn clear_tombstone(&self, feed: &str, id: &str, version: &NuGetVersion) -> Result<()>;

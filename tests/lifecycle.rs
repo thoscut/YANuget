@@ -1,10 +1,15 @@
 //! End-to-end tests of a version's life across feeds: who may claim an id,
 //! what an overwrite keeps, and what retention may delete.
 
+mod common;
+
 use std::io::{Cursor, Write};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
+use common::binary::{
+    config_toml, feed_tables, server_command, server_exits, start_server, text, yanuget_command,
+};
 use yanuget::config::{Config, FeedConfig, OverwriteMode, RetentionConfig};
 use yanuget::database::SqliteDatabase;
 use yanuget::storage::FilesystemStorage;
@@ -104,7 +109,7 @@ async fn spawn_feeds(customize: impl FnOnce(&mut Config)) -> TestServer {
     });
     TestServer {
         base: format!("http://{addr}"),
-        client: reqwest::Client::builder()
+        client: common::client_builder()
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .unwrap(),
@@ -342,11 +347,7 @@ async fn yanuget(
     port: u16,
     args: &[&str],
 ) -> std::process::Output {
-    let tables: String = feeds
-        .iter()
-        .map(|name| format!("[[feeds]]\nname = '{name}'\n"))
-        .collect();
-    yanuget_with(data, &tables, port, args).await
+    yanuget_with(data, &feed_tables(feeds), port, args).await
 }
 
 /// [`yanuget`] with the `[[feeds]]` tables written out.
@@ -357,14 +358,8 @@ async fn yanuget_with(
     args: &[&str],
 ) -> std::process::Output {
     let config = data.join("cli.toml");
-    // A TOML literal string takes a Windows path's backslashes as they are.
-    let mut toml = format!(
-        "data_dir = '{}'\ntls_enabled = false\nhost = '127.0.0.1'\nport = {port}\n",
-        data.display()
-    );
-    toml.push_str(feeds);
-    std::fs::write(&config, toml).unwrap();
-    tokio::process::Command::new(env!("CARGO_BIN_EXE_yanuget"))
+    std::fs::write(&config, config_toml(data, port, feeds)).unwrap();
+    yanuget_command()
         .arg("--config")
         .arg(&config)
         .args(args)
@@ -387,14 +382,6 @@ async fn silent_port() -> u16 {
         }
     });
     port
-}
-
-fn text(out: &std::process::Output) -> String {
-    format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    )
 }
 
 #[tokio::test]
@@ -639,4 +626,200 @@ async fn a_rename_into_a_gated_feed_confirms_the_approvals_it_carries() {
         offered(&after, "/prod", "gate.pkg").await.is_empty(),
         "pending until approved again"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The data lock, between a real server and the offline commands
+// ---------------------------------------------------------------------------
+
+/// The real binary serving `data`, on a port the system picked: killed when
+/// dropped.
+/// `COR-43`: a running server holds the data lock for as long as it runs, so
+/// the offline commands refuse wherever it answers, and no second server
+/// starts on the same data. The in-process harness above never takes the
+/// lock; only the real binary shows that `run_server` does, and keeps it.
+#[tokio::test]
+async fn a_running_server_holds_the_data_lock() {
+    let data = tempfile::tempdir().unwrap();
+    let path = data.path().to_path_buf();
+    // What a crashed run left in the staging directory, for the startup
+    // sweep: once, whatever the number of feeds.
+    let staging = path.join("packages").join(".uploads");
+    std::fs::create_dir_all(&staging).unwrap();
+    std::fs::write(staging.join("crashed.tmp"), b"left over").unwrap();
+    std::fs::write(staging.join("0a1b2c.part"), b"a resumable upload").unwrap();
+
+    let mut server = start_server(&path, &["old", "other"]).await;
+    let client = common::client();
+    let ready = client
+        .get(format!("http://127.0.0.1:{}/health/ready", server.port))
+        .send()
+        .await
+        .unwrap();
+    assert!(ready.status().is_success());
+    assert!(!staging.join("crashed.tmp").exists());
+    assert!(staging.join("0a1b2c.part").exists());
+
+    // Held, by a process that is up and answering: not taken and let go.
+    let db = path.join("yanuget.db").to_string_lossy().into_owned();
+    let busy = yanuget::data_lock::DataLock::try_acquire(&db);
+    assert!(busy.is_err(), "the running server does not hold the lock");
+
+    // The offline commands look at a port nothing answers on, as if the
+    // server ran in another container on the same volume: only the lock can
+    // tell them.
+    let free = silent_port().await;
+    let rename = yanuget(
+        &path,
+        &["new", "other"],
+        free,
+        &["feeds", "rename", "old", "new"],
+    )
+    .await;
+    assert!(!rename.status.success());
+    assert!(text(&rename).contains("is locked"), "{}", text(&rename));
+    let backup = tempfile::tempdir().unwrap();
+    let mut config = Config {
+        data_dir: path.clone(),
+        ..Config::default()
+    };
+    config.feeds = vec![feed("old"), feed("other")];
+    yanuget::backup::backup(
+        &config,
+        backup.path(),
+        indicatif::ProgressDrawTarget::hidden(),
+    )
+    .await
+    .unwrap();
+    let source = backup.path().to_string_lossy().into_owned();
+    let restore = yanuget(
+        &path,
+        &["old", "other"],
+        free,
+        &["restore", &source, "--force"],
+    )
+    .await;
+    assert!(!restore.status.success());
+    assert!(text(&restore).contains("is locked"), "{}", text(&restore));
+
+    // Nor does a second server start on the same data, on a port of its own.
+    let second = server_exits(server_command(&path, &["old", "other"])).await;
+    assert!(!second.status.success());
+    assert!(
+        text(&second).contains("is another server running on it?"),
+        "{}",
+        text(&second)
+    );
+    // The first one is none the worse for it.
+    let ready = client
+        .get(format!("http://127.0.0.1:{}/health/ready", server.port))
+        .send()
+        .await
+        .unwrap();
+    assert!(ready.status().is_success());
+
+    // Released with the process, however it ends.
+    server.child.kill().await.unwrap();
+    let free_again = yanuget::data_lock::DataLock::try_acquire(&db).unwrap();
+    assert!(free_again.is_some());
+}
+
+/// `restore` writes the database and the store behind a server's back, so
+/// it stops at a held lock even when nothing answers on the configured port.
+#[tokio::test]
+async fn restore_stops_while_the_data_lock_is_held() {
+    let data = tempfile::tempdir().unwrap();
+    let path = data.path().to_path_buf();
+    let server = spawn_feeds(|c| {
+        c.data_dir = path.clone();
+        c.feeds = vec![feed("kept")];
+    })
+    .await;
+    assert_eq!(
+        push(&server, "/kept", build_nupkg("Backed.Up", "1.0.0", b"b")).await,
+        reqwest::StatusCode::CREATED
+    );
+    let backup = tempfile::tempdir().unwrap();
+    let mut config = Config {
+        data_dir: path.clone(),
+        ..Config::default()
+    };
+    config.feeds = vec![feed("kept")];
+    yanuget::backup::backup(
+        &config,
+        backup.path(),
+        indicatif::ProgressDrawTarget::hidden(),
+    )
+    .await
+    .unwrap();
+    // Pushed after the backup: a restore would take it away again.
+    assert_eq!(
+        push(&server, "/kept", build_nupkg("Backed.Up", "2.0.0", b"b")).await,
+        reqwest::StatusCode::CREATED
+    );
+    server.stop().await;
+
+    let free = silent_port().await;
+    let source = backup.path().to_string_lossy().into_owned();
+    let args = ["restore", source.as_str(), "--force"];
+    let db = path.join("yanuget.db").to_string_lossy().into_owned();
+    {
+        let _held = yanuget::data_lock::DataLock::try_acquire(&db)
+            .unwrap()
+            .expect("the lock is free once the server stopped");
+        let refused = yanuget(&path, &["kept"], free, &args).await;
+        assert!(!refused.status.success());
+        assert!(text(&refused).contains("is locked"), "{}", text(&refused));
+        assert!(
+            text(&refused).contains("stop it before restoring"),
+            "{}",
+            text(&refused)
+        );
+    }
+    // Refused, it changed nothing.
+    let untouched = spawn_feeds(|c| {
+        c.data_dir = path.clone();
+        c.feeds = vec![feed("kept")];
+    })
+    .await;
+    assert_eq!(
+        offered(&untouched, "/kept", "backed.up").await,
+        ["1.0.0", "2.0.0"]
+    );
+    untouched.stop().await;
+
+    // With the lock free, the same command goes through.
+    let restored = yanuget(&path, &["kept"], free, &args).await;
+    assert!(restored.status.success(), "{}", text(&restored));
+    let after = spawn_feeds(|c| {
+        c.data_dir = path.clone();
+        c.feeds = vec![feed("kept")];
+    })
+    .await;
+    assert_eq!(offered(&after, "/kept", "backed.up").await, ["1.0.0"]);
+}
+
+/// The other direction: while an offline command holds the lock, a server
+/// does not start on the data it is changing.
+#[tokio::test]
+async fn a_server_does_not_start_while_the_data_lock_is_held() {
+    let data = tempfile::tempdir().unwrap();
+    let path = data.path().to_path_buf();
+    let db = path.join("yanuget.db").to_string_lossy().into_owned();
+    {
+        let _held = yanuget::data_lock::DataLock::try_acquire(&db)
+            .unwrap()
+            .expect("nothing else uses a new directory");
+        let refused = server_exits(server_command(&path, &[])).await;
+        assert!(!refused.status.success());
+        let said = text(&refused);
+        assert!(said.contains("is locked"), "{said}");
+        assert!(said.contains("is another server running on it?"), "{said}");
+        // It stopped before it touched anything.
+        assert!(!path.join("yanuget.db").exists());
+    }
+    // The lock was all that kept it.
+    let server = start_server(&path, &[]).await;
+    assert!(path.join("yanuget.db").exists());
+    drop(server);
 }

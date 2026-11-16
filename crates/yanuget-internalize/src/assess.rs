@@ -71,7 +71,7 @@ pub fn assess(
         Ok(raw) => raw,
         Err(e) => {
             for d in drafts.iter_mut() {
-                d.fail(format!("the capture failed: {e}"));
+                d.fail(format!("the capture failed: {}", crate::error_chain(&e)));
             }
             return wanted;
         }
@@ -215,7 +215,7 @@ pub async fn fetch(
         let file = match got {
             Ok(file) => file,
             Err(e) => {
-                draft.fail(e.to_string());
+                draft.fail(crate::error_chain(&e));
                 continue;
             }
         };
@@ -417,6 +417,14 @@ mod tests {
         let [(s, why), (s2, _)] = reasons(Err(SandboxError::Failed("guest crashed".into())));
         assert_eq!((s, s2), (Status::Failed, Status::Failed));
         assert_eq!(why, ["the capture failed: sandbox failed: guest crashed"]);
+        // An error that keeps its cause as a source still names it (`MNT-30`).
+        let [(_, why), _] = reasons(Err(SandboxError::Io(std::io::Error::other(
+            "the disk is full",
+        ))));
+        assert_eq!(
+            why,
+            ["the capture failed: sandbox I/O error: the disk is full"]
+        );
 
         let mut timed_out = raw(&[]);
         timed_out.timed_out = true;

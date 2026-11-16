@@ -26,7 +26,7 @@ use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
 use crate::error::Error;
-use crate::nupkg::{normalize_entry, open_archive};
+use crate::nupkg::{extracted_name, normalize_entry, open_archive};
 
 /// The package signature, which any change invalidates.
 const SIGNATURE: &str = ".signature.p7s";
@@ -147,6 +147,9 @@ fn rewrite_into(input: &Path, output: &Path, plan: &Rewrite) -> Result<Rewritten
     let mut actions = Vec::with_capacity(archive.len());
     let mut names_out: Vec<String> = Vec::new();
     let mut seen = HashSet::new();
+    // What the entries that stay are extracted as, to keep an added name off
+    // them.
+    let mut extracted = HashSet::new();
     let mut done = Rewritten::default();
     let mut has_content_types = false;
     let mut has_nuspec = false;
@@ -187,6 +190,7 @@ fn rewrite_into(input: &Path, output: &Path, plan: &Rewrite) -> Result<Rewritten
             Action::Copy
         };
         if !matches!(action, Action::Drop) {
+            extracted.insert(normalize_entry(&extracted_name(&name)));
             names_out.push(normalized);
         }
         actions.push((name, action));
@@ -208,6 +212,14 @@ fn rewrite_into(input: &Path, output: &Path, plan: &Rewrite) -> Result<Rewritten
             continue;
         }
         check_new_name(name)?;
+        // A new name is plain, so it is extracted as it is written: onto an
+        // entry the package spells with percent-encoding, if it has one.
+        if extracted.contains(normalized) {
+            return Err(invalid(format!(
+                "{name} cannot be added: the package has that entry under a percent-encoded \
+                 name, and both would extract to the same file"
+            )));
+        }
         let reserved = normalized == CONTENT_TYPES
             || normalized == RELATIONSHIPS
             || normalized == SIGNATURE
@@ -780,6 +792,43 @@ mod tests {
                 .remove("TOOLS/X.ps1")
         )
         .contains("no such entry"));
+    }
+
+    /// `SEC-42`: an entry is extracted under its percent-decoded name, so a
+    /// name added beside an encoded spelling of it would be one file twice.
+    #[test]
+    fn an_added_name_may_not_extract_over_an_encoded_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("tool.1.0.0.nupkg");
+        let mut zip = ZipWriter::new(File::create(&input).unwrap());
+        for (name, bytes) in [
+            ("Tool.nuspec", NUSPEC.as_bytes()),
+            ("[Content_Types].xml", TYPES.as_bytes()),
+            ("internalizer%2Freport.json", b"{}".as_slice()),
+            ("tools/setup%2Eexe", b"MZ".as_slice()),
+        ] {
+            zip.start_file(name, SimpleFileOptions::default()).unwrap();
+            zip.write_all(bytes).unwrap();
+        }
+        zip.finish().unwrap();
+        let output = dir.path().join("out.nupkg");
+
+        for name in ["internalizer/report.json", "Tools/Setup.exe"] {
+            let plan = Rewrite::new().put(name, Source::Bytes(b"new".to_vec()));
+            let err = rewrite_blocking(&input, &output, &plan).unwrap_err();
+            assert!(matches!(err, Error::InvalidRewrite(_)), "{name}: {err}");
+            assert!(err.to_string().contains("percent-encoded"), "{name}: {err}");
+            assert!(!output.exists());
+        }
+        // Once the encoded entry is gone, the name is free; and the entry is
+        // replaced under the name the package gives it.
+        let plan = Rewrite::new()
+            .remove("tools/setup%2Eexe")
+            .put("tools/setup.exe", Source::Bytes(b"new".to_vec()))
+            .put("internalizer%2Freport.json", Source::Bytes(b"[]".to_vec()));
+        let done = rewrite_blocking(&input, &output, &plan).unwrap();
+        assert_eq!(done.added, ["tools/setup.exe"]);
+        assert_eq!(done.replaced, ["internalizer%2Freport.json"]);
     }
 
     #[test]
