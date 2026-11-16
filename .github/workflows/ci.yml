@@ -253,8 +253,19 @@ jobs:
       # `--deny yanked`: cargo-audit only warns about a yanked crate in the
       # lockfile, and a yank is often how a broken or compromised release is
       # withdrawn, so it fails the job like an advisory does.
+      #
+      # RUSTSEC-2026-0459 (bundled SQLite before 3.54.0 returns uninitialized
+      # page-cache memory when a database is opened with a crafted sibling
+      # `-wal` of another page size) is fixed in libsqlite3-sys 0.39, which no
+      # sqlx release accepts yet (0.8 pins ^0.30, 0.9 caps it below 0.38).
+      # YANuget opens only its own database in `data_dir`; `restore` copies
+      # just the backup's `yanuget.db` and deletes any `-wal` next to the live
+      # file before opening it. Writing a `-wal` there already needs write
+      # access to the data directory, which owns the server anyway. Ignored,
+      # as decided by the maintainer on 2026-11-16, until sqlx allows
+      # libsqlite3-sys >= 0.39 (ROADMAP `DEP-14`).
       - name: Audit dependencies for known vulnerabilities
-        run: cargo audit --deny yanked --ignore RUSTSEC-2023-0071
+        run: cargo audit --deny yanked --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0459
 
       # Licenses, sources and duplicate crates, as set out in deny.toml. A
       # dependency under a license nobody has looked at, or from a git

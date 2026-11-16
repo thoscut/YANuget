@@ -38,6 +38,14 @@ the detail; this list is the index.
 - `INT-33` internalization requests, if the open question about it is
   answered for it.
 
+**Dependencies**
+
+- `DEP-14` Drop the `cargo audit` ignore for `RUSTSEC-2026-0459` (bundled
+  SQLite before 3.54.0, crafted `-wal` next to a database) once an sqlx
+  release accepts `libsqlite3-sys` 0.39 or later: 0.8 pins `^0.30`, 0.9.0
+  caps it below 0.38. The reasoning for the ignore is next to it in
+  `.github/workflows/ci.yml`; the server opens only its own database.
+
 **Features under discussion**
 
 - Markdown readmes on the package page; see [Features](#features).
