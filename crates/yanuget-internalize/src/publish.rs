@@ -43,12 +43,12 @@ pub enum PublishError {
     /// The feed refused, or could not be reached.
     #[error("{0}")]
     Feed(String),
-    #[error("cannot rewrite the package: {0}")]
+    #[error("cannot rewrite the package")]
     Rewrite(#[from] yanuget_pkg::Error),
     /// The report is larger than YANuget reads (`MAX_REPORT_BYTES`).
     #[error("{0}")]
     Report(String),
-    #[error("work directory: {0}")]
+    #[error("work directory")]
     Io(#[from] std::io::Error),
 }
 
@@ -274,7 +274,7 @@ impl Publisher {
             for file in release.files {
                 match self.attach(&package.id, &package.version, file).await {
                     Ok(how) => published.attached.push((file.name.clone(), how)),
-                    Err(e) => published.errors.push(e.to_string()),
+                    Err(e) => published.errors.push(crate::error_chain(&e)),
                 }
             }
         }

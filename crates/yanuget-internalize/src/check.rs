@@ -369,9 +369,11 @@ pub async fn check_upstream_online(config: &Config, report: &mut Report) {
         Err(e) => Err(e),
     };
     if let Err(e) = probe {
-        report
-            .errors
-            .push(format!("upstream {}: {e}", config.upstream.url));
+        report.errors.push(format!(
+            "upstream {}: {}",
+            config.upstream.url,
+            crate::error_chain(&e)
+        ));
     }
 }
 

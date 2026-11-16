@@ -126,6 +126,71 @@ async fn the_script_is_replaced_in_place_or_added() {
     )));
 }
 
+/// `SEC-42`: an entry that is extracted as a `chocolateyInstall.ps1` without
+/// being named so would stay the package's own, and Chocolatey might run it
+/// instead of the override's.
+#[tokio::test]
+async fn an_install_script_under_an_encoded_name_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let (input, output) = (dir.path().join("in.nupkg"), dir.path().join("out.nupkg"));
+    for scripts in [
+        vec!["tools/chocolateyInstall%2Eps1"],
+        vec![
+            "tools/chocolateyInstall.ps1",
+            "legacy%2FchocolateyInstall.ps1",
+        ],
+        vec![
+            "tools/chocolateyInstall.ps1",
+            "legacy/%43hocolateyinstall.ps1",
+        ],
+    ] {
+        nupkg_with(&input, "tool", &scripts);
+        let err = with_script(&input, &output, b"Write-Host internal".to_vec())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, yanuget_pkg::Error::InvalidPackage(_)),
+            "{scripts:?}: {err}"
+        );
+        assert!(
+            err.to_string()
+                .contains("which is extracted as a chocolateyInstall.ps1"),
+            "{scripts:?}: {err}"
+        );
+        assert!(!output.exists(), "{scripts:?}");
+    }
+
+    // A script named as one is replaced in place, whatever its folder is
+    // called, and an encoded uninstall script is not the override's concern.
+    nupkg_with(
+        &input,
+        "tool",
+        &[
+            "my%20tools/chocolateyInstall.ps1",
+            "tools/chocolateyUninstall%2Eps1",
+        ],
+    );
+    with_script(&input, &output, b"Write-Host internal".to_vec())
+        .await
+        .unwrap();
+    assert_eq!(
+        entries(&output)
+            .into_iter()
+            .filter(|(n, _)| n.ends_with("ps1"))
+            .collect::<Vec<_>>(),
+        [
+            (
+                "my%20tools/chocolateyInstall.ps1".to_string(),
+                "Write-Host internal".to_string()
+            ),
+            (
+                "tools/chocolateyUninstall%2Eps1".to_string(),
+                "Install-ChocolateyPackage upstream".to_string()
+            ),
+        ]
+    );
+}
+
 const INSTALLER: &[u8] = b"MZ\x90\x00 from the mirror";
 const CABINET: &[u8] = b"MSCF an extra cabinet";
 const SCRIPT: &str = "Install-ChocolateyPackage internal";

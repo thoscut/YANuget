@@ -50,7 +50,7 @@ pub enum UpstreamError {
     /// A download is not what the feed said it would be.
     #[error("{0}")]
     Integrity(String),
-    #[error("cache: {0}")]
+    #[error("cache")]
     Io(#[from] std::io::Error),
 }
 

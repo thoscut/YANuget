@@ -357,7 +357,7 @@ impl HttpClient {
                 UpstreamError::Http(format!(
                     "{label} {what} {}: {}",
                     redact(&current),
-                    chain(&e)
+                    crate::error_chain(&e)
                 ))
             })?;
             if !resp.status().is_redirection() {
@@ -481,19 +481,4 @@ fn credentials(config: &UpstreamConfig) -> Result<HeaderMap, String> {
         put(name, value.expose().to_string())?;
     }
     Ok(headers)
-}
-
-/// An error with its causes, which is where reqwest says what went wrong.
-fn chain(e: &dyn std::error::Error) -> String {
-    let mut s = e.to_string();
-    let mut source = e.source();
-    while let Some(cause) = source {
-        let c = cause.to_string();
-        if !s.contains(&c) {
-            s.push_str(": ");
-            s.push_str(&c);
-        }
-        source = cause.source();
-    }
-    s
 }

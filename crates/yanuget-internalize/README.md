@@ -222,13 +222,26 @@ copy of these scripts in the package is wrapped, in whatever folder, since
 which one Chocolatey runs depends on how it walks the extracted package. A
 package that already has entries under the new names is refused.
 
+Entries count by the name they are extracted under: NuGet percent-decodes an
+entry's name before it writes the file, so `tools/chocolateyInstall%2Eps1` is
+an install script on the client's disk, and `internalizer%2Fprelude.ps1`
+lands on the prelude. A package with a script under such a name, or in a
+folder with one (`my%20tools/`), is refused rather than wrapped: the loader
+and the package's own script would have to go where the archive's spelling
+does not say, and a well-formed package has no such name. An override's
+script does not go into a package that hides a `chocolateyInstall.ps1` this
+way either.
+
 The prelude wraps `Get-ChocolateyWebFile`, `Get-WebFile`, `Get-FtpFile`,
 `Install-ChocolateyPackage`, `Install-ChocolateyZipPackage`,
 `Install-ChocolateyVsixPackage` and `Install-ChocolateyPowershellCommand` in
 proxy commands. The client makes them at install time from the helpers it
 has (`ProxyCommand::Create`), so positional parameters and aliases bind as
 they do against those helpers, whatever Chocolatey version is installed. A
-wrapper:
+helper the client's Chocolatey does not have is passed over. One it has in
+another form than a function of its `chocolateyInstaller` module (a compiled
+cmdlet, another module's function) cannot be wrapped and would download as
+before, so it stops the install. A wrapper:
 
 - replaces each `http(s)` or `ftp(s)` URL with the attached file's URL;
 - replaces the checksum with the file's SHA-256, whatever the package

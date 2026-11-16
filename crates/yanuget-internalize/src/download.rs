@@ -52,7 +52,7 @@ pub enum DownloadError {
     /// The host answered something other than the file.
     #[error("{0}")]
     Status(String),
-    #[error("download cache: {0}")]
+    #[error("download cache")]
     Io(#[from] std::io::Error),
 }
 

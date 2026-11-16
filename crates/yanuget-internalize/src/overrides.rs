@@ -350,6 +350,10 @@ const INSTALL_SCRIPT: &str = "tools/chocolateyInstall.ps1";
 /// the search the prelude wraps them by): which one Chocolatey runs depends
 /// on how it walks the extracted package, so whichever it is runs the
 /// override's. A package without one gets `tools/chocolateyInstall.ps1`.
+///
+/// A package with an entry that only becomes a `chocolateyInstall.ps1` when
+/// it is extracted (`tools/chocolateyInstall%2Eps1`) is refused: Chocolatey
+/// might run that one instead of the override's.
 pub async fn with_script(
     nupkg: &Path,
     out: &Path,
@@ -357,7 +361,19 @@ pub async fn with_script(
 ) -> Result<(), yanuget_pkg::Error> {
     let (nupkg, out) = (nupkg.to_path_buf(), out.to_path_buf());
     tokio::task::spawn_blocking(move || {
-        let mut names: Vec<String> = find_scripts(entry_names(&nupkg)?)
+        let found = find_scripts(entry_names(&nupkg)?);
+        if let Some(hidden) = found
+            .encoded
+            .iter()
+            .find(|s| s.upstream == crate::prelude::UPSTREAM_SCRIPT)
+        {
+            return Err(yanuget_pkg::Error::InvalidPackage(format!(
+                "the package has an entry {}, which is extracted as a chocolateyInstall.ps1 \
+                 the override's script cannot take the place of",
+                hidden.name
+            )));
+        }
+        let mut names: Vec<String> = found
             .scripts
             .into_iter()
             .filter(|s| s.upstream == crate::prelude::UPSTREAM_SCRIPT)

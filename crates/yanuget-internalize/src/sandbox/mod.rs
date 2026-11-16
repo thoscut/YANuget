@@ -70,7 +70,7 @@ pub enum SandboxError {
     /// is an exit code in [`RawCapture`]).
     #[error("sandbox failed: {0}")]
     Failed(String),
-    #[error("sandbox I/O error: {0}")]
+    #[error("sandbox I/O error")]
     Io(#[from] std::io::Error),
 }
 

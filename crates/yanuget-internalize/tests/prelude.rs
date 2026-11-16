@@ -191,6 +191,81 @@ async fn a_package_the_prelude_cannot_go_into_is_refused() {
         assert!(err.to_string().contains("would replace"), "{taken}: {err}");
     }
 
+    // `SEC-42`: an entry is extracted under its percent-decoded name. One
+    // that lands on a name the prelude adds is taken like any other.
+    for taken in [
+        "internalizer%2Fprelude.ps1",
+        "Internalizer%5Creport.json",
+        "tools/chocolateyInstall%2Eupstream.ps1",
+    ] {
+        write_nupkg(
+            &nupkg,
+            &[("tools/chocolateyInstall.ps1", UPSTREAM), (taken, "x")],
+        );
+        let err = prelude::build(&nupkg, ID, VERSION, &downloads(), &feed())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("would replace"), "{taken}: {err}");
+    }
+    // One that only becomes a script once extracted would run without the
+    // prelude, beside a wrapped one or alone; a script in a folder with an
+    // encoded name has no place for the package's own beside it.
+    for (scripts, extracted) in [
+        (
+            vec![
+                "tools/chocolateyInstall.ps1",
+                "legacy/chocolateyInstall%2Eps1",
+            ],
+            "legacy/chocolateyInstall.ps1",
+        ),
+        (
+            vec!["tools/chocolateyInstall%2Eps1"],
+            "tools/chocolateyInstall.ps1",
+        ),
+        (
+            vec![
+                "tools/chocolateyInstall.ps1",
+                "tools%2FchocolateyUninstall.ps1",
+            ],
+            "tools/chocolateyUninstall.ps1",
+        ),
+        (
+            vec![
+                "tools/chocolateyInstall.ps1",
+                "%43hocolateyBeforeModify.ps1",
+            ],
+            "ChocolateyBeforeModify.ps1",
+        ),
+        (
+            vec!["my%20tools/chocolateyInstall.ps1"],
+            "my tools/chocolateyInstall.ps1",
+        ),
+    ] {
+        let entries: Vec<(&str, &str)> = scripts.iter().map(|name| (*name, UPSTREAM)).collect();
+        write_nupkg(&nupkg, &entries);
+        let err = prelude::build(&nupkg, ID, VERSION, &downloads(), &feed())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(&format!("which is extracted as {extracted}")),
+            "{scripts:?}: {err}"
+        );
+        assert!(err.contains("percent-encoded"), "{scripts:?}: {err}");
+    }
+    // Encoding elsewhere in the package is none of the prelude's business.
+    write_nupkg(
+        &nupkg,
+        &[
+            ("tools/chocolateyInstall.ps1", UPSTREAM),
+            ("tools/My%20Tool.exe", "MZ"),
+        ],
+    );
+    assert!(prelude::build(&nupkg, ID, VERSION, &downloads(), &feed())
+        .await
+        .unwrap()
+        .is_some());
+
     // Nothing attached, nothing to change: the package installs as it is.
     write_nupkg(&nupkg, &[("tools/readme.txt", "no script")]);
     assert!(prelude::build(&nupkg, ID, VERSION, &[], &feed())
@@ -311,6 +386,11 @@ $ErrorActionPreference = 'Stop'
 $env:ChocolateyPackageName = 'tool.install'
 $env:ChocolateyPackageVersion = '1.0.0'
 New-Module -Name chocolateyInstaller -ScriptBlock ([scriptblock]::Create((Get-Content -Raw (Join-Path $env:YANUGET_TEST_DIR 'module.ps1')))) | Import-Module
+# A helper that is no function of the module, as one a later Chocolatey
+# moved elsewhere would be.
+if ($env:YANUGET_TEST_FOREIGN_HELPER -eq 'true') {
+    function Get-WebFile { 'unwrapped' }
+}
 # The message on one line: PowerShell's own error view wraps it at the
 # console's width.
 try {
@@ -435,6 +515,25 @@ async fn an_install_fetches_the_attached_file() {
         std::fs::read(dir.path().join("download.bin")).unwrap(),
         INSTALLER
     );
+
+    // A helper the prelude finds, but not as a function of Chocolatey's
+    // module, would run unwrapped: the install stops before the package's
+    // script starts (`SEC-43`). The helpers the stand-in does not have at
+    // all, as in the run above, are nothing a package could call.
+    let out = run(vec![("YANUGET_TEST_FOREIGN_HELPER", "true".into())])
+        .await
+        .unwrap();
+    let all = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!out.status.success(), "{all}");
+    assert!(
+        all.contains("yanuget: cannot wrap Get-WebFile of this Chocolatey version"),
+        "{all}"
+    );
+    assert!(!all.contains("installed"), "{all}");
 
     // After a host move, the client says where the feed is now; an address
     // that does not answer fails the install rather than reaching anywhere

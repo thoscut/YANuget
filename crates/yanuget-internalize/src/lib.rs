@@ -25,22 +25,65 @@ pub mod sync;
 pub mod target;
 pub mod upstream;
 
-/// An error with its causes, `: `-separated, for a message that has room
-/// for one line only (a check report, a sync's reason). A cause already in
-/// the text is not repeated.
-pub fn error_chain(e: &dyn std::error::Error) -> String {
-    let mut s = e.to_string();
-    let mut source = e.source();
-    while let Some(cause) = source {
-        let c = cause.to_string();
-        if !s.contains(&c) {
-            s.push_str(": ");
-            s.push_str(&c);
-        }
-        source = cause.source();
-    }
-    s
-}
+/// An error with its causes on one line, as the shared crate has it.
+pub use yanuget_pkg::error::error_chain;
 
 /// What the tool calls itself in HTTP requests.
 pub const USER_AGENT: &str = concat!("yanuget-internalize/", env!("CARGO_PKG_VERSION"));
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn denied() -> std::io::Error {
+        std::io::Error::new(std::io::ErrorKind::PermissionDenied, "permission denied")
+    }
+
+    /// `MNT-30`: an error that has its cause as a source does not spell it
+    /// out in its own text as well, so the cause is printed once, by `{:#}`
+    /// (as `main` prints what a command returns) and by [`error_chain`]
+    /// alike.
+    #[test]
+    fn a_cause_is_printed_once() {
+        let pkg = || yanuget_pkg::Error::from(denied());
+        let cases: Vec<(anyhow::Error, &str)> = vec![
+            (
+                upstream::UpstreamError::from(denied()).into(),
+                "cache: permission denied",
+            ),
+            (
+                download::DownloadError::from(denied()).into(),
+                "download cache: permission denied",
+            ),
+            (
+                download::DownloadError::from(upstream::UpstreamError::from(denied())).into(),
+                "cache: permission denied",
+            ),
+            (
+                sandbox::SandboxError::from(denied()).into(),
+                "sandbox I/O error: permission denied",
+            ),
+            (
+                publish::PublishError::from(denied()).into(),
+                "work directory: permission denied",
+            ),
+            (
+                publish::PublishError::from(pkg()).into(),
+                "cannot rewrite the package: permission denied",
+            ),
+            (
+                publish::PublishError::from(yanuget_pkg::Error::InvalidRewrite("no".into())).into(),
+                "cannot rewrite the package: invalid rewrite: no",
+            ),
+            (
+                prelude::PreludeError::from(pkg()).into(),
+                "permission denied",
+            ),
+            (pkg().into(), "permission denied"),
+        ];
+        for (e, want) in cases {
+            assert_eq!(format!("{e:#}"), want);
+            assert_eq!(error_chain(e.as_ref()), want);
+        }
+    }
+}

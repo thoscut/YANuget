@@ -12,7 +12,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use reqwest::Url;
-use yanuget_pkg::nupkg::{entry_name, open_archive};
+use yanuget_pkg::nupkg::{entry_name, extracted_name, normalize_entry, open_archive};
 
 use crate::assess::Wanted;
 use crate::report::Draft;
@@ -63,12 +63,14 @@ fn scan_blocking(nupkg: &Path) -> Result<Scan, yanuget_pkg::Error> {
         let Some(name) = entry_name(&archive, i)? else {
             continue;
         };
-        let lower = name.to_ascii_lowercase();
+        // A script by the name it is extracted under: `tools/helper%2Eps1`
+        // is one on the client's disk.
+        let extracted = extracted_name(&name).to_ascii_lowercase();
         let is_script = [".ps1", ".psm1", ".psd1"]
             .iter()
-            .any(|ext| lower.ends_with(ext));
+            .any(|ext| extracted.ends_with(ext));
         // The tool's own entries say what it did, not what the package does.
-        let own = lower.replace('\\', "/").starts_with(OWN_DIR);
+        let own = normalize_entry(&name).starts_with(OWN_DIR);
         if !is_script || own {
             continue;
         }

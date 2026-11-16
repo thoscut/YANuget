@@ -36,9 +36,16 @@ async fn every_script_in_the_package_is_scanned() {
         b"function Get-Url { 'https://example.com/helper.zip' }",
     );
     add("tools/readme.txt", b"https://example.com/not-a-script");
+    // `SEC-42`: a script by the name it is extracted under.
+    add("tools/extra%2Eps1", b"'https://example.com/encoded.exe'");
     add(
         "internalizer/prelude.ps1",
         b"$base = 'https://nuget.example.com/files/'",
+    );
+    // Not the tool's own, whatever it is extracted as.
+    add(
+        "internalizer%2Fother.ps1",
+        b"'https://example.com/not-own.exe'",
     );
     let mut huge = b"# padding\n".repeat((MAX_SCRIPT_BYTES / 10 + 1) as usize);
     huge.extend_from_slice(b"'https://example.com/hidden.exe'");
@@ -65,6 +72,12 @@ async fn every_script_in_the_package_is_scanned() {
                 "https://example.com/cleanup.exe"
             ),
             mention("tools\\Helpers.PSM1", 1, "https://example.com/helper.zip"),
+            mention("tools/extra%2Eps1", 1, "https://example.com/encoded.exe"),
+            mention(
+                "internalizer%2Fother.ps1",
+                1,
+                "https://example.com/not-own.exe"
+            ),
         ]
     );
     assert_eq!(found.skipped, ["tools/huge.ps1"]);
