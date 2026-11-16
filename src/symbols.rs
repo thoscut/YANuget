@@ -31,7 +31,7 @@
 //!    moved to another package. It moves to another version of the same
 //!    package in one case only: the version holding it is deleted, and the
 //!    other one's own symbol package holds the same bytes, which its own
-//!    assemblies vouch for ([`successor`]). A re-push of an identical PDB by
+//!    assemblies vouch for (`successor`). A re-push of an identical PDB by
 //!    a second version records nothing, so without that the second version
 //!    would lose its symbols with the first.
 //! 3. **Stored bytes are never replaced by different ones.** A re-push of the

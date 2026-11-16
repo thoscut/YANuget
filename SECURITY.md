@@ -207,5 +207,5 @@ that still carries one says so in its changelog.
 | Advisory | Crate | `cargo audit bin` | Bill of materials | Why it is accepted |
 | --- | --- | --- | --- | --- |
 | RUSTSEC-2026-0459 | `libsqlite3-sys` 0.30 (bundled SQLite before 3.54.0) | reported | reported | Compiled in. The fix is in `libsqlite3-sys` 0.39, which no sqlx release accepts yet. The attack needs a crafted `-wal` file next to a database YANuget opens; the changelog's *Security* section says where that could happen and why it is accepted (ROADMAP `DEP-14`). |
-| RUSTSEC-2023-0071 | `rsa` (Marvin attack) | not reported | reported | Not compiled: it is in the lockfile only through sqlx's MySQL driver, which this SQLite-only build never builds. There is no fixed release. |
+| RUSTSEC-2023-0071 | `rsa` (Marvin attack) | not reported | reported up to 0.10.0 | Not compiled: it was in the lockfile only through sqlx's MySQL driver, which this SQLite-only build never builds. Since sqlx's default features are off, the driver and `rsa` are out of the lockfile as well. There is no fixed release. |
 | RUSTSEC-2026-0538 | `quinn-udp` 0.5.15 | not reported | reported, 0.10.0 only | Not compiled: listed for reqwest's optional HTTP/3 support, which YANuget does not enable. The lockfile has 0.5.16 since. |

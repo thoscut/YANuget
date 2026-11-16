@@ -221,6 +221,11 @@ RUSTSEC-2026-0459 is still open, see *Security*.
 - CI: the prelude's end-to-end test fails instead of skipping itself when
   `pwsh` is missing (`YANUGET_REQUIRE_PWSH`), and the job prints the
   PowerShell version it ran with. (`TEST-23`)
+- Unused dependencies (`tower`, `futures-util`, `quick-xml`, `mime`, and
+  `flate2` in the internalizer) and sqlx's default features (its query macros
+  and the MySQL and Postgres drivers) are gone from the build; `Cargo.lock`
+  lists 340 packages instead of 384. `rsa` is no longer in it, so `cargo
+  audit` no longer ignores RUSTSEC-2023-0071. (`MNT-34`)
 - CI: the weekly run fails once an sqlx release accepts the `libsqlite3-sys`
   that fixes RUSTSEC-2026-0459, so the ignore does not outlive its reason.
   (`CI-22`, `DEP-14`)

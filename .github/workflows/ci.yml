@@ -259,11 +259,6 @@ jobs:
         with:
           tool: cargo-audit@0.22.2,cargo-deny@0.20.2
 
-      # RUSTSEC-2023-0071 (rsa, Marvin attack) has no fixed release and reaches
-      # the lockfile only via sqlx-mysql, an optional driver this sqlite-only
-      # build never compiles. Verified rather than assumed: `cargo tree -i rsa
-      # -e normal` finds nothing, so the crate is in `Cargo.lock` and not in the
-      # binary. Ignored deliberately; revisit if a fix ships.
       # `--deny yanked`: cargo-audit only warns about a yanked crate in the
       # lockfile, and a yank is often how a broken or compromised release is
       # withdrawn, so it fails the job like an advisory does.
@@ -281,7 +276,7 @@ jobs:
       # as decided by the maintainer on 2026-11-16, until sqlx allows
       # libsqlite3-sys >= 0.39 (ROADMAP `DEP-14`).
       - name: Audit dependencies for known vulnerabilities
-        run: cargo audit --deny yanked --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0459
+        run: cargo audit --deny yanked --ignore RUSTSEC-2026-0459
 
       # The ignore of RUSTSEC-2026-0459 has to go once an sqlx release
       # accepts libsqlite3-sys >= 0.39, and nothing else would say so:

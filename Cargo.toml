@@ -36,19 +36,23 @@ axum = { version = "0.8", features = ["macros", "multipart"] }
 axum-server = { version = "0.8", default-features = false, features = ["tls-rustls-no-provider"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
-tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.7", features = ["trace", "cors", "compression-gzip", "compression-br"] }
-hyper = "1"
-hyper-util = { version = "0.1", features = ["tokio"] }
+# `server.rs` serves through hyper-util's auto (HTTP/1 and HTTP/2)
+# connection builder and `error.rs` reads hyper's `ReasonPhrase`: named
+# here, not left to what axum-server happens to turn on.
+hyper = { version = "1", features = ["http1", "http2", "server"] }
+hyper-util = { version = "0.1", features = ["tokio", "server-auto", "http1", "http2"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "macros", "chrono"] }
+# The runtime API only: no `query!` macros, no `migrate!` (see
+# `database/sqlite/schema.rs`), no `Any` driver, and timestamps are bound as
+# RFC 3339 text. The default features build sqlx's proc-macro stack, with a
+# second copy of the driver in it.
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
 futures = "0.3"
-futures-util = "0.3"
 tokio-util = { version = "0.7", features = ["io", "rt"] }
 bytes = "1"
 zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
-quick-xml = { version = "0.42", features = ["serialize"] }
 sha2 = "0.11"
 base64 = "0.23"
 hex = "0.4"
@@ -60,14 +64,12 @@ chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4"] }
 clap = { version = "4", features = ["derive", "env"] }
 async-trait = "0.1"
-mime = "0.3"
 percent-encoding = "2"
 toml = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "rustls-tls-native-roots"] }
 rust-embed = { version = "8", features = ["debug-embed", "interpolate-folder-path"] }
 indicatif = "0.18"
 fs4 = "1.1.0"
-flate2 = "1"
 
 # The SSH inbox walks a directory the uploader writes to one component at a
 # time relative to open handles (openat with O_NOFOLLOW), so no link it plants
@@ -78,10 +80,8 @@ rustix = { version = "1", features = ["fs"] }
 [dev-dependencies]
 tempfile = "3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "multipart", "rustls-tls", "http2"] }
-tokio = { version = "1", features = ["full"] }
-zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
-serde_json = "1"
-toml = "1"
+# The tests gzip and gunzip bodies (compressed responses, mirrored feeds).
+flate2 = "1"
 
 [profile.release]
 opt-level = 3
