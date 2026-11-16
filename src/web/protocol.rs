@@ -11,7 +11,7 @@ use serde::Deserialize;
 use super::helpers::{check_id, is_semver2_level, parse_stored_version, parse_version};
 use super::state::Access;
 use super::{files, ui, AppState, FeedCounters};
-use crate::database::SearchRequest;
+use crate::database::{SearchRequest, VersionKey};
 use crate::error::{Error, Result};
 use crate::nuget;
 use crate::storage::{AuxFile, PackageContent};
@@ -90,27 +90,40 @@ pub(super) async fn package_versions(
     // Admin-disabled and still-pending versions are a different matter and
     // remain excluded: those are withheld from clients outright.
     const INCLUDE_UNLISTED: bool = true;
-    let mut packages = state
-        .db
-        .find_versions(state.feed(), &id, INCLUDE_UNLISTED)
-        .await?;
-    if packages.is_empty() {
-        state.mirror_if_needed(&id).await;
-        packages = state
-            .db
-            .find_versions(state.feed(), &id, INCLUDE_UNLISTED)
-            .await?;
-    } else {
-        state.mirror_refresh(&id);
-    }
-    if packages.is_empty() {
+    // Only the versions: a restore asks this for every package in its graph.
+    let keys = servable_versions(&state, &id, INCLUDE_UNLISTED).await?;
+    if keys.is_empty() {
         return Err(Error::PackageNotFound);
     }
-    let versions: Vec<String> = packages
+    let versions: Vec<String> = keys
         .iter()
-        .map(|p| p.normalized_version().to_lowercase())
+        .map(|k| k.version.normalized().to_lowercase())
         .collect();
     Ok(Json(nuget::flat_container_index(&versions)))
+}
+
+/// The versions of `id` this feed serves, ascending, read through to the
+/// mirror: fetched first when the feed has none, refreshed in the background
+/// when it has.
+async fn servable_versions(
+    state: &AppState,
+    id: &str,
+    include_unlisted: bool,
+) -> Result<Vec<VersionKey>> {
+    let mut keys = state
+        .db
+        .version_keys(state.feed(), id, include_unlisted)
+        .await?;
+    if keys.is_empty() {
+        state.mirror_if_needed(id).await;
+        keys = state
+            .db
+            .version_keys(state.feed(), id, include_unlisted)
+            .await?;
+    } else {
+        state.mirror_refresh(id);
+    }
+    Ok(keys)
 }
 
 pub(super) async fn download_package(
@@ -301,21 +314,26 @@ async fn registration_index_for(
     check_id(id)?;
     state.require_read(headers)?;
     // Registration includes unlisted versions (flagged listed=false).
-    let mut packages = state.db.find_versions(state.feed(), id, true).await?;
-    if packages.is_empty() {
-        state.mirror_if_needed(id).await;
-        packages = state.db.find_versions(state.feed(), id, true).await?;
-    } else {
-        state.mirror_refresh(id);
-    }
-    if packages.is_empty() {
-        return Err(Error::PackageNotFound);
-    }
-    let packages = filter_hive(packages, semver2);
-    if packages.is_empty() {
+    let keys = servable_versions(state, id, true).await?;
+    let versions = hive_versions(keys, semver2);
+    if versions.is_empty() {
         return Err(Error::PackageNotFound);
     }
     let urls = state.url_builder(headers).with_hive(semver2);
+    // An index of external pages names their bounds and no leaf, so the
+    // version list is all of it: the rows are read a page at a time, by
+    // whoever asks for a page.
+    if nuget::registration_is_paged(versions.len()) {
+        return Ok(Json(nuget::registration_index_paged(&urls, id, &versions)).into_response());
+    }
+    let packages = state
+        .db
+        .find_versions_in(state.feed(), id, &versions)
+        .await?;
+    // Gone between the two reads.
+    if packages.is_empty() {
+        return Err(Error::PackageNotFound);
+    }
     Ok(Json(nuget::registration_index(&urls, id, &packages)).into_response())
 }
 
@@ -349,9 +367,20 @@ async fn registration_page_for(
     let lower = parse_version(lower)?;
     let upper = parse_version(upper)?;
     // Registration includes unlisted versions; restrict to the page's range.
-    let packages = state.db.find_versions(state.feed(), id, true).await?;
-    let mut packages = filter_hive(packages, semver2);
-    packages.retain(|p| p.version >= lower && p.version <= upper);
+    // SemVer order is not something SQL can compare, so the range is cut
+    // from the version list here and only its rows are read in full: a
+    // client walking every page of a large package used to make the server
+    // build every version's row once per page.
+    let mut keys = state.db.version_keys(state.feed(), id, true).await?;
+    keys.retain(|k| k.version >= lower && k.version <= upper);
+    let versions = hive_versions(keys, semver2);
+    if versions.is_empty() {
+        return Err(Error::PackageNotFound);
+    }
+    let packages = state
+        .db
+        .find_versions_in(state.feed(), id, &versions)
+        .await?;
     if packages.is_empty() {
         return Err(Error::PackageNotFound);
     }
@@ -400,15 +429,14 @@ async fn registration_leaf_for(
 }
 
 /// Restrict a version list to what the requested hive may expose.
-fn filter_hive(
-    packages: Vec<crate::models::Package>,
-    semver2: bool,
-) -> Vec<crate::models::Package> {
-    if semver2 {
-        packages
-    } else {
-        packages.into_iter().filter(|p| !p.is_semver2).collect()
-    }
+/// The normalized versions of `keys` that belong in a registration hive: all
+/// of them in the SemVer2 one, and in the other only those a SemVer1 client
+/// can parse.
+fn hive_versions(keys: Vec<VersionKey>, semver2: bool) -> Vec<String> {
+    keys.into_iter()
+        .filter(|k| semver2 || !k.is_semver2)
+        .map(|k| k.version.normalized())
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -488,16 +516,16 @@ pub(super) async fn autocomplete(
     // `id` present => enumerate that package's versions.
     if let Some(id) = params.id.filter(|s| !s.is_empty()) {
         // An id no package can have has no versions.
-        let packages = if check_id(&id).is_ok() {
-            state.db.find_versions(state.feed(), &id, false).await?
+        let keys = if check_id(&id).is_ok() {
+            state.db.version_keys(state.feed(), &id, false).await?
         } else {
             Vec::new()
         };
-        let versions: Vec<String> = packages
+        let versions: Vec<String> = keys
             .iter()
-            .filter(|p| include_prerelease || !p.is_prerelease())
-            .filter(|p| include_semver2 || !p.is_semver2)
-            .map(|p| p.normalized_version())
+            .filter(|k| include_prerelease || !k.version.is_prerelease())
+            .filter(|k| include_semver2 || !k.is_semver2)
+            .map(|k| k.version.normalized())
             .collect();
         return Ok(Json(nuget::enumerate_versions_response(&versions)));
     }

@@ -218,6 +218,10 @@ impl Config {
         if let Some(v) = get("YANUGET_FILES_MAX_OPEN_UPLOADS")? {
             self.files.max_open_uploads = parse_env_int("YANUGET_FILES_MAX_OPEN_UPLOADS", &v)?;
         }
+        if let Some(v) = get("YANUGET_FILES_MAX_UPLOAD_SPACE_PERCENT")? {
+            self.files.max_upload_space_percent =
+                parse_env_int("YANUGET_FILES_MAX_UPLOAD_SPACE_PERCENT", &v)?;
+        }
         if let Some(v) = get("YANUGET_FILES_INBOX_DIR")? {
             self.files.inbox_dir = (!v.trim().is_empty()).then(|| PathBuf::from(v.trim()));
         }

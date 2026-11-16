@@ -239,6 +239,12 @@ struct DependencyDoc<'a> {
     registration: String,
 }
 
+/// Whether a package with `versions` versions gets a registration index of
+/// external pages rather than one with every leaf inlined.
+pub fn registration_is_paged(versions: usize) -> bool {
+    versions >= REGISTRATION_INLINE_MAX
+}
+
 /// Build the registration index (`/v3/registration/{id}/index.json`).
 ///
 /// For small packages all leaves are inlined into one page. Once a package has
@@ -251,29 +257,50 @@ pub fn registration_index<'a>(
     id: &str,
     packages: &'a [Package],
 ) -> RegistrationIndexDoc<'a> {
+    if registration_is_paged(packages.len()) {
+        let versions: Vec<String> = packages.iter().map(|p| p.normalized_version()).collect();
+        return registration_index_paged(urls, id, &versions);
+    }
     let lower_id = id.to_lowercase();
     let index_url = urls.registration_index(&lower_id);
+    let items = vec![inline_page(urls, &lower_id, &index_url, packages)];
+    registration_index_doc(index_url, items)
+}
 
-    let items: Vec<RegistrationPageDoc<'a>> = if packages.len() < REGISTRATION_INLINE_MAX {
-        vec![inline_page(urls, &lower_id, &index_url, packages)]
-    } else {
-        packages
-            .chunks(REGISTRATION_PAGE_SIZE)
-            .map(|chunk| {
-                let (lower, upper) = bounds(chunk);
-                RegistrationPageDoc {
-                    id: urls.registration_page(&lower_id, &lower, &upper),
-                    page_type: None,
-                    count: chunk.len(),
-                    items: None,
-                    lower,
-                    parent: None,
-                    upper,
-                }
-            })
-            .collect()
-    };
+/// The registration index of a package with too many versions to inline
+/// ([`registration_is_paged`]): the pages it is split into, by their bounds.
+/// It names no leaf, so the versions are all it takes: `versions`,
+/// normalized and sorted ascending.
+pub fn registration_index_paged(
+    urls: &UrlBuilder,
+    id: &str,
+    versions: &[String],
+) -> RegistrationIndexDoc<'static> {
+    let lower_id = id.to_lowercase();
+    let index_url = urls.registration_index(&lower_id);
+    let items = versions
+        .chunks(REGISTRATION_PAGE_SIZE)
+        .map(|chunk| {
+            let lower = chunk.first().cloned().unwrap_or_default();
+            let upper = chunk.last().cloned().unwrap_or_default();
+            RegistrationPageDoc {
+                id: urls.registration_page(&lower_id, &lower, &upper),
+                page_type: None,
+                count: chunk.len(),
+                items: None,
+                lower,
+                parent: None,
+                upper,
+            }
+        })
+        .collect();
+    registration_index_doc(index_url, items)
+}
 
+fn registration_index_doc<'a>(
+    index_url: String,
+    items: Vec<RegistrationPageDoc<'a>>,
+) -> RegistrationIndexDoc<'a> {
     RegistrationIndexDoc {
         id: index_url,
         types: [

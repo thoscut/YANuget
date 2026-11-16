@@ -48,7 +48,7 @@ use crate::version::NuGetVersion;
 use super::{
     AdminFilter, AdminOverview, DatabaseStats, FeedVersion, Membership, MembershipChange,
     PackageDatabase, PackageFile, SearchPage, SearchRequest, StoredFeed, SymbolKey, SymbolRef,
-    TagCount, UploadSession, VersionFootprint,
+    TagCount, UploadSession, VersionFootprint, VersionKey,
 };
 
 /// The feed-scoped projection: every `packages` column plus the membership's
@@ -318,6 +318,14 @@ impl PackageDatabase for SqliteDatabase {
         memberships::follow_upstream_listing(self, feed, id, version, listed).await
     }
 
+    async fn held_versions(
+        &self,
+        feed: &str,
+        id: &str,
+    ) -> Result<std::collections::HashSet<String>> {
+        memberships::held_versions(self, feed, id).await
+    }
+
     async fn upstream_listed(&self, feed: &str, id: &str) -> Result<Vec<(String, bool)>> {
         memberships::upstream_listed(self, feed, id).await
     }
@@ -378,6 +386,24 @@ impl PackageDatabase for SqliteDatabase {
         include_unlisted: bool,
     ) -> Result<Vec<Package>> {
         feeds::find_versions(self, feed, id, include_unlisted).await
+    }
+
+    async fn version_keys(
+        &self,
+        feed: &str,
+        id: &str,
+        include_unlisted: bool,
+    ) -> Result<Vec<VersionKey>> {
+        feeds::version_keys(self, feed, id, include_unlisted).await
+    }
+
+    async fn find_versions_in(
+        &self,
+        feed: &str,
+        id: &str,
+        versions: &[String],
+    ) -> Result<Vec<Package>> {
+        feeds::find_versions_in(self, feed, id, versions).await
     }
 
     async fn find_all_versions(&self, feed: &str, id: &str) -> Result<Vec<FeedVersion>> {
@@ -500,8 +526,13 @@ impl PackageDatabase for SqliteDatabase {
         uploads::get_upload(self, id).await
     }
 
-    async fn set_upload_received(&self, id: &str, received: u64) -> Result<()> {
-        uploads::set_upload_received(self, id, received).await
+    async fn set_upload_received(
+        &self,
+        id: &str,
+        received: u64,
+        held_since: Option<DateTime<Utc>>,
+    ) -> Result<()> {
+        uploads::set_upload_received(self, id, received, held_since).await
     }
 
     async fn set_upload_held(&self, id: &str, since: Option<DateTime<Utc>>) -> Result<()> {
@@ -518,6 +549,15 @@ impl PackageDatabase for SqliteDatabase {
         held_after: DateTime<Utc>,
     ) -> Result<u64> {
         uploads::outstanding_upload_bytes(self, now, held_after).await
+    }
+
+    async fn feed_upload_bytes(
+        &self,
+        feed: &str,
+        now: DateTime<Utc>,
+        held_after: DateTime<Utc>,
+    ) -> Result<u64> {
+        uploads::feed_upload_bytes(self, feed, now, held_after).await
     }
 
     async fn open_uploads(&self, feed: &str, now: DateTime<Utc>) -> Result<u64> {
@@ -560,6 +600,14 @@ impl PackageDatabase for SqliteDatabase {
 
     async fn add_tombstone(&self, feed: &str, id: &str, version: &NuGetVersion) -> Result<()> {
         tombstones::add_tombstone(self, feed, id, version).await
+    }
+
+    async fn tombstoned_versions(
+        &self,
+        feed: &str,
+        id: &str,
+    ) -> Result<std::collections::HashSet<String>> {
+        tombstones::tombstoned_versions(self, feed, id).await
     }
 
     async fn is_tombstoned(&self, feed: &str, id: &str, version: &NuGetVersion) -> Result<bool> {

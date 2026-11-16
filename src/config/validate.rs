@@ -36,6 +36,13 @@ impl Config {
                     .into(),
             ));
         }
+        if self.files.max_upload_space_percent > 100 {
+            return Err(Error::BadRequest(
+                "files.max_upload_space_percent is a share of the free space: 1 to 100 \
+                 (0 or 100 for no cap)"
+                    .into(),
+            ));
+        }
         Ok(())
     }
 }

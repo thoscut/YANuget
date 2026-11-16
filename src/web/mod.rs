@@ -37,7 +37,7 @@ mod state;
 mod ui;
 
 pub use hosted::sweep_expired_uploads;
-pub use state::{AppState, FeedContext, FeedCounters, FeedMeta};
+pub use state::{sweep_stale_uploads, AppState, FeedContext, FeedCounters, FeedMeta};
 
 use axum::response::Html;
 use axum::routing::{delete, get, head, post, put};

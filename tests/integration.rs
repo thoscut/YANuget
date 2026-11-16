@@ -691,3 +691,131 @@ async fn concurrent_pushes_with_prune_on_push_stay_consistent() {
     );
     assert!(list.len() <= 8);
 }
+
+/// A package with enough versions that its registration is split into pages:
+/// the index, its pages, the flat container and the version enumeration are
+/// built from the version list alone, and each page from its own rows.
+#[tokio::test]
+async fn a_large_package_is_listed_and_paged_like_a_small_one() {
+    let server = spawn().await;
+    let get = |url: String| async {
+        let resp = server.client.get(url).send().await.unwrap();
+        assert!(resp.status().is_success(), "{}", resp.status());
+        resp.json::<serde_json::Value>().await.unwrap()
+    };
+    // 127 SemVer1 versions (10 to a minor, so text order is not version
+    // order), and three only a SemVer2 client can read.
+    let mut pushed: Vec<String> = (0..127)
+        .map(|n| format!("1.{}.{}", n / 10, n % 10))
+        .collect();
+    pushed.extend(["2.0.0-rc.1", "2.0.0-rc.2", "2.0.0-rc.10"].map(String::from));
+    for version in &pushed {
+        let resp = push_multipart(
+            &server,
+            API_KEY,
+            build_nupkg("Many.Versions", version, b"x"),
+        );
+        assert_eq!(resp.await.status(), reqwest::StatusCode::CREATED);
+    }
+    // Pushed in version order: 1.10.0 after 1.9.9 and rc.10 after rc.2,
+    // neither of which a text sort would give.
+    let ordered = pushed.clone();
+    let unlisted = server
+        .client
+        .delete(server.url("/api/v2/package/many.versions/1.6.5"))
+        .header("X-NuGet-ApiKey", API_KEY)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unlisted.status(), reqwest::StatusCode::NO_CONTENT);
+
+    // The flat container lists them all, unlisted included, ascending.
+    let flat = get(server.url("/v3/package/many.versions/index.json")).await;
+    assert_eq!(flat["versions"], serde_json::json!(ordered));
+
+    // The SemVer2 hive holds 130 versions: an index of three pages, by their
+    // bounds, with no leaf in it.
+    let index = get(server.url("/v3/registration-semver2/many.versions/index.json")).await;
+    assert_eq!(index["count"], 3);
+    let pages = index["items"].as_array().unwrap();
+    let bounds: Vec<(&str, &str, u64)> = pages
+        .iter()
+        .map(|p| {
+            assert!(p.get("items").is_none(), "an external page inlines nothing");
+            (
+                p["lower"].as_str().unwrap(),
+                p["upper"].as_str().unwrap(),
+                p["count"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        bounds,
+        [
+            ("1.0.0", "1.6.3", 64),
+            ("1.6.4", "2.0.0-rc.1", 64),
+            ("2.0.0-rc.2", "2.0.0-rc.10", 2)
+        ]
+    );
+
+    // Each page serves exactly its range, in full.
+    let mut paged = Vec::new();
+    for page in pages {
+        let doc = get(page["@id"].as_str().unwrap().to_string()).await;
+        assert_eq!(doc["@type"], "catalog:CatalogPage");
+        assert_eq!(doc["count"], page["count"]);
+        for leaf in doc["items"].as_array().unwrap() {
+            let entry = &leaf["catalogEntry"];
+            assert_eq!(entry["id"], "Many.Versions");
+            let version = entry["version"].as_str().unwrap().to_string();
+            assert_eq!(entry["listed"], version != "1.6.5", "{version}");
+            assert_eq!(
+                entry["dependencyGroups"][0]["dependencies"][0]["id"],
+                "Newtonsoft.Json"
+            );
+            paged.push(version);
+        }
+    }
+    assert_eq!(paged, ordered);
+
+    // The SemVer1 hive leaves the three out, which makes it small enough to
+    // inline: one page, with every leaf.
+    let index = get(server.url("/v3/registration/many.versions/index.json")).await;
+    assert_eq!(index["count"], 1);
+    let inlined: Vec<&str> = index["items"][0]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|leaf| leaf["catalogEntry"]["version"].as_str().unwrap())
+        .collect();
+    assert_eq!(inlined, &ordered[..127]);
+    // A page of that hive holds no SemVer2 version either, whatever range is
+    // asked for.
+    let page = get(server.url("/v3/registration/many.versions/page/1.12.0/2.0.0-rc.10.json")).await;
+    let in_range: Vec<&str> = page["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|leaf| leaf["catalogEntry"]["version"].as_str().unwrap())
+        .collect();
+    assert_eq!(in_range, &ordered[120..127]);
+    assert_eq!(
+        status_of(
+            &server,
+            "/v3/registration/many.versions/page/2.0.0-rc.1/2.0.0-rc.10.json"
+        )
+        .await,
+        reqwest::StatusCode::NOT_FOUND
+    );
+
+    // The version enumeration: listed versions only, pre-releases and SemVer2
+    // ones when asked for.
+    let stable = get(server.url("/v3/autocomplete?id=Many.Versions")).await;
+    let stable = stable["data"].as_array().unwrap();
+    assert_eq!(stable.len(), 126);
+    assert!(!stable.contains(&serde_json::json!("1.6.5")));
+    let all =
+        get(server.url("/v3/autocomplete?id=Many.Versions&prerelease=true&semVerLevel=2.0.0"))
+            .await;
+    assert_eq!(all["data"].as_array().unwrap().len(), 129);
+}

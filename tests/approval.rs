@@ -128,6 +128,113 @@ async fn spawn_gated_pending_only() -> TestServer {
     server
 }
 
+/// An `intake` feed under `pending-only` and a `prod` feed whose license
+/// policy handles GPL as `action` says, both gated and both holding the same
+/// MIT build of `Lic.Pkg` 1.0.0, pending. Returns the server and that build.
+async fn spawn_intake_beside_a_feed_without_gpl(
+    action: yanuget::config::PolicyAction,
+) -> (TestServer, Vec<u8>) {
+    let server = spawn_feeds(|c| {
+        c.api_key = Some(API_KEY.into());
+        c.admin_api_key = Some(ADMIN_KEY.into());
+        let mut intake = feed("intake");
+        intake.requires_approval = true;
+        intake.allow_overwrite = Some(yanuget::config::OverwriteMode::PendingOnly);
+        let mut prod = feed("prod");
+        prod.requires_approval = true;
+        prod.preview_api_key = Some("prod-preview".into());
+        prod.license_policy = yanuget::config::LicensePolicyConfig {
+            enabled: true,
+            blocked: vec!["GPL-3.0-only".into()],
+            action,
+            ..Default::default()
+        };
+        c.feeds = vec![intake, prod];
+    })
+    .await;
+    let mit = build_nupkg_with_license("Lic.Pkg", "1.0.0", "MIT");
+    for path in ["/intake/api/v2/package", "/prod/api/v2/package"] {
+        let pushed = push_to(&server, path, API_KEY, mit.clone()).await;
+        assert_eq!(pushed.status(), reqwest::StatusCode::CREATED, "{path}");
+    }
+    (server, mit)
+}
+
+/// The build of `Lic.Pkg` 1.0.0 that `prod` holds, as its reviewer gets it.
+async fn prod_build(server: &TestServer) -> Vec<u8> {
+    let nupkg = server
+        .client
+        .get(server.url("/prod/v3/package/lic.pkg/1.0.0/lic.pkg.1.0.0.nupkg"))
+        .header("X-NuGet-ApiKey", "prod-preview")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(nupkg.status(), reqwest::StatusCode::OK);
+    nupkg.bytes().await.unwrap().to_vec()
+}
+
+/// Whether, and why, `feed` flags `Lic.Pkg` 1.0.0.
+async fn flag_in(server: &TestServer, feed: &str) -> Option<String> {
+    use yanuget::database::PackageDatabase;
+    let db = SqliteDatabase::connect(&server._dir.path().join("yanuget.db").to_string_lossy())
+        .await
+        .unwrap();
+    let versions = db.find_all_versions(feed, "lic.pkg").await.unwrap();
+    assert_eq!(versions.len(), 1, "{feed}");
+    assert_eq!(versions[0].flagged, versions[0].flag_reason.is_some());
+    versions[0].flag_reason.clone()
+}
+
+/// Under `pending-only` a push into one feed replaces the pending build in
+/// every feed that holds it, so each of their license policies judges the
+/// new build: the push key of an intake feed must not be a way to put a
+/// build into a feed whose policy blocks it. `push_package` hands the other
+/// feeds' policies to the index for that (`PERF-11` narrowed when).
+#[tokio::test]
+async fn a_pending_only_push_is_refused_by_another_holding_feeds_license_policy() {
+    use yanuget::config::PolicyAction;
+    let (server, mit) = spawn_intake_beside_a_feed_without_gpl(PolicyAction::Block).await;
+    assert_eq!(prod_build(&server).await, mit);
+
+    // `intake` has no policy of its own, and would take the GPL build.
+    let gpl = build_nupkg_with_license("Lic.Pkg", "1.0.0", "GPL-3.0-only");
+    let refused = push_to(&server, "/intake/api/v2/package", API_KEY, gpl.clone()).await;
+    assert_eq!(refused.status(), reqwest::StatusCode::FORBIDDEN);
+    // `prod` goes on holding the build it had, and so does `intake`.
+    assert_eq!(prod_build(&server).await, mit);
+    assert_eq!(flag_in(&server, "prod").await, None);
+    assert_eq!(flag_in(&server, "intake").await, None);
+
+    // A build `prod` accepts replaces it in both.
+    let apache = build_nupkg_with_license("Lic.Pkg", "1.0.0", "Apache-2.0");
+    let replaced = push_to(&server, "/intake/api/v2/package", API_KEY, apache.clone()).await;
+    assert_eq!(replaced.status(), reqwest::StatusCode::CREATED);
+    assert_eq!(prod_build(&server).await, apache);
+}
+
+/// The same under `action = "warn"`: the build goes in, and is flagged in
+/// the feed whose policy says so, not in the one it was pushed to.
+#[tokio::test]
+async fn a_pending_only_push_is_flagged_where_another_holding_feeds_policy_warns() {
+    use yanuget::config::PolicyAction;
+    let (server, _) = spawn_intake_beside_a_feed_without_gpl(PolicyAction::Warn).await;
+    let gpl = build_nupkg_with_license("Lic.Pkg", "1.0.0", "GPL-3.0-only");
+    let pushed = push_to(&server, "/intake/api/v2/package", API_KEY, gpl.clone()).await;
+    assert_eq!(pushed.status(), reqwest::StatusCode::CREATED);
+    assert_eq!(prod_build(&server).await, gpl);
+    let why = flag_in(&server, "prod")
+        .await
+        .expect("prod flags the new build");
+    assert!(why.contains("GPL-3.0-only"), "{why}");
+    assert_eq!(flag_in(&server, "intake").await, None);
+
+    // A build `prod` accepts clears the flag again.
+    let mit = build_nupkg_with_license("Lic.Pkg", "1.0.0", "MIT");
+    let pushed = push_to(&server, "/intake/api/v2/package", API_KEY, mit).await;
+    assert_eq!(pushed.status(), reqwest::StatusCode::CREATED);
+    assert_eq!(flag_in(&server, "prod").await, None);
+}
+
 /// Attach `body` as `name` to `Ring.Pkg` 1.0.0 in `gated`, with the push key
 /// and, if `admin`, the admin key too.
 async fn put_gated_file(

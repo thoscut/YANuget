@@ -34,11 +34,12 @@ pub type Measure = Arc<dyn Fn(&Path) -> io::Result<u64> + Send + Sync>;
 pub const RESERVE_CHECK_INTERVAL: u64 = 64 * 1024 * 1024;
 
 /// How long an unfinished resumable upload holds the space it has still to
-/// receive after its last request ended (or after it was created). An upload
-/// may stay open for `upload_expiry_hours`, but one a client abandoned
-/// without a `DELETE` must not keep every other upload out for that long:
-/// past this, it holds nothing, and its next request is admitted again like
-/// a new upload of what is left.
+/// receive after its last request that brought bytes ended (or after it was
+/// created). An upload may stay open for `upload_expiry_hours`, but one a
+/// client abandoned without a `DELETE` must not keep every other upload out
+/// for that long: past this, it holds nothing, and its next request is
+/// admitted again like a new upload of what is left. A request that brings
+/// nothing does not renew the hold.
 pub const RESUMABLE_HOLD: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
 /// The admission of writes into one staging directory: its volume's free
@@ -189,9 +190,38 @@ impl SpaceGuard {
                 "{available} bytes free on the storage volume, {needed} needed: \
                  {incoming} incoming, {in_flight} promised to other uploads in progress, \
                  {resumable} held by unfinished resumable uploads (each for up to {} min \
-                 after its last request), and the configured reserve of {}",
+                 after the last request that brought bytes), and the configured reserve of {}",
                 RESUMABLE_HOLD.as_secs() / 60,
                 self.reserve
+            )));
+        }
+        Ok(())
+    }
+
+    /// Whether one feed's unfinished resumable uploads may together hold
+    /// `held` bytes: at most `percent` of what the volume has free above the
+    /// reserve.
+    ///
+    /// [`Self::check`] alone lets a single feed promise all of it, and a
+    /// promise costs nothing: whoever holds one feed's push key could keep
+    /// every other feed's uploads out with uploads that never arrive. Capped,
+    /// the rest stays for the others. A `percent` of 0 or 100 (and more) is
+    /// no cap; like the reserve itself, it is not applied when the reserve
+    /// is off or the volume cannot be measured.
+    pub async fn check_share(&self, held: u64, percent: u8) -> Result<()> {
+        if self.reserve == 0 || percent == 0 || percent >= 100 {
+            return Ok(());
+        }
+        let Some(available) = self.available().await else {
+            return Ok(());
+        };
+        let headroom = available.saturating_sub(self.reserve);
+        let share = (u128::from(headroom) * u128::from(percent) / 100) as u64;
+        if held > share {
+            return Err(Error::InsufficientStorage(format!(
+                "this feed's unfinished resumable uploads would hold {held} bytes, and may \
+                 hold {share}: {percent} % (files.max_upload_space_percent) of the {headroom} \
+                 bytes free above the configured reserve"
             )));
         }
         Ok(())
@@ -257,6 +287,7 @@ impl Reservations {
         Reservation {
             pool: Arc::clone(self),
             held: AtomicU64::new(bytes),
+            also: None,
         }
     }
 }
@@ -266,9 +297,22 @@ impl Reservations {
 pub struct Reservation {
     pool: Arc<Reservations>,
     held: AtomicU64,
+    /// A second pool the same bytes are counted in (see [`Self::counted_in`]).
+    also: Option<Arc<Reservations>>,
 }
 
 impl Reservation {
+    /// Count what this reservation holds in `pool` as well, in step with its
+    /// own: a feed's resumable uploads are promised space on the volume and
+    /// counted against that feed's share of it, and both must shrink as the
+    /// bytes arrive.
+    pub fn counted_in(mut self, pool: &Arc<Reservations>) -> Self {
+        pool.promised
+            .fetch_add(self.held.load(Ordering::SeqCst), Ordering::SeqCst);
+        self.also = Some(Arc::clone(pool));
+        self
+    }
+
     /// `n` bytes went to disk through this upload: off the promise, never
     /// more than it holds, so a write longer than declared takes nothing off
     /// another upload's share.
@@ -278,6 +322,9 @@ impl Reservation {
         let take = n.min(held);
         self.held.store(held - take, Ordering::SeqCst);
         self.pool.promised.fetch_sub(take, Ordering::SeqCst);
+        if let Some(also) = &self.also {
+            also.promised.fetch_sub(take, Ordering::SeqCst);
+        }
     }
 }
 
@@ -285,6 +332,9 @@ impl Drop for Reservation {
     fn drop(&mut self) {
         let held = self.held.load(Ordering::SeqCst);
         self.pool.promised.fetch_sub(held, Ordering::SeqCst);
+        if let Some(also) = &self.also {
+            also.promised.fetch_sub(held, Ordering::SeqCst);
+        }
     }
 }
 
@@ -427,6 +477,47 @@ mod tests {
         // An upload that stops part-way gives back the rest.
         drop(second);
         assert_eq!(pool.promised(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_reservation_counted_in_a_second_pool_keeps_both_in_step() {
+        let space = fixed(0, 0);
+        let feed = Arc::new(Reservations::default());
+        let upload = space.reserve(1000).counted_in(&feed);
+        let other = space.reserve(300);
+        assert_eq!((space.promised(), feed.promised()), (1300, 1000));
+
+        let mut sink = tokio::io::sink();
+        let mut guarded = space.guard(&mut sink, &upload);
+        guarded.write_all(&[0u8; 400]).await.unwrap();
+        assert_eq!((space.promised(), feed.promised()), (900, 600));
+        drop(upload);
+        assert_eq!((space.promised(), feed.promised()), (300, 0));
+        drop(other);
+        assert_eq!(space.promised(), 0);
+    }
+
+    #[tokio::test]
+    async fn one_feed_may_hold_only_its_share_of_the_free_space() {
+        // 1000 free, 100 kept: 900 to promise, half of it to one feed.
+        let space = fixed(100, 1000);
+        assert!(space.check_share(450, 50).await.is_ok());
+        let err = space.check_share(451, 50).await.unwrap_err();
+        assert!(matches!(err, Error::InsufficientStorage(_)), "{err}");
+        let why = err.to_string();
+        assert!(why.contains("may hold 450"), "{why}");
+        assert!(why.contains("max_upload_space_percent"), "{why}");
+        // No cap, by either spelling.
+        assert!(space.check_share(u64::MAX, 0).await.is_ok());
+        assert!(space.check_share(u64::MAX, 100).await.is_ok());
+        // Nothing is held to a share where nothing is held to the reserve,
+        // or where free space cannot be measured.
+        assert!(fixed(0, 10).check_share(1000, 50).await.is_ok());
+        let blind = SpaceGuard::new("/nowhere", 100)
+            .with_measure(|_| Err(io::Error::other("no statvfs here")));
+        assert!(blind.check_share(u64::MAX, 50).await.is_ok());
+        // A volume already under its reserve has nothing to share out.
+        assert!(fixed(100, 50).check_share(1, 50).await.is_err());
     }
 
     #[tokio::test]

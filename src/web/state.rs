@@ -17,7 +17,7 @@ use crate::error::{Error, Result};
 use crate::mirror::{self, MirrorClient, MirrorOptions};
 use crate::nuget::UrlBuilder;
 use crate::retention;
-use crate::space::{Reservation, SpaceGuard};
+use crate::space::{Reservation, Reservations, SpaceGuard};
 use crate::storage::{PackageStorage, TempPath};
 use crate::version::NuGetVersion;
 
@@ -56,6 +56,10 @@ pub struct FeedContext {
     pub cleanup: Arc<retention::RetentionState>,
     /// What `/metrics` counts for this feed since startup.
     pub counters: FeedCounters,
+    /// What the feed's resumable uploads being written right now have still
+    /// to receive: with what the others hold between their requests, the
+    /// feed's part of the volume (`files.max_upload_space_percent`).
+    pub(super) resumable: Arc<Reservations>,
 }
 
 /// Events `/metrics` counts per feed, since the process started.
@@ -125,6 +129,7 @@ impl FeedContext {
             allowed_extensions: feed.allowed_extensions.clone(),
             cleanup: Arc::default(),
             counters: FeedCounters::default(),
+            resumable: Arc::default(),
         })
     }
 }
@@ -223,13 +228,16 @@ impl AppState {
         Self::new_with_space(storage, db, config, space).await
     }
 
-    /// [`Self::new`], admitting writes through `space`.
+    /// [`Self::new`], admitting writes through `space`. As the whole server
+    /// of a single feed, it clears `space`'s directory of what a previous run
+    /// left there (see [`sweep_stale_uploads`]).
     pub async fn new_with_space(
         storage: Arc<dyn PackageStorage>,
         db: Arc<dyn PackageDatabase>,
         config: Arc<Config>,
         space: Arc<SpaceGuard>,
     ) -> Result<Self> {
+        sweep_stale_uploads(space.dir()).await;
         let feeds = config.resolved_feeds()?;
         // `resolved_feeds` with no `[[feeds]]` yields exactly the root feed.
         let resolved = feeds
@@ -243,6 +251,10 @@ impl AppState {
     /// `space`'s directory and admitted by it: every feed of a server shares
     /// one (see [`SpaceGuard::for_store`]), so each sees what the others
     /// promised.
+    ///
+    /// That directory is not cleared here: it is the same one for every feed,
+    /// so whoever builds the feeds calls [`sweep_stale_uploads`] once, before
+    /// the first of them.
     pub async fn for_feed(
         storage: Arc<dyn PackageStorage>,
         db: Arc<dyn PackageDatabase>,
@@ -255,7 +267,6 @@ impl AppState {
         // is an atomic rename rather than a multi-gigabyte copy.
         let temp_dir = space.dir().to_path_buf();
         tokio::fs::create_dir_all(&temp_dir).await?;
-        sweep_stale_uploads(&temp_dir).await;
         let feed = Arc::new(FeedContext::from_resolved(resolved, &config, &space)?);
         Ok(Self {
             storage,
@@ -492,9 +503,11 @@ impl AppState {
 /// eventually fill the volume holding the packages.
 ///
 /// Startup is the safe moment: none of this process's uploads can be in flight
-/// yet. Best-effort throughout — a directory we cannot read is not a reason to
+/// yet. So it runs once per staging directory, before the feeds that share the
+/// directory are built, rather than with each of them. Best-effort throughout —
+/// a directory we cannot read (or that is not there yet) is not a reason to
 /// refuse to start.
-async fn sweep_stale_uploads(temp_dir: &std::path::Path) {
+pub async fn sweep_stale_uploads(temp_dir: &std::path::Path) {
     let Ok(mut entries) = tokio::fs::read_dir(temp_dir).await else {
         return;
     };

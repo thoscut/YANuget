@@ -829,6 +829,7 @@ pub(super) async fn tus_create(
              finish or delete one, or wait for one to expire"
         )));
     }
+    check_feed_share(&state, length).await?;
     // Held until the row exists, which promises the space from then on.
     let _reservation = state.reserve_disk_space(Some(length)).await?;
 
@@ -857,6 +858,36 @@ pub(super) async fn tus_create(
             .header(header::LOCATION, location)
             .header("upload-expires", http_date(expires)),
     )
+}
+
+/// How far back an upload's hold on its space reaches: one that has held
+/// since before this holds nothing any more.
+fn hold_cutoff() -> chrono::DateTime<Utc> {
+    Utc::now() - chrono::Duration::from_std(crate::space::RESUMABLE_HOLD).unwrap_or_default()
+}
+
+/// Refuse (`507`) when this feed's resumable uploads would hold more than
+/// their share of the free space (`files.max_upload_space_percent`) with
+/// `more` bytes on top: what its uploads hold between their requests, and
+/// what the requests writing one right now have still to receive.
+///
+/// The space check alone admits whatever fits, and a promise costs its
+/// holder nothing, so one feed's push key could promise the whole volume to
+/// uploads that never arrive and keep every other feed out. Requests that
+/// trickle are held to the same share, since they are counted while they run.
+async fn check_feed_share(state: &AppState, more: u64) -> Result<()> {
+    let percent = state.config.files.max_upload_space_percent;
+    if percent == 0 || percent >= 100 {
+        return Ok(());
+    }
+    let between_requests = state
+        .db
+        .feed_upload_bytes(state.feed(), Utc::now(), hold_cutoff())
+        .await?;
+    let held = between_requests
+        .saturating_add(state.feed.resumable.promised())
+        .saturating_add(more);
+    state.space.check_share(held, percent).await
 }
 
 /// The upload `upload` of this feed, still current.
@@ -967,10 +998,20 @@ pub(super) async fn tus_patch(
     // is still to come itself, like a new upload, and the row stops promising
     // it until the request ends: promised here first, then given up there,
     // then checked, so it is never counted twice in a check, nor missed.
+    // While the request runs the bytes count towards the feed's share too.
     let rest = s.length - s.received;
-    let reservation = state.space.reserve(rest);
+    let reservation = state.space.reserve(rest).counted_in(&state.feed.resumable);
     state.db.set_upload_held(&upload, None).await?;
-    if let Err(e) = state.space.check(rest).await {
+    // An upload that still holds its space was admitted to the feed's share
+    // with it. One that let its hold lapse comes back like a new one.
+    let lapsed = s.held_since.is_none_or(|since| since < hold_cutoff());
+    let admitted = async {
+        if lapsed {
+            check_feed_share(&state, 0).await?;
+        }
+        state.space.check(rest).await
+    };
+    if let Err(e) = admitted.await {
         // Refused: the upload keeps whatever hold it had.
         let _ = state.db.set_upload_held(&upload, s.held_since).await;
         return Err(e);
@@ -1012,11 +1053,22 @@ pub(super) async fn tus_patch(
     // Should the row then not be updated, the two disagree and the next
     // request rebuilds the hash from the file.
     *hashing = Some(h);
-    // The row holds what is left again from now (and so this request's
-    // reservation can go): counted twice for a moment rather than not at
-    // all. Should the update fail, the upload holds nothing until its next
-    // request, which is admitted afresh.
-    let recorded = state.db.set_upload_received(&upload, received).await;
+    // The row holds what is left again (and so this request's reservation
+    // can go): counted twice for a moment rather than not at all. Only a
+    // request that brought bytes holds it from now. One that brought none
+    // leaves the hold as old as it found it: otherwise an empty `PATCH` an
+    // hour would keep space promised to an upload that never arrives, for as
+    // long as the upload may stay open. Should the update fail, the upload
+    // holds nothing until its next request, which is admitted afresh.
+    let held_since = if written > 0 {
+        Some(Utc::now())
+    } else {
+        s.held_since
+    };
+    let recorded = state
+        .db
+        .set_upload_received(&upload, received, held_since)
+        .await;
     drop(reservation);
     recorded?;
     if let Err(e) = streamed {

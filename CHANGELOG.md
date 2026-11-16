@@ -25,6 +25,30 @@ expected to change incompatibly at any version.
   directory, which is control of the server already. The ignore goes when
   sqlx allows the fixed version. (`DEP-14`)
 
+- A resumable upload's hold on the space it has still to receive is renewed
+  only by a `PATCH` that brings bytes. An empty `PATCH` an hour used to keep
+  the space promised for as long as the upload may stay open, which kept
+  every feed's uploads out with `507`. (`SEC-41`)
+- `files.max_upload_space_percent` (default `80`): the unfinished resumable
+  uploads of one feed together hold at most that share of the space free
+  above `min_free_disk_bytes`, counting the requests writing one right now.
+  One feed's push key can no longer promise the whole volume to uploads that
+  never arrive, or to ones that trickle. A single resumable upload larger
+  than the share is refused with `507` where it was admitted before; set
+  `100` for the old behaviour. (`SEC-41`)
+- The internalizer finds a package's Chocolatey scripts, and the entries its
+  prelude would replace, by the names NuGet extracts them under: an entry
+  such as `tools/chocolateyInstall%2Eps1` used to run on the client without
+  the prelude. A package with a script under a percent-encoded name is
+  refused, an override's `script` does not go into one, and the static
+  cross-check reads such scripts too. (`SEC-42`)
+- A package whose entries differ only in percent-encoding (`a.dll` and
+  `a%2Edll`) is refused, like one whose names differ only in case: a client
+  extracts both to the same file. (`SEC-42`)
+- The internalizer's prelude stops the install when a download helper is
+  there but is not a function of Chocolatey's `chocolateyInstaller` module,
+  instead of leaving it unwrapped. (`SEC-43`)
+
 ### Fixed
 
 - `scripts/Send-YanugetFile.ps1` could not attach a file to a version a feed
@@ -32,6 +56,19 @@ expected to change incompatibly at any version.
   key. It has `-AdminKey` (a `SecureString`) now, sent as HTTP Basic
   credentials on every request and, like the push key, only to the origin of
   `-Feed`.
+
+- `yanuget migrate` indexes a version the source has unlisted as unlisted, in
+  the write that adds it. It used to be listed first and unlisted in a second
+  write: visible in between, listed for good when that write failed (the next
+  run skips what the feed has), and counted as unlisted by hand, so a mirror
+  on the same feed never followed the source's listing for it again.
+  (`COR-44`)
+- `yanuget migrate` admits all downloads of a run through one space guard,
+  which also counts what the resumable uploads of a server running beside it
+  hold. Each download used to check the free space on its own, so parallel
+  ones could together write several times what was checked. (`MNT-29`)
+- The internalizer no longer prints the cause of an I/O or rewrite error
+  twice (`download cache: Permission denied: Permission denied`). (`MNT-30`)
 
 ### Changed
 
@@ -51,6 +88,24 @@ expected to change incompatibly at any version.
   data lock; the architecture page's module map matches the source tree and
   shows `yanuget-pkg`; `config check`'s list has the mirror proxy warning;
   RELEASING.md has a step for ROADMAP.md.
+- The flat container's version list, the version enumeration and a paged
+  registration index are built from the version list alone, and a
+  registration page reads only its own rows; each used to build the full row
+  of every version of the package. (`PERF-15`)
+- A mirror's listing refresh reads which versions the feed holds and which
+  were deleted from it in two queries, not two per upstream version, and the
+  cached upstream listing of a package is dropped once it is older than
+  `refresh_secs`. (`PERF-16`, `PERF-17`)
+- Upload temp files a previous run left are removed once at startup, not
+  once per feed. (`MNT-31`)
+- `yanuget-pkg` gains `nupkg::extracted_name` and `error::error_chain`, which
+  the server and the internalizer now share; its `Error::Io` prints the I/O
+  error's own text.
+- Tests: the real binary is run as a server to show that it holds the data
+  lock, that `restore` and `feeds rename` stop at it and that no second
+  server starts on the same data; a `pending-only` push is held to the
+  license policy of every feed holding the version, end to end. (`TEST-17`,
+  `TEST-18`)
 
 ## [0.10.0] — 2026-11-04
 

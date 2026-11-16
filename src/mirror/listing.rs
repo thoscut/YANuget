@@ -53,9 +53,12 @@ impl MirrorTarget<'_> {
         // indexed with the upstream's listing from the start, and shared with
         // the reconciliation after the loop.
         let mut listing: Option<Option<Listing>> = None;
+        // What the feed holds, what was deleted from it and what just failed,
+        // read once for the whole list rather than asked for each version.
+        let unwanted = self.unwanted(lower_id).await;
 
         for version in versions {
-            if !self.wanted(lower_id, &version).await {
+            if !unwanted.as_ref().is_some_and(|u| u.wants(&version)) {
                 continue;
             }
             if Instant::now() >= deadline {
@@ -154,12 +157,9 @@ impl MirrorTarget<'_> {
         let client = self.client;
         let key = MirrorClient::key(self.feed, lower_id);
         if !fresh {
+            // The tracker has dropped one older than `refresh_secs`.
             let cached = client.tracker.with(&key, client.refresh, |state| {
-                state
-                    .listing
-                    .as_ref()
-                    .filter(|(at, _)| at.elapsed() < client.refresh)
-                    .map(|(_, listing)| listing.clone())
+                state.listing.as_ref().map(|(_, listing)| listing.clone())
             });
             if cached.is_some() {
                 return cached;

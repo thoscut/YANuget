@@ -38,6 +38,14 @@ the detail; this list is the index.
 - `INT-33` internalization requests, if the open question about it is
   answered for it.
 
+**From the review of 2026-11-16** ([below](#review-of-2026-11-16))
+
+- `SEC-44` open resumable uploads in the admin area, `SEC-45` a deadline or
+  minimum rate for upload bodies, `SEC-46` entry names NuGet rewrites on
+  extraction, `SEC-47` aliases that shadow the prelude's wrappers.
+- `TEST-19` one harness for all integration tests, `TEST-20` the PowerShell
+  upload script run in CI, `MNT-32` the four files above 1000 lines.
+
 **Dependencies**
 
 - `DEP-14` Drop the `cargo audit` ignore for `RUSTSEC-2026-0459` (bundled
@@ -63,6 +71,69 @@ the detail; this list is the index.
 - The internalizer's [open questions](#open-questions), above all the Windows
   license for the golden images (needed before `INT-13` ships) and the
   release scheme for the tool.
+
+## Review of 2026-11-16
+
+A multi-expert review of `main` at 0.10.0 (`09867bc`) in three rounds, each
+by the same five reviewers as on 2026-11-03, each followed by its fixes. The
+changelog's *Unreleased* section describes the fixes for operators. Open
+boxes are what the review left for later.
+
+### Round 1
+
+- [x] **`cargo audit` was red.** `RUSTSEC-2026-0538`
+  (`quinn-udp`) is fixed by 0.5.16; `RUSTSEC-2026-0459` (bundled SQLite) is
+  ignored with its reasoning until sqlx allows the fix, see `DEP-14` in the
+  index.
+- [x] **`SEC-41` An empty `PATCH` an hour kept a resumable upload's hold on
+  the free space.** *Done:* only a `PATCH` that brings bytes renews it, and
+  `files.max_upload_space_percent` (default 80) caps what one feed's
+  unfinished uploads hold together, requests in flight included.
+- [ ] **`SEC-44` Open resumable uploads cannot be seen or deleted in the
+  admin area.** Only the feed's push key (`DELETE`) removes one. Needs a
+  query, a table with a CSRF-guarded action, and care with the write slot.
+- [ ] **`SEC-45` No deadline or minimum rate for an upload body.** A push
+  with a large `Content-Length` and no `max_package_size_bytes` keeps its
+  reservation for as long as it trickles (only `upload_idle_timeout_secs`
+  per chunk). A fixed deadline hurts large legitimate uploads; a rate has to
+  fit the size.
+- [x] **`SEC-42` The internalizer did not percent-decode entry names,** so a
+  script under `tools/chocolateyInstall%2Eps1` would have run without the
+  prelude. *Done:* scripts and reserved names are found by the extracted
+  name; archives whose entries collide once decoded are refused.
+- [ ] **`SEC-46` Other names NuGet rewrites on extraction.** A leading `/`
+  is stripped (read in NuGet.Client's `CopyFiles`); `.`/`..` segments,
+  doubled slashes and trailing dots or spaces are unverified. Refuse
+  non-canonical entry names once a prelude is needed.
+- [x] **`SEC-43` The prelude passed over a helper that was not a function.**
+  *Done:* it stops the install when the helper exists in another form.
+- [ ] **`SEC-47` An alias named like a helper would win over the prelude's
+  wrapper function.** Unverified: check on a client with
+  `chocolatey.extension`, which may define such aliases.
+- [x] **`COR-44` `migrate` listed a version before unlisting it.** *Done:*
+  indexed unlisted in one write, without `listing_set`.
+- [x] **`PERF-15` to `PERF-17`** narrow queries for the flat container and
+  registration, two queries per mirror refresh, expired upstream listings
+  dropped.
+- [x] **`MNT-29` `migrate` bypassed the shared `SpaceGuard`.** *Done:* one
+  guard per run.
+- [x] **`MNT-30` Errors printed their cause twice; three copies of
+  `error_chain`.** *Done:* one in `yanuget-pkg`.
+- [x] **`MNT-31` Stale upload files were swept once per feed.** *Done:* once
+  per start.
+- [ ] **`MNT-32` Four files are still above 1000 lines** (`web/hosted.rs`,
+  `web/ui/admin.rs`, `web/admin.rs`, `main.rs`).
+- [x] **`CI-21` A red audit skipped `cargo deny` and the SBOM.** *Done:*
+  they run regardless; the job still fails.
+- [x] **`TEST-17`, `TEST-18`** the data lock tested against the real binary;
+  the license policies of other holding feeds tested end to end.
+- [ ] **`TEST-19` Seven test files keep a harness of their own** next to
+  `tests/common/`; a change to `AppState` has to be made in each.
+- [ ] **`TEST-20` `scripts/Send-YanugetFile.ps1` has never been run by CI,**
+  `-AdminKey` included. A `pwsh` step against the test server would do it.
+- [x] **`DEP-15`, `DEP-16`, `DOC-20` to `DOC-24`** the 0.10.0 upgrade note,
+  `-AdminKey` for the upload script, troubleshooting, the one-off container,
+  the module tree, this file and the `config check` list.
 
 ## Review of 2026-11-03
 

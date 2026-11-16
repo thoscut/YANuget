@@ -5,7 +5,7 @@ use sqlx::Row;
 
 use crate::database::{
     canonical_id, AdminFilter, AdminOverview, AdminPackageSummary, DatabaseStats, FeedVersion,
-    VersionFootprint,
+    VersionFootprint, VersionKey,
 };
 use crate::error::{Error, Result};
 use crate::models::Package;
@@ -42,6 +42,72 @@ pub(super) async fn find_versions(
     include_unlisted: bool,
 ) -> Result<Vec<Package>> {
     find_versions_filtered(db, feed, &canonical_id(id), true, true, !include_unlisted).await
+}
+
+pub(super) async fn version_keys(
+    db: &SqliteDatabase,
+    feed: &str,
+    id: &str,
+    include_unlisted: bool,
+) -> Result<Vec<VersionKey>> {
+    // The visibility rules of `find_versions_filtered`, over two columns.
+    let rows: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT p.original_version, p.is_semver2 \
+         FROM packages p \
+         JOIN feed_packages fp \
+           ON fp.lower_id = p.lower_id AND fp.normalized_version = p.normalized_version \
+         WHERE fp.feed = ?1 AND fp.lower_id = ?2 \
+           AND fp.enabled = 1 AND fp.pending = 0 \
+           AND (?3 = 1 OR fp.listed = 1)",
+    )
+    .bind(feed)
+    .bind(canonical_id(id))
+    .bind(i64::from(include_unlisted))
+    .fetch_all(&db.pool)
+    .await?;
+    let mut keys = rows
+        .into_iter()
+        .map(|(original, is_semver2)| {
+            // Read with the rules it was written under, as a full row is.
+            let version = NuGetVersion::parse_stored(&original)
+                .map_err(|e| Error::InvalidVersion(e.to_string()))?;
+            Ok(VersionKey {
+                version,
+                is_semver2: is_semver2 != 0,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    keys.sort_by(|a, b| a.version.cmp(&b.version));
+    Ok(keys)
+}
+
+pub(super) async fn find_versions_in(
+    db: &SqliteDatabase,
+    feed: &str,
+    id: &str,
+    versions: &[String],
+) -> Result<Vec<Package>> {
+    // The list goes in as one JSON array: a statement with a placeholder per
+    // version would be a different statement for every length.
+    let wanted = serde_json::to_string(versions)
+        .map_err(|e| Error::Other(anyhow::anyhow!("could not encode the version list: {e}")))?;
+    let rows = sqlx::query(concat!(
+        feed_select!(),
+        " WHERE fp.feed = ?1 AND fp.lower_id = ?2 \
+           AND fp.enabled = 1 AND fp.pending = 0 \
+           AND fp.normalized_version IN (SELECT value FROM json_each(?3))"
+    ))
+    .bind(feed)
+    .bind(canonical_id(id))
+    .bind(wanted)
+    .fetch_all(&db.pool)
+    .await?;
+    let mut packages = rows
+        .iter()
+        .map(|r| row_to_feed_package(r).map(|fv| fv.package))
+        .collect::<Result<Vec<_>>>()?;
+    packages.sort_by(|a, b| a.version.cmp(&b.version));
+    Ok(packages)
 }
 
 pub(super) async fn find_all_versions(
@@ -354,6 +420,124 @@ mod tests {
         assert_eq!(listed.len(), 3);
         let with_unlisted = db.find_versions(FEED, "pkg", true).await.unwrap();
         assert_eq!(with_unlisted.len(), 4);
+    }
+
+    /// `Pkg` `version` in [`FEED`], waiting for approval.
+    async fn add_pending(db: &SqliteDatabase, version: &str) {
+        let package = sample("Pkg", version);
+        db.upsert_package_data(&package).await.unwrap();
+        db.add_membership(&Membership {
+            pending: true,
+            ..Membership::active(FEED, &package)
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn version_keys_are_the_versions_find_versions_serves() {
+        let db = SqliteDatabase::in_memory().await.unwrap();
+        for v in ["1.0.0", "1.0.1", "2.0.0-rc.1", "0.9.0", "3.0.0"] {
+            db.add_to_feed(FEED, &sample("Pkg", v)).await.unwrap();
+        }
+        add_pending(&db, "4.0.0").await;
+        // SemVer2 by its dependencies, which the version does not show.
+        let mut by_dependency = sample("Pkg", "5.0.0");
+        by_dependency.is_semver2 = true;
+        db.add_to_feed(FEED, &by_dependency).await.unwrap();
+        // Another feed's versions, and another package's, are not this one's.
+        db.add_to_feed("other", &sample("Pkg", "9.0.0"))
+            .await
+            .unwrap();
+        db.add_to_feed(FEED, &sample("Pkg.Other", "8.0.0"))
+            .await
+            .unwrap();
+        let v = |s: &str| NuGetVersion::parse(s).unwrap();
+        db.set_listed(FEED, "pkg", &v("1.0.1"), false)
+            .await
+            .unwrap();
+        db.set_enabled(FEED, "pkg", &v("3.0.0"), false)
+            .await
+            .unwrap();
+
+        for include_unlisted in [true, false] {
+            let keys = db
+                .version_keys(FEED, "Pkg", include_unlisted)
+                .await
+                .unwrap();
+            let full = db
+                .find_versions(FEED, "Pkg", include_unlisted)
+                .await
+                .unwrap();
+            let from_rows: Vec<VersionKey> = full
+                .iter()
+                .map(|p| VersionKey {
+                    version: p.version.clone(),
+                    is_semver2: p.is_semver2,
+                })
+                .collect();
+            assert_eq!(keys, from_rows, "include_unlisted = {include_unlisted}");
+        }
+        let all: Vec<(String, bool)> = db
+            .version_keys(FEED, "pkg", true)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|k| (k.version.normalized(), k.is_semver2))
+            .collect();
+        let expected = [
+            ("0.9.0", false),
+            ("1.0.0", false),
+            ("1.0.1", false),
+            ("2.0.0-rc.1", true),
+            ("5.0.0", true),
+        ]
+        .map(|(v, s)| (v.to_string(), s));
+        assert_eq!(all, expected);
+        assert!(db
+            .version_keys(FEED, "nope", true)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn find_versions_in_reads_only_the_versions_asked_for() {
+        let db = SqliteDatabase::in_memory().await.unwrap();
+        for v in ["1.0.0", "1.0.1", "2.0.0", "3.0.0"] {
+            db.add_to_feed(FEED, &sample("Pkg", v)).await.unwrap();
+        }
+        add_pending(&db, "4.0.0").await;
+        db.add_to_feed("other", &sample("Pkg", "9.0.0"))
+            .await
+            .unwrap();
+        let v = |s: &str| NuGetVersion::parse(s).unwrap();
+        db.set_listed(FEED, "pkg", &v("1.0.1"), false)
+            .await
+            .unwrap();
+        db.set_enabled(FEED, "pkg", &v("3.0.0"), false)
+            .await
+            .unwrap();
+
+        let wanted = ["2.0.0", "1.0.1", "3.0.0", "4.0.0", "9.0.0", "7.7.7"].map(String::from);
+        let page = db.find_versions_in(FEED, "Pkg", &wanted).await.unwrap();
+        // Ascending; unlisted included and marked; nothing withheld, nothing
+        // of another feed, nothing that was not asked for.
+        let got: Vec<(String, bool)> = page
+            .iter()
+            .map(|p| (p.normalized_version(), p.listed))
+            .collect();
+        assert_eq!(
+            got,
+            [("1.0.1".to_string(), false), ("2.0.0".to_string(), true)]
+        );
+        // The rows are whole.
+        assert_eq!(page[1].description, "description for Pkg");
+        assert!(db
+            .find_versions_in(FEED, "pkg", &[])
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

@@ -525,6 +525,56 @@ async fn staging_files_a_crash_left_are_swept_on_startup() {
     assert_eq!(left, ["4c1d5e.part"]);
 }
 
+/// Every feed stages into the same directory, so it is swept once, before the
+/// first feed is built, and not again for each: a feed built later must leave
+/// alone what is in there by then.
+#[tokio::test]
+async fn the_staging_directory_is_swept_once_and_not_per_feed() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = Config {
+        data_dir: dir.path().to_path_buf(),
+        tls_enabled: false,
+        ..Config::default()
+    };
+    config.feeds = ["one", "two"]
+        .map(|name| yanuget::config::FeedConfig {
+            name: name.into(),
+            ..Default::default()
+        })
+        .to_vec();
+    let storage = Arc::new(FilesystemStorage::new(config.storage_path()).await.unwrap());
+    let db = Arc::new(
+        SqliteDatabase::connect(&config.database_path())
+            .await
+            .unwrap(),
+    );
+    let config = Arc::new(config);
+    let feeds = config.resolved_feeds().unwrap();
+    let space = Arc::new(yanuget::space::SpaceGuard::for_store(&config, db.clone()));
+    let staging = config.storage_path().join(".uploads");
+    std::fs::create_dir_all(&staging).unwrap();
+    std::fs::write(staging.join("crashed.tmp"), b"left over").unwrap();
+
+    // As the server does at startup.
+    web::sweep_stale_uploads(space.dir()).await;
+    assert!(!staging.join("crashed.tmp").exists());
+    let build = |feed: usize| {
+        AppState::for_feed(
+            storage.clone(),
+            db.clone(),
+            config.clone(),
+            &feeds[feed],
+            Arc::new(Vec::new()),
+            space.clone(),
+        )
+    };
+    build(0).await.unwrap();
+    // Whatever is staged from here on is not a previous run's.
+    std::fs::write(staging.join("arriving.tmp"), b"an upload in flight").unwrap();
+    build(1).await.unwrap();
+    assert!(staging.join("arriving.tmp").exists());
+}
+
 /// Wait up to two seconds for the staging directory to empty.
 async fn staging_empties(server: &TestServer) -> Vec<PathBuf> {
     for _ in 0..40 {

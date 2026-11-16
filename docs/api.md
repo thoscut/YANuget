@@ -417,11 +417,13 @@ upload on a mismatch, `400`) and attaches the file.
 
 Unfinished uploads expire after `[files].upload_expiry_hours` (`Upload-Expires`
 says when) and are swept. Each counts against `min_free_disk_bytes` with what
-it has still to receive, for an hour after it was created or its last `PATCH`
-ended: an upload a client abandoned without a `DELETE` does not keep other
+it has still to receive, for an hour after it was created or after its last `PATCH`
+that brought bytes ended: an upload a client abandoned without a `DELETE` does not keep other
 uploads out until it expires. Idle for longer, its next `PATCH` is checked
 again like a new upload of what is left. A feed holds at most
-`[files].max_open_uploads` of them (`429` for another). [`scripts/Send-YanugetFile.ps1`](https://github.com/thoscut/yanuget/blob/main/scripts/Send-YanugetFile.ps1)
+`[files].max_open_uploads` of them (`429` for another), and together they
+hold at most `[files].max_upload_space_percent` of the free space (`507` for
+more). [`scripts/Send-YanugetFile.ps1`](https://github.com/thoscut/yanuget/blob/main/scripts/Send-YanugetFile.ps1)
 is a PowerShell 7 function that uploads resumably:
 
 ```powershell

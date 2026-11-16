@@ -812,8 +812,11 @@ async fn a_download_that_would_eat_the_disk_reserve_is_refused() {
     let upstream = Upstream::start().await;
     upstream.publish("Big.Pkg", "1.0.0");
     let mut client = yanuget::mirror::MirrorClient::from_config(&mirror_config(&upstream)).unwrap();
-    client.set_min_free_disk_bytes(u64::MAX / 2);
     let dir = tempfile::tempdir().unwrap();
+    client.set_space(Arc::new(yanuget::space::SpaceGuard::new(
+        dir.path(),
+        u64::MAX / 2,
+    )));
     let dest = dir.path().join("big.nupkg");
     let err = client
         .download_nupkg("big.pkg", "1.0.0", &dest)
@@ -826,7 +829,7 @@ async fn a_download_that_would_eat_the_disk_reserve_is_refused() {
     assert!(!dest.exists(), "nothing may be written");
 
     // A reserve the volume can meet lets it through.
-    client.set_min_free_disk_bytes(1);
+    client.set_space(Arc::new(yanuget::space::SpaceGuard::new(dir.path(), 1)));
     client
         .download_nupkg("big.pkg", "1.0.0", &dest)
         .await
@@ -898,6 +901,51 @@ async fn migrate_holds_downloads_to_the_disk_reserve() {
         "{:?}",
         summary.failures
     );
+}
+
+#[tokio::test]
+async fn migrate_downloads_are_admitted_by_the_runs_one_guard() {
+    // Each download used to build a guard of its own, which knew of nothing
+    // promised to anything else: not to the other downloads of the run, which
+    // go four at a time, nor to whoever else writes to the volume.
+    let upstream = three_packages().await;
+    let local = local_feed().await;
+    let space =
+        Arc::new(yanuget::space::SpaceGuard::new(&local.temp, 1).with_measure(|_| Ok(10_000_000)));
+    let feeds = Config::default().resolved_feeds().unwrap();
+    let migrate = |space: Arc<yanuget::space::SpaceGuard>| {
+        yanuget::migrate::run_with_space(
+            &local.storage,
+            &local.db,
+            &feeds[0],
+            mirror_config(&upstream),
+            yanuget::migrate::MigrateOptions {
+                quiet: true,
+                ..Default::default()
+            },
+            indicatif::ProgressDrawTarget::hidden(),
+            space,
+        )
+    };
+
+    // All of the volume is promised to something else the guard admitted.
+    let promised = space.admit(Some(9_999_999)).await.unwrap();
+    let summary = migrate(space.clone()).await.unwrap();
+    assert_eq!((summary.imported, summary.failed), (0, 3));
+    assert!(
+        summary
+            .failures
+            .iter()
+            .all(|f| f.error.contains("promised")),
+        "{:?}",
+        summary.failures
+    );
+
+    // Given back, the run goes through, and holds nothing once it is over.
+    drop(promised);
+    let summary = migrate(space.clone()).await.unwrap();
+    assert_eq!((summary.imported, summary.failed), (3, 0));
+    assert_eq!(space.promised(), 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -1434,13 +1482,10 @@ async fn versions_unlisted_on_the_source_stay_unlisted() {
     let migrated = local_feed().await;
     let summary = migrated.migrate(&upstream).await;
     assert_eq!((summary.imported, summary.unlisted), (2, 1));
-    assert!(
-        !migrated
-            .membership("hidden.pkg", "1.0.0")
-            .await
-            .unwrap()
-            .listed
-    );
+    let hidden = migrated.membership("hidden.pkg", "1.0.0").await.unwrap();
+    assert!(!hidden.listed);
+    // Unlisted because the source has it so, not by hand here.
+    assert!(!hidden.listing_set);
     assert!(
         migrated
             .membership("hidden.pkg", "2.0.0")
@@ -1614,6 +1659,63 @@ async fn a_refresh_follows_the_upstreams_listing() {
     upstream.behave(|b| b.registration = false);
     local.mirror(&upstream, "Relisted.Pkg", options).await;
     assert!(local.listed("relisted.pkg", "2.0.0").await);
+}
+
+#[tokio::test]
+async fn a_migrated_version_still_follows_the_sources_listing() {
+    // Seed a mirror feed with `migrate`, then serve it read-through: what the
+    // migration brought in unlisted is listed again once the source lists it.
+    // Unlisted in a second write, it counted as unlisted by hand and stayed
+    // hidden for good.
+    let upstream = Upstream::start().await;
+    upstream.publish("Seeded.Pkg", "1.0.0");
+    upstream.behave(|b| {
+        b.registration = true;
+        b.unlisted.insert(("seeded.pkg".into(), "1.0.0".into()));
+    });
+    let local = local_feed().await;
+    let summary = local.migrate(&upstream).await;
+    assert_eq!((summary.imported, summary.unlisted), (1, 1));
+    assert!(!local.listed("seeded.pkg", "1.0.0").await);
+
+    upstream.set_unlisted("Seeded.Pkg", "1.0.0", false);
+    local
+        .mirror(&upstream, "Seeded.Pkg", MirrorOptions::default())
+        .await;
+    assert!(local.listed("seeded.pkg", "1.0.0").await);
+}
+
+#[tokio::test]
+async fn migrate_with_overwrite_unlists_what_the_source_has_since_unlisted() {
+    // An overwrite keeps the listing a version had here, so this is the one
+    // case that still takes a second write.
+    let upstream = Upstream::start().await;
+    upstream.publish("Again.Pkg", "1.0.0");
+    upstream.behave(|b| b.registration = true);
+    let local = local_feed().await;
+    assert_eq!(local.migrate(&upstream).await.imported, 1);
+    assert!(local.listed("again.pkg", "1.0.0").await);
+
+    upstream.set_unlisted("Again.Pkg", "1.0.0", true);
+    let mut resolved = Config::default().resolved_feeds().unwrap().remove(0);
+    resolved.name = "mirror".to_string();
+    let summary = yanuget::migrate::run(
+        &local.storage,
+        &local.db,
+        &resolved,
+        &local.temp,
+        mirror_config(&upstream),
+        yanuget::migrate::MigrateOptions {
+            quiet: true,
+            overwrite: yanuget::config::OverwriteMode::Enabled,
+            ..Default::default()
+        },
+        indicatif::ProgressDrawTarget::hidden(),
+    )
+    .await
+    .unwrap();
+    assert_eq!((summary.imported, summary.unlisted), (1, 1));
+    assert!(!local.listed("again.pkg", "1.0.0").await);
 }
 
 #[tokio::test]

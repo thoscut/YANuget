@@ -445,6 +445,15 @@ pub fn package_base_address(index: &serde_json::Value) -> String {
 
 /// Spawn a server from fully resolved feeds (the multi-feed `build_app` path).
 pub async fn spawn_feeds(customize: impl FnOnce(&mut Config)) -> TestServer {
+    spawn_feeds_with_free_space(customize, None).await
+}
+
+/// [`spawn_feeds`], on a storage volume that always has `free` bytes free
+/// when given, rather than whatever the test machine's disk has.
+pub async fn spawn_feeds_with_free_space(
+    customize: impl FnOnce(&mut Config),
+    free: Option<u64>,
+) -> TestServer {
     let dir = tempfile::tempdir().unwrap();
     let mut config = Config {
         data_dir: dir.path().to_path_buf(),
@@ -469,7 +478,11 @@ pub async fn spawn_feeds(customize: impl FnOnce(&mut Config)) -> TestServer {
             .map(FeedMeta::from_resolved)
             .collect::<Vec<_>>(),
     );
-    let space = Arc::new(yanuget::space::SpaceGuard::for_store(&config, db.clone()));
+    let mut space = yanuget::space::SpaceGuard::for_store(&config, db.clone());
+    if let Some(free) = free {
+        space = space.with_measure(move |_| Ok(free));
+    }
+    let space = Arc::new(space);
     let mut states = Vec::new();
     for f in &feeds {
         states.push(

@@ -57,6 +57,21 @@ pub(super) async fn is_tombstoned(
     Ok(row.is_some())
 }
 
+pub(super) async fn tombstoned_versions(
+    db: &SqliteDatabase,
+    feed: &str,
+    id: &str,
+) -> Result<std::collections::HashSet<String>> {
+    let rows: Vec<String> = sqlx::query_scalar(
+        "SELECT normalized_version FROM tombstones WHERE feed = ?1 AND lower_id = ?2",
+    )
+    .bind(feed)
+    .bind(canonical_id(id))
+    .fetch_all(&db.pool)
+    .await?;
+    Ok(rows.into_iter().collect())
+}
+
 pub(super) async fn clear_tombstone(
     db: &SqliteDatabase,
     feed: &str,
@@ -100,5 +115,34 @@ mod tests {
         assert!(!db.is_tombstoned("other", "gone", &v1).await.unwrap());
         db.clear_tombstone(FEED, "Gone", &v1).await.unwrap();
         assert!(!db.is_tombstoned(FEED, "gone", &v1).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn the_tombstones_of_a_package_are_read_at_once() {
+        let db = SqliteDatabase::in_memory().await.unwrap();
+        let v = |s: &str| NuGetVersion::parse(s).unwrap();
+        for version in ["1.0.0", "2.0.0-rc.1"] {
+            db.add_tombstone(FEED, "Gone", &v(version)).await.unwrap();
+        }
+        db.add_tombstone(FEED, "Other", &v("3.0.0")).await.unwrap();
+        db.add_tombstone("other", "Gone", &v("4.0.0"))
+            .await
+            .unwrap();
+        // Exactly the versions `is_tombstoned` says yes to, as it names them.
+        let gone = db.tombstoned_versions(FEED, "GONE").await.unwrap();
+        let expected = ["1.0.0", "2.0.0-rc.1"].map(String::from);
+        assert_eq!(gone, expected.into_iter().collect());
+        for version in ["1.0.0", "2.0.0-rc.1", "3.0.0", "4.0.0"] {
+            assert_eq!(
+                gone.contains(&v(version).normalized()),
+                db.is_tombstoned(FEED, "gone", &v(version)).await.unwrap(),
+                "{version}"
+            );
+        }
+        assert!(db
+            .tombstoned_versions(FEED, "never")
+            .await
+            .unwrap()
+            .is_empty());
     }
 }
