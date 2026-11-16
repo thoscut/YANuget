@@ -6,6 +6,9 @@
 // elsewhere their helpers go unused.
 #![cfg_attr(not(unix), allow(dead_code))]
 
+#[path = "common/http.rs"]
+mod test_http;
+
 use std::io::{Cursor, Write};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -64,7 +67,7 @@ async fn spawn_with(customize: impl FnOnce(&mut Config)) -> TestServer {
     });
     TestServer {
         base: format!("http://{addr}"),
-        client: reqwest::Client::new(),
+        client: test_http::client(),
         dir,
     }
 }

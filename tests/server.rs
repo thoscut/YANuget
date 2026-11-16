@@ -115,7 +115,7 @@ async fn graceful_shutdown_stops_the_server() {
     });
 
     let base = format!("http://{addr}");
-    let client = reqwest::Client::new();
+    let client = common::client();
     assert!(client
         .get(format!("{base}/health"))
         .send()
@@ -129,10 +129,7 @@ async fn graceful_shutdown_stops_the_server() {
     server.await.unwrap();
 
     // The listener is closed: new connections are refused.
-    let after = reqwest::Client::new()
-        .get(format!("{base}/health"))
-        .send()
-        .await;
+    let after = common::client().get(format!("{base}/health")).send().await;
     assert!(after.is_err());
 }
 
@@ -145,7 +142,11 @@ async fn graceful_shutdown_stops_the_server() {
 async fn the_server_stops_on_sigterm() {
     let data = tempfile::tempdir().unwrap();
     let server = common::binary::start_server(data.path(), &[]).await;
-    let ready = reqwest::get(server.url("/health/ready")).await.unwrap();
+    let ready = common::client()
+        .get(server.url("/health/ready"))
+        .send()
+        .await
+        .unwrap();
     assert!(ready.status().is_success());
 
     // Idle, it has nothing to wait for.
@@ -184,7 +185,11 @@ async fn sigterm_waits_for_an_unfinished_request_only_for_the_grace_period() {
     upload.write_all(head.as_bytes()).await.unwrap();
     upload.flush().await.unwrap();
     // Once a second request is answered, the first is being read.
-    let ready = reqwest::get(server.url("/health/ready")).await.unwrap();
+    let ready = common::client()
+        .get(server.url("/health/ready"))
+        .send()
+        .await
+        .unwrap();
     assert!(ready.status().is_success());
 
     let started = std::time::Instant::now();

@@ -809,11 +809,12 @@ pub trait PackageDatabase: Send + Sync {
         now: chrono::DateTime<chrono::Utc>,
         held_after: chrono::DateTime<chrono::Utc>,
     ) -> Result<u64>;
-    /// [`Self::outstanding_upload_bytes`] of one feed: what its uploads
-    /// hold between their requests, for the feed's share of the volume.
-    async fn feed_upload_bytes(
+    /// [`Self::outstanding_upload_bytes`] of the uploads of `feeds`: what
+    /// they hold between their requests, for the share of the volume those
+    /// feeds have together.
+    async fn feeds_upload_bytes(
         &self,
-        feed: &str,
+        feeds: &[String],
         now: chrono::DateTime<chrono::Utc>,
         held_after: chrono::DateTime<chrono::Utc>,
     ) -> Result<u64>;
@@ -858,7 +859,7 @@ pub trait PackageDatabase: Send + Sync {
     /// Move a symbol mapping from version `from` of `id` to version `to` of
     /// the same id, when `from` still holds it. The only change a mapping
     /// ever sees: the version that claimed a key is going, and `to` pushed
-    /// the same bytes (see `symbols::successor`). Returns `true` if it moved.
+    /// the same bytes (see `symbols::Successors`). Returns `true` if it moved.
     async fn hand_over_symbol(
         &self,
         key: &str,

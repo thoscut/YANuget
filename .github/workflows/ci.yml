@@ -270,7 +270,7 @@ jobs:
       # YANuget opens only its own database in `data_dir` and its snapshot in
       # a backup directory; `restore` copies just the backup's `yanuget.db`
       # and deletes any `-wal` next to the live file before opening it, and
-      # `backup` deletes any next to its snapshot before every opening.
+      # `backup` opens its snapshot only in a private directory of its own.
       # Writing a `-wal` there already needs write
       # access to the data directory, which owns the server anyway. Ignored,
       # as decided by the maintainer on 2026-11-16, until sqlx allows
@@ -286,8 +286,12 @@ jobs:
       # resolves only when such a release exists (the two cannot both link
       # SQLite in different versions), and then this step fails and says
       # what to do. Pull requests skip it: the answer does not depend on them.
+      # So does a release (`inputs.ref` set): called from release.yml,
+      # `github.event_name` is the caller's event, and a release started by
+      # hand is `workflow_dispatch` too. A fix arriving upstream must not stop
+      # an urgent release; the weekly run reports it.
       - name: Is an sqlx release with the fix for RUSTSEC-2026-0459 out?
-        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') }}
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' && !inputs.ref && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') }}
         run: |
           set -euo pipefail
           probe="$RUNNER_TEMP/sqlx-probe"

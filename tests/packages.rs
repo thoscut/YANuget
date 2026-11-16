@@ -4,6 +4,9 @@
 //!
 //! The harness is a trimmed copy of the one in `integration.rs`.
 
+#[path = "common/http.rs"]
+mod test_http;
+
 use std::io::{Cursor, Write};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -99,7 +102,7 @@ async fn spawn() -> TestServer {
     });
     TestServer {
         base: format!("http://{addr}"),
-        client: reqwest::Client::new(),
+        client: test_http::client(),
         _dir: dir,
     }
 }

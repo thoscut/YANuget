@@ -199,10 +199,12 @@ binary does not is in a crate the binary does not contain.
 
 #### Known advisories
 
-These are reported for current releases, have been looked at, and are
-accepted until a fix can be taken; `cargo audit` in CI ignores them, each
-with its reason next to the ignore. Each goes when it is fixed, and a release
-that still carries one says so in its changelog.
+A scan of a release reports these, and each has been looked at. The first is
+in the current source too and is accepted until a fix can be taken: `cargo
+audit` in CI ignores it, with its reason next to the ignore, and a release
+that still carries it says so in its changelog. The others are reported only
+for the bill of materials of earlier releases, are gone from the lockfile
+since, and need nothing from you.
 
 | Advisory | Crate | `cargo audit bin` | Bill of materials | Why it is accepted |
 | --- | --- | --- | --- | --- |

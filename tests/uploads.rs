@@ -928,7 +928,7 @@ async fn an_upload_resumed_after_a_restart_has_the_hash_of_all_its_bytes() {
     let dir = tempfile::tempdir().unwrap();
     // The machine's disk is not the test's to judge.
     let config = format!("api_key = '{API_KEY}'\nmin_free_disk_bytes = 0\n");
-    let client = reqwest::Client::new();
+    let client = client();
     // Over two of the buffers the hash is rebuilt with, and not a multiple.
     let bytes: Vec<u8> = (0..700_001u32)
         .map(|i| (i % 251) as u8 ^ (i >> 11) as u8)

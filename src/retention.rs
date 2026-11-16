@@ -485,7 +485,7 @@ pub(crate) async fn purge_file_blobs(
 /// Drop every symbol file and mapping belonging to one version, leaving the
 /// package itself alone. A mapping another version of the package pushed the
 /// same PDB for is handed to that version instead, file and all
-/// ([`crate::symbols::successor`]).
+/// ([`crate::symbols::Successors`]).
 ///
 /// Separate from [`purge_global_data`] because an overwriting push needs exactly
 /// this and nothing else: the replacement build's PDBs have different SSQP keys,
@@ -500,24 +500,44 @@ pub(crate) async fn purge_symbols(
     id: &str,
     version: &NuGetVersion,
 ) -> Result<()> {
-    for sym in db.find_symbols(id, version).await? {
+    let symbols = db.find_symbols(id, version).await?;
+    if symbols.is_empty() {
+        return Ok(());
+    }
+    let lower_id = crate::database::canonical_id(id);
+    let normalized = version.normalized();
+    let mut successors = crate::symbols::Successors::new(storage, db, id, version);
+    for sym in &symbols {
         // Under the key's lock, as a claim is made: a push of the same key
         // cannot decide on the mapping while it moves or goes.
         let _key = crate::locks::lock_symbol(&sym.key, &sym.filename).await;
-        let next =
-            crate::symbols::successor(storage, db, id, version, &sym.key, &sym.filename).await?;
-        if let Some(next) = next {
+        // The row is deleted by key below, so only while it is still this
+        // version's: what moved or went since it was listed is not ours.
+        let ours = db
+            .find_symbol(&sym.key, &sym.filename)
+            .await?
+            .is_some_and(|o| o.lower_id == lower_id && o.normalized_version == normalized);
+        if !ours {
+            continue;
+        }
+        if let Some(heir) = successors.successor(&sym.key, &sym.filename).await? {
             if db
-                .hand_over_symbol(&sym.key, &sym.filename, id, version, &next)
+                .hand_over_symbol(&sym.key, &sym.filename, id, version, &heir.version)
                 .await?
             {
-                tracing::info!(%id, from = %version.normalized(), to = %next.normalized(), key = %sym.key, "handed a symbol over to another version with the same PDB");
+                tracing::info!(%id, from = %normalized, to = %heir.version.normalized(), key = %sym.key, "handed a symbol over to another version with the same PDB");
                 continue;
             }
         }
+        // File first, then the row, both before the key is released. With the
+        // rows left for the end, a push of the same PDB by another version in
+        // between found the key claimed by this version with no file, and was
+        // refused for it.
         storage.delete_symbol(&sym.key, &sym.filename).await?;
+        db.delete_symbol(&sym.key, &sym.filename).await?;
     }
-    db.delete_symbols(id, version).await?;
+    let work = successors.work();
+    tracing::debug!(%id, version = %normalized, symbols = symbols.len(), listed = work.listed, decompressed = work.decompressed, "looked for versions to hand symbols over to");
     Ok(())
 }
 

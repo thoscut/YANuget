@@ -5,6 +5,9 @@
 //! The helpers are a minimal copy of those in `integration.rs`, so each test
 //! binary stays self-contained.
 
+#[path = "common/http.rs"]
+mod test_http;
+
 use std::io::{Cursor, Write};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -57,7 +60,7 @@ async fn serve_plain(app: axum::Router, dir: tempfile::TempDir) -> TestServer {
     });
     TestServer {
         base: format!("http://{addr}"),
-        client: reqwest::Client::builder()
+        client: test_http::client_builder()
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .unwrap(),
@@ -1138,7 +1141,7 @@ async fn tls_serves_hsts_and_keeps_its_generated_key_private() {
     // was issued for.
     let cert =
         reqwest::Certificate::from_pem(&std::fs::read(tls.join("cert.pem")).unwrap()).unwrap();
-    let client = reqwest::Client::builder()
+    let client = test_http::client_builder()
         .add_root_certificate(cert)
         .resolve("localhost", served.addr)
         .build()
@@ -1340,7 +1343,7 @@ async fn one_http2_connection_holds_a_bounded_number_of_requests() {
     let base = format!("http://{}", served.addr);
     // Larger than the window a client grants a stream before it reads: a
     // download nobody reads keeps its stream open.
-    let pushed = reqwest::Client::new()
+    let pushed = test_http::client()
         .put(format!("{base}/api/v2/package"))
         .header("X-NuGet-ApiKey", API_KEY)
         .body(build_large_nupkg("Big.Pkg", "1.0.0", 3 * 1024 * 1024))
@@ -1351,7 +1354,7 @@ async fn one_http2_connection_holds_a_bounded_number_of_requests() {
     let url = format!("{base}/v3/package/big.pkg/1.0.0/big.pkg.1.0.0.nupkg");
 
     // One connection, every request a stream of it.
-    let client = reqwest::Client::builder()
+    let client = test_http::client_builder()
         .http2_prior_knowledge()
         .build()
         .unwrap();

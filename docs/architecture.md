@@ -51,8 +51,8 @@ src/
 ├── streaming.rs      Bounded copy-to-disk with incremental SHA-512
 ├── space.rs          SpaceGuard: free space and the bytes promised to writes in
 │                     progress, one guard for uploads, mirror downloads,
-│                     inbox imports and `migrate`; a feed's share of it for
-│                     resumable uploads
+│                     inbox imports and `migrate`; the share of it the
+│                     feeds of one push key may promise to uploads
 ├── config/           Layered config (defaults < TOML < env)
 │   ├── mod.rs        Config, loading, resolved paths
 │   ├── env.rs        The `YANUGET_*` overlay, and the names nothing reads

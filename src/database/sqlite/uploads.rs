@@ -5,7 +5,7 @@ use sqlx::sqlite::SqliteRow;
 use sqlx::Row;
 
 use crate::database::{canonical_id, UploadSession};
-use crate::error::Result;
+use crate::error::{Error, Result};
 
 use super::{parse_time, SqliteDatabase};
 
@@ -95,18 +95,22 @@ pub(super) async fn outstanding_upload_bytes(
     Ok(left.max(0) as u64)
 }
 
-pub(super) async fn feed_upload_bytes(
+pub(super) async fn feeds_upload_bytes(
     db: &SqliteDatabase,
-    feed: &str,
+    feeds: &[String],
     now: DateTime<Utc>,
     held_after: DateTime<Utc>,
 ) -> Result<u64> {
-    // The same uploads as above, of one feed.
+    // The same uploads as above, of some feeds. The list goes in as one JSON
+    // array, so that a group of any size is one statement and one query.
+    let feeds = serde_json::to_string(feeds)
+        .map_err(|e| Error::Other(anyhow::anyhow!("could not encode the feed list: {e}")))?;
     let left: i64 = sqlx::query_scalar(
         "SELECT COALESCE(SUM(MAX(length - received, 0)), 0) FROM uploads \
-         WHERE feed = ?1 AND expires >= ?2 AND held_since >= ?3",
+         WHERE feed IN (SELECT value FROM json_each(?1)) \
+           AND expires >= ?2 AND held_since >= ?3",
     )
-    .bind(feed)
+    .bind(feeds)
     .bind(now.to_rfc3339())
     .bind(held_after.to_rfc3339())
     .fetch_one(&db.pool)
@@ -264,16 +268,22 @@ mod tests {
             600
         );
         // What each feed holds of that, for its share of the volume.
-        let held = |feed: &'static str| db.feed_upload_bytes(feed, now, recently());
-        assert_eq!(held("team").await.unwrap(), 300);
-        assert_eq!(held("prod").await.unwrap(), 300);
-        assert_eq!(held("other").await.unwrap(), 0);
+        let db = &db;
+        let held = |feeds: &'static [&'static str]| {
+            let feeds: Vec<String> = feeds.iter().map(|f| f.to_string()).collect();
+            async move { db.feeds_upload_bytes(&feeds, now, recently()).await }
+        };
+        assert_eq!(held(&["team"]).await.unwrap(), 300);
+        assert_eq!(held(&["prod"]).await.unwrap(), 300);
+        assert_eq!(held(&["other"]).await.unwrap(), 0);
+        assert_eq!(held(&["team", "prod", "other"]).await.unwrap(), 600);
+        assert_eq!(held(&[]).await.unwrap(), 0);
         // An upload being written, or idle, holds none of its feed's share.
         db.set_upload_held("a", None).await.unwrap();
         db.set_upload_held("b", Some(now - Duration::hours(2)))
             .await
             .unwrap();
-        assert_eq!(held("team").await.unwrap(), 0);
+        assert_eq!(held(&["team"]).await.unwrap(), 0);
     }
 
     #[tokio::test]

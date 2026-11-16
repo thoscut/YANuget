@@ -421,11 +421,18 @@ impl AppState {
         }
         let now = chrono::Utc::now();
         let cutoff = super::hosted::hold_cutoff();
-        let mut held = self.feed.resumable.promised.promised();
-        for feed in &self.feed.resumable.group {
-            let between_requests = self.db.feed_upload_bytes(feed, now, cutoff).await?;
-            held = held.saturating_add(between_requests);
-        }
+        // One query for the whole group, however large: this runs for every
+        // upload, and a tus creation runs it under `CREATING` (`PERF-23`).
+        let between_requests = self
+            .db
+            .feeds_upload_bytes(&self.feed.resumable.group, now, cutoff)
+            .await?;
+        let held = self
+            .feed
+            .resumable
+            .promised
+            .promised()
+            .saturating_add(between_requests);
         Ok(Some(Share { held, percent }))
     }
 

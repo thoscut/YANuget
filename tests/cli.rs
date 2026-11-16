@@ -31,9 +31,8 @@ fn settings(admin_key: bool) -> String {
 
 /// A client that reaches the server under the name it serves.
 fn client(port: u16) -> reqwest::Client {
-    reqwest::Client::builder()
+    common::client_builder()
         .resolve("nuget.test", SocketAddr::from((Ipv4Addr::LOCALHOST, port)))
-        .no_proxy()
         .build()
         .unwrap()
 }
@@ -85,10 +84,7 @@ async fn admin_acts_on_the_local_server_by_the_name_it_serves() {
     let port = server.port;
 
     // The host check is on: by address, the server does not answer.
-    let by_address = reqwest::Client::builder()
-        .no_proxy()
-        .build()
-        .unwrap()
+    let by_address = common::client()
         .get(server.url("/gated/v3/index.json"))
         .send()
         .await

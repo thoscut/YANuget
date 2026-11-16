@@ -52,7 +52,12 @@ the detail; this list is the index.
   `MNT-35` the internalizer's partial cache files, `MNT-37` the name of
   `files.max_upload_space_percent`, `CI-23` tests on Windows and macOS,
   `CI-24` new recordings in `media.yml`, `DEP-22` a `config check` warning
-  for the port in `base_url`, `DEP-23` the reason for a `507` to the client.
+  for the port in `base_url`, `DEP-23` the reason for a `507` to the client,
+  `MNT-36` small things.
+- Round 3: `SEC-56` the upload share per push key rather than per group,
+  `SEC-57` race-free writes into the backup directory, `MNT-39` rules the
+  three fix rounds left in two places, `TEST-32` the migration tests behind
+  a proxy, `DEP-25` a checksum check before skipping a crate on crates.io.
 
 **Dependencies**
 
@@ -190,9 +195,16 @@ were medium.
 - [ ] **`SEC-52` The self-signed certificate** is valid from 1975 to 4096, has
   no extended key usage, is never renewed, and its key is in every backup.
 - [x] **`DEP-17`** `backup` deletes a `-wal` next to its snapshot before
-  opening it, so the reasoning for the `DEP-14` ignore holds there too.
+  opening it, so the reasoning for the `DEP-14` ignore holds there too
+  (since `SEC-54` the snapshot lives in a private directory).
 - [x] **`PERF-18` (retention), `PERF-19`, `PERF-20`, `MNT-33`, the
-  internalizer's I/O context.**
+  internalizer's I/O context, `MNT-34` unused dependencies and sqlx's default
+  features.**
+- [ ] **`MNT-36` Small things** (Info): the doc comment "Resolve once the
+  shutdown signal …" sits over `spawn_file_tasks` (`src/main.rs`);
+  `normalized.to_lowercase()` is redundant in `src/mirror/target.rs`; the
+  internalizer's `cached` (`download.rs`) reads with `tokio::fs` and a 64 KiB
+  buffer.
 - [ ] **`PERF-21` The gallery's package page** loads every version as a full
   row and lists them without a limit.
 - [ ] **`MNT-35` The internalizer's cache keeps partial files** (up to 8 GiB)
@@ -216,6 +228,71 @@ were medium.
   differs from the listening port and no proxy is trusted.
 - [ ] **`DEP-23` A `507` tells the client only "internal server error";** the
   reason (the reserve or the share) is in the server log only.
+
+### Round 3
+
+The last pass, over `d387a37`, with a view to releasing the branch as
+0.11.0. All five reviewers found it releasable once the medium finding was
+fixed and the changelog cleaned up; the version number and the `## [0.11.0]`
+heading are the maintainer's call at release time.
+
+- [x] **`COR-52` (also `PERF-22`) Handing a symbol over was expensive:** every
+  delete of a version with symbols extracted and verified the same-named
+  PDBs of every other version, under the locks and, with `prune_on_push`,
+  inside the push. *Done:* candidates are filtered by name, length and CRC-32
+  from the zip directory, each symbol package is listed once per delete, and
+  nothing is written out.
+- [x] **`COR-53`, `MNT-38` Races around the handover.** *Done:* a symbol push
+  keeps its keys until its symbol package is stored, a delete releases each
+  key with its file, and a version being changed is passed over
+  (`try_lock_version`). A symbol whose only candidate is locked at that
+  moment is deleted, as before `COR-47`.
+- [x] **`COR-54` A kept backup copy was checked by size only.** *Done:* kept
+  copies are hashed, and one with the wrong bytes is reported and kept.
+- [x] **`SEC-54` `backup` followed links in its destination.** *Done:* fresh
+  temp names, no links followed under `packages/` and `tls/`, the snapshot in
+  a private directory.
+- [ ] **`SEC-57` Fully race-free writes into the backup directory:** `openat`
+  with `O_NOFOLLOW` relative to the open directory, as the inbox does, and a
+  warning when the directory is writable by group or others. Today someone
+  who swaps directories during a run is not covered.
+- [x] **`SEC-55` Many `X-YANuget-Admin-Key` headers counted as one failed
+  guess.** *Done:* each wrong key counts, at most eight (or one per reviewing
+  feed and one more) per request, and the `403` no longer tells which key
+  was right.
+- [ ] **`SEC-56` The upload share belongs to the connected group of feeds
+  that share a push key,** so a key valid only for `c` can fill the share of
+  `{c, d, e}` and block uploads to `e`, which it cannot push to. Counting
+  each upload against the key that admitted it fixes this: `uploads` records
+  that key (a hash, or its index in the deduplicated key list), `SpaceGuard`
+  keeps one in-flight pool per key, and a request with key k is measured
+  against what k's uploads hold across all feeds that accept k. This needs a
+  new column in `uploads`, so it waits for a release that migrates the
+  schema anyway. Until then `config check` could warn when one feed joins
+  two otherwise separate key groups. Documented under
+  `files.max_upload_space_percent`.
+- [x] **`PERF-23`** the share check reads the whole group in one query.
+- [ ] **`MNT-39` Rules left in two places by the fix rounds:** the hold limit
+  computed three times, "servable" twice, two `ID_CHUNK` constants (200 and
+  400), two ways to strip the URL from a reqwest error,
+  `find_all_versions_of` called by tests only, `zip` listed twice in
+  `yanuget-pkg`.
+- [x] **`TEST-30` (partly), `TEST-31`, the rest of `TEST-27`** one test client
+  without a proxy, the binary started without proxy variables, the SEC-51
+  exception tested, the internalizer's redirect check tested through its
+  caller.
+- [ ] **`TEST-32` The migration tests fail behind a proxy** whose `NO_PROXY`
+  does not cover loopback: `MirrorClient::for_migration` takes the
+  environment's proxy on purpose. Taking none for a loopback upstream would
+  fix it.
+- [x] **`DOC-31` to `DOC-35`, the rest of `DOC-28`, `DEP-24` (partly)** the
+  changelog merged and its library list complete, the example configuration,
+  `SECURITY.md`, the `yanuget-pkg` README, a release step for the crates'
+  versions; the release job downloads only `yanuget-*` artifacts and checks
+  they are all there, and the weekly `DEP-14` check cannot block a release.
+- [ ] **`DEP-25` The `crates-io` job skips a crate whose version is already
+  published** without comparing checksums, so a changed `yanuget-pkg` under
+  an old version would go unnoticed.
 
 ## Review of 2026-11-03
 

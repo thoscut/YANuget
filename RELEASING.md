@@ -82,6 +82,14 @@ incompatibly at any version.
    usually written up under *Security*, which is how 0.10.0's upgrade note
    first left two of them out.
 
+   Merge entries that a later fix in the same cycle superseded. The section
+   becomes the release notes word for word, and two entries on one mechanism
+   read as two rules, the first of which never shipped. Write each entry
+   against the previous release, not against the state in between. List the
+   breaking changes to the library API of `yanuget` and the changes to
+   `yanuget-pkg` too: `git diff vPREV -- src/ crates/yanuget-pkg/src` and
+   every `pub` item or trait method that it adds, removes or changes.
+
 4. **Check what has already been released.**
 
    ```bash
@@ -95,6 +103,20 @@ incompatibly at any version.
 5. **Bump `version` in `Cargo.toml`** past the highest released tag, then
    `cargo build` so `Cargo.lock` records the new version too. Commit both, and
    update the supported-versions table in `SECURITY.md`.
+
+   Decide the version of `yanuget-pkg` on purpose, too. If
+   `git diff vPREV -- crates/yanuget-pkg` is not empty and the crate is on
+   crates.io, bump `version` in `crates/yanuget-pkg/Cargo.toml` (the patch
+   for fixes and additions, the minor for a break) and raise the
+   `yanuget-pkg` requirement in `Cargo.toml` and in
+   `crates/yanuget-internalize/Cargo.toml` to it: both call what the
+   workspace copy has, and a lockfile still on the old `yanuget-pkg` would
+   not build them. The `crates-io` job skips a version crates.io already
+   has; `guard` refuses such a release while `PUBLISH_TO_CRATES_IO` is on,
+   but raises nothing itself, and with publishing off nothing checks it. A
+   crate never published yet can keep its version. `yanuget-internalize`
+   has `publish = false` and `0.0.0` until its first release; once it has
+   one, the same goes for it.
 
    The release workflow refuses to build if the tag does not equal
    `v` + the `Cargo.toml` version, or if the changelog has no section for it.

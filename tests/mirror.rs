@@ -1,6 +1,9 @@
 //! Read-through mirroring and migration against a fake upstream V3 feed on
 //! loopback: what the mirror fetches, what it sends where, and what it refuses.
 
+#[path = "common/http.rs"]
+mod test_http;
+
 use std::collections::BTreeMap;
 use std::io::{Cursor, Write};
 use std::net::{Ipv4Addr, SocketAddr};
@@ -589,7 +592,7 @@ async fn spawn_mirror_with(
     });
     Server {
         base: format!("http://{addr}"),
-        client: reqwest::Client::new(),
+        client: test_http::client(),
         _dir: dir,
     }
 }

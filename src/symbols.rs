@@ -31,7 +31,7 @@
 //!    moved to another package. It moves to another version of the same
 //!    package in one case only: the version holding it is deleted, and the
 //!    other one's own symbol package holds the same bytes, which its own
-//!    assemblies vouch for (`successor`). A re-push of an identical PDB by
+//!    assemblies vouch for (`Successors`). A re-push of an identical PDB by
 //!    a second version records nothing, so without that the second version
 //!    would lose its symbols with the first.
 //! 3. **Stored bytes are never replaced by different ones.** A re-push of the
@@ -42,11 +42,13 @@
 //! all-or-nothing: every PDB is validated before any is stored, and a failure
 //! while storing undoes the claims this push made.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
+use tokio::sync::OwnedMutexGuard;
 
 use crate::database::PackageDatabase;
 use crate::error::{Error, Result};
@@ -153,7 +155,7 @@ async fn index_inner(
     //    overwrite of it running alongside would otherwise leave symbols
     //    claimed for a version that is gone, or validated against a package
     //    that has since been replaced.
-    let _version_guard = locks::lock_version(&id, &normalized).await;
+    let version_guard = locks::lock_version(&id, &normalized).await;
     if !db.exists(feed, &id, &version).await? {
         return Err(Error::PackageNotFound);
     }
@@ -170,7 +172,7 @@ async fn index_inner(
         .map_err(|e| Error::Other(anyhow::anyhow!("symbol verification task panicked: {e}")))??;
 
     // 6. Claim and store, all or nothing.
-    let claimed = store_all(storage, db, &id, &version, &verified).await?;
+    let (claimed, key_guards) = store_all(storage, db, &id, &version, &verified).await?;
 
     // 7. Store the whole .snupkg alongside the package (moves the temp file).
     if let Err(e) = storage
@@ -180,6 +182,16 @@ async fn index_inner(
         release(storage, db, &claimed).await;
         return Err(e);
     }
+
+    // The keys stay locked until the symbol package is in place. A key this
+    // push found `Unchanged` still belongs to another version, and a purge of
+    // that one looks for a version whose symbol package holds the same PDB to
+    // hand the key to (`Successors`): released any earlier, the purge could
+    // take the key in between, find no symbol package here and delete the
+    // PDB this push was just told it has. The version lock goes first, since
+    // that purge passes over a version that is locked rather than wait for it.
+    drop(version_guard);
+    drop(key_guards);
 
     Ok(SymbolResult {
         id,
@@ -323,20 +335,21 @@ enum Plan {
 }
 
 /// Claim and store every verified PDB, or none. Returns the keys this call
-/// newly claimed (for [`release`] should a later step fail).
+/// newly claimed (for [`release`] should a later step fail), and the locks on
+/// every key it touched, for the caller to hold until the push is complete.
 async fn store_all(
     storage: &dyn PackageStorage,
     db: &dyn PackageDatabase,
     id: &str,
     version: &NuGetVersion,
     verified: &[Verified],
-) -> Result<Vec<(String, String)>> {
+) -> Result<(Vec<(String, String)>, Vec<OwnedMutexGuard<()>>)> {
     // Every key this push touches is locked for the whole decision, in one
     // global order (the list is sorted), so two pushes sharing keys cannot
     // deadlock and none can claim a key between our check and our write.
-    let mut _key_guards = Vec::with_capacity(verified.len());
+    let mut key_guards = Vec::with_capacity(verified.len());
     for v in verified {
-        _key_guards.push(locks::lock_symbol(&v.key, &v.filename).await);
+        key_guards.push(locks::lock_symbol(&v.key, &v.filename).await);
     }
 
     // Decide everything first; nothing is written unless every PDB is fine.
@@ -405,91 +418,392 @@ async fn store_all(
             return Err(e);
         }
     }
-    Ok(claimed)
+    Ok((claimed, key_guards))
 }
 
-/// Another version of `id` that `gone`'s symbol `key`/`filename` can be handed
-/// to as `gone` is deleted: one whose stored symbol package holds a PDB with
-/// exactly the bytes stored under the key, and whose own stored package has
-/// the assembly that vouches for it, as a push of it would have checked. The
-/// newest such version, or `None`.
+/// Finds, for the symbols of a version being deleted, another version of the
+/// same package to hand each one to: one whose stored symbol package holds a
+/// PDB with exactly the bytes stored under the key, and whose own stored
+/// package has the assembly that vouches for it, as a push of it would have
+/// checked. The newest such version wins.
 ///
 /// "Build once, pack twice" (`1.0.0-rc.1` and `1.0.0` from the same
 /// assemblies) pushes the same PDB for both. The second push finds the bytes
 /// in place and changes nothing, so the key stays with the first version;
 /// retention removing that one would otherwise take the second one's symbols
-/// with it, silently. The caller holds `gone`'s version lock and the key's.
-pub(crate) async fn successor(
-    storage: &dyn PackageStorage,
-    db: &dyn PackageDatabase,
-    id: &str,
-    gone: &NuGetVersion,
-    key: &str,
-    filename: &str,
-) -> Result<Option<NuGetVersion>> {
-    let Some(stored) = stored_sha256(storage, key, filename).await? else {
-        return Ok(None);
-    };
-    let mut versions = db.stored_versions(id).await?;
-    versions.retain(|v| v != gone);
-    for version in versions.into_iter().rev() {
-        let normalized = version.normalized();
-        let package = match storage.get_package(id, &normalized).await {
+/// with it, silently.
+///
+/// The search is built for its usual answer, which is "none": every build
+/// writes PDBs with new ids, while every version of `Foo` carries a `Foo.pdb`.
+/// A candidate entry is only decompressed when the central directory already
+/// says it has the stored PDB's name, length and CRC-32, so a purge with no
+/// successor reads each other symbol package's directory once (they are kept
+/// for every key of the purge) and decompresses nothing. Entries are hashed
+/// as they stream past, never written out: the bytes are only of interest if
+/// they are the stored ones, and those are already on disk to check against.
+///
+/// One per purge. The caller holds `gone`'s version lock, and the key's lock
+/// around each [`Self::successor`].
+pub(crate) struct Successors<'a> {
+    storage: &'a dyn PackageStorage,
+    db: &'a dyn PackageDatabase,
+    id: &'a str,
+    gone: &'a NuGetVersion,
+    /// Every other stored version, newest first; read on first use.
+    versions: Option<Vec<NuGetVersion>>,
+    /// What each version's symbol package lists, by normalized version.
+    listings: HashMap<String, Arc<Listing>>,
+    work: Work,
+}
+
+/// What a search has cost so far, for the log and for tests.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Work {
+    /// Symbol packages whose central directory was read.
+    pub listed: usize,
+    /// Entries decompressed, which only a likely match is.
+    pub decompressed: usize,
+}
+
+/// A version picked to take a symbol over, still locked: the claim is made
+/// for it, so it must stay what it was checked as until the claim is
+/// recorded, as on a push of its own. Drop it after the hand-over.
+pub(crate) struct Heir {
+    pub version: NuGetVersion,
+    _guard: OwnedMutexGuard<()>,
+}
+
+/// The PDB entries of one stored symbol package, from its central directory.
+struct Listing {
+    /// Length and modification time of the file when it was read. A symbol
+    /// push replacing it while the purge runs makes them differ, and it is
+    /// read again.
+    stamp: (u64, Option<std::time::SystemTime>),
+    package: PathBuf,
+    snupkg: PathBuf,
+    pdbs: Vec<PdbEntry>,
+}
+
+struct PdbEntry {
+    /// As the archive spells it.
+    name: String,
+    /// [`file_name`] of it.
+    filename: String,
+    size: u64,
+    crc32: u32,
+}
+
+impl<'a> Successors<'a> {
+    pub(crate) fn new(
+        storage: &'a dyn PackageStorage,
+        db: &'a dyn PackageDatabase,
+        id: &'a str,
+        gone: &'a NuGetVersion,
+    ) -> Self {
+        Self {
+            storage,
+            db,
+            id,
+            gone,
+            versions: None,
+            listings: HashMap::new(),
+            work: Work::default(),
+        }
+    }
+
+    pub(crate) fn work(&self) -> Work {
+        self.work
+    }
+
+    /// The version `gone`'s symbol `key`/`filename` goes to, or `None`.
+    ///
+    /// A candidate whose version lock is taken is passed over: it is being
+    /// deleted, overwritten or given symbols right now, and none of those
+    /// leaves it a safe place for a claim checked against what it was. It is
+    /// only tried, never waited for — a symbol push holds its version's lock
+    /// while it waits for the key's, which the caller holds.
+    pub(crate) async fn successor(&mut self, key: &str, filename: &str) -> Result<Option<Heir>> {
+        let stored = match self.storage.get_symbol(key, filename).await {
             Ok(PackageContent::LocalPath(path)) => path,
-            Err(_) => continue,
+            Err(Error::PackageNotFound) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let size = match tokio::fs::metadata(&stored).await {
+            Ok(meta) => meta.len(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let filename = filename.to_ascii_lowercase();
+        let versions = match &self.versions {
+            Some(versions) => versions.clone(),
+            None => {
+                let mut versions = self.db.stored_versions(self.id).await?;
+                versions.retain(|v| v != self.gone);
+                versions.reverse();
+                self.versions.insert(versions).clone()
+            }
+        };
+        // Hashed once a candidate gets past the name and length.
+        let mut fingerprint: Option<(u32, [u8; 32])> = None;
+        for version in versions {
+            let Some(listing) = self.listing(&version).await else {
+                continue;
+            };
+            if !listing
+                .pdbs
+                .iter()
+                .any(|e| e.filename == filename && e.size == size)
+            {
+                continue;
+            }
+            let (crc32, sha256) = match fingerprint {
+                Some(known) => known,
+                None => *fingerprint.insert(fingerprint_file(&stored).await?),
+            };
+            let names: Vec<String> = listing
+                .pdbs
+                .iter()
+                .filter(|e| e.filename == filename && e.size == size && e.crc32 == crc32)
+                .map(|e| e.name.clone())
+                .collect();
+            if names.is_empty() {
+                continue;
+            }
+
+            let normalized = version.normalized();
+            let Some(guard) = locks::try_lock_version(self.id, &normalized) else {
+                tracing::warn!(id = %self.id, version = %normalized, %key, "not handing a symbol over to a version that is being changed");
+                continue;
+            };
+            if !self.db.package_data_exists(self.id, &version).await? {
+                continue;
+            }
+            let (package, snupkg) = (listing.package.clone(), listing.snupkg.clone());
+            let (stored, key_owned, filename_owned) =
+                (stored.clone(), key.to_owned(), filename.clone());
+            let (outcome, decompressed) = tokio::task::spawn_blocking(move || {
+                let mut decompressed = 0;
+                let outcome = holds_pdb(
+                    &package,
+                    &snupkg,
+                    &names,
+                    &stored,
+                    (&key_owned, &filename_owned),
+                    (size, &sha256),
+                    &mut decompressed,
+                );
+                (outcome, decompressed)
+            })
+            .await
+            .map_err(|e| Error::Other(anyhow::anyhow!("symbol verification task panicked: {e}")))?;
+            self.work.decompressed += decompressed;
+            match outcome {
+                Ok(true) => {
+                    return Ok(Some(Heir {
+                        version,
+                        _guard: guard,
+                    }))
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::warn!(id = %self.id, version = %normalized, %key, error = %e, "could not read a symbol package to hand a symbol over to");
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// The PDB entries of `version`'s stored symbol package, or `None` when
+    /// it has none (a version without symbols of its own is no one to hand
+    /// them to). Read once per purge unless the file changes.
+    async fn listing(&mut self, version: &NuGetVersion) -> Option<Arc<Listing>> {
+        let normalized = version.normalized();
+        let package = match self.storage.get_package(self.id, &normalized).await {
+            Ok(PackageContent::LocalPath(path)) => path,
+            Err(_) => return None,
         };
         // The store keeps a version's symbol package beside its package.
         let snupkg = package.with_extension("snupkg");
-        if !tokio::fs::try_exists(&snupkg).await.unwrap_or(false) {
-            continue;
-        }
-        match holds_pdb(&package, &snupkg, key, filename, &stored).await {
-            Ok(true) => return Ok(Some(version)),
-            Ok(false) => {}
-            Err(e) => {
-                tracing::warn!(%id, version = %normalized, %key, error = %e, "could not read a symbol package to hand a symbol over to");
+        let Ok(meta) = tokio::fs::metadata(&snupkg).await else {
+            self.listings.remove(&normalized);
+            return None;
+        };
+        let stamp = (meta.len(), meta.modified().ok());
+        if let Some(listing) = self.listings.get(&normalized) {
+            if listing.stamp == stamp {
+                return Some(listing.clone());
             }
         }
+        self.work.listed += 1;
+        let path = snupkg.clone();
+        let pdbs = match tokio::task::spawn_blocking(move || list_pdbs(&path)).await {
+            Ok(Ok(pdbs)) => pdbs,
+            Ok(Err(e)) => {
+                tracing::warn!(id = %self.id, version = %normalized, error = %e, "could not read a symbol package to hand a symbol over to");
+                Vec::new()
+            }
+            Err(e) => {
+                tracing::warn!(id = %self.id, version = %normalized, error = %e, "symbol package listing task panicked");
+                Vec::new()
+            }
+        };
+        let listing = Arc::new(Listing {
+            stamp,
+            package,
+            snupkg,
+            pdbs,
+        });
+        self.listings.insert(normalized, listing.clone());
+        Some(listing)
     }
-    Ok(None)
 }
 
-/// Whether the symbol package at `snupkg` holds a PDB named `filename` with
-/// key `key` and SHA-256 `sha256` that an assembly in `package` vouches for.
-async fn holds_pdb(
+/// The `.pdb` entries of a symbol package with their declared length and
+/// CRC-32, from the central directory alone (blocking).
+fn list_pdbs(snupkg: &Path) -> Result<Vec<PdbEntry>> {
+    let archive = nupkg::open_archive(snupkg)?;
+    let mut pdbs = Vec::new();
+    for i in 0..archive.len() {
+        let Some(name) = nupkg::entry_name(&archive, i)? else {
+            continue;
+        };
+        if !nupkg::normalize_entry(&name).ends_with(".pdb") {
+            continue;
+        }
+        let entry = archive
+            .by_index_data(i)
+            .map_err(|e| Error::InvalidPackage(format!("could not read the entry {name}: {e}")))?;
+        pdbs.push(PdbEntry {
+            filename: file_name(&name),
+            size: entry.size(),
+            crc32: entry.crc32(),
+            name,
+        });
+    }
+    Ok(pdbs)
+}
+
+/// Whether one of the entries `names` of the symbol package at `snupkg` is
+/// byte for byte the PDB stored at `stored` (`size` bytes, SHA-256 `sha256`)
+/// under `key`/`filename`, and an assembly in `package` vouches for it
+/// (blocking). Counts the entries it decompresses into `decompressed`.
+fn holds_pdb(
     package: &Path,
     snupkg: &Path,
-    key: &str,
-    filename: &str,
-    sha256: &[u8; 32],
+    names: &[String],
+    stored: &Path,
+    (key, filename): (&str, &str),
+    (size, sha256): (u64, &[u8; 32]),
+    decompressed: &mut usize,
 ) -> Result<bool> {
-    let archive = nupkg::read_archive(snupkg).await?;
-    let names: Vec<String> = archive
-        .entry_names
-        .iter()
-        .filter(|name| name.ends_with(".pdb") && file_name(name) == filename)
-        .cloned()
-        .collect();
-    if names.is_empty() {
-        return Ok(false);
+    use std::io::Read;
+
+    let mut archive = nupkg::open_archive(snupkg)?;
+    let indices = nupkg::entry_indices(&archive);
+    for name in names {
+        // Looked up again: the file may have been replaced since the listing.
+        let Some(&index) = indices.get(&nupkg::normalize_entry(name)) else {
+            continue;
+        };
+        let mut entry = archive
+            .by_index(index)
+            .map_err(|e| Error::InvalidPackage(format!("could not open {name}: {e}")))?;
+        if entry.size() != size {
+            continue;
+        }
+        *decompressed += 1;
+        let mut hasher = Sha256::new();
+        let read = crate::streaming::hash_reader(&mut (&mut entry).take(size + 1), &mut hasher)
+            .map_err(|e| Error::InvalidPackage(format!("could not read {name}: {e}")))?;
+        if read != size || <[u8; 32]>::from(hasher.finalize()) != *sha256 {
+            continue;
+        }
+        // These are the stored bytes, so the stored file is what the
+        // candidate's assembly has to vouch for.
+        let (verified, _) = match verify(package, &[(name.clone(), stored.to_path_buf())]) {
+            Ok(verified) => verified,
+            Err(e) => {
+                tracing::warn!(pdb = %name, error = %e, "a symbol package's PDB is not vouched for by its package");
+                continue;
+            }
+        };
+        if verified
+            .iter()
+            .any(|v| v.key.eq_ignore_ascii_case(key) && v.filename == filename)
+        {
+            return Ok(true);
+        }
     }
-    let dir = snupkg.parent().unwrap_or_else(|| Path::new("."));
-    let extracted = TempFiles(
-        nupkg::extract_entries_to_files(snupkg, &names, dir, MAX_PDB_BYTES, MAX_PDB_TOTAL_BYTES)
-            .await?,
-    );
-    let entries: Vec<(String, PathBuf)> = extracted
-        .0
-        .iter()
-        .map(|e| (e.name.clone(), e.path.clone()))
-        .collect();
-    let package = package.to_path_buf();
-    let (verified, _) = tokio::task::spawn_blocking(move || verify(&package, &entries))
-        .await
-        .map_err(|e| Error::Other(anyhow::anyhow!("symbol verification task panicked: {e}")))??;
-    Ok(verified
-        .iter()
-        .any(|v| v.key.eq_ignore_ascii_case(key) && v.filename == filename && v.sha256 == *sha256))
+    Ok(false)
+}
+
+/// CRC-32 and SHA-256 of a stored file, in one pass.
+async fn fingerprint_file(path: &Path) -> Result<(u32, [u8; 32])> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+        let mut file = File::open(path)?;
+        let mut crc = Crc32::new();
+        let mut sha = Sha256::new();
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            let n = match file.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e.into()),
+            };
+            crc.update(&buf[..n]);
+            sha.update(&buf[..n]);
+        }
+        Ok((crc.finish(), sha.finalize().into()))
+    })
+    .await
+    .map_err(|e| Error::Other(anyhow::anyhow!("symbol hash task panicked: {e}")))?
+}
+
+/// The CRC-32 a ZIP central directory records for each entry (IEEE 802.3,
+/// reflected), to hold a stored file against an entry without decompressing
+/// it. Bytewise from a table: it only runs over a PDB some candidate entry
+/// already matches in name and length.
+struct Crc32(u32);
+
+const CRC32_TABLE: [u32; 256] = {
+    let mut table = [0u32; 256];
+    let mut i = 0;
+    while i < 256 {
+        let mut c = i as u32;
+        let mut bit = 0;
+        while bit < 8 {
+            c = if c & 1 != 0 {
+                0xEDB8_8320 ^ (c >> 1)
+            } else {
+                c >> 1
+            };
+            bit += 1;
+        }
+        table[i] = c;
+        i += 1;
+    }
+    table
+};
+
+impl Crc32 {
+    fn new() -> Self {
+        Self(!0)
+    }
+
+    fn update(&mut self, bytes: &[u8]) {
+        let mut c = self.0;
+        for &b in bytes {
+            c = CRC32_TABLE[((c ^ u32::from(b)) & 0xFF) as usize] ^ (c >> 8);
+        }
+        self.0 = c;
+    }
+
+    fn finish(&self) -> u32 {
+        !self.0
+    }
 }
 
 /// Undo claims made by a push that failed later on: the rows, and any bytes
@@ -628,9 +942,9 @@ mod tests {
         zip.finish().unwrap();
     }
 
-    fn nuspec(id: &str) -> Vec<u8> {
+    fn nuspec(id: &str, version: &str) -> Vec<u8> {
         format!(
-            "<package><metadata><id>{id}</id><version>1.0.0</version>\
+            "<package><metadata><id>{id}</id><version>{version}</version>\
              <authors>A</authors><description>d</description></metadata></package>"
         )
         .into_bytes()
@@ -638,9 +952,14 @@ mod tests {
 
     /// A `.snupkg` for `id` 1.0.0 holding `pdbs`, as `(entry name, bytes)`.
     fn snupkg(id: &str, pdbs: &[(&str, &[u8])]) -> (tempfile::TempDir, PathBuf) {
+        snupkg_at(id, "1.0.0", pdbs)
+    }
+
+    /// A `.snupkg` for `id` `version` holding `pdbs`.
+    fn snupkg_at(id: &str, version: &str, pdbs: &[(&str, &[u8])]) -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pkg.snupkg");
-        let manifest = nuspec(id);
+        let manifest = nuspec(id, version);
         let mut entries: Vec<(&str, &[u8])> = vec![("Pkg.nuspec", &manifest)];
         entries.extend_from_slice(pdbs);
         zip_file(&path, &entries);
@@ -662,20 +981,37 @@ mod tests {
         id: &str,
         assemblies: &[(&str, &[u8])],
     ) {
+        publish_at(storage, db, id, "1.0.0", assemblies).await;
+    }
+
+    /// Publish `id` `version` into the feed, as [`publish`] does 1.0.0.
+    async fn publish_at(
+        storage: &FilesystemStorage,
+        db: &SqliteDatabase,
+        id: &str,
+        version: &str,
+        assemblies: &[(&str, &[u8])],
+    ) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pkg.nupkg");
-        let manifest = nuspec(id);
+        let manifest = nuspec(id, version);
         let mut entries: Vec<(&str, &[u8])> = vec![("Pkg.nuspec", &manifest)];
         entries.extend_from_slice(assemblies);
         zip_file(&path, &entries);
-        storage.store_package(id, "1.0.0", path).await.unwrap();
-        db.add_to_feed(FEED, &owning_package(id)).await.unwrap();
+        let version = NuGetVersion::parse(version).unwrap();
+        storage
+            .store_package(id, &version.normalized(), path)
+            .await
+            .unwrap();
+        db.add_to_feed(FEED, &owning_package(id, &version))
+            .await
+            .unwrap();
     }
 
-    fn owning_package(id: &str) -> crate::models::Package {
+    fn owning_package(id: &str, version: &NuGetVersion) -> crate::models::Package {
         crate::models::Package {
             id: id.into(),
-            version: NuGetVersion::parse("1.0.0").unwrap(),
+            version: version.clone(),
             listed: true,
             enabled: true,
             authors: vec![],
@@ -941,5 +1277,407 @@ mod tests {
         let key = pdb::portable_pdb_signature(&pdb).unwrap();
         let owner = db.find_symbol(&key, "shared.pdb").await.unwrap().unwrap();
         assert_eq!(owner.lower_id, winner);
+    }
+
+    #[test]
+    fn crc32_is_the_one_a_zip_records() {
+        let mut crc = Crc32::new();
+        crc.update(b"1234");
+        crc.update(b"56789");
+        assert_eq!(crc.finish(), 0xCBF4_3926);
+
+        let pdb = portable_pdb(&[3u8; 16], 3, &[0xA5; 70_000]);
+        let (_sd, path) = snupkg("Sym.Lib", &[("lib/net8.0/Sym.Lib.pdb", &pdb)]);
+        let listed = list_pdbs(&path).unwrap();
+        let mut crc = Crc32::new();
+        crc.update(&pdb);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].filename, "sym.lib.pdb");
+        assert_eq!(listed[0].size, pdb.len() as u64);
+        assert_eq!(listed[0].crc32, crc.finish());
+    }
+
+    /// Two PDBs per version, `A.pdb` and `B.pdb`, as every build of a package
+    /// has them: same names, same lengths, new ids (`seed`).
+    fn build(seed: u8) -> [Vec<u8>; 2] {
+        [
+            portable_pdb(&[seed; 16], u32::from(seed), b"tables of A"),
+            portable_pdb(&[seed ^ 0x80; 16], u32::from(seed), b"tables of B"),
+        ]
+    }
+
+    async fn publish_build(
+        storage: &FilesystemStorage,
+        db: &SqliteDatabase,
+        id: &str,
+        version: &str,
+        [a, b]: &[Vec<u8>; 2],
+    ) {
+        publish_at(
+            storage,
+            db,
+            id,
+            version,
+            &[
+                ("lib/net8.0/A.dll", &assembly_for(a)),
+                ("lib/net8.0/B.dll", &assembly_for(b)),
+            ],
+        )
+        .await;
+    }
+
+    /// `PERF-22`: the usual purge has no successor, and finding that out
+    /// read, extracted and verified every same-named PDB of every other
+    /// version, once per key. The central directory now rules them out,
+    /// and each symbol package is listed once for all keys.
+    #[tokio::test]
+    async fn a_purge_without_a_matching_pdb_decompresses_nothing() {
+        const ID: &str = "Many.Lib";
+        let (_d, storage, db) = fixtures().await;
+        let first = build(21);
+        for (version, pdbs) in [
+            ("1.0.0", &first),
+            ("2.0.0", &build(22)),
+            ("3.0.0", &build(23)),
+        ] {
+            publish_build(&storage, &db, ID, version, pdbs).await;
+            let (_sd, path) = snupkg_at(
+                ID,
+                version,
+                &[
+                    ("lib/net8.0/A.pdb", &pdbs[0]),
+                    ("lib/net8.0/B.pdb", &pdbs[1]),
+                ],
+            );
+            index_symbol_package(&storage, &db, FEED, path)
+                .await
+                .unwrap();
+        }
+        let gone = NuGetVersion::parse("1.0.0").unwrap();
+        let symbols = db.find_symbols(ID, &gone).await.unwrap();
+        assert_eq!(symbols.len(), 2);
+
+        let mut successors = Successors::new(&storage, &db, ID, &gone);
+        for sym in &symbols {
+            let heir = successors.successor(&sym.key, &sym.filename).await.unwrap();
+            assert!(heir.is_none(), "{}", sym.filename);
+        }
+        assert_eq!(
+            successors.work(),
+            Work {
+                listed: 2,
+                decompressed: 0
+            }
+        );
+
+        // A version that does hold one of them is found, at the cost of
+        // decompressing that one entry.
+        publish_at(
+            &storage,
+            &db,
+            ID,
+            "4.0.0",
+            &[("lib/net8.0/A.dll", &assembly_for(&first[0]))],
+        )
+        .await;
+        let (_sd, path) = snupkg_at(ID, "4.0.0", &[("lib/net8.0/A.pdb", &first[0])]);
+        index_symbol_package(&storage, &db, FEED, path)
+            .await
+            .unwrap();
+        let mut successors = Successors::new(&storage, &db, ID, &gone);
+        let key_a = pdb::portable_pdb_signature(&first[0]).unwrap();
+        let key_b = pdb::portable_pdb_signature(&first[1]).unwrap();
+        let heir = successors.successor(&key_a, "a.pdb").await.unwrap();
+        assert_eq!(heir.unwrap().version.normalized(), "4.0.0");
+        assert!(successors
+            .successor(&key_b, "b.pdb")
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            successors.work(),
+            Work {
+                listed: 3,
+                decompressed: 1
+            }
+        );
+        // Nothing was written anywhere to find that out.
+        let mut stray = Vec::new();
+        let mut dirs = vec![_d.path().to_path_buf()];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    dirs.push(path);
+                } else if path.extension().is_some_and(|e| e == "tmp") {
+                    stray.push(path);
+                }
+            }
+        }
+        assert!(stray.is_empty(), "{stray:?}");
+    }
+
+    /// Two versions of `Sym.Lib`, `1.0.0-rc.1` and `1.0.0`, from one build.
+    /// The first one's symbols are pushed; returns the PDB and its key.
+    async fn built_twice(
+        storage: &FilesystemStorage,
+        db: &SqliteDatabase,
+        id: &str,
+        seed: u8,
+    ) -> (Vec<u8>, String) {
+        let pdb = portable_pdb(&[seed; 16], u32::from(seed), b"shared tables");
+        for version in ["1.0.0-rc.1", "1.0.0"] {
+            publish_at(
+                storage,
+                db,
+                id,
+                version,
+                &[("lib/Sym.Lib.dll", &assembly_for(&pdb))],
+            )
+            .await;
+        }
+        let (_sd, path) = snupkg_at(id, "1.0.0-rc.1", &[("lib/Sym.Lib.pdb", &pdb)]);
+        index_symbol_package(storage, db, FEED, path).await.unwrap();
+        let key = pdb::portable_pdb_signature(&pdb).unwrap();
+        (pdb, key)
+    }
+
+    /// `MNT-38`: a hand-over claims the key for the other version, so that
+    /// version must not be in the middle of a delete or an overwrite. One that
+    /// is locked is passed over, without waiting for it.
+    #[tokio::test]
+    async fn a_symbol_is_not_handed_to_a_version_being_changed() {
+        const ID: &str = "Busy.Lib";
+        let (_d, storage, db) = fixtures().await;
+        let (pdb, key) = built_twice(&storage, &db, ID, 11).await;
+        let (_sd, path) = snupkg_at(ID, "1.0.0", &[("lib/Sym.Lib.pdb", &pdb)]);
+        index_symbol_package(&storage, &db, FEED, path)
+            .await
+            .unwrap();
+
+        let rc = NuGetVersion::parse("1.0.0-rc.1").unwrap();
+        let _gone = locks::lock_version(ID, "1.0.0-rc.1").await;
+        let _busy = locks::lock_version(ID, "1.0.0").await;
+        crate::retention::purge_symbols(&storage, &db, ID, &rc)
+            .await
+            .unwrap();
+        assert!(db.find_symbol(&key, "sym.lib.pdb").await.unwrap().is_none());
+        assert!(storage.get_symbol(&key, "sym.lib.pdb").await.is_err());
+    }
+
+    /// A store that stops in one method, on its `nth` call, until the test
+    /// lets it go on: a fixed point inside a push or a purge to race against.
+    struct Paused {
+        inner: FilesystemStorage,
+        at: &'static str,
+        nth: usize,
+        calls: std::sync::atomic::AtomicUsize,
+        reached: tokio::sync::Notify,
+        go: tokio::sync::Semaphore,
+        /// The keys `delete_symbol` was called with, in order.
+        deleted: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl Paused {
+        fn new(inner: FilesystemStorage, at: &'static str, nth: usize) -> Self {
+            Self {
+                inner,
+                at,
+                nth,
+                calls: Default::default(),
+                reached: tokio::sync::Notify::new(),
+                go: tokio::sync::Semaphore::new(0),
+                deleted: Default::default(),
+            }
+        }
+
+        async fn pause(&self, at: &str) {
+            use std::sync::atomic::Ordering;
+            if at == self.at && self.calls.fetch_add(1, Ordering::SeqCst) + 1 == self.nth {
+                self.reached.notify_one();
+                let _ = self.go.acquire().await.unwrap();
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl PackageStorage for Paused {
+        async fn store_package(&self, id: &str, version: &str, temp: PathBuf) -> Result<u64> {
+            self.inner.store_package(id, version, temp).await
+        }
+        async fn get_package(&self, id: &str, version: &str) -> Result<PackageContent> {
+            self.inner.get_package(id, version).await
+        }
+        async fn package_exists(&self, id: &str, version: &str) -> bool {
+            self.inner.package_exists(id, version).await
+        }
+        async fn store_symbol_package(
+            &self,
+            id: &str,
+            version: &str,
+            temp: PathBuf,
+        ) -> Result<u64> {
+            self.pause("store_symbol_package").await;
+            self.inner.store_symbol_package(id, version, temp).await
+        }
+        async fn store_symbol(&self, key: &str, filename: &str, bytes: &[u8]) -> Result<()> {
+            self.inner.store_symbol(key, filename, bytes).await
+        }
+        async fn store_symbol_file(&self, key: &str, filename: &str, temp: PathBuf) -> Result<()> {
+            self.inner.store_symbol_file(key, filename, temp).await
+        }
+        async fn get_symbol(&self, key: &str, filename: &str) -> Result<PackageContent> {
+            self.inner.get_symbol(key, filename).await
+        }
+        async fn delete_symbol(&self, key: &str, filename: &str) -> Result<()> {
+            self.deleted.lock().unwrap().push(key.to_owned());
+            self.pause("delete_symbol").await;
+            self.inner.delete_symbol(key, filename).await
+        }
+        async fn store_aux(
+            &self,
+            id: &str,
+            version: &str,
+            kind: crate::storage::AuxFile,
+            bytes: &[u8],
+        ) -> Result<()> {
+            self.inner.store_aux(id, version, kind, bytes).await
+        }
+        async fn get_aux(
+            &self,
+            id: &str,
+            version: &str,
+            kind: crate::storage::AuxFile,
+        ) -> Result<Vec<u8>> {
+            self.inner.get_aux(id, version, kind).await
+        }
+        async fn aux_content(
+            &self,
+            id: &str,
+            version: &str,
+            kind: crate::storage::AuxFile,
+        ) -> Result<PackageContent> {
+            self.inner.aux_content(id, version, kind).await
+        }
+        async fn delete(&self, id: &str, version: &str) -> Result<()> {
+            self.inner.delete(id, version).await
+        }
+        async fn store_blob(&self, sha256_hex: &str, temp: PathBuf) -> Result<u64> {
+            self.inner.store_blob(sha256_hex, temp).await
+        }
+        async fn get_blob(&self, sha256_hex: &str) -> Result<PackageContent> {
+            self.inner.get_blob(sha256_hex).await
+        }
+        async fn delete_blob(&self, sha256_hex: &str) -> Result<()> {
+            self.inner.delete_blob(sha256_hex).await
+        }
+        async fn list_blobs(&self) -> Result<Vec<String>> {
+            self.inner.list_blobs().await
+        }
+    }
+
+    /// `COR-53`: a push of PDBs another version already holds changes
+    /// nothing under their keys and used to release them at once, before its
+    /// own symbol package was stored. A purge of the other version taking a
+    /// key in that gap found no symbol package to hand it to and deleted the
+    /// PDB the push had just answered `201` for.
+    #[tokio::test]
+    async fn a_symbol_push_keeps_its_keys_until_its_symbol_package_is_stored() {
+        const ID: &str = "Window.Lib";
+        let (_d, storage, db) = fixtures().await;
+        let (pdb, key) = built_twice(&storage, &db, ID, 12).await;
+        let paused = Paused::new(storage, "store_symbol_package", 1);
+
+        let (_sd, path) = snupkg_at(ID, "1.0.0", &[("lib/Sym.Lib.pdb", &pdb)]);
+        let push = index_symbol_package(&paused, &db, FEED, path);
+        let purge = async {
+            // The push is storing its symbol package.
+            paused.reached.notified().await;
+            let rc = NuGetVersion::parse("1.0.0-rc.1").unwrap();
+            let purge = async {
+                let _gone = locks::lock_version(ID, "1.0.0-rc.1").await;
+                crate::retention::purge_symbols(&paused.inner, &db, ID, &rc).await
+            };
+            tokio::pin!(purge);
+            // As far as the purge gets before the push goes on.
+            let early =
+                tokio::time::timeout(std::time::Duration::from_millis(300), &mut purge).await;
+            paused.go.add_permits(1);
+            match early {
+                Ok(done) => done,
+                Err(_) => purge.await,
+            }
+        };
+        let (pushed, purged) = tokio::join!(push, purge);
+        pushed.unwrap();
+        purged.unwrap();
+
+        let owner = db.find_symbol(&key, "sym.lib.pdb").await.unwrap();
+        assert_eq!(owner.unwrap().normalized_version, "1.0.0");
+        let PackageContent::LocalPath(stored) =
+            paused.inner.get_symbol(&key, "sym.lib.pdb").await.unwrap();
+        assert_eq!(std::fs::read(stored).unwrap(), pdb);
+    }
+
+    /// `COR-53`: a purge deleted the files key by key but every row only at
+    /// the end, so in between another version pushing one of those PDBs found
+    /// the key claimed by the version going away, with no file, and was
+    /// refused. Each row now goes with its file, under the key's lock.
+    #[tokio::test]
+    async fn a_purge_releases_each_key_with_its_file() {
+        const ID: &str = "Rows.Lib";
+        let (_d, storage, db) = fixtures().await;
+        let pdbs = build(13);
+        for version in ["1.0.0", "2.0.0"] {
+            publish_build(&storage, &db, ID, version, &pdbs).await;
+        }
+        let (_sd, path) = snupkg_at(
+            ID,
+            "1.0.0",
+            &[
+                ("lib/net8.0/A.pdb", &pdbs[0]),
+                ("lib/net8.0/B.pdb", &pdbs[1]),
+            ],
+        );
+        index_symbol_package(&storage, &db, FEED, path)
+            .await
+            .unwrap();
+        let paused = Paused::new(storage, "delete_symbol", 2);
+
+        let gone = NuGetVersion::parse("1.0.0").unwrap();
+        let purge = async {
+            let _gone = locks::lock_version(ID, "1.0.0").await;
+            crate::retention::purge_symbols(&paused, &db, ID, &gone).await
+        };
+        let push = async {
+            // One key is gone, the purge is deleting the other.
+            paused.reached.notified().await;
+            let first = paused.deleted.lock().unwrap()[0].clone();
+            let (entry, pdb) = if pdb::portable_pdb_signature(&pdbs[0]).unwrap() == first {
+                ("lib/net8.0/A.pdb", &pdbs[0])
+            } else {
+                ("lib/net8.0/B.pdb", &pdbs[1])
+            };
+            let (_sd, path) = snupkg_at(ID, "2.0.0", &[(entry, pdb)]);
+            let pushed = index_symbol_package(&paused.inner, &db, FEED, path).await;
+            paused.go.add_permits(1);
+            (pushed, first)
+        };
+        let (purged, (pushed, first)) = tokio::join!(purge, push);
+        purged.unwrap();
+        pushed.unwrap();
+
+        assert!(db.find_symbols(ID, &gone).await.unwrap().is_empty());
+        let owner = db.find_symbol(&first, &file_name_of(&pdbs, &first)).await;
+        assert_eq!(owner.unwrap().unwrap().normalized_version, "2.0.0");
+    }
+
+    /// The file name `build`'s PDB with `key` is pushed under.
+    fn file_name_of(pdbs: &[Vec<u8>; 2], key: &str) -> String {
+        if pdb::portable_pdb_signature(&pdbs[0]).unwrap() == key {
+            "a.pdb".into()
+        } else {
+            "b.pdb".into()
+        }
     }
 }

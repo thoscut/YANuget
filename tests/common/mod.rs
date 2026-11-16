@@ -4,6 +4,9 @@
 #![allow(dead_code)]
 
 pub mod binary;
+pub mod http;
+
+pub use http::{client, client_builder};
 
 use std::io::{Cursor, Write};
 use std::net::{Ipv4Addr, SocketAddr};
@@ -82,7 +85,7 @@ pub async fn spawn_with_free_space(
 
     TestServer {
         base: format!("http://{addr}"),
-        client: reqwest::Client::new(),
+        client: client(),
         _dir: dir,
     }
 }
@@ -395,7 +398,7 @@ pub fn admin_body(key: &str) -> String {
 }
 
 pub fn no_redirect() -> reqwest::Client {
-    reqwest::Client::builder()
+    client_builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .unwrap()
@@ -511,7 +514,7 @@ pub async fn spawn_feeds_with_free_space(
     });
     TestServer {
         base: format!("http://{addr}"),
-        client: reqwest::Client::new(),
+        client: client(),
         _dir: dir,
     }
 }

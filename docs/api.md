@@ -441,6 +441,15 @@ from. In the repository it is `scripts/Send-YanugetFile.ps1`; use the one at
 your server's release tag (`…/blob/vX.Y.Z/scripts/…`), since `main` may
 already speak to a newer server.
 
+The script is not Authenticode-signed. On Windows, a copy unpacked from a
+downloaded archive carries the mark of the web, and under the `RemoteSigned`
+execution policy PowerShell refuses to load it. Check the archive against
+`SHA256SUMS` or its attestation first (see
+[Verifying a release](https://github.com/thoscut/yanuget/blob/main/SECURITY.md#verifying-a-release)),
+then clear the mark on that one file with
+`Unblock-File .\Send-YanugetFile.ps1` rather than reaching for
+`-ExecutionPolicy Bypass`, which lifts the check for every script.
+
 ```powershell
 . ./Send-YanugetFile.ps1
 # The key comes from $env:YANUGET_API_KEY, from -ApiKey as a SecureString,

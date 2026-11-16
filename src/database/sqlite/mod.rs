@@ -563,13 +563,13 @@ impl PackageDatabase for SqliteDatabase {
         uploads::outstanding_upload_bytes(self, now, held_after).await
     }
 
-    async fn feed_upload_bytes(
+    async fn feeds_upload_bytes(
         &self,
-        feed: &str,
+        feeds: &[String],
         now: DateTime<Utc>,
         held_after: DateTime<Utc>,
     ) -> Result<u64> {
-        uploads::feed_upload_bytes(self, feed, now, held_after).await
+        uploads::feeds_upload_bytes(self, feeds, now, held_after).await
     }
 
     async fn open_uploads(&self, feed: &str, now: DateTime<Utc>) -> Result<u64> {

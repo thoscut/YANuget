@@ -4,18 +4,27 @@
 use std::path::Path;
 
 /// A command for the binary that does not see the caller's `YANUGET_*`
-/// variables or its `RUST_LOG`.
+/// variables, its `RUST_LOG` or its proxy.
 ///
 /// The variables override the configuration file, so an exported
 /// `YANUGET_DATA_DIR` would send a test's `restore --force` or `migrate`
 /// into a data directory that is not the test's. `RUST_LOG` decides what
-/// the binary prints, which the tests read. A test that wants either sets
-/// it on the command itself.
+/// the binary prints, which the tests read. `yanuget migrate` and `yanuget
+/// admin --url` take `HTTP(S)_PROXY` from the environment, as a command run
+/// by hand should, and reqwest does not leave loopback out by itself, so
+/// behind a proxy whose `NO_PROXY` does not name `127.0.0.1` they would ask
+/// the proxy for the test's servers. A test that wants any of these sets it
+/// on the command itself.
 pub fn yanuget_command() -> tokio::process::Command {
     let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_yanuget"));
     for (name, _) in std::env::vars_os() {
-        if name.to_str().is_some_and(|n| n.starts_with("YANUGET_")) {
-            command.env_remove(&name);
+        let Some(name) = name.to_str() else { continue };
+        let proxy = matches!(
+            name.to_ascii_uppercase().as_str(),
+            "HTTP_PROXY" | "HTTPS_PROXY" | "ALL_PROXY" | "NO_PROXY"
+        );
+        if name.starts_with("YANUGET_") || proxy {
+            command.env_remove(name);
         }
     }
     command

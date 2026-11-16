@@ -79,6 +79,11 @@ of a server that has a problem, not a backup that hides one.
 Resumable uploads that were unfinished at backup time are not included; a
 client resuming one after a restore starts it over.
 
+The backup directory should be writable only by the user `yanuget backup`
+runs as: the backup does not follow links it finds there, and makes its
+database snapshot in a private directory of its own, but it cannot guard
+against someone else swapping directories in it while a run is under way.
+
 ### What it does not include
 
 - The configuration file (`yanuget.toml`). Back it up with the rest of `/etc`;

@@ -939,6 +939,17 @@ async fn the_files_of_a_version_approved_in_two_feeds_change_with_both_admin_key
         let refused = delete(basic, extra).await.unwrap();
         assert_eq!(refused.status(), reqwest::StatusCode::FORBIDDEN);
     }
+    // The refusal does not tell which of the keys offered was right: with a
+    // wrong one beside it, the right key is refused in the same words as two
+    // wrong ones (`SEC-55`).
+    let text = |basic: &'static str, extra: &'static [&'static str]| async move {
+        let refused = delete(basic, extra).await.unwrap();
+        assert_eq!(refused.status(), reqwest::StatusCode::FORBIDDEN);
+        refused.text().await.unwrap()
+    };
+    let mixed = text(INTAKE_ADMIN, &["wrong-1"]).await;
+    assert!(!mixed.contains("admin key of prod"), "{mixed}");
+    assert_eq!(text("wrong-2", &["wrong-3"]).await, mixed);
     // Both are.
     assert_eq!(
         delete(INTAKE_ADMIN, &[PROD_ADMIN]).await.unwrap().status(),
@@ -946,17 +957,19 @@ async fn the_files_of_a_version_approved_in_two_feeds_change_with_both_admin_key
     );
 }
 
-/// A wrong admin key at the file endpoints is a failed guess like one at
-/// `/admin`, and held to `max_failed_auth`, though the answer is a `403`
-/// (`SEC-51`). A refusal without an admin key is no guess.
-#[tokio::test]
-async fn a_wrong_admin_key_for_an_approved_version_counts_as_a_failed_guess() {
+/// A `gated` feed that reviews what it serves, configured further by
+/// `customize`, holding `Ring.Pkg` 1.0.0, approved there; at most three
+/// failed authentications per address.
+async fn spawn_approved_gated(
+    customize: impl FnOnce(&mut yanuget::config::FeedConfig),
+) -> TestServer {
     let server = spawn_feeds(|c| {
         c.api_key = Some(API_KEY.into());
         c.admin_api_key = Some(ADMIN_KEY.into());
         c.rate_limit.max_failed_auth = 3;
         let mut gated = feed("gated");
         gated.requires_approval = true;
+        customize(&mut gated);
         c.feeds = vec![gated];
     })
     .await;
@@ -978,22 +991,47 @@ async fn a_wrong_admin_key_for_an_approved_version_counts_as_a_failed_guess() {
         .await
         .unwrap();
     assert_eq!(approved.status(), reqwest::StatusCode::SEE_OTHER);
+    server
+}
 
-    let create = |admin: Option<String>| {
-        let mut req = tus(no_redirect().post(server.url("/gated/api/v2/uploads")))
-            .header("Upload-Length", "10")
-            .header(
-                "Upload-Metadata",
-                tus_metadata(&[
-                    ("id", "Ring.Pkg"),
-                    ("version", "1.0.0"),
-                    ("filename", "a.zip"),
-                ]),
-            );
-        if let Some(key) = admin {
-            req = req.basic_auth("admin", Some(key));
-        }
-        async move { req.send().await.unwrap().status() }
+/// Start a tus upload of a file for `Ring.Pkg` 1.0.0 in `gated` with the
+/// push key, `basic` as the Basic password and an `X-YANuget-Admin-Key`
+/// header for each of `extra`.
+async fn create_gated_upload(
+    server: &TestServer,
+    basic: Option<&str>,
+    extra: &[&str],
+) -> reqwest::Response {
+    let mut req = tus(no_redirect().post(server.url("/gated/api/v2/uploads")))
+        .header("Upload-Length", "10")
+        .header(
+            "Upload-Metadata",
+            tus_metadata(&[
+                ("id", "Ring.Pkg"),
+                ("version", "1.0.0"),
+                ("filename", "a.zip"),
+            ]),
+        );
+    if let Some(key) = basic {
+        req = req.basic_auth("admin", Some(key));
+    }
+    for key in extra {
+        req = req.header("X-YANuget-Admin-Key", *key);
+    }
+    req.send().await.unwrap()
+}
+
+/// A wrong admin key at the file endpoints is a failed guess like one at
+/// `/admin`, and held to `max_failed_auth`, though the answer is a `403`
+/// (`SEC-51`). A refusal without an admin key is no guess.
+#[tokio::test]
+async fn a_wrong_admin_key_for_an_approved_version_counts_as_a_failed_guess() {
+    let server = spawn_approved_gated(|_| {}).await;
+    let server = &server;
+    let create = |admin: Option<String>| async move {
+        create_gated_upload(server, admin.as_deref(), &[])
+            .await
+            .status()
     };
     for _ in 0..5 {
         assert_eq!(create(None).await, reqwest::StatusCode::FORBIDDEN);
@@ -1014,4 +1052,58 @@ async fn a_wrong_admin_key_for_an_approved_version_counts_as_a_failed_guess() {
         create(Some(ADMIN_KEY.into())).await,
         reqwest::StatusCode::TOO_MANY_REQUESTS
     );
+}
+
+/// Each wrong admin key a request offers is a failed guess of its own,
+/// however many `X-YANuget-Admin-Key` headers carry them; a request with
+/// more keys than it could need is refused before any is compared
+/// (`SEC-55`).
+#[tokio::test]
+async fn each_wrong_admin_key_offered_counts_as_a_failed_guess() {
+    let server = spawn_approved_gated(|_| {}).await;
+    // More than eight keys: nothing compared, nothing counted.
+    let nine: Vec<String> = (0..9).map(|i| format!("guess-{i}")).collect();
+    let nine: Vec<&str> = nine.iter().map(String::as_str).collect();
+    for _ in 0..4 {
+        let refused = create_gated_upload(&server, None, &nine).await;
+        assert_eq!(refused.status(), reqwest::StatusCode::BAD_REQUEST);
+    }
+    let refused = create_gated_upload(&server, Some("guess-a"), &["guess-b", "guess-c"]).await;
+    assert_eq!(refused.status(), reqwest::StatusCode::FORBIDDEN);
+    // Three wrong keys in one request: out of guesses, the right key
+    // refused before it is compared.
+    let locked = create_gated_upload(&server, Some(ADMIN_KEY), &[]).await;
+    assert_eq!(locked.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+}
+
+/// A client that sends this feed's push, read or preview key as its Basic
+/// password is not guessing an admin key: refused as often as the budget
+/// allows guesses and more, it is never locked out (`TEST-31`).
+#[tokio::test]
+async fn a_feeds_own_keys_as_the_basic_password_are_no_failed_guess() {
+    const READ_KEY: &str = "read-key";
+    const PREVIEW_KEY: &str = "preview-key";
+    let server = spawn_approved_gated(|gated| {
+        gated.read_api_key = Some(READ_KEY.into());
+        gated.preview_api_key = Some(PREVIEW_KEY.into());
+    })
+    .await;
+    for key in [API_KEY, READ_KEY, PREVIEW_KEY] {
+        for _ in 0..4 {
+            let refused = create_gated_upload(&server, Some(key), &[]).await;
+            assert_eq!(refused.status(), reqwest::StatusCode::FORBIDDEN, "{key}");
+            // A refusal that is no guess still names the feed whose key is
+            // missing.
+            let body = refused.text().await.unwrap();
+            assert!(body.contains("takes the admin key of gated"), "{body}");
+        }
+    }
+    let pushed = push_to(
+        &server,
+        "/gated/api/v2/package",
+        API_KEY,
+        build_nupkg("Ring.Pkg", "1.0.1", b"x"),
+    )
+    .await;
+    assert_eq!(pushed.status(), reqwest::StatusCode::CREATED);
 }

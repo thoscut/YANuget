@@ -127,7 +127,11 @@ against `max_failed_auth`, and once that is spent the client's credentialed
 requests are answered `429` until the window rolls over. A `403` to a file or
 upload request that offered an admin key (Basic password or
 `X-YANuget-Admin-Key`) that is no feed's counts as a failed authentication
-too. A `401` to a request *without* credentials is the challenge a NuGet client waits for before it
+too. Behind a reverse proxy that asks for a Basic login of its own and passes
+`Authorization` on (nginx does by default), that password is such a key on
+every file or upload request refused with `403`; list the proxy in
+[`trusted_proxies`](#trusted-proxies), or all its clients share one budget,
+and one retrying in a loop locks the others out with `429`. A `401` to a request *without* credentials is the challenge a NuGet client waits for before it
 sends its key, and is not counted. YANuget also warns at startup about any
 push, read or admin key shorter than 32 characters: the limiter bounds online
 guessing, a long random key makes it pointless.
@@ -347,7 +351,7 @@ wherever their version goes, retention included.
 | `files.allowed_extensions` | `YANUGET_FILES_ALLOWED_EXTENSIONS` | string[] | `wim, swm, esd, iso, vhd, vhdx, zip, 7z, cab` | Accepted file types (env: comma-separated). |
 | `files.upload_expiry_hours` | `YANUGET_FILES_UPLOAD_EXPIRY_HOURS` | int | `72` | How long an unfinished resumable upload is kept. It holds the space it has still to receive against `min_free_disk_bytes` for an hour after it was created. After that, each `PATCH` renews the hold by as much of the hour as its bytes are of the upload's pace: its length divided by `upload_expiry_hours`, what it must bring each hour to arrive in time. An upload that keeps that pace holds its space throughout; one that sends nothing or trickles (a byte an hour) lets the hold run out, and its next `PATCH` is admitted again like a new upload of what is left (`507` when that no longer fits). |
 | `files.max_open_uploads` | `YANUGET_FILES_MAX_OPEN_UPLOADS` | int | `32` | How many unfinished resumable uploads one feed may hold at once; another is refused with `429` until one finishes, is deleted or expires. `0` is no limit. |
-| `files.max_upload_space_percent` | `YANUGET_FILES_MAX_UPLOAD_SPACE_PERCENT` | int | `80` | The most of the storage volume's free space (what is free above `min_free_disk_bytes`) that the feeds of one push key may promise together to uploads that have not arrived, in percent. Feeds count together when they accept a common push key, directly or through another feed; a feed without keys of its own takes the global ones, so with one global key all such feeds are one group, and feeds without any push key are one group too. Counted are the unfinished resumable uploads that still hold their space, the `PATCH` requests being written, and pushes and `PUT …/files` in progress with their declared `Content-Length`. A resumable upload's `POST` that would take the group past it is refused with `507`, and so is the `PATCH` of an upload whose hold has lapsed; an upload that still holds its space goes on. A push or `PUT` is refused when, beside what the group has promised already, it would take the group past the share; alone it is held to the volume only, so a single file larger than the share still goes in one `PUT`. A single resumable upload larger than the share is refused: with 120 GiB free, the 2 GiB reserve and nothing else open on the group, the default lets a resumable upload be at most 94.4 GiB (see [Free space](large-packages.md#free-space)). The rest stays for other push keys, mirror downloads and the inbox, so one push key cannot promise the whole volume to uploads that never arrive. `0` or `100` is no cap, and none applies while `min_free_disk_bytes` is `0`. |
+| `files.max_upload_space_percent` | `YANUGET_FILES_MAX_UPLOAD_SPACE_PERCENT` | int | `80` | The most of the storage volume's free space (what is free above `min_free_disk_bytes`) that the feeds of one push key may promise together to uploads that have not arrived, in percent. Feeds count together when they accept a common push key, directly or through another feed; a feed without keys of its own takes the global ones, so with one global key all such feeds are one group, and feeds without any push key are one group too. Counted are the unfinished resumable uploads that still hold their space, the `PATCH` requests being written, and pushes and `PUT …/files` in progress with their declared `Content-Length`. A resumable upload's `POST` that would take the group past it is refused with `507`, and so is the `PATCH` of an upload whose hold has lapsed; an upload that still holds its space goes on. A push or `PUT` is refused when, beside what the group has promised already, it would take the group past the share; alone it is held to the volume only, so a single file larger than the share still goes in one `PUT`. A single resumable upload larger than the share is refused: with 120 GiB free, the 2 GiB reserve and nothing else open on the group, the default lets a resumable upload be at most 94.4 GiB (see [Free space](large-packages.md#free-space)). The rest stays for other push keys, mirror downloads and the inbox, so one push key cannot promise the whole volume to uploads that never arrive. Because the grouping is transitive, a push key valid only for feed `c` can, through a feed `d` that accepts it beside another key, use up the share that feed `e` is measured against too: every upload to `e` is then refused with `507` while the volume still has room for other groups. Give a feed that two teams share a key of its own if that matters. `0` or `100` is no cap, and none applies while `min_free_disk_bytes` is `0`. |
 | `files.inbox_dir` | `YANUGET_FILES_INBOX_DIR` | path | *(off)* | The SSH inbox (below). |
 | `files.inbox_scan_secs` | `YANUGET_FILES_INBOX_SCAN_SECS` | int | `30` | How often the inbox is scanned (at least 5). |
 
@@ -626,9 +630,12 @@ feed's own `allow_overwrite`:
   …/api/v2/files/…`. Neither feed's admin page can, since a browser sends one
   password; there the `403` names the other feed. `Send-YanugetFile.ps1
   -AdminKey` sends one key.
-- An admin key offered here that is no feed's counts against
+- Each admin key offered here that is no feed's counts against
   [`rate_limit.max_failed_auth`](#rate-limiting) like a `401`, though the
-  answer is `403`.
+  answer is `403`. A request may offer at most eight admin keys, or one per
+  feed that reviews what it serves and one more where that is larger; more
+  is `400` before any is compared. When a wrong key was offered, the `403`
+  does not say which feeds' keys are still missing.
 - While the version is still pending everywhere that reviews, and in feeds
   that approve on arrival, the push key attaches and deletes as before.
 - The file inbox holds no credentials: for a feed with `requires_approval` or

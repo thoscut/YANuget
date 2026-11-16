@@ -12,16 +12,30 @@ expected to change incompatibly at any version.
 
 ## [Unreleased]
 
-**Upgrading:** no schema change; 0.10.0 opens the database again. A resumable
-(tus) upload larger than `files.max_upload_space_percent` (default `80`) of
-the space free above `min_free_disk_bytes` is now refused with `507` at its
-`POST`, where 0.10.0 admitted it: with 120 GiB free and the 2 GiB reserve,
-that is one over 94.4 GiB. A file that size still goes in one `PUT` or
-through the SSH inbox; set `files.max_upload_space_percent = 100` to admit
-it resumably as before (see *Free space* in `docs/large-packages.md`).
-Since `files.max_upload_space_percent` now caps the feeds of one push key
-together, counting pushes and `PUT`s in progress, a push beside large
-resumable uploads of the same key can see `507` where 0.10.0 took it.
+**Upgrading:** no schema change; 0.10.0 opens the database again. No setting
+is renamed or removed. The new `files.max_upload_space_percent` (default `80`)
+caps the share of the space free above `min_free_disk_bytes` that the uploads
+of the feeds of one push key may hold together. A resumable (tus) upload larger than
+that share is refused with `507` at its `POST`, where 0.10.0 admitted it: with
+120 GiB free and the 2 GiB reserve, that is one over 94.4 GiB. A file that size
+still goes in one `PUT` or through the SSH inbox; set
+`files.max_upload_space_percent = 100` to admit it resumably as before (see
+*Free space* in `docs/large-packages.md`). Pushes and `PUT`s in progress count
+towards the share as well, so a push beside other uploads of the same push key
+in progress, resumable or not, can see `507` where 0.10.0 took it, such as the
+last of many large packages a CI run pushes in parallel with one key.
+
+A wrong admin key at the file and upload endpoints now counts against
+`rate_limit.max_failed_auth`, though the answer stays `403`. Behind a reverse
+proxy that asks for a Basic login of its own and passes the password on (nginx
+does by default), that password is taken for a wrong admin key on every such
+`403`: list the proxy in `trusted_proxies`, or one client retrying in a loop locks every client out
+with `429`. Further admin keys travel in `X-YANuget-Admin-Key` headers; a proxy
+that passes only the headers it knows has to let that one through. One HTTP/2
+connection carries at most 32 requests at once (200 before); further ones
+wait. A package with entry names that differ only in percent-encoding, or whose
+root `.nuspec` is one only before or after decoding, is refused, on a push and
+in a mirror alike. Code that uses `yanuget` as a library: see *Changed*.
 RUSTSEC-2026-0459 is still open, see *Security*.
 
 ### Security
@@ -33,23 +47,54 @@ RUSTSEC-2026-0459 is still open, see *Security*.
   is in `libsqlite3-sys` 0.39, which no sqlx release accepts yet. YANuget
   opens only its own database in `data_dir` and the snapshot in a backup
   directory; `restore` copies just the backup's `yanuget.db` and deletes any
-  `-wal` next to the live file before opening it, and `backup` deletes any
-  next to its snapshot before every opening (`DEP-17`). Planting such a file
+  `-wal` next to the live file before opening it, and `backup` makes, checks and
+  opens its snapshot only in a private directory of its own (`DEP-17`,
+  `SEC-54`). Planting such a file
   next to the live database takes write access to the data directory, which
   is control of the server already. The ignore goes when
   sqlx allows the fixed version. (`DEP-14`)
-
-- A resumable upload's hold on the space it has still to receive is renewed
-  only by a `PATCH` that brings bytes. An empty `PATCH` an hour used to keep
-  the space promised for as long as the upload may stay open, which kept
-  every feed's uploads out with `507`. (`SEC-41`)
-- `files.max_upload_space_percent` (default `80`): the unfinished resumable
-  uploads of one feed together hold at most that share of the space free
-  above `min_free_disk_bytes`, counting the requests writing one right now.
-  One feed's push key can no longer promise the whole volume to uploads that
-  never arrive, or to ones that trickle. A single resumable upload larger
-  than the share is refused with `507` where it was admitted before; set
-  `100` for the old behaviour. (`SEC-41`)
+- Each wrong admin key a request offers at the file and upload endpoints
+  counts against `rate_limit.max_failed_auth` on its own, and a request
+  offering more admin keys than it could need (more than eight, or one per
+  feed that reviews what it serves and one more) is refused with `400` before
+  any is compared. One request with repeated `X-YANuget-Admin-Key` headers
+  could otherwise try some 95 (HTTP/1) to 270 (HTTP/2) keys for one counted
+  failure, and the `403` told which feeds' keys were still missing, so which
+  of them had been right; that list is left out when a wrong key was offered.
+  (`SEC-55`)
+- `yanuget backup` no longer writes through links in the backup directory.
+  The manifest and every copied file are staged under fresh names created
+  anew, a link in place of `.backup.lock` is not followed, and a directory
+  link under `packages/` or `tls/` (or in their place) stops the run. A link
+  at the manifest's fixed temp name used to overwrite whatever it pointed at,
+  the live database included, and a directory link put package files wherever
+  it pointed. The database snapshot is made and checked in a private
+  directory (mode `0700`) inside the backup directory, so no `-wal` or
+  `-journal` can be laid next to it between the clean-up and the open. The
+  backup directory should still be writable by the user `backup` runs as
+  alone. (`SEC-54`)
+- A resumable upload's hold on the space it has still to receive is bought
+  with bytes: each `PATCH` renews it by as much of the hour as its bytes are
+  of the upload's pace (its length over `files.upload_expiry_hours`), and one
+  without bytes does not renew it. Every `PATCH` used to renew the full
+  hour, so an empty one, or one byte, an hour kept the space promised for as
+  long as the upload may stay open (72 hours by default), and with it every
+  feed's uploads out with `507`. (`SEC-41`, `SEC-48`)
+- `files.max_upload_space_percent` (new, default `80`): the uploads of the
+  feeds of one push key together hold at most that share of the space free
+  above `min_free_disk_bytes`. Feeds count together when they accept a common
+  push key, directly or through another feed, so one global key holds one
+  share for all its feeds, not one each. Counted are the unfinished resumable
+  uploads that still hold their space, and pushes and `PUT …/files` in
+  progress with their declared `Content-Length`; a resumable upload being
+  created counts from the start, so a `PATCH` checking the share at the same
+  moment sees it. A resumable upload larger than the share is refused with
+  `507` at its `POST`, where it was admitted before. A push or `PUT` is
+  refused when it would take the group past its share beside what the group
+  has promised already; alone it is held to the volume only, so a file larger
+  than the share still goes in one `PUT`. One push key can no longer promise
+  the whole volume to uploads that never arrive, or that trickle. `0` or
+  `100` is no cap. (`SEC-41`, `SEC-48`)
 - The internalizer finds a package's Chocolatey scripts, and the entries its
   prelude would replace, by the names NuGet extracts them under: an entry
   such as `tools/chocolateyInstall%2Eps1` used to run on the client without
@@ -62,20 +107,6 @@ RUSTSEC-2026-0459 is still open, see *Security*.
 - The internalizer's prelude stops the install when a download helper is
   there but is not a function of Chocolatey's `chocolateyInstaller` module,
   instead of leaving it unwrapped. (`SEC-43`)
-
-- A resumable upload's hold on its space is bought with bytes: each `PATCH`
-  renews it by as much of the hour as its bytes are of the upload's pace
-  (its length over `files.upload_expiry_hours`). A byte an hour used to keep
-  the space promised for the full 72 hours. (`SEC-48`)
-- `files.max_upload_space_percent` caps the feeds of one push key together,
-  not each feed: feeds that accept a common key share one part of the volume,
-  so one global key no longer holds the share of every feed and with it the
-  volume. Pushes and `PUT …/files` in progress count towards it with their
-  declared `Content-Length`, and one is refused with `507` when it would take
-  the group past its share beside what the group has promised already; alone
-  it is held to the volume only, so a file larger than the share still goes
-  in one `PUT`. A resumable upload being created counts towards the share from
-  the start, so a `PATCH` checking it at the same moment sees it. (`SEC-48`)
 - A wrong admin key at the file and upload endpoints (`PUT`/`DELETE
   …/files/…`, `POST`/`PATCH …/uploads`) counts against
   `rate_limit.max_failed_auth` like a `401`, though the answer is `403`. It
@@ -100,7 +131,6 @@ RUSTSEC-2026-0459 is still open, see *Security*.
   key. It has `-AdminKey` (a `SecureString`) now, sent as HTTP Basic
   credentials on every request and, like the push key, only to the origin of
   `-Feed`.
-
 - `yanuget migrate` indexes a version the source has unlisted as unlisted, in
   the write that adds it. It used to be listed first and unlisted in a second
   write: visible in between, listed for good when that write failed (the next
@@ -113,7 +143,6 @@ RUSTSEC-2026-0459 is still open, see *Security*.
   ones could together write several times what was checked. (`MNT-29`)
 - The internalizer no longer prints the cause of an I/O or rewrite error
   twice (`download cache: Permission denied: Permission denied`). (`MNT-30`)
-
 - The files of a version approved in two feeds that review what they serve,
   with different admin keys, can be changed again: a request may carry
   further admin keys in `X-YANuget-Admin-Key` headers next to its Basic
@@ -129,6 +158,25 @@ RUSTSEC-2026-0459 is still open, see *Security*.
   deleted or overwritten, if that version's own symbol package holds the same
   PDB. It used to go with the first version, and the debugger got `404` for
   the second. (`COR-47`)
+- Deleting or overwriting a version with symbols no longer extracts and
+  verifies the same-named PDBs of every other version of the package, once
+  per symbol, to look for one to hand each symbol to. A PDB is only read when
+  the symbol package's directory already lists it with the stored one's
+  length and CRC-32, each symbol package is listed once per delete, and
+  nothing is written out. With `prune_on_push` the cost was paid by the push.
+  (`COR-52`, `PERF-22`)
+- A symbol push that finds its PDBs already stored for another version keeps
+  their keys locked until its own symbol package is stored, so a delete of
+  that other version running alongside hands them over rather than deleting
+  them, and a delete releases each symbol's mapping together with its file,
+  so a push of the same PDB in the meantime is not refused as "already
+  claimed". A symbol is not handed to a version that is itself being deleted,
+  overwritten or given symbols at that moment; it goes, as in 0.10.0.
+  (`COR-53`, `MNT-38`)
+- A copy that `yanuget backup` keeps because the live store lost the file is
+  hashed, not only measured: when the version was overwritten since with a
+  build of the same size, the backup's copy holds the old bytes, and it is
+  reported under `missing` (and kept, as the last copy there is). (`COR-54`)
 - A mirror refresh downloads a version the upstream lists twice (`1.0` and
   `1.0.0`, or a repeated entry) once. (`COR-48`)
 - yanuget-internalize: errors from HTTP requests (`config check`, downloads,
@@ -141,6 +189,8 @@ RUSTSEC-2026-0459 is still open, see *Security*.
 
 ### Changed
 
+- The share check of an upload reads what the uploads of the whole push-key
+  group hold in one query, not one per feed. (`PERF-23`)
 - `quinn-udp` 0.5.16 replaces 0.5.15 in `Cargo.lock`, against
   RUSTSEC-2026-0538 (its receive loop can spin after a truncated datagram).
   Lockfile only: the crate is listed for reqwest's optional HTTP/3 support,
@@ -183,9 +233,6 @@ RUSTSEC-2026-0459 is still open, see *Security*.
   `refresh_secs`. (`PERF-16`, `PERF-17`)
 - Upload temp files a previous run left are removed once at startup, not
   once per feed. (`MNT-31`)
-- `yanuget-pkg` gains `nupkg::extracted_name` and `error::error_chain`, which
-  the server and the internalizer now share; its `Error::Io` prints the I/O
-  error's own text.
 - Tests: the real binary is run as a server to show that it holds the data
   lock, that `restore` and `feeds rename` stop at it and that no second
   server starts on the same data; a `pending-only` push is held to the
@@ -201,9 +248,40 @@ RUSTSEC-2026-0459 is still open, see *Security*.
   running every tick they missed back to back. (`PERF-19`)
 - Creating a resumable upload, and resuming one whose hold lapsed, measures
   the free space once instead of twice under the lock all creations share.
-- Library: `MigrateOptions::min_free_disk_bytes` is gone.
-  `migrate::run_with_space` takes the guard that holds the reserve, and
-  `migrate::run` keeps none.
+- Library: code that uses `yanuget` as a library, rather than running the
+  server, has to change where it implements or builds these:
+  - `database::PackageDatabase` has nine new methods without a default:
+    `version_keys`, `find_versions_in`, `held_versions`,
+    `tombstoned_versions`, `feed_upload_bytes`, `retention_versions`,
+    `referenced_blobs`, `hand_over_symbol` and `stored_versions` (with the
+    new `database::VersionKey` and `database::RetentionVersion`), and
+    `set_upload_received` takes `held_since` as well.
+  - `retention::Candidate` has `id` and `version` in place of `package`.
+  - `migrate::MigrateOptions::min_free_disk_bytes` is gone:
+    `migrate::run_with_space` takes the guard that holds the reserve, and
+    `migrate::run` keeps none.
+  - `mirror::MirrorClient::set_min_free_disk_bytes` is gone: `set_space` is
+    the one way to give a client a reserve, and one without it holds none.
+  - `config::FilesConfig` has the new field `max_upload_space_percent`, and
+    `backup::BackupSummary` the new field `kept`; neither is
+    `#[non_exhaustive]`, so a struct literal without `..` needs them.
+
+  New, and compatible: `auth::ADMIN_KEY_HEADER`, `auth::offered_admin_keys`,
+  `is_key` on `ApiKeyAuth`, `ReadAuth` and `AdminAuth`,
+  `migrate::run_with_space`, `nuget::registration_is_paged` and
+  `nuget::registration_index_paged`, `ratelimit::FailedAuth`,
+  `retention::plan_for_rows`, `server::HTTP2_MAX_CONCURRENT_STREAMS`,
+  `space::Share`, `SpaceGuard::check_with`, `SpaceGuard::share_pool`,
+  `SpaceGuard::enforced`, `Reservation::counted_in` and
+  `web::sweep_stale_uploads`.
+- `yanuget-pkg` (still 0.1.0, not on crates.io yet) gains
+  `nupkg::extracted_name`, the name a NuGet client writes an entry to disk
+  under, and `error::error_chain`, which the server and the internalizer now
+  share. Its `Error::Io` prints the I/O error's own text, no longer
+  `I/O error: …`. `nupkg` refuses archives whose entry names collide once
+  percent-decoded and a root `.nuspec` that is one only before or after
+  decoding, and `rewrite` refuses a new name that would extract over an
+  encoded entry. (`SEC-42`, `SEC-50`)
 - Tests: every test that runs the `yanuget` binary starts it without the
   caller's `YANUGET_*` variables and `RUST_LOG`. An exported
   `YANUGET_DATA_DIR` used to send a test's `restore --force` or `migrate`
@@ -227,8 +305,28 @@ RUSTSEC-2026-0459 is still open, see *Security*.
   lists 340 packages instead of 384. `rsa` is no longer in it, so `cargo
   audit` no longer ignores RUSTSEC-2023-0071. (`MNT-34`)
 - CI: the weekly run fails once an sqlx release accepts the `libsqlite3-sys`
-  that fixes RUSTSEC-2026-0459, so the ignore does not outlive its reason.
-  (`CI-22`, `DEP-14`)
+  that fixes RUSTSEC-2026-0459, so the ignore does not outlive its reason. A
+  release does not run that check, one started by hand included, so the fix
+  arriving upstream cannot stop it. (`CI-22`, `DEP-14`)
+- The release publishes and attests only its own artifacts (`yanuget-*`: the
+  archives and the SBOM), whatever else the CI run it calls uploads, and stops
+  when an archive or the SBOM is missing rather than publishing without it.
+- Tests: every end-to-end test talks to its servers through one client that
+  takes no proxy from the environment, and the binary is started without
+  `HTTP(S)_PROXY`. Behind a proxy whose `NO_PROXY` leaves out loopback, the
+  requests went to the proxy and the tests failed. The internalizer's refusal
+  of an https-to-http redirect is tested on the path every redirect takes.
+  (`TEST-30`, `TEST-27`)
+- Documentation: the example configuration and the architecture page describe
+  `files.max_upload_space_percent` per push key; *Rate limiting* says what a
+  reverse proxy with a Basic login of its own does to `max_failed_auth`; the
+  resumable upload section says how to run the unsigned `Send-YanugetFile.ps1`
+  under `RemoteSigned` (`Unblock-File`, after checking `SHA256SUMS`);
+  SECURITY.md's *Known advisories* says which advisory CI still ignores; the
+  README of `yanuget-pkg` lists all its modules; RELEASING.md asks to merge
+  changelog entries a later fix superseded, to list the library's changes, and
+  to decide the version of `yanuget-pkg`. (`DOC-28`, `DOC-31` to `DOC-34`,
+  `DEP-24`)
 
 ## [0.10.0] — 2026-11-04
 

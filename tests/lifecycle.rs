@@ -109,7 +109,7 @@ async fn spawn_feeds(customize: impl FnOnce(&mut Config)) -> TestServer {
     });
     TestServer {
         base: format!("http://{addr}"),
-        client: reqwest::Client::builder()
+        client: common::client_builder()
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .unwrap(),
@@ -650,7 +650,7 @@ async fn a_running_server_holds_the_data_lock() {
     std::fs::write(staging.join("0a1b2c.part"), b"a resumable upload").unwrap();
 
     let mut server = start_server(&path, &["old", "other"]).await;
-    let client = reqwest::Client::new();
+    let client = common::client();
     let ready = client
         .get(format!("http://127.0.0.1:{}/health/ready", server.port))
         .send()

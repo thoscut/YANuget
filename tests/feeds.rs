@@ -106,7 +106,7 @@ async fn approval_ring_withholds_until_approved() {
     assert_eq!(pending.status(), reqwest::StatusCode::NOT_FOUND);
 
     // Admin approves it.
-    let approve = reqwest::Client::builder()
+    let approve = common::client_builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .unwrap()
@@ -161,7 +161,7 @@ async fn promotion_moves_a_version_into_the_next_ring() {
     );
 
     // Promote dev -> stable.
-    let promote = reqwest::Client::builder()
+    let promote = common::client_builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .unwrap()
@@ -583,8 +583,16 @@ async fn the_admin_client_promotes_and_approves_across_rings() {
         build_nupkg("Cli.Pkg", "1.0.0", b"x"),
     )
     .await;
+    // The policy `yanuget admin` uses for a server on this machine: it takes
+    // no proxy from the environment, which `System` would, and on plain
+    // HTTP the certificate half of it does not come into play.
     let client = |feed: &str, key: &str| {
-        AdminClient::new(&server.url(feed), key, CertPolicy::System).unwrap()
+        AdminClient::new(
+            &server.url(feed),
+            key,
+            CertPolicy::ThisMachine { pin: None },
+        )
+        .unwrap()
     };
 
     let promoted = client("/dev", ADMIN_KEY)

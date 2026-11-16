@@ -14,7 +14,8 @@ pub const API_KEY_HEADER: &str = "X-NuGet-ApiKey";
 /// A header that carries one admin key, beside the password of HTTP Basic
 /// credentials, where a request may need several: changing the files of a
 /// version approved in two feeds takes the admin key of each. Repeated, one
-/// key per header.
+/// key per header; the file endpoints take no more keys than a request could
+/// need, and count each wrong one as a failed guess.
 pub const ADMIN_KEY_HEADER: &str = "X-YANuget-Admin-Key";
 
 /// Authenticator holding the configured API keys. Several keys may be accepted

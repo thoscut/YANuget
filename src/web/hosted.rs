@@ -220,11 +220,23 @@ pub(crate) struct ApprovalGuard {
     admin_of: Vec<String>,
     /// The feed the request came in on.
     feed: String,
-    /// The request offered an admin key that is no feed's (nor any other
-    /// key of this feed's): a refusal is then a failed guess (see
-    /// [`Self::refusal`]).
-    guessed: bool,
+    /// How many of the admin keys the request offered are no feed's (nor
+    /// any other key of this feed's): a refusal then counts each as a
+    /// failed guess (see [`Self::refusal`]).
+    guesses: u32,
+    /// The request offered more admin keys than it could need (see
+    /// [`ADMIN_KEYS_PER_REQUEST`]); none of them was compared, and
+    /// [`check_not_approved`] refuses it.
+    too_many: bool,
 }
+
+/// The most admin keys a request may offer at the file endpoints, unless
+/// more feeds review what they serve: then one for each of them and one for
+/// this feed. Each wrong key counts as a failed guess, but without a bound
+/// one request near the end of the budget would still compare as many
+/// candidates as hyper lets headers through, some 95 over HTTP/1 and 270
+/// over HTTP/2 (`SEC-55`).
+const ADMIN_KEYS_PER_REQUEST: usize = 8;
 
 impl ApprovalGuard {
     /// The guard for a request on `state`'s feed, with its credentials.
@@ -242,7 +254,13 @@ impl ApprovalGuard {
         if reviews(own.requires_approval, own.allow_overwrite) {
             reviewing.push(own.name.clone());
         }
-        let offered = crate::auth::offered_admin_keys(headers);
+        let mut offered = crate::auth::offered_admin_keys(headers);
+        // One key for each feed whose approval may hold the files, and this
+        // feed's: more is no legitimate request, so nothing is compared.
+        let too_many = offered.len() > ADMIN_KEYS_PER_REQUEST.max(reviewing.len() + 1);
+        if too_many {
+            offered.clear();
+        }
         let opens = |admin: &crate::auth::AdminAuth| offered.iter().any(|k| admin.is_key(k));
         let mut admin_of: Vec<String> = state
             .feeds
@@ -267,22 +285,29 @@ impl ApprovalGuard {
             reviewing,
             admin_of,
             feed: own.name.clone(),
-            guessed: offered.iter().any(|k| !known(k)),
+            guesses: offered
+                .iter()
+                .filter(|k| !known(k))
+                .count()
+                .try_into()
+                .unwrap_or(u32::MAX),
+            too_many,
         }
     }
 
     /// The answer to a request this guard's approvals refused with `error`:
-    /// when it offered an admin key that is none, marked as a failed
-    /// authentication ([`crate::ratelimit::FailedAuth`]), so that guessing
+    /// when it offered admin keys that are none, marked as that many failed
+    /// authentications ([`crate::ratelimit::FailedAuth`]), so that guessing
     /// an admin key here is held to `rate_limit.max_failed_auth` like
-    /// guessing it at `/admin`. Any other error is passed on as it is.
+    /// guessing it at `/admin`, one key per failure however many headers
+    /// carry them. Any other error is passed on as it is.
     fn refusal(&self, error: Error) -> Result<Response> {
         match error {
-            Error::Forbidden(_) if self.guessed => {
+            Error::Forbidden(_) if self.guesses > 0 => {
                 let mut response = error.into_response();
                 response
                     .extensions_mut()
-                    .insert(crate::ratelimit::FailedAuth);
+                    .insert(crate::ratelimit::FailedAuth(self.guesses));
                 Ok(response)
             }
             error => Err(error),
@@ -324,6 +349,13 @@ async fn check_not_approved(
     v: &NuGetVersion,
     guard: &ApprovalGuard,
 ) -> Result<Vec<String>> {
+    if guard.too_many {
+        return Err(Error::BadRequest(format!(
+            "too many admin keys: the Basic password and the {} headers offer more \
+             than one for each feed whose approval could hold these files",
+            crate::auth::ADMIN_KEY_HEADER
+        )));
+    }
     let approved: Vec<String> = db
         .approved_in(id, v)
         .await?
@@ -340,6 +372,17 @@ async fn check_not_approved(
         .collect();
     if missing.is_empty() {
         return Ok(approved);
+    }
+    // Which feeds still lack their key would tell a guesser which of the
+    // keys offered beside a wrong one was right.
+    if guard.guesses > 0 {
+        return Err(Error::Forbidden(format!(
+            "{id} {} is approved in {}, and an approved version keeps its files as they \
+             were approved; changing them takes the admin key of each, and a key \
+             offered is none",
+            v.normalized(),
+            approved.join(", "),
+        )));
     }
     Err(Error::Forbidden(format!(
         "{id} {} is approved in {}, and an approved version keeps its files as they \
