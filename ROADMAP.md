@@ -45,6 +45,14 @@ the detail; this list is the index.
   extraction, `SEC-47` aliases that shadow the prelude's wrappers.
 - `TEST-19` one harness for all integration tests, `TEST-20` the PowerShell
   upload script run in CI, `MNT-32` the four files above 1000 lines.
+- Round 2: `SEC-52` the self-signed certificate, `SEC-53` connection limits
+  per client, `COR-49` the internalizer's sync and failed entries, `COR-50`
+  several admin keys on the admin page and in the upload script, `COR-51`
+  one symbol row per version, `PERF-21` the gallery's package page,
+  `MNT-35` the internalizer's partial cache files, `MNT-37` the name of
+  `files.max_upload_space_percent`, `CI-23` tests on Windows and macOS,
+  `CI-24` new recordings in `media.yml`, `DEP-22` a `config check` warning
+  for the port in `base_url`, `DEP-23` the reason for a `507` to the client.
 
 **Dependencies**
 
@@ -52,7 +60,8 @@ the detail; this list is the index.
   SQLite before 3.54.0, crafted `-wal` next to a database) once an sqlx
   release accepts `libsqlite3-sys` 0.39 or later: 0.8 pins `^0.30`, 0.9.0
   caps it below 0.38. The reasoning for the ignore is next to it in
-  `.github/workflows/ci.yml`; the server opens only its own database.
+  `.github/workflows/ci.yml`; the server opens only its own database and its backup snapshot, and deletes
+  any `-wal` next to either before opening it.
 
 **Features under discussion**
 
@@ -134,6 +143,79 @@ boxes are what the review left for later.
 - [x] **`DEP-15`, `DEP-16`, `DOC-20` to `DOC-24`** the 0.10.0 upgrade note,
   `-AdminKey` for the upload script, troubleshooting, the one-off container,
   the module tree, this file and the `config check` list.
+
+### Round 2
+
+A second pass over the branch with round 1's fixes (`cebd152`): each
+reviewer checked those fixes first, then read what round 1 had left out.
+The fixes held (852 tests three times, 15 mutations caught); three findings
+were medium.
+
+- [x] **`SEC-48` The share from `SEC-41` could be sidestepped:** a byte an
+  hour renewed the hold, a global push key gave every feed a share of its
+  own, and pushes and `PUT`s did not count. *Done:* a hold is renewed by as
+  much of the hour as its bytes are of the upload's pace; the share is per
+  group of feeds that accept a common push key; pushes and `PUT`s in progress
+  count. What is left is `SEC-45`: a single request that trickles.
+- [x] **`COR-46` A repeated backup deleted the last copy of a file the live
+  store had lost,** and reported nothing missing. *Done:* a file the
+  snapshot references stays in the backup; one missing in both is reported.
+- [x] **`TEST-21`, `TEST-22` The tests that start the binary inherited
+  `YANUGET_*` and `RUST_LOG`.** *Done:* one helper starts it with a clean
+  environment.
+- [x] **`COR-45` Two approving feeds with different admin keys left a
+  version's files unchangeable.** *Done:* further keys in
+  `X-YANuget-Admin-Key` headers; every approving feed's key is still needed.
+- [ ] **`COR-50` The admin page and `Send-YanugetFile.ps1 -AdminKey` still
+  send one admin key.** A browser sends one Basic password.
+- [x] **`COR-47` A symbol key went with the first version that stored it.**
+  *Done:* it is handed to another version of the package whose symbol
+  package holds the same PDB.
+- [ ] **`COR-51` One symbol row per version.** The clean fix: the key, file
+  and version as the primary key, the file deleted with its last row, and a
+  download allowed when any owner is servable in the feed. Today a feed
+  that lacks the owning version, or has it disabled or pending, answers
+  `404`. Also a `symbol_package_path` getter on `PackageStorage`.
+- [x] **`COR-48`** a version listed twice upstream is downloaded once.
+- [ ] **`COR-49` The internalizer's `sync` marks a failed entry approved** once
+  the feed serves the version, and drops its reasons; missing attachments
+  are never delivered. Matters once the pipeline is wired (`INT-15`).
+- [x] **`SEC-49` (partly) 32 HTTP/2 streams per connection** instead of 200.
+- [ ] **`SEC-53` Connections per client.** A cap per IP (/64 for IPv6) in
+  the acceptor, an idle limit for HTTP/2 connections without streams (hyper
+  has none), and an idle limit for response bodies.
+- [x] **`SEC-50`** a root `.nuspec` that moves in or out of the root once
+  percent-decoded is refused. **`SEC-51`** a wrong admin key at the file and
+  upload endpoints counts as a failed authentication.
+- [ ] **`SEC-52` The self-signed certificate** is valid from 1975 to 4096, has
+  no extended key usage, is never renewed, and its key is in every backup.
+- [x] **`DEP-17`** `backup` deletes a `-wal` next to its snapshot before
+  opening it, so the reasoning for the `DEP-14` ignore holds there too.
+- [x] **`PERF-18` (retention), `PERF-19`, `PERF-20`, `MNT-33`, the
+  internalizer's I/O context.**
+- [ ] **`PERF-21` The gallery's package page** loads every version as a full
+  row and lists them without a limit.
+- [ ] **`MNT-35` The internalizer's cache keeps partial files** (up to 8 GiB)
+  after an aborted process. Matters from `INT-15`.
+- [ ] **`MNT-37` `files.max_upload_space_percent` now covers pushes too;**
+  rename it, with an alias for the old name.
+- [x] **`TEST-23` to `TEST-29`, `CI-22`/`DEP-21`** the pwsh test fails without
+  pwsh in CI; tests for the tus hash after a restart, the expiry sweep, copy
+  and move under a license policy, backup with files and symbols, the
+  internalizer's redirect and resolver, SIGTERM, `admin` and `backup`; a
+  weekly check that tells when `DEP-14` can go.
+- [ ] **`CI-23` Windows and macOS get `cargo check` only,** and the release
+  smoke test runs `--version` only.
+- [ ] **`CI-24` `media.yml` misses a new recording** (`git diff --quiet` does
+  not see untracked files).
+- [x] **`DEP-18` to `DEP-20`, `DOC-25` to `DOC-30`** the Compose example's
+  port, commands run by hand and `secrets.env`, the upload script in the
+  release archives, free space in `large-packages.md`, the upgrade note, the
+  architecture page, the README, `SECURITY.md` and the help texts.
+- [ ] **`DEP-22` `config check` could warn** when the port in `base_url`
+  differs from the listening port and no proxy is trusted.
+- [ ] **`DEP-23` A `507` tells the client only "internal server error";** the
+  reason (the reserve or the share) is in the server log only.
 
 ## Review of 2026-11-03
 

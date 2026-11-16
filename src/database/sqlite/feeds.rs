@@ -5,7 +5,7 @@ use sqlx::Row;
 
 use crate::database::{
     canonical_id, AdminFilter, AdminOverview, AdminPackageSummary, DatabaseStats, FeedVersion,
-    VersionFootprint, VersionKey,
+    RetentionVersion, VersionFootprint, VersionKey,
 };
 use crate::error::{Error, Result};
 use crate::models::Package;
@@ -160,6 +160,60 @@ pub(super) async fn find_all_versions_of(
             .cmp(&b.package.lower_id())
             .then_with(|| a.package.version.cmp(&b.package.version))
     });
+    Ok(versions)
+}
+
+pub(super) async fn retention_versions(
+    db: &SqliteDatabase,
+    feed: &str,
+    ids: &[String],
+) -> Result<Vec<RetentionVersion>> {
+    let mut versions = Vec::new();
+    for chunk in ids.chunks(ID_CHUNK) {
+        // The only interpolation is `?2,?3,…`, generated from a range.
+        let sql = format!(
+            "SELECT p.id, p.original_version, p.package_size, p.published, \
+                    fp.enabled, fp.pending, fp.pinned, fp.added \
+             FROM packages p \
+             JOIN feed_packages fp \
+               ON fp.lower_id = p.lower_id AND fp.normalized_version = p.normalized_version \
+             WHERE fp.feed = ?1 AND fp.lower_id IN ({})",
+            placeholders(2, chunk.len())
+        );
+        let mut query =
+            sqlx::query_as::<_, (String, String, i64, String, i64, i64, i64, String)>(&sql)
+                .bind(feed);
+        for id in chunk {
+            query = query.bind(canonical_id(id));
+        }
+        for (id, original, size, published, enabled, pending, pinned, added) in
+            query.fetch_all(&db.pool).await?
+        {
+            // Read with the rules it was written under, as a full row is.
+            let version = NuGetVersion::parse_stored(&original)
+                .map_err(|e| Error::InvalidVersion(e.to_string()))?;
+            // The fallback of a full row (`row_to_feed_package`): a row that
+            // is not RFC 3339 counts from `published`.
+            let parse = |t: &str| {
+                chrono::DateTime::parse_from_rfc3339(t).map(|t| t.with_timezone(&chrono::Utc))
+            };
+            let added = match parse(&added) {
+                Ok(added) => added,
+                Err(_) => parse(&published)
+                    .map_err(|e| Error::Other(anyhow::anyhow!("bad published timestamp: {e}")))?,
+            };
+            versions.push(RetentionVersion {
+                id,
+                version,
+                package_size: size as u64,
+                enabled: enabled != 0,
+                pending: pending != 0,
+                pinned: pinned != 0,
+                added,
+            });
+        }
+    }
+    versions.sort_by_cached_key(|v| (canonical_id(&v.id), v.version.clone()));
     Ok(versions)
 }
 
@@ -432,6 +486,51 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    /// `PERF-18`: retention reads these instead of full rows, so they must say
+    /// what the full rows say about every version, withheld ones included.
+    #[tokio::test]
+    async fn retention_versions_are_the_full_rows_narrowed() {
+        let db = SqliteDatabase::in_memory().await.unwrap();
+        for v in ["1.0.0", "2.0.0-rc.1", "0.9.0"] {
+            db.add_to_feed(FEED, &sample("Pkg", v)).await.unwrap();
+        }
+        add_pending(&db, "4.0.0").await;
+        let v = |s: &str| NuGetVersion::parse(s).unwrap();
+        db.set_pinned(FEED, "pkg", &v("0.9.0"), true).await.unwrap();
+        db.set_enabled(FEED, "pkg", &v("1.0.0"), false)
+            .await
+            .unwrap();
+        db.add_to_feed(FEED, &sample("Other.Pkg", "3.0.0"))
+            .await
+            .unwrap();
+        db.add_to_feed("other", &sample("Pkg", "9.0.0"))
+            .await
+            .unwrap();
+
+        let ids = ["pkg".to_string(), "other.pkg".to_string()];
+        let narrow = db.retention_versions(FEED, &ids).await.unwrap();
+        let full: Vec<RetentionVersion> = db
+            .find_all_versions_of(FEED, &ids)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|fv| RetentionVersion {
+                id: fv.package.id,
+                version: fv.package.version,
+                package_size: fv.package.package_size,
+                enabled: fv.package.enabled,
+                pending: fv.pending,
+                pinned: fv.pinned,
+                added: fv.added,
+            })
+            .collect();
+        assert_eq!(narrow, full);
+        assert_eq!(narrow.len(), 5);
+        assert!(narrow.iter().any(|r| r.pinned && r.version == v("0.9.0")));
+        assert!(narrow.iter().any(|r| !r.enabled && r.version == v("1.0.0")));
+        assert!(narrow.iter().any(|r| r.pending && r.version == v("4.0.0")));
     }
 
     #[tokio::test]

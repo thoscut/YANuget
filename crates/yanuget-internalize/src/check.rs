@@ -391,18 +391,20 @@ pub async fn check_target_online(config: &Config, report: &mut Report) {
     {
         Ok(c) => c,
         Err(e) => {
-            report
-                .errors
-                .push(format!("cannot build an HTTP client: {e}"));
+            report.errors.push(format!(
+                "cannot build an HTTP client: {}",
+                crate::error_chain(&e)
+            ));
             return;
         }
     };
     let response = match client.get(&index).send().await {
         Ok(r) => r,
         Err(e) => {
-            report
-                .errors
-                .push(format!("target feed {index} does not answer: {e}"));
+            report.errors.push(format!(
+                "target feed {index} does not answer: {}",
+                crate::error_chain(&e)
+            ));
             return;
         }
     };
@@ -424,7 +426,8 @@ pub async fn check_target_online(config: &Config, report: &mut Report) {
         Ok(b) => b,
         Err(e) => {
             report.errors.push(format!(
-                "target feed {index} does not answer with a service index: {e}"
+                "target feed {index} does not answer with a service index: {}",
+                crate::error_chain(&e)
             ));
             return;
         }

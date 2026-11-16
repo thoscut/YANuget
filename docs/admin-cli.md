@@ -27,12 +27,17 @@ says that the version is pending there.
 
 ### Which server, which key
 
-On the server's own machine, nothing else is needed: with no `--url`, the
-command reads the same configuration the server does (`--config` or
-`YANUGET_CONFIG`), connects to the configured port on this machine, and takes
-the feed's admin key from it. It asks for the server by its `base_url` host,
-so `allowed_hosts` still lets it in, and does not check the certificate,
-since the connection never leaves the machine.
+On the server's own machine, nothing else is needed when the configuration
+holds the admin key: with no `--url`, the command reads the same
+configuration the server does (`--config` or `YANUGET_CONFIG`, then the
+`YANUGET_*` environment of the shell it runs in), connects to the configured
+port on this machine, and takes the feed's admin key from it. It asks for the
+server by its `base_url` host, so `allowed_hosts` still lets it in, and does
+not check the certificate, since the connection never leaves the machine. A key the service gets from
+its environment, such as `YANUGET_ADMIN_API_KEY` in the systemd unit's
+`secrets.env`, is not in that shell: pass `--admin-key-file` or
+`YANUGET_ADMIN_KEY`, or run the command in the unit's environment (see
+[Commands you run by hand](deployment.md#commands-you-run-by-hand)).
 
 From anywhere else, name the server and supply the key:
 
@@ -42,9 +47,9 @@ yanuget admin --url https://nuget.example.com --ca-cert /etc/ssl/internal-ca.pem
     --feed stage promote Contoso.Utils 1.4.0
 ```
 
-- `--url` is the address clients use, without the feed; `--feed` adds
-  `/{feed}`. Without `--feed` the command acts on the root feed, which is right
-  only for a server with no `[[feeds]]`.
+- `--url` (or `YANUGET_ADMIN_URL`) is the address clients use, without the
+  feed; `--feed` adds `/{feed}`. Without `--feed` the command acts on the root
+  feed, which is right only for a server with no `[[feeds]]`.
 - The key comes from `--admin-key-file`, else `YANUGET_ADMIN_KEY`, else the
   configuration. There is no flag for the key itself: a value on the command
   line is visible to every local user in `ps`.
@@ -62,7 +67,12 @@ yanuget --config /etc/yanuget/yanuget.toml config check
 
 loads the configuration exactly as the server would (the file, then the
 `YANUGET_*` environment, [key files](configuration.md#keys-from-the-environment-or-a-file)
-included) and then opens what the server would only open later:
+included) and then opens what the server would only open later. It sees the
+environment it runs in, not the server's: to check a systemd service whose
+keys are in `secrets.env`, run it as shown in
+[Commands you run by hand](deployment.md#commands-you-run-by-hand).
+
+What it checks:
 
 - every value parses, feed names are valid and unique, and every
   `promotes_to` names a configured feed;

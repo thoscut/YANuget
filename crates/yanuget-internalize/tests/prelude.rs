@@ -404,6 +404,11 @@ try {
 #[tokio::test(flavor = "multi_thread")]
 async fn an_install_fetches_the_attached_file() {
     let Some(pwsh) = pwsh() else {
+        // CI sets YANUGET_REQUIRE_PWSH: a skip there would leave every check
+        // green with no prelude code run at all.
+        if std::env::var_os("YANUGET_REQUIRE_PWSH").is_some_and(|v| !v.is_empty() && v != "0") {
+            panic!("no pwsh, and YANUGET_REQUIRE_PWSH is set (set YANUGET_TEST_PWSH)");
+        }
         eprintln!("skipped: no pwsh (set YANUGET_TEST_PWSH)");
         return;
     };

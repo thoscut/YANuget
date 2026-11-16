@@ -12,12 +12,13 @@
 //! One guard is built per staging directory and shared by every feed, the
 //! mirror clients and the inbox, so all of them see what the others promised.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use tokio::io::AsyncWrite;
@@ -42,6 +43,17 @@ pub const RESERVE_CHECK_INTERVAL: u64 = 64 * 1024 * 1024;
 /// nothing does not renew the hold.
 pub const RESUMABLE_HOLD: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
+/// What one group of feeds — those a push key opens together — promises,
+/// for [`SpaceGuard::check_with`] to hold to its share of the free space.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Share {
+    /// The bytes the group has promised, the incoming ones included.
+    pub held: u64,
+    /// The most of the free space above the reserve it may promise, in
+    /// percent (`files.max_upload_space_percent`).
+    pub percent: u8,
+}
+
 /// The admission of writes into one staging directory: its volume's free
 /// space, the reserve to keep, and the bytes promised to writes in progress.
 pub struct SpaceGuard {
@@ -51,6 +63,9 @@ pub struct SpaceGuard {
     /// Where unfinished resumable uploads are recorded, whose rest counts as
     /// promised too.
     resumable: Option<Arc<dyn PackageDatabase>>,
+    /// What each group of feeds that share a push key has promised to
+    /// writes in progress (see [`Self::share_pool`]).
+    shares: Mutex<HashMap<String, Arc<Reservations>>>,
     measure: Measure,
 }
 
@@ -73,6 +88,7 @@ impl SpaceGuard {
             reserve,
             pool: Arc::default(),
             resumable: None,
+            shares: Mutex::default(),
             measure: Arc::new(|dir: &Path| fs4::available_space(dir)),
         }
     }
@@ -113,6 +129,21 @@ impl SpaceGuard {
     /// counting resumable uploads between two requests).
     pub fn promised(&self) -> u64 {
         self.pool.promised()
+    }
+
+    /// Whether anything is held to the reserve at all: with a reserve of 0
+    /// nothing is checked, a feed's share included.
+    pub fn enforced(&self) -> bool {
+        self.reserve > 0
+    }
+
+    /// The pool in which the writes of the group of feeds named `group` are
+    /// counted ([`Reservation::counted_in`]), the same one for every feed of
+    /// the group: what the feeds a push key opens promise together is what
+    /// their share caps.
+    pub fn share_pool(&self, group: &str) -> Arc<Reservations> {
+        let mut shares = self.shares.lock().unwrap_or_else(|e| e.into_inner());
+        Arc::clone(shares.entry(group.to_string()).or_default())
     }
 
     /// Admit a write of `incoming` bytes (when its size is known), or refuse
@@ -165,12 +196,29 @@ impl SpaceGuard {
     /// promised and to what: an operator looking at one on a half-empty disk
     /// needs to see that it is held by uploads that have not arrived.
     pub async fn check(&self, incoming: u64) -> Result<()> {
+        self.check_with(incoming, None).await
+    }
+
+    /// [`Self::check`], and first, when given, whether a group of feeds may
+    /// hold what `share` says it would: at most `share.percent` of what the
+    /// volume has free above the reserve. One measurement serves both.
+    ///
+    /// [`Self::check`] alone lets the feeds of one push key promise all of
+    /// the space, and a promise costs nothing: whoever holds the key could
+    /// keep every other feed, the mirrors and the inbox out with uploads that
+    /// never arrive. Capped, the rest stays for the others. Like the reserve
+    /// itself, the share is not applied when the reserve is off or the volume
+    /// cannot be measured; a `percent` of 0 or 100 (and more) is no cap.
+    pub async fn check_with(&self, incoming: u64, share: Option<Share>) -> Result<()> {
         if self.reserve == 0 {
             return Ok(());
         }
         let Some(available) = self.available().await else {
             return Ok(());
         };
+        if let Some(share) = share {
+            self.within_share(available, share)?;
+        }
         let resumable = match &self.resumable {
             Some(db) => {
                 let now = chrono::Utc::now();
@@ -198,30 +246,20 @@ impl SpaceGuard {
         Ok(())
     }
 
-    /// Whether one feed's unfinished resumable uploads may together hold
-    /// `held` bytes: at most `percent` of what the volume has free above the
-    /// reserve.
-    ///
-    /// [`Self::check`] alone lets a single feed promise all of it, and a
-    /// promise costs nothing: whoever holds one feed's push key could keep
-    /// every other feed's uploads out with uploads that never arrive. Capped,
-    /// the rest stays for the others. A `percent` of 0 or 100 (and more) is
-    /// no cap; like the reserve itself, it is not applied when the reserve
-    /// is off or the volume cannot be measured.
-    pub async fn check_share(&self, held: u64, percent: u8) -> Result<()> {
-        if self.reserve == 0 || percent == 0 || percent >= 100 {
+    /// Whether `share.held` is within `share.percent` of what `available`
+    /// leaves above the reserve.
+    fn within_share(&self, available: u64, share: Share) -> Result<()> {
+        let Share { held, percent } = share;
+        if percent == 0 || percent >= 100 {
             return Ok(());
         }
-        let Some(available) = self.available().await else {
-            return Ok(());
-        };
         let headroom = available.saturating_sub(self.reserve);
-        let share = (u128::from(headroom) * u128::from(percent) / 100) as u64;
-        if held > share {
+        let cap = (u128::from(headroom) * u128::from(percent) / 100) as u64;
+        if held > cap {
             return Err(Error::InsufficientStorage(format!(
-                "this feed's unfinished resumable uploads would hold {held} bytes, and may \
-                 hold {share}: {percent} % (files.max_upload_space_percent) of the {headroom} \
-                 bytes free above the configured reserve"
+                "the feeds this push key opens would hold {held} bytes for uploads that have \
+                 not arrived, and may hold {cap}: {percent} % (files.max_upload_space_percent) \
+                 of the {headroom} bytes free above the configured reserve"
             )));
         }
         Ok(())
@@ -499,25 +537,51 @@ mod tests {
 
     #[tokio::test]
     async fn one_feed_may_hold_only_its_share_of_the_free_space() {
+        let share = |held, percent| Some(Share { held, percent });
         // 1000 free, 100 kept: 900 to promise, half of it to one feed.
         let space = fixed(100, 1000);
-        assert!(space.check_share(450, 50).await.is_ok());
-        let err = space.check_share(451, 50).await.unwrap_err();
+        assert!(space.check_with(0, share(450, 50)).await.is_ok());
+        let err = space.check_with(0, share(451, 50)).await.unwrap_err();
         assert!(matches!(err, Error::InsufficientStorage(_)), "{err}");
         let why = err.to_string();
         assert!(why.contains("may hold 450"), "{why}");
         assert!(why.contains("max_upload_space_percent"), "{why}");
-        // No cap, by either spelling.
-        assert!(space.check_share(u64::MAX, 0).await.is_ok());
-        assert!(space.check_share(u64::MAX, 100).await.is_ok());
+        // No cap, by either spelling; the volume is still checked.
+        assert!(space.check_with(0, share(u64::MAX, 0)).await.is_ok());
+        assert!(space.check_with(0, share(u64::MAX, 100)).await.is_ok());
+        assert!(space.check_with(901, share(901, 100)).await.is_err());
         // Nothing is held to a share where nothing is held to the reserve,
         // or where free space cannot be measured.
-        assert!(fixed(0, 10).check_share(1000, 50).await.is_ok());
+        assert!(fixed(0, 10).check_with(0, share(1000, 50)).await.is_ok());
         let blind = SpaceGuard::new("/nowhere", 100)
             .with_measure(|_| Err(io::Error::other("no statvfs here")));
-        assert!(blind.check_share(u64::MAX, 50).await.is_ok());
+        assert!(blind.check_with(0, share(u64::MAX, 50)).await.is_ok());
         // A volume already under its reserve has nothing to share out.
-        assert!(fixed(100, 50).check_share(1, 50).await.is_err());
+        assert!(fixed(100, 50).check_with(0, share(1, 50)).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn both_checks_share_one_measurement() {
+        let measured = Arc::new(AtomicU64::new(0));
+        let count = Arc::clone(&measured);
+        let space = SpaceGuard::new("/nowhere", 100).with_measure(move |_| {
+            count.fetch_add(1, Ordering::SeqCst);
+            Ok(1000)
+        });
+        let share = Share {
+            held: 10,
+            percent: 50,
+        };
+        space.check_with(10, Some(share)).await.unwrap();
+        assert_eq!(measured.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn the_feeds_of_one_group_share_one_pool() {
+        let space = fixed(0, 0);
+        let (a, b) = (space.share_pool("team"), space.share_pool("team"));
+        assert!(Arc::ptr_eq(&a, &b));
+        assert!(!Arc::ptr_eq(&a, &space.share_pool("prod")));
     }
 
     #[tokio::test]

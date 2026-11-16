@@ -161,9 +161,12 @@ impl HttpClient {
                 hosts: options.allowed_private_hosts.clone(),
             }));
         }
-        let client = builder
-            .build()
-            .map_err(|e| invalid(format!("cannot build the HTTP client: {e}")))?;
+        let client = builder.build().map_err(|e| {
+            invalid(format!(
+                "cannot build the HTTP client: {}",
+                crate::error_chain(&e)
+            ))
+        })?;
         Ok(HttpClient {
             client,
             label,
@@ -380,7 +383,7 @@ impl HttpClient {
                     redact(&current)
                 ))
             })?;
-            if current.scheme() == "https" && next.scheme() == "http" {
+            if is_downgrade(&current, &next) {
                 return Err(UpstreamError::Refused(format!(
                     "{label} {what} {} redirected from https to http; refusing the downgrade",
                     redact(&current)
@@ -406,6 +409,12 @@ impl HttpClient {
             tracing::info!("the {} answers again", self.label);
         }
     }
+}
+
+/// Whether a redirect from `current` to `next` gives up TLS: the credentials
+/// on the next hop, and what it answers, would travel in the clear.
+fn is_downgrade(current: &Url, next: &Url) -> bool {
+    current.scheme() == "https" && next.scheme() == "http"
 }
 
 /// Whether `host` is on an allow-list of host names, compared without case.
@@ -481,4 +490,70 @@ fn credentials(config: &UpstreamConfig) -> Result<HeaderMap, String> {
         put(name, value.expose().to_string())?;
     }
     Ok(headers)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+
+    fn url(s: &str) -> Url {
+        Url::parse(s).unwrap()
+    }
+
+    /// `TEST-27`: a redirect may change the host or stay on plain http, but
+    /// never step down from https to http.
+    #[test]
+    fn a_redirect_from_https_to_http_is_a_downgrade() {
+        let https = url("https://feed.example/v3/index.json");
+        let http = url("http://feed.example/v3/index.json");
+        assert!(is_downgrade(&https, &http));
+        assert!(is_downgrade(&https, &url("http://cdn.example/a.nupkg")));
+        assert!(!is_downgrade(&https, &url("https://cdn.example/a.nupkg")));
+        assert!(!is_downgrade(&http, &https));
+        assert!(!is_downgrade(&http, &url("http://cdn.example/a.nupkg")));
+    }
+
+    fn allow_listed(hosts: &[&str]) -> AllowListed {
+        AllowListed {
+            guarded: GuardedResolver {
+                proxy_host: None,
+                fixed: Vec::new(),
+                hint: None,
+            },
+            hosts: hosts.iter().map(|h| h.to_string()).collect(),
+        }
+    }
+
+    async fn resolve(
+        resolver: &AllowListed,
+        name: &str,
+    ) -> Result<Vec<std::net::SocketAddr>, String> {
+        use reqwest::dns::Resolve;
+        let name = reqwest::dns::Name::from_str(name).unwrap();
+        resolver
+            .resolve(name)
+            .await
+            .map(Iterator::collect)
+            .map_err(|e| e.to_string())
+    }
+
+    /// `TEST-27`: without `allow_private_hosts`, every name goes through the
+    /// guarded resolver, which refuses one that resolves to a private address
+    /// (here `localhost`). A name on the list is resolved as it is, and only
+    /// that name: the list is no way around the filter for the others.
+    #[tokio::test]
+    async fn only_the_allowed_private_hosts_resolve_to_private_addresses() {
+        let refused = resolve(&allow_listed(&[]), "localhost").await;
+        assert!(refused.is_err(), "{refused:?}");
+        let refused = resolve(&allow_listed(&["build.internal"]), "localhost").await;
+        assert!(refused.is_err(), "{refused:?}");
+
+        // Compared without case, as host names are.
+        let allowed = resolve(&allow_listed(&["LocalHost"]), "localhost")
+            .await
+            .unwrap();
+        assert!(!allowed.is_empty());
+        assert!(allowed.iter().all(|a| a.ip().is_loopback()), "{allowed:?}");
+    }
 }

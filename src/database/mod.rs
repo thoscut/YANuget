@@ -414,6 +414,23 @@ pub struct FeedVersion {
     pub added: chrono::DateTime<chrono::Utc>,
 }
 
+/// A version as retention decides about it: the few columns of a
+/// [`FeedVersion`] a plan reads, without building the whole [`Package`]
+/// (metadata JSON, description, release notes) for every version of a feed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetentionVersion {
+    /// The id as published.
+    pub id: String,
+    pub version: NuGetVersion,
+    pub package_size: u64,
+    /// The membership's: disabled in this feed.
+    pub enabled: bool,
+    pub pending: bool,
+    pub pinned: bool,
+    /// As [`FeedVersion::added`].
+    pub added: chrono::DateTime<chrono::Utc>,
+}
+
 /// Metadata store for indexed packages.
 #[async_trait]
 pub trait PackageDatabase: Send + Sync {
@@ -655,6 +672,11 @@ pub trait PackageDatabase: Send + Sync {
     /// order, each id's versions ascending.
     async fn find_all_versions_of(&self, feed: &str, ids: &[String]) -> Result<Vec<FeedVersion>>;
 
+    /// [`Self::find_all_versions_of`] narrowed to what retention reads, for a
+    /// sweep or preview that visits every version of a feed. Same order.
+    async fn retention_versions(&self, feed: &str, ids: &[String])
+        -> Result<Vec<RetentionVersion>>;
+
     /// For every version of the given ids (lower-cased): how many feeds hold
     /// it and how many bytes of attached files it has. What deleting it would
     /// free, for many versions in two statements.
@@ -745,6 +767,10 @@ pub trait PackageDatabase: Send + Sync {
     /// How many attached files, across all versions, reference a blob.
     async fn blob_references(&self, sha256: &str) -> Result<i64>;
 
+    /// Every blob at least one attached file references, in one statement:
+    /// what a sweep over the whole store asks rather than counting each blob.
+    async fn referenced_blobs(&self) -> Result<std::collections::HashSet<String>>;
+
     /// Count one download of a file.
     async fn increment_file_downloads(
         &self,
@@ -804,8 +830,9 @@ pub trait PackageDatabase: Send + Sync {
     /// Claim a symbol-file mapping: its SSQP `key`/`filename` and the owning
     /// package version (for serving and for cleanup on delete/retention).
     /// Returns `true` when this call created it. An existing mapping is never
-    /// changed — a key belongs to whichever version claimed it first — so
-    /// `false` means someone else holds it.
+    /// changed — a key belongs to whichever version claimed it first, until
+    /// that version is deleted ([`Self::hand_over_symbol`]) — so `false`
+    /// means someone else holds it.
     async fn add_symbol(
         &self,
         key: &str,
@@ -827,6 +854,22 @@ pub trait PackageDatabase: Send + Sync {
     /// Remove all symbol mappings for a package version. Returns how many rows
     /// were removed.
     async fn delete_symbols(&self, id: &str, version: &NuGetVersion) -> Result<u64>;
+
+    /// Move a symbol mapping from version `from` of `id` to version `to` of
+    /// the same id, when `from` still holds it. The only change a mapping
+    /// ever sees: the version that claimed a key is going, and `to` pushed
+    /// the same bytes (see `symbols::successor`). Returns `true` if it moved.
+    async fn hand_over_symbol(
+        &self,
+        key: &str,
+        filename: &str,
+        id: &str,
+        from: &NuGetVersion,
+        to: &NuGetVersion,
+    ) -> Result<bool>;
+
+    /// Every version of `id` with global data, in any feed or none, ascending.
+    async fn stored_versions(&self, id: &str) -> Result<Vec<NuGetVersion>>;
 
     // --- tombstones (per feed) ---
 

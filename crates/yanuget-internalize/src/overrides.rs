@@ -361,7 +361,9 @@ pub async fn with_script(
 ) -> Result<(), yanuget_pkg::Error> {
     let (nupkg, out) = (nupkg.to_path_buf(), out.to_path_buf());
     tokio::task::spawn_blocking(move || {
-        let found = find_scripts(entry_names(&nupkg)?);
+        let found = find_scripts(entry_names(&nupkg).map_err(crate::io_context(|| {
+            format!("cannot read the package {}", nupkg.display())
+        }))?);
         if let Some(hidden) = found
             .encoded
             .iter()
@@ -386,7 +388,15 @@ pub async fn with_script(
         for name in names {
             plan = plan.put(name, yanuget_pkg::rewrite::Source::Bytes(script.clone()));
         }
-        yanuget_pkg::rewrite::rewrite_blocking(&nupkg, &out, &plan).map(|_| ())
+        yanuget_pkg::rewrite::rewrite_blocking(&nupkg, &out, &plan)
+            .map(|_| ())
+            .map_err(crate::io_context(|| {
+                format!(
+                    "cannot write {} from the package {}",
+                    out.display(),
+                    nupkg.display()
+                )
+            }))
     })
     .await
     .map_err(|e| yanuget_pkg::Error::Task(format!("script replacement panicked: {e}")))?

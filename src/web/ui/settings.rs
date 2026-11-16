@@ -160,7 +160,7 @@ pub fn settings_page(urls: &UrlBuilder, config: &Config, feed: &crate::web::Feed
             },
         ));
         files.push_str(&kv(
-            "Free space unfinished uploads may hold, per feed",
+            "Free space uploads may hold, per push key",
             &match fc.max_upload_space_percent {
                 0 | 100.. => "Unlimited".to_string(),
                 n => format!("{n} %"),

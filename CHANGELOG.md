@@ -12,6 +12,18 @@ expected to change incompatibly at any version.
 
 ## [Unreleased]
 
+**Upgrading:** no schema change; 0.10.0 opens the database again. A resumable
+(tus) upload larger than `files.max_upload_space_percent` (default `80`) of
+the space free above `min_free_disk_bytes` is now refused with `507` at its
+`POST`, where 0.10.0 admitted it: with 120 GiB free and the 2 GiB reserve,
+that is one over 94.4 GiB. A file that size still goes in one `PUT` or
+through the SSH inbox; set `files.max_upload_space_percent = 100` to admit
+it resumably as before (see *Free space* in `docs/large-packages.md`).
+Since `files.max_upload_space_percent` now caps the feeds of one push key
+together, counting pushes and `PUT`s in progress, a push beside large
+resumable uploads of the same key can see `507` where 0.10.0 took it.
+RUSTSEC-2026-0459 is still open, see *Security*.
+
 ### Security
 
 - RUSTSEC-2026-0459 is not fixed in this release, and `cargo audit` in CI
@@ -19,10 +31,12 @@ expected to change incompatibly at any version.
   3.54.0) can return uninitialized page-cache memory when a database is
   opened with a crafted `-wal` file of another page size next to it. The fix
   is in `libsqlite3-sys` 0.39, which no sqlx release accepts yet. YANuget
-  opens only its own database in `data_dir`, and `restore` copies just the
-  backup's `yanuget.db` and deletes any `-wal` next to the live file before
-  opening it, so planting such a file takes write access to the data
-  directory, which is control of the server already. The ignore goes when
+  opens only its own database in `data_dir` and the snapshot in a backup
+  directory; `restore` copies just the backup's `yanuget.db` and deletes any
+  `-wal` next to the live file before opening it, and `backup` deletes any
+  next to its snapshot before every opening (`DEP-17`). Planting such a file
+  next to the live database takes write access to the data directory, which
+  is control of the server already. The ignore goes when
   sqlx allows the fixed version. (`DEP-14`)
 
 - A resumable upload's hold on the space it has still to receive is renewed
@@ -49,6 +63,36 @@ expected to change incompatibly at any version.
   there but is not a function of Chocolatey's `chocolateyInstaller` module,
   instead of leaving it unwrapped. (`SEC-43`)
 
+- A resumable upload's hold on its space is bought with bytes: each `PATCH`
+  renews it by as much of the hour as its bytes are of the upload's pace
+  (its length over `files.upload_expiry_hours`). A byte an hour used to keep
+  the space promised for the full 72 hours. (`SEC-48`)
+- `files.max_upload_space_percent` caps the feeds of one push key together,
+  not each feed: feeds that accept a common key share one part of the volume,
+  so one global key no longer holds the share of every feed and with it the
+  volume. Pushes and `PUT …/files` in progress count towards it with their
+  declared `Content-Length`, and one is refused with `507` when it would take
+  the group past its share beside what the group has promised already; alone
+  it is held to the volume only, so a file larger than the share still goes
+  in one `PUT`. A resumable upload being created counts towards the share from
+  the start, so a `PATCH` checking it at the same moment sees it. (`SEC-48`)
+- A wrong admin key at the file and upload endpoints (`PUT`/`DELETE
+  …/files/…`, `POST`/`PATCH …/uploads`) counts against
+  `rate_limit.max_failed_auth` like a `401`, though the answer is `403`. It
+  used to be held only to the general budget, and each guess was compared with
+  the admin key of every feed. (`SEC-51`)
+- One HTTP/2 connection may have at most 32 requests open at once (hyper's
+  default was 200), which bounds the open files and send buffers a client
+  that never reads its downloads can hold per connection. (`SEC-49`, partly)
+- `yanuget backup` deletes any `-wal`, `-shm` or `-journal` next to the
+  database snapshot in the backup directory before every time it opens it, as
+  `restore` does next to the live database. A log planted in a backup
+  directory other systems can write to was replayed into the snapshot it
+  checks and keeps. (`DEP-17`)
+- A package with an entry that is the root `.nuspec` only once percent-decoded
+  (`evil%2Enuspec`), or only before (`x%2Fgood.nuspec`), is refused: the
+  server and the NuGet client would read different manifests. (`SEC-50`)
+
 ### Fixed
 
 - `scripts/Send-YanugetFile.ps1` could not attach a file to a version a feed
@@ -70,6 +114,31 @@ expected to change incompatibly at any version.
 - The internalizer no longer prints the cause of an I/O or rewrite error
   twice (`download cache: Permission denied: Permission denied`). (`MNT-30`)
 
+- The files of a version approved in two feeds that review what they serve,
+  with different admin keys, can be changed again: a request may carry
+  further admin keys in `X-YANuget-Admin-Key` headers next to its Basic
+  password, and still needs the key of every feed that approved the version.
+  No request could change them before. (`COR-45`)
+- A `yanuget backup` into an existing backup no longer deletes the last copy
+  of a file the live store has lost while its database still references it,
+  and reports a file missing from both. The check ran before the prune and
+  counted the earlier run's copy, which the prune then removed, leaving
+  `missing: []`. The kept copies are logged. (`COR-46`)
+- A symbol shared by two versions of a package (built once, packed twice) is
+  handed to the other version when the version that first stored it is
+  deleted or overwritten, if that version's own symbol package holds the same
+  PDB. It used to go with the first version, and the debugger got `404` for
+  the second. (`COR-47`)
+- A mirror refresh downloads a version the upstream lists twice (`1.0` and
+  `1.0.0`, or a repeated entry) once. (`COR-48`)
+- yanuget-internalize: errors from HTTP requests (`config check`, downloads,
+  the upstream's package and document streams, building the HTTP client)
+  name their cause, such as "Connection refused" or the JSON error, instead
+  of only "error sending request". (`MNT-33`)
+- yanuget-internalize: an I/O error while reading or rewriting a package
+  names the package again ("cannot read the package …: No such file or
+  directory"), not just the operating system's message.
+
 ### Changed
 
 - `quinn-udp` 0.5.16 replaces 0.5.15 in `Cargo.lock`, against
@@ -88,6 +157,22 @@ expected to change incompatibly at any version.
   data lock; the architecture page's module map matches the source tree and
   shows `yanuget-pkg`; `config check`'s list has the mirror proxy warning;
   RELEASING.md has a step for ROADMAP.md.
+- Documentation: the Compose example and the minimal setup give `base_url`
+  the port clients reach, which a URL without it sent to 443; the systemd
+  section shows how to run `config check` and `yanuget admin` with the
+  unit's `secrets.env`; *Large packages* explains the free space an upload
+  needs and the share a single resumable upload is held to, and the `507`
+  row in troubleshooting says what to change for it; the limit on two
+  approving feeds with different admin keys is documented, with the way
+  round it; SECURITY.md lists the advisories a scan of a release reports
+  and why each is accepted; the README describes the three crates;
+  the nginx recipe says it needs `tls_enabled = false`; `--help` of
+  `yanuget feeds` and of the internalizer's `config check --offline` say
+  what they do. RELEASING.md asks for the **Upgrading** paragraph and for a
+  review of the audit ignores.
+- The release archives carry `Send-YanugetFile.ps1`, so a server on an
+  isolated network has the upload script that matches its version. The
+  documentation pointed at the copy on GitHub's `main`.
 - The flat container's version list, the version enumeration and a paged
   registration index are built from the version list alone, and a
   registration page reads only its own rows; each used to build the full row
@@ -106,6 +191,39 @@ expected to change incompatibly at any version.
   server starts on the same data; a `pending-only` push is held to the
   license policy of every feed holding the version, end to end. (`TEST-17`,
   `TEST-18`)
+- Retention (the scheduled run, prune on push, the admin preview and "delete
+  now") reads only the columns its plan needs, and the scheduled run reads
+  200 package IDs per query instead of one query per ID. The daily blob sweep
+  reads which blobs are referenced in one query instead of counting each
+  blob. (`PERF-18`, `PERF-20`)
+- The background loops (inbox scan, retention, orphan and blob sweeps,
+  expired uploads) wait a full period after a run that overran it, instead of
+  running every tick they missed back to back. (`PERF-19`)
+- Creating a resumable upload, and resuming one whose hold lapsed, measures
+  the free space once instead of twice under the lock all creations share.
+- Library: `MigrateOptions::min_free_disk_bytes` is gone.
+  `migrate::run_with_space` takes the guard that holds the reserve, and
+  `migrate::run` keeps none.
+- Tests: every test that runs the `yanuget` binary starts it without the
+  caller's `YANUGET_*` variables and `RUST_LOG`. An exported
+  `YANUGET_DATA_DIR` used to send a test's `restore --force` or `migrate`
+  into that directory, and a `RUST_LOG` stricter than `info` made the server
+  tests time out after a minute. (`TEST-21`, `TEST-22`)
+- Tests: the real server is stopped with SIGTERM, idle and with a push still
+  arriving: it exits 0, by the grace period at the latest, and lets go of the
+  data lock. `yanuget admin` and `yanuget backup` run as commands against a
+  running server. A resumable upload's hash is rebuilt from its partial file
+  after a restart, and expired uploads are swept. Bulk copy and move are held
+  to the target feed's license policy. Backup and restore are covered with
+  attached files and symbols. The internalizer's refusal of an https-to-http
+  redirect and its resolver behind `allow_private_hosts` have tests of their
+  own. (`TEST-24` to `TEST-29`)
+- CI: the prelude's end-to-end test fails instead of skipping itself when
+  `pwsh` is missing (`YANUGET_REQUIRE_PWSH`), and the job prints the
+  PowerShell version it ran with. (`TEST-23`)
+- CI: the weekly run fails once an sqlx release accepts the `libsqlite3-sys`
+  that fixes RUSTSEC-2026-0459, so the ignore does not outlive its reason.
+  (`CI-22`, `DEP-14`)
 
 ## [0.10.0] — 2026-11-04
 

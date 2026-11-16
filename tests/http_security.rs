@@ -1298,6 +1298,93 @@ async fn plain_http_shutdown_has_a_deadline() {
     drop(conn);
 }
 
+/// A package of `size` bytes that do not compress, stored as they are.
+fn build_large_nupkg(id: &str, version: &str, size: usize) -> Vec<u8> {
+    let nuspec = format!(
+        r#"<?xml version="1.0"?>
+<package xmlns="http://schemas.microsoft.com/packaging/2013/05/nuspec.xsd">
+  <metadata>
+    <id>{id}</id>
+    <version>{version}</version>
+    <authors>Test Author</authors>
+    <description>A large test package.</description>
+  </metadata>
+</package>"#
+    );
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    let payload: Vec<u8> = (0..size)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as u8
+        })
+        .collect();
+    let mut cursor = Cursor::new(Vec::new());
+    {
+        let mut zip = zip::ZipWriter::new(&mut cursor);
+        let stored =
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        zip.start_file(format!("{id}.nuspec"), stored).unwrap();
+        zip.write_all(nuspec.as_bytes()).unwrap();
+        zip.start_file("content/blob.bin", stored).unwrap();
+        zip.write_all(&payload).unwrap();
+        zip.finish().unwrap();
+    }
+    cursor.into_inner()
+}
+
+#[tokio::test]
+async fn one_http2_connection_holds_a_bounded_number_of_requests() {
+    let served = serve_real(|_| {}, |_| {}).await;
+    let base = format!("http://{}", served.addr);
+    // Larger than the window a client grants a stream before it reads: a
+    // download nobody reads keeps its stream open.
+    let pushed = reqwest::Client::new()
+        .put(format!("{base}/api/v2/package"))
+        .header("X-NuGet-ApiKey", API_KEY)
+        .body(build_large_nupkg("Big.Pkg", "1.0.0", 3 * 1024 * 1024))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(pushed.status(), StatusCode::CREATED);
+    let url = format!("{base}/v3/package/big.pkg/1.0.0/big.pkg.1.0.0.nupkg");
+
+    // One connection, every request a stream of it.
+    let client = reqwest::Client::builder()
+        .http2_prior_knowledge()
+        .build()
+        .unwrap();
+    let max = yanuget::server::HTTP2_MAX_CONCURRENT_STREAMS as usize;
+    let mut unread = Vec::new();
+    for _ in 0..max {
+        let resp = client.get(&url).send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.version(), reqwest::Version::HTTP_2);
+        unread.push(resp);
+    }
+    // One more has to wait for one of them to end; with hyper's default of
+    // 200 streams it was served at once.
+    let next = tokio::spawn({
+        let (client, url) = (client.clone(), url.clone());
+        async move { client.get(&url).send().await.map(|r| r.status()) }
+    });
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(
+        !next.is_finished(),
+        "a request over the stream limit was served"
+    );
+    drop(unread.pop());
+    let status = tokio::time::timeout(Duration::from_secs(10), next)
+        .await
+        .expect("the waiting request was never served")
+        .unwrap()
+        .unwrap();
+    assert_eq!(status, StatusCode::OK);
+    drop(unread);
+    served.handle.shutdown();
+}
+
 /// Run the real binary with `env` and return its exit status and stderr,
 /// killing it if it is still running after `timeout` (it then started, which
 /// is what these tests assert does not happen).

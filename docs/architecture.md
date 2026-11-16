@@ -50,8 +50,9 @@ src/
 ├── validation.rs     Package-id rules
 ├── streaming.rs      Bounded copy-to-disk with incremental SHA-512
 ├── space.rs          SpaceGuard: free space and the bytes promised to writes in
-│                     progress, one guard for uploads, mirror downloads and
-│                     inbox imports
+│                     progress, one guard for uploads, mirror downloads,
+│                     inbox imports and `migrate`; a feed's share of it for
+│                     resumable uploads
 ├── config/           Layered config (defaults < TOML < env)
 │   ├── mod.rs        Config, loading, resolved paths
 │   ├── env.rs        The `YANUGET_*` overlay, and the names nothing reads
@@ -183,8 +184,11 @@ or trigger is a new step, never an edit to an old one.
 
 ```
 GET /v3/index.json                → nuget::service_index(UrlBuilder)
-GET /v3/package/{id}/index.json   → db.find_versions → nuget::flat_container_index
-GET /v3/registration/{id}/...     → db.find_versions → nuget::registration_index
+GET /v3/package/{id}/index.json   → db.version_keys  → nuget::flat_container_index
+GET /v3/registration/{id}/index.json
+                                  → db.version_keys  → db.find_versions_in → nuget::registration_index
+                                    (paged: the version list alone → nuget::registration_index_paged)
+GET /v3/registration/{id}/page/…  → db.version_keys  → db.find_versions_in → nuget::registration_page
 GET /v3/search?q=...              → db.search        → nuget::search_response
 GET /v3/package/{id}/{v}/{f}.nupkg→ storage.get_package → files::serve_local_file (Range)
 ```

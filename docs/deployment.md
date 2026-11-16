@@ -29,16 +29,25 @@ the feed's `mirror.ca_cert_path` (`--source-ca-cert` for `migrate`).
 ```bash
 YANUGET_API_KEY=<a long random string> \
 YANUGET_DATA_DIR=/var/lib/yanuget \
-YANUGET_BASE_URL=https://nuget.example.com \
+YANUGET_BASE_URL=https://nuget.example.com:5000 \
 yanuget
 ```
+
+This serves clients directly on the default port 5000, with the self-signed
+certificate (see [TLS](configuration.md#tls)). On port 443 itself (see
+[Port 443 as a non-root user](#port-443-as-a-non-root-user)) or behind a
+reverse proxy, the port goes out of `base_url` again.
 
 Three settings do most of the work:
 
 - **`api_key`** — without it, anybody who can reach the port can push and delete.
   The server logs a loud warning at startup when it is unset.
 - **`base_url`** — the absolute URLs a restoring client is handed are built from
-  this. Set it explicitly when the server is behind a proxy; the alternative is
+  this, word for word, so it is the address clients use, port included when it
+  is not 443. A `base_url` without the port while the server answers on 5000
+  lets `dotnet nuget add source …:5000/v3/index.json` work and the first
+  restore fail on port 443, where nothing listens. Set it explicitly when the
+  server is behind a proxy; the alternative is
   deriving it per-request from headers, which is correct only when
   `trusted_proxies` is also right.
 - **`trusted_proxies`** — see [Trusted proxies](configuration.md#trusted-proxies).
@@ -167,6 +176,30 @@ user so it reads the same configuration:
 sudo -u yanuget yanuget --config /etc/yanuget/yanuget.toml healthcheck
 ```
 
+### Commands you run by hand
+
+A command started with `sudo -u yanuget` runs outside the unit, so it sees
+neither `YANUGET_DATA_DIR` nor the keys in `/etc/yanuget/secrets.env`, which
+only root and systemd can read. With the keys there and not in the file,
+`yanuget admin` finds no admin key, and `yanuget config check` warns that a
+feed has no push key while the service has one; it also misses a blank
+`YANUGET_API_KEY=` in `secrets.env` that would stop the service at its next
+start. To check what the service will load, run the command in the unit's
+environment:
+
+```bash
+sudo systemd-run --pipe --wait --collect --quiet \
+    -p User=yanuget -p EnvironmentFile=/etc/yanuget/secrets.env \
+    -p Environment=YANUGET_DATA_DIR=/var/lib/yanuget \
+    /usr/local/bin/yanuget --config /etc/yanuget/yanuget.toml config check
+```
+
+The same works for `yanuget admin …`. Without root, give `yanuget admin` the
+key itself, with `--admin-key-file` or `YANUGET_ADMIN_KEY` (see
+[Which server, which key](admin-cli.md#which-server-which-key)). `backup`,
+`restore` and `feeds` need no keys; they need the absolute `data_dir` in the
+file, as above.
+
 ### Port 443 as a non-root user
 
 Ports below 1024 normally need root. The unit instead grants the process the
@@ -217,7 +250,8 @@ services:
     ports:
       - "5000:5000"
     environment:
-      YANUGET_BASE_URL: https://nuget.example.com
+      # The address clients use, port included: 5000 is what is published.
+      YANUGET_BASE_URL: https://nuget.example.com:5000
     env_file:
       - secrets.env          # YANUGET_API_KEY, YANUGET_ADMIN_API_KEY
     volumes:
@@ -227,8 +261,10 @@ volumes:
   yanuget-data:
 ```
 
-Clients reach the container directly here, so `trusted_proxies` stays at its
-empty default. Setting it to `private` in this setup would let any machine on
+Clients reach the container directly here, on the published port 5000, so
+`base_url` names that port and `trusted_proxies` stays at its empty default.
+To serve on the standard port instead, publish `"443:5000"` and drop `:5000`
+from `base_url`. Setting it to `private` in this setup would let any machine on
 the network send its own `X-Forwarded-For` and `X-Forwarded-Host`. When a
 reverse proxy runs in front — another service in the same Compose file, say —
 set `YANUGET_TRUSTED_PROXIES` to that proxy's address, or to the Compose
@@ -275,7 +311,9 @@ promotion rates and mirror upstream status, enable
 ## Behind a reverse proxy
 
 See [Reverse proxy](configuration.md#reverse-proxy) for the nginx configuration.
-Two settings there are not optional for a package server: disable request and
+It passes plain HTTP to YANuget, which then needs `tls_enabled = false`;
+otherwise nginx answers every request with `502`. Two settings there are not
+optional for a package server: disable request and
 response buffering, and remove the body size limit. A proxy that buffers a 25 GB
 upload in memory or on its own disk undoes the whole point of streaming, and a
 default `client_max_body_size` will reject the push outright.

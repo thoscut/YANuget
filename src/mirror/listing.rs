@@ -36,6 +36,11 @@ impl MirrorTarget<'_> {
             .collect();
         // Newest first, so a bounded fetch keeps the versions clients actually want.
         versions.sort_by(|a, b| b.cmp(a));
+        // An upstream may name one version twice (`1.0` and `1.0.0`, or the
+        // same entry repeated). What the feed holds is read once before the
+        // loop, so a second spelling would be downloaded in full again, only
+        // to be refused as existing. Equal versions sort next to each other.
+        versions.dedup();
         let considered = versions.len();
         if let Some(max) = client.max_versions_per_package() {
             versions.truncate(max);

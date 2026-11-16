@@ -28,7 +28,12 @@
 //!    checksum; nuget.org refuses their symbols too.)
 //! 2. **A key is claimed once, atomically.** The `(key, file)` row is claimed
 //!    under a per-key lock before any bytes are written, and a claim is never
-//!    moved to another package or version.
+//!    moved to another package. It moves to another version of the same
+//!    package in one case only: the version holding it is deleted, and the
+//!    other one's own symbol package holds the same bytes, which its own
+//!    assemblies vouch for ([`successor`]). A re-push of an identical PDB by
+//!    a second version records nothing, so without that the second version
+//!    would lose its symbols with the first.
 //! 3. **Stored bytes are never replaced by different ones.** A re-push of the
 //!    same PDB is a no-op; anything else under an existing key is refused.
 //!
@@ -401,6 +406,90 @@ async fn store_all(
         }
     }
     Ok(claimed)
+}
+
+/// Another version of `id` that `gone`'s symbol `key`/`filename` can be handed
+/// to as `gone` is deleted: one whose stored symbol package holds a PDB with
+/// exactly the bytes stored under the key, and whose own stored package has
+/// the assembly that vouches for it, as a push of it would have checked. The
+/// newest such version, or `None`.
+///
+/// "Build once, pack twice" (`1.0.0-rc.1` and `1.0.0` from the same
+/// assemblies) pushes the same PDB for both. The second push finds the bytes
+/// in place and changes nothing, so the key stays with the first version;
+/// retention removing that one would otherwise take the second one's symbols
+/// with it, silently. The caller holds `gone`'s version lock and the key's.
+pub(crate) async fn successor(
+    storage: &dyn PackageStorage,
+    db: &dyn PackageDatabase,
+    id: &str,
+    gone: &NuGetVersion,
+    key: &str,
+    filename: &str,
+) -> Result<Option<NuGetVersion>> {
+    let Some(stored) = stored_sha256(storage, key, filename).await? else {
+        return Ok(None);
+    };
+    let mut versions = db.stored_versions(id).await?;
+    versions.retain(|v| v != gone);
+    for version in versions.into_iter().rev() {
+        let normalized = version.normalized();
+        let package = match storage.get_package(id, &normalized).await {
+            Ok(PackageContent::LocalPath(path)) => path,
+            Err(_) => continue,
+        };
+        // The store keeps a version's symbol package beside its package.
+        let snupkg = package.with_extension("snupkg");
+        if !tokio::fs::try_exists(&snupkg).await.unwrap_or(false) {
+            continue;
+        }
+        match holds_pdb(&package, &snupkg, key, filename, &stored).await {
+            Ok(true) => return Ok(Some(version)),
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!(%id, version = %normalized, %key, error = %e, "could not read a symbol package to hand a symbol over to");
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Whether the symbol package at `snupkg` holds a PDB named `filename` with
+/// key `key` and SHA-256 `sha256` that an assembly in `package` vouches for.
+async fn holds_pdb(
+    package: &Path,
+    snupkg: &Path,
+    key: &str,
+    filename: &str,
+    sha256: &[u8; 32],
+) -> Result<bool> {
+    let archive = nupkg::read_archive(snupkg).await?;
+    let names: Vec<String> = archive
+        .entry_names
+        .iter()
+        .filter(|name| name.ends_with(".pdb") && file_name(name) == filename)
+        .cloned()
+        .collect();
+    if names.is_empty() {
+        return Ok(false);
+    }
+    let dir = snupkg.parent().unwrap_or_else(|| Path::new("."));
+    let extracted = TempFiles(
+        nupkg::extract_entries_to_files(snupkg, &names, dir, MAX_PDB_BYTES, MAX_PDB_TOTAL_BYTES)
+            .await?,
+    );
+    let entries: Vec<(String, PathBuf)> = extracted
+        .0
+        .iter()
+        .map(|e| (e.name.clone(), e.path.clone()))
+        .collect();
+    let package = package.to_path_buf();
+    let (verified, _) = tokio::task::spawn_blocking(move || verify(&package, &entries))
+        .await
+        .map_err(|e| Error::Other(anyhow::anyhow!("symbol verification task panicked: {e}")))??;
+    Ok(verified
+        .iter()
+        .any(|v| v.key.eq_ignore_ascii_case(key) && v.filename == filename && v.sha256 == *sha256))
 }
 
 /// Undo claims made by a push that failed later on: the rows, and any bytes

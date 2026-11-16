@@ -210,5 +210,5 @@ curl -fC - -O https://host:5000/v3/package/mylib/1.0.0/mylib.1.0.0.nupkg
 ```
 
 Ids and versions in these URLs are lower-case. For large files attached to a
-package, `scripts/Send-YanugetFile.ps1` uploads resumably from PowerShell; see
-[Attached files](api.md#attached-files).
+package, `Send-YanugetFile.ps1` (in every release archive) uploads resumably
+from PowerShell; see [Resumable upload](api.md#resumable-upload-tus).

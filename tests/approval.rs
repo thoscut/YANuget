@@ -849,3 +849,169 @@ async fn an_unreadable_report_is_shown_as_such() {
     assert!(html.contains("schema version 2"), "{html}");
     assert!(html.contains("Approve it anyway?"));
 }
+
+/// A version approved in two feeds that each review what they serve, with
+/// admin keys of their own, takes both keys to change its files: the Basic
+/// password carries one, an `X-YANuget-Admin-Key` header each other one
+/// (`COR-45`). Either key alone is still refused.
+#[tokio::test]
+async fn the_files_of_a_version_approved_in_two_feeds_change_with_both_admin_keys() {
+    const INTAKE_ADMIN: &str = "intake-admin";
+    const PROD_ADMIN: &str = "prod-admin";
+    let server = spawn_feeds(|c| {
+        c.api_key = Some(API_KEY.into());
+        let mut intake = feed("intake");
+        intake.admin_api_key = Some(INTAKE_ADMIN.into());
+        intake.requires_approval = true;
+        intake.promotes_to = Some("prod".into());
+        let mut prod = feed("prod");
+        prod.admin_api_key = Some(PROD_ADMIN.into());
+        prod.requires_approval = true;
+        c.feeds = vec![intake, prod];
+    })
+    .await;
+    let pushed = push_to(
+        &server,
+        "/intake/api/v2/package",
+        API_KEY,
+        build_nupkg("Ring.Pkg", "1.0.0", b"x"),
+    )
+    .await;
+    assert_eq!(pushed.status(), reqwest::StatusCode::CREATED);
+    let file = |name: &str| server.url(&format!("/intake/api/v2/files/Ring.Pkg/1.0.0/{name}"));
+    let attached = server
+        .client
+        .put(file("setup.zip"))
+        .header("X-NuGet-ApiKey", API_KEY)
+        .body(image_bytes(1))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(attached.status(), reqwest::StatusCode::CREATED);
+    let server = &server;
+    let approve = |prefix: &'static str, key: &'static str| async move {
+        let fields = shown_review_fields_in(server, prefix, key).await;
+        no_redirect()
+            .post(server.url(&format!("{prefix}/admin/packages/ring.pkg/1.0.0/approve")))
+            .basic_auth("admin", Some(key))
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(format!("{}&{fields}", admin_body(key)))
+            .send()
+            .await
+            .unwrap()
+            .status()
+    };
+    assert_eq!(
+        approve("/intake", INTAKE_ADMIN).await,
+        reqwest::StatusCode::SEE_OTHER
+    );
+    let promoted = no_redirect()
+        .post(server.url("/intake/admin/packages/ring.pkg/1.0.0/promote"))
+        .basic_auth("admin", Some(INTAKE_ADMIN))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(admin_body(INTAKE_ADMIN))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(promoted.status(), reqwest::StatusCode::SEE_OTHER);
+    assert_eq!(
+        approve("/prod", PROD_ADMIN).await,
+        reqwest::StatusCode::SEE_OTHER
+    );
+
+    let delete = |basic: &'static str, extra: &'static [&'static str]| {
+        let mut req = server
+            .client
+            .delete(file("setup.zip"))
+            .header("X-NuGet-ApiKey", API_KEY)
+            .basic_auth("admin", Some(basic));
+        for key in extra {
+            req = req.header("X-YANuget-Admin-Key", *key);
+        }
+        req.send()
+    };
+    // One key of the two is not enough, whichever it is and however sent.
+    for (basic, extra) in [
+        (INTAKE_ADMIN, &[][..]),
+        (PROD_ADMIN, &[][..]),
+        (PROD_ADMIN, &[PROD_ADMIN][..]),
+    ] {
+        let refused = delete(basic, extra).await.unwrap();
+        assert_eq!(refused.status(), reqwest::StatusCode::FORBIDDEN);
+    }
+    // Both are.
+    assert_eq!(
+        delete(INTAKE_ADMIN, &[PROD_ADMIN]).await.unwrap().status(),
+        reqwest::StatusCode::NO_CONTENT
+    );
+}
+
+/// A wrong admin key at the file endpoints is a failed guess like one at
+/// `/admin`, and held to `max_failed_auth`, though the answer is a `403`
+/// (`SEC-51`). A refusal without an admin key is no guess.
+#[tokio::test]
+async fn a_wrong_admin_key_for_an_approved_version_counts_as_a_failed_guess() {
+    let server = spawn_feeds(|c| {
+        c.api_key = Some(API_KEY.into());
+        c.admin_api_key = Some(ADMIN_KEY.into());
+        c.rate_limit.max_failed_auth = 3;
+        let mut gated = feed("gated");
+        gated.requires_approval = true;
+        c.feeds = vec![gated];
+    })
+    .await;
+    let pushed = push_to(
+        &server,
+        "/gated/api/v2/package",
+        API_KEY,
+        build_nupkg("Ring.Pkg", "1.0.0", b"x"),
+    )
+    .await;
+    assert_eq!(pushed.status(), reqwest::StatusCode::CREATED);
+    let fields = shown_review_fields(&server).await;
+    let approved = no_redirect()
+        .post(server.url("/gated/admin/packages/ring.pkg/1.0.0/approve"))
+        .basic_auth("admin", Some(ADMIN_KEY))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(format!("{}&{fields}", admin_body(ADMIN_KEY)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(approved.status(), reqwest::StatusCode::SEE_OTHER);
+
+    let create = |admin: Option<String>| {
+        let mut req = tus(no_redirect().post(server.url("/gated/api/v2/uploads")))
+            .header("Upload-Length", "10")
+            .header(
+                "Upload-Metadata",
+                tus_metadata(&[
+                    ("id", "Ring.Pkg"),
+                    ("version", "1.0.0"),
+                    ("filename", "a.zip"),
+                ]),
+            );
+        if let Some(key) = admin {
+            req = req.basic_auth("admin", Some(key));
+        }
+        async move { req.send().await.unwrap().status() }
+    };
+    for _ in 0..5 {
+        assert_eq!(create(None).await, reqwest::StatusCode::FORBIDDEN);
+    }
+    for guess in 0..3 {
+        assert_eq!(
+            create(Some(format!("guess-{guess}"))).await,
+            reqwest::StatusCode::FORBIDDEN
+        );
+    }
+    // Out of guesses: refused before the key is even compared, the right
+    // one included.
+    assert_eq!(
+        create(Some("guess-3".into())).await,
+        reqwest::StatusCode::TOO_MANY_REQUESTS
+    );
+    assert_eq!(
+        create(Some(ADMIN_KEY.into())).await,
+        reqwest::StatusCode::TOO_MANY_REQUESTS
+    );
+}

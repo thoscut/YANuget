@@ -216,9 +216,12 @@ YANuget implements the NuGet v3 protocol. Full reference in
 
 ## Architecture
 
-YANuget is a single crate with clearly separated modules behind trait
-boundaries, which keeps each piece small and unit-testable. See
-[docs/architecture.md](docs/architecture.md).
+The YANuget server is a single crate (library + binary) with clearly
+separated modules behind trait boundaries, which keeps each piece small and
+unit-testable. The package handling it shares with its tools lives in a
+second crate, [`yanuget-pkg`](crates/yanuget-pkg/), and the Chocolatey
+internalizer is a third, [`yanuget-internalize`](crates/yanuget-internalize/).
+The full module map is in [docs/architecture.md](docs/architecture.md#module-map).
 
 ```
 HTTP (axum)  ──▶  indexing pipeline  ──▶  PackageStorage (trait)  ──▶  filesystem
@@ -229,8 +232,8 @@ HTTP (axum)  ──▶  indexing pipeline  ──▶  PackageStorage (trait)  �
 
 | Module | Responsibility |
 | --- | --- |
-| `version` | NuGet version parsing, normalization & ordering |
-| `nuspec` / `nupkg` | Manifest parsing; seek-based archive reading |
+| `version` (crate `yanuget-pkg`) | NuGet version parsing, normalization & ordering |
+| `nuspec` / `nupkg` (crate `yanuget-pkg`) | Manifest parsing; seek-based archive reading |
 | `streaming` | Bounded-memory copy-to-disk with incremental SHA-512 |
 | `storage` | `PackageStorage` trait + streaming filesystem backend |
 | `database` | `PackageDatabase` trait + SQLite backend |
@@ -408,9 +411,10 @@ lines that download one and check its SHA-256.
 
 Files arrive with the push key in one `PUT`, resumably over the
 [tus](https://tus.io) protocol (a multi-gigabyte upload that drops continues
-where it stopped; `scripts/Send-YanugetFile.ps1` does it from PowerShell), or
-over SSH — `scp`, `sftp`, `rsync` through the host's own `sshd` into an inbox
-YANuget imports from, checksum-verified. Each file is stored once under its
+where it stopped; `Send-YanugetFile.ps1`, in every release archive and under
+`scripts/`, does it from PowerShell), or over SSH — `scp`, `sftp`, `rsync`
+through the host's own `sshd` into an inbox YANuget imports from,
+checksum-verified. Each file is stored once under its
 SHA-256, however many versions attach it, and goes with its version: deleted,
 pruned or moved together. See [the API](docs/api.md#attached-files) and
 [the configuration](docs/configuration.md#attached-files).
@@ -480,8 +484,9 @@ degrades to a normal cache miss.
 
 Moving to YANuget from another NuGet server? Where mirroring caches packages
 *on demand*, the `migrate` sub-command copies **everything** at once. It
-discovers every package on the source (paging its `SearchQueryService`, falling
-back to the `Catalog/3.0.0` resource), then streams each `.nupkg` through the
+discovers every package on the source (paging its `SearchQueryService` and
+walking its `Catalog/3.0.0` resource when it has one, and taking the union),
+then streams each `.nupkg` through the
 same indexing pipeline a push uses — honouring the target feed's
 `requires_approval` gate and `license_policy`. A live display shows progress,
 ETA and transfer rate:

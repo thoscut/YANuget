@@ -3,7 +3,7 @@
 use sqlx::Row;
 
 use crate::database::{canonical_id, SymbolKey, SymbolRef};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::version::NuGetVersion;
 
 use super::SqliteDatabase;
@@ -104,6 +104,43 @@ pub(super) async fn delete_symbols(
     Ok(result.rows_affected())
 }
 
+pub(super) async fn hand_over_symbol(
+    db: &SqliteDatabase,
+    key: &str,
+    filename: &str,
+    id: &str,
+    from: &NuGetVersion,
+    to: &NuGetVersion,
+) -> Result<bool> {
+    let result = sqlx::query(
+        "UPDATE symbols SET normalized_version = ?5
+         WHERE ssqp_key = ?1 AND filename = ?2 AND lower_id = ?3 AND normalized_version = ?4",
+    )
+    .bind(key.to_uppercase())
+    .bind(filename.to_lowercase())
+    .bind(canonical_id(id))
+    .bind(from.normalized())
+    .bind(to.normalized())
+    .execute(&db.pool)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+pub(super) async fn stored_versions(db: &SqliteDatabase, id: &str) -> Result<Vec<NuGetVersion>> {
+    let rows: Vec<String> =
+        sqlx::query_scalar("SELECT original_version FROM packages WHERE lower_id = ?1")
+            .bind(canonical_id(id))
+            .fetch_all(&db.pool)
+            .await?;
+    let mut versions = rows
+        .iter()
+        // Read with the rules it was written under, as a full row is.
+        .map(|v| NuGetVersion::parse_stored(v).map_err(|e| Error::InvalidVersion(e.to_string())))
+        .collect::<Result<Vec<_>>>()?;
+    versions.sort();
+    Ok(versions)
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::test_support::*;
@@ -151,6 +188,38 @@ mod tests {
         assert!(db.add_symbol("K", "a.pdb", "Sym", &other).await.is_err());
         db.add_to_feed(FEED, &sample("Sym", "2.0.0")).await.unwrap();
         assert!(db.add_symbol("K", "a.pdb", "Sym", &other).await.unwrap());
+
+        // A mapping moves to another version of its package only from the
+        // version that holds it, and only to one the server has.
+        assert!(!db
+            .hand_over_symbol("K", "a.pdb", "sym", &v, &other)
+            .await
+            .unwrap());
+        let third = NuGetVersion::parse("3.0.0").unwrap();
+        assert!(db
+            .hand_over_symbol("K", "a.pdb", "sym", &other, &third)
+            .await
+            .is_err());
+        assert!(db
+            .hand_over_symbol("k", "A.PDB", "SYM", &other, &v)
+            .await
+            .unwrap());
+        assert_eq!(
+            db.find_symbol("K", "a.pdb")
+                .await
+                .unwrap()
+                .unwrap()
+                .normalized_version,
+            "1.0.0"
+        );
+        assert_eq!(
+            db.stored_versions("SYM").await.unwrap(),
+            [v.clone(), other.clone()]
+        );
+        assert!(db
+            .hand_over_symbol("K", "a.pdb", "sym", &v, &other)
+            .await
+            .unwrap());
 
         // Deleting the version takes its claims with it.
         assert!(db.delete_package_data("sym", &other).await.unwrap());

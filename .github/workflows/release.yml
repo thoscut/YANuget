@@ -286,6 +286,12 @@ jobs:
           # exactly as given.
           cp "target/$TARGET/release/$bin" "staging/$name/"
           cp README.md LICENSE CHANGELOG.md yanuget.example.toml "staging/$name/"
+          # The resumable upload client, in every archive: it runs wherever
+          # PowerShell 7 does, and the copy that matches this server's
+          # protocol is this one, not whatever `main` has by then. The
+          # offline docs point here, since an isolated network cannot reach
+          # GitHub (see docs/api.md#resumable-upload-tus).
+          cp scripts/Send-YanugetFile.ps1 "staging/$name/"
           # The hardened service unit and its system user, next to the binary
           # they run (see docs/deployment.md#systemd).
           if [[ "$TARGET" == *-linux-* ]]; then

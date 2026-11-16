@@ -51,9 +51,13 @@ pub struct Scan {
 /// entry order, outside comments.
 pub async fn scan(nupkg: &Path) -> Result<Scan, yanuget_pkg::Error> {
     let nupkg: PathBuf = nupkg.to_path_buf();
-    tokio::task::spawn_blocking(move || scan_blocking(&nupkg))
-        .await
-        .map_err(|e| yanuget_pkg::Error::Task(format!("script scan panicked: {e}")))?
+    tokio::task::spawn_blocking(move || {
+        scan_blocking(&nupkg).map_err(crate::io_context(|| {
+            format!("cannot read the package {}", nupkg.display())
+        }))
+    })
+    .await
+    .map_err(|e| yanuget_pkg::Error::Task(format!("script scan panicked: {e}")))?
 }
 
 fn scan_blocking(nupkg: &Path) -> Result<Scan, yanuget_pkg::Error> {

@@ -3,6 +3,8 @@
 
 #![allow(dead_code)]
 
+pub mod binary;
+
 use std::io::{Cursor, Write};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;

@@ -79,3 +79,58 @@ async fn service_index_advertises_symbol_server() {
     assert!(types.contains(&"SymbolServer/4.9.0"));
     assert!(types.contains(&"SymbolPackagePublish/4.9.0"));
 }
+
+/// `COR-47`: two versions built from the same assemblies push the same PDB.
+/// The second push finds the bytes in place and records nothing, so the key
+/// stayed with the first version, and deleting that one took the second
+/// one's symbols with it. The key is handed over instead.
+#[tokio::test]
+async fn symbols_shared_by_two_versions_outlive_the_first() {
+    let server = spawn_with(|c| c.hard_delete_enabled = true).await;
+    let pdb = build_portable_pdb(&[0x5a; 16]);
+    let key = yanuget::pdb::portable_pdb_signature(&pdb).expect("portable pdb key");
+    for version in ["1.0.0-rc.1", "1.0.0"] {
+        push_multipart(
+            &server,
+            API_KEY,
+            build_nupkg_for_pdb("Twice.Lib", version, "twice.lib.pdb", &pdb),
+        )
+        .await;
+        let snupkg = build_snupkg("Twice.Lib", version, "twice.lib.pdb", &pdb);
+        let resp = push_symbol(&server, API_KEY, snupkg).await;
+        assert_eq!(resp.status(), reqwest::StatusCode::CREATED, "{version}");
+    }
+    // A version without symbols of its own is no one to hand them to.
+    push_multipart(
+        &server,
+        API_KEY,
+        build_nupkg_for_pdb("Twice.Lib", "0.9.0", "twice.lib.pdb", &pdb),
+    )
+    .await;
+
+    let url = server.url(&format!(
+        "/download/symbols/twice.lib.pdb/{key}/twice.lib.pdb"
+    ));
+    let delete = |version: &'static str| {
+        server
+            .client
+            .delete(server.url(&format!("/api/v2/package/twice.lib/{version}")))
+            .header("X-NuGet-ApiKey", API_KEY)
+            .send()
+    };
+    let resp = delete("1.0.0-rc.1").await.unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT);
+    let resp = server.client.get(&url).send().await.unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "1.0.0 lost its symbols"
+    );
+    assert_eq!(&resp.bytes().await.unwrap()[..], &pdb[..]);
+
+    // With the last version that pushed it, the PDB goes.
+    let resp = delete("1.0.0").await.unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT);
+    let resp = server.client.get(&url).send().await.unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+}

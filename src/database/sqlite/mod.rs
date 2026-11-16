@@ -47,8 +47,8 @@ use crate::version::NuGetVersion;
 
 use super::{
     AdminFilter, AdminOverview, DatabaseStats, FeedVersion, Membership, MembershipChange,
-    PackageDatabase, PackageFile, SearchPage, SearchRequest, StoredFeed, SymbolKey, SymbolRef,
-    TagCount, UploadSession, VersionFootprint, VersionKey,
+    PackageDatabase, PackageFile, RetentionVersion, SearchPage, SearchRequest, StoredFeed,
+    SymbolKey, SymbolRef, TagCount, UploadSession, VersionFootprint, VersionKey,
 };
 
 /// The feed-scoped projection: every `packages` column plus the membership's
@@ -414,6 +414,14 @@ impl PackageDatabase for SqliteDatabase {
         feeds::find_all_versions_of(self, feed, ids).await
     }
 
+    async fn retention_versions(
+        &self,
+        feed: &str,
+        ids: &[String],
+    ) -> Result<Vec<RetentionVersion>> {
+        feeds::retention_versions(self, feed, ids).await
+    }
+
     async fn version_footprints(&self, ids: &[String]) -> Result<Vec<VersionFootprint>> {
         feeds::version_footprints(self, ids).await
     }
@@ -507,6 +515,10 @@ impl PackageDatabase for SqliteDatabase {
         files::blob_references(self, sha256).await
     }
 
+    async fn referenced_blobs(&self) -> Result<std::collections::HashSet<String>> {
+        files::referenced_blobs(self).await
+    }
+
     async fn increment_file_downloads(
         &self,
         id: &str,
@@ -594,6 +606,21 @@ impl PackageDatabase for SqliteDatabase {
 
     async fn delete_symbols(&self, id: &str, version: &NuGetVersion) -> Result<u64> {
         symbols::delete_symbols(self, id, version).await
+    }
+
+    async fn hand_over_symbol(
+        &self,
+        key: &str,
+        filename: &str,
+        id: &str,
+        from: &NuGetVersion,
+        to: &NuGetVersion,
+    ) -> Result<bool> {
+        symbols::hand_over_symbol(self, key, filename, id, from, to).await
+    }
+
+    async fn stored_versions(&self, id: &str) -> Result<Vec<NuGetVersion>> {
+        symbols::stored_versions(self, id).await
     }
 
     // --- tombstones: `tombstones` ---

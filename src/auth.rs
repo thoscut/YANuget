@@ -11,6 +11,12 @@ use sha2::{Digest, Sha256};
 /// The header NuGet clients use to carry the push API key.
 pub const API_KEY_HEADER: &str = "X-NuGet-ApiKey";
 
+/// A header that carries one admin key, beside the password of HTTP Basic
+/// credentials, where a request may need several: changing the files of a
+/// version approved in two feeds takes the admin key of each. Repeated, one
+/// key per header.
+pub const ADMIN_KEY_HEADER: &str = "X-YANuget-Admin-Key";
+
 /// Authenticator holding the configured API keys. Several keys may be accepted
 /// at once (e.g. one per team/developer); a presented key matching any of them
 /// is valid.
@@ -87,6 +93,13 @@ impl ReadAuth {
     /// Whether a credential is required for reads.
     pub fn is_enabled(&self) -> bool {
         self.expected.is_some()
+    }
+
+    /// Whether `key` is this key. False while none is configured.
+    pub fn is_key(&self, key: &str) -> bool {
+        self.expected
+            .as_deref()
+            .is_some_and(|expected| constant_time_eq(key.as_bytes(), expected.as_bytes()))
     }
 
     /// Whether the request carries this key. Unlike
@@ -351,6 +364,27 @@ pub fn offered_keys(headers: &HeaderMap) -> Vec<String> {
         .collect()
 }
 
+/// The admin keys a request offers where several may be needed (see
+/// [`ADMIN_KEY_HEADER`]): the password of HTTP Basic credentials and the
+/// value of each `X-YANuget-Admin-Key` header, each trimmed, blank ones left
+/// out.
+pub fn offered_admin_keys(headers: &HeaderMap) -> Vec<String> {
+    let basic = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(basic_password);
+    let extra = headers
+        .get_all(ADMIN_KEY_HEADER)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .map(|v| v.trim().to_string());
+    basic
+        .into_iter()
+        .chain(extra)
+        .filter(|k| !k.is_empty())
+        .collect()
+}
+
 /// Whether the request carries `Authorization: Bearer <expected>`.
 pub fn bearer_matches(headers: &HeaderMap, expected: &str) -> bool {
     headers
@@ -428,6 +462,29 @@ mod tests {
 
         let empty = HeaderMap::new();
         assert!(!auth.check_headers(&empty));
+    }
+
+    #[test]
+    fn admin_keys_come_from_basic_credentials_and_a_repeatable_header() {
+        use base64::Engine;
+        let mut headers = HeaderMap::new();
+        assert!(offered_admin_keys(&headers).is_empty());
+        let basic = base64::engine::general_purpose::STANDARD.encode("admin:first");
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Basic {basic}")).unwrap(),
+        );
+        headers.append(ADMIN_KEY_HEADER, HeaderValue::from_static(" second "));
+        headers.append(ADMIN_KEY_HEADER, HeaderValue::from_static(""));
+        headers.append(ADMIN_KEY_HEADER, HeaderValue::from_static("third"));
+        assert_eq!(
+            offered_admin_keys(&headers),
+            ["first", "second", "third"].map(String::from)
+        );
+        // The push key header is not an admin key.
+        let mut push = HeaderMap::new();
+        push.insert(API_KEY_HEADER, HeaderValue::from_static("key"));
+        assert!(offered_admin_keys(&push).is_empty());
     }
 
     #[test]

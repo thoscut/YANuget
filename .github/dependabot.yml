@@ -28,7 +28,9 @@ updates:
       # three interpolating call sites take `&'static str` only.
       #
       # Scoped to the 0.9 majors, so 0.8.x patches — the ones that would carry a
-      # security fix — still arrive.
+      # security fix — still arrive. What this hides does not go unnoticed: the
+      # weekly CI run fails once an sqlx release takes the libsqlite3-sys that
+      # fixes RUSTSEC-2026-0459 (the audit job, ROADMAP `DEP-14`).
       - dependency-name: sqlx
         versions: [">=0.9.0"]
 

@@ -52,7 +52,8 @@ enum Command {
     /// Work with the configuration without starting the server.
     Config(cli::ConfigArgs),
     /// Deal with what the database still holds for a feed that was renamed
-    /// or taken out of the configuration. The server must be stopped.
+    /// or taken out of the configuration. The server must be stopped, except
+    /// for a --dry-run.
     Feeds(cli::FeedsArgs),
 }
 
@@ -328,6 +329,7 @@ async fn run_server(config_path: Option<&str>) -> anyhow::Result<()> {
                 // seconds). Saturating keeps an absurd value meaning "never".
                 let period = Duration::from_secs(interval.saturating_mul(3600));
                 let mut tick = tokio::time::interval(period);
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 loop {
                     tokio::select! {
                         _ = tick.tick() => {}
@@ -375,6 +377,7 @@ async fn run_server(config_path: Option<&str>) -> anyhow::Result<()> {
         let mut shutdown = shutdown_rx.clone();
         background.push(tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(24 * 3600));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tokio::select! {
                     _ = tick.tick() => {}
@@ -751,14 +754,13 @@ async fn run_migrate(config_path: Option<&str>, args: MigrateArgs) -> anyhow::Re
         },
         dry_run: args.dry_run,
         quiet: false,
-        min_free_disk_bytes: config.min_free_disk_bytes,
     };
     // One admission for every download of the run, held to the server's
     // reserve. A server may be running beside it: what that one's writes in
     // progress were promised is in its memory and out of reach, but what its
     // resumable uploads hold is in the database, and counts here too.
     let space = Arc::new(
-        yanuget::space::SpaceGuard::new(&temp_dir, opts.min_free_disk_bytes)
+        yanuget::space::SpaceGuard::new(&temp_dir, config.min_free_disk_bytes)
             .with_resumable(db.clone()),
     );
 
@@ -895,6 +897,7 @@ fn spawn_file_tasks(
         let mut shutdown = shutdown.clone();
         tasks.push(tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(15 * 60));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tokio::select! {
                     _ = tick.tick() => { web::sweep_expired_uploads(db.as_ref(), &staging).await; }
@@ -943,6 +946,10 @@ fn spawn_file_tasks(
     tasks.push(tokio::spawn(async move {
         let period = Duration::from_secs(config.files.inbox_scan_secs.max(5));
         let mut tick = tokio::time::interval(period);
+        // A scan runs to the end, and an import in it copies and hashes the
+        // whole file. The default `Burst` would follow a long one with every
+        // tick it missed, back to back.
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 _ = tick.tick() => {}

@@ -17,7 +17,7 @@ use crate::error::{Error, Result};
 use crate::mirror::{self, MirrorClient, MirrorOptions};
 use crate::nuget::UrlBuilder;
 use crate::retention;
-use crate::space::{Reservation, Reservations, SpaceGuard};
+use crate::space::{Reservation, Reservations, Share, SpaceGuard};
 use crate::storage::{PackageStorage, TempPath};
 use crate::version::NuGetVersion;
 
@@ -56,10 +56,63 @@ pub struct FeedContext {
     pub cleanup: Arc<retention::RetentionState>,
     /// What `/metrics` counts for this feed since startup.
     pub counters: FeedCounters,
-    /// What the feed's resumable uploads being written right now have still
-    /// to receive: with what the others hold between their requests, the
-    /// feed's part of the volume (`files.max_upload_space_percent`).
-    pub(super) resumable: Arc<Reservations>,
+    /// The part of the volume this feed's uploads share with the other
+    /// feeds of its push keys (`files.max_upload_space_percent`).
+    pub(super) resumable: UploadShare,
+}
+
+/// The feeds whose uploads count towards one share of the volume, and what
+/// those being written right now have still to receive.
+#[derive(Debug, Default)]
+pub(crate) struct UploadShare {
+    /// Every feed a push key of this one also opens, and so on, this one
+    /// included (see [`share_group`]).
+    group: Vec<String>,
+    /// What the uploads of the group's feeds being written right now have
+    /// still to receive — pushes, attached files and resumable uploads
+    /// alike, one pool for the whole group. With what the group's resumable
+    /// uploads hold between their requests, it is the group's part of the
+    /// volume.
+    pub(super) promised: Arc<Reservations>,
+}
+
+/// The feeds that `feed`'s uploads share one part of the volume with: the
+/// feeds it shares a push key with, the feeds those share one with, and so
+/// on. Feeds without a push key, which anyone may push to, are one group.
+///
+/// The share caps what one push key can promise away from the others. A cap
+/// per feed would not: in the usual setup with one global key and several
+/// feeds, that key held the share of every feed, and with it the volume.
+fn share_group(feed: &ResolvedFeed, all: &[ResolvedFeed]) -> Vec<String> {
+    let keys = |f: &ResolvedFeed| -> Vec<String> {
+        f.api_keys
+            .iter()
+            .map(|k| k.trim())
+            .filter(|k| !k.is_empty())
+            .map(str::to_string)
+            .collect()
+    };
+    let feeds: Vec<(&str, Vec<String>)> = std::iter::once(feed)
+        .chain(all.iter().filter(|f| f.name != feed.name))
+        .map(|f| (f.name.as_str(), keys(f)))
+        .collect();
+    let related = |a: &[String], b: &[String]| {
+        (a.is_empty() && b.is_empty()) || a.iter().any(|k| b.contains(k))
+    };
+    let mut group = vec![0];
+    let mut next = 0;
+    while next < group.len() {
+        let (_, of) = &feeds[group[next]];
+        for (i, (_, other)) in feeds.iter().enumerate() {
+            if !group.contains(&i) && related(of, other) {
+                group.push(i);
+            }
+        }
+        next += 1;
+    }
+    let mut names: Vec<String> = group.into_iter().map(|i| feeds[i].0.to_string()).collect();
+    names.sort();
+    names
 }
 
 /// Events `/metrics` counts per feed, since the process started.
@@ -111,6 +164,11 @@ impl FeedContext {
             client.set_space(Arc::clone(space));
             client.set_feed_name(&feed.name);
         }
+        // A feed built from settings the configuration does not list (only
+        // tests do that) shares with nobody.
+        let all = config.resolved_feeds().unwrap_or_default();
+        let group = share_group(feed, &all);
+        let promised = space.share_pool(&group[0]);
         Ok(Self {
             name: feed.name.clone(),
             prefix: feed.prefix.clone(),
@@ -129,7 +187,7 @@ impl FeedContext {
             allowed_extensions: feed.allowed_extensions.clone(),
             cleanup: Arc::default(),
             counters: FeedCounters::default(),
-            resumable: Arc::default(),
+            resumable: UploadShare { group, promised },
         })
     }
 }
@@ -311,11 +369,64 @@ impl AppState {
         UrlBuilder::with_prefix(root, &self.feed.prefix).with_icons(self.config.enable_web_ui)
     }
 
-    /// Admit an upload of `incoming` bytes (when the client declared a size),
-    /// or refuse it when it would leave the storage volume with less than
-    /// `min_free_disk_bytes` free (see [`SpaceGuard::admit`]).
+    /// Admit an upload in one request of `incoming` bytes (when the client
+    /// declared a size), or refuse it when it would leave the storage volume
+    /// with less than `min_free_disk_bytes` free (see [`SpaceGuard::admit`]),
+    /// or when, beside what this feed's group has promised already, it would
+    /// take the group over its share of the volume ([`Self::share`]).
+    ///
+    /// Alone in its group such an upload is held to the volume only, unlike
+    /// a resumable one ([`Self::reserve_resumable`]): its promise ends with
+    /// its request, and a file larger than the share has to go in somehow.
     pub(super) async fn reserve_disk_space(&self, incoming: Option<u64>) -> Result<Reservation> {
-        self.space.admit(incoming).await
+        self.admit_upload(incoming.unwrap_or(0), false).await
+    }
+
+    /// Admit a resumable upload of `length` bytes like
+    /// [`Self::reserve_disk_space`], held to the group's share even alone:
+    /// it keeps its space promised between its requests, for nothing.
+    pub(super) async fn reserve_resumable(&self, length: u64) -> Result<Reservation> {
+        self.admit_upload(length, true).await
+    }
+
+    /// The bytes are promised first, in the group's pool as well, and then
+    /// checked: two uploads that arrive together each see the other.
+    async fn admit_upload(&self, bytes: u64, alone_too: bool) -> Result<Reservation> {
+        let reservation = self
+            .space
+            .reserve(bytes)
+            .counted_in(&self.feed.resumable.promised);
+        // An upload of unknown size promises nothing, so it takes nothing
+        // from the share; the volume's reserve still holds it.
+        let share = if bytes > 0 {
+            self.share()
+                .await?
+                .filter(|share| alone_too || share.held > bytes)
+        } else {
+            None
+        };
+        self.space.check_with(bytes, share).await?;
+        Ok(reservation)
+    }
+
+    /// What this feed's group ([`UploadShare`]) promises now,
+    /// to hold to `files.max_upload_space_percent` of the free space: what
+    /// its resumable uploads hold between their requests, and what the
+    /// uploads being written right now have still to receive. `None` when
+    /// there is no cap, or no reserve to measure it against.
+    pub(super) async fn share(&self) -> Result<Option<Share>> {
+        let percent = self.config.files.max_upload_space_percent;
+        if !self.space.enforced() || percent == 0 || percent >= 100 {
+            return Ok(None);
+        }
+        let now = chrono::Utc::now();
+        let cutoff = super::hosted::hold_cutoff();
+        let mut held = self.feed.resumable.promised.promised();
+        for feed in &self.feed.resumable.group {
+            let between_requests = self.db.feed_upload_bytes(feed, now, cutoff).await?;
+            held = held.saturating_add(between_requests);
+        }
+        Ok(Some(Share { held, percent }))
     }
 
     /// `writer`, made to fail part-way once the storage volume drops below
@@ -538,4 +649,51 @@ pub async fn sweep_stale_uploads(temp_dir: &std::path::Path) {
 /// outlives restarts on purpose and goes when the upload expires.
 fn is_stale_temp_name(name: &str) -> bool {
     name.ends_with(".tmp") || (name.starts_with("inbox-") && name.ends_with(".part"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::FeedConfig;
+
+    fn feed(name: &str, keys: &[&str]) -> FeedConfig {
+        FeedConfig {
+            name: name.into(),
+            api_keys: keys.iter().map(|k| k.to_string()).collect(),
+            ..FeedConfig::default()
+        }
+    }
+
+    fn groups(config: &Config) -> Vec<Vec<String>> {
+        let all = config.resolved_feeds().unwrap();
+        all.iter().map(|f| share_group(f, &all)).collect()
+    }
+
+    #[test]
+    fn feeds_share_the_volume_with_every_feed_their_keys_open() {
+        let config = Config {
+            api_key: Some("global".into()),
+            feeds: vec![
+                // Both on the global key.
+                feed("a", &[]),
+                feed("b", &[]),
+                // `c` and `e` share no key, but each shares one with `d`.
+                feed("c", &["c1"]),
+                feed("d", &["c1", "e1"]),
+                feed("e", &["e1"]),
+                feed("f", &["f1"]),
+            ],
+            ..Config::default()
+        };
+        let [ab, cde, f] = [&["a", "b"][..], &["c", "d", "e"], &["f"]];
+        assert_eq!(groups(&config), [ab, ab, cde, cde, cde, f]);
+
+        // Feeds anyone may push to are one group.
+        let open = Config {
+            feeds: vec![feed("x", &[]), feed("y", &[]), feed("z", &["z1"])],
+            ..Config::default()
+        };
+        let [xy, z] = [&["x", "y"][..], &["z"]];
+        assert_eq!(groups(&open), [xy, xy, z]);
+    }
 }

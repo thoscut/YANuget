@@ -1,10 +1,15 @@
 //! End-to-end tests of a version's life across feeds: who may claim an id,
 //! what an overwrite keeps, and what retention may delete.
 
+mod common;
+
 use std::io::{Cursor, Write};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
+use common::binary::{
+    config_toml, feed_tables, server_command, server_exits, start_server, text, yanuget_command,
+};
 use yanuget::config::{Config, FeedConfig, OverwriteMode, RetentionConfig};
 use yanuget::database::SqliteDatabase;
 use yanuget::storage::FilesystemStorage;
@@ -342,11 +347,7 @@ async fn yanuget(
     port: u16,
     args: &[&str],
 ) -> std::process::Output {
-    let tables: String = feeds
-        .iter()
-        .map(|name| format!("[[feeds]]\nname = '{name}'\n"))
-        .collect();
-    yanuget_with(data, &tables, port, args).await
+    yanuget_with(data, &feed_tables(feeds), port, args).await
 }
 
 /// [`yanuget`] with the `[[feeds]]` tables written out.
@@ -357,14 +358,8 @@ async fn yanuget_with(
     args: &[&str],
 ) -> std::process::Output {
     let config = data.join("cli.toml");
-    // A TOML literal string takes a Windows path's backslashes as they are.
-    let mut toml = format!(
-        "data_dir = '{}'\ntls_enabled = false\nhost = '127.0.0.1'\nport = {port}\n",
-        data.display()
-    );
-    toml.push_str(feeds);
-    std::fs::write(&config, toml).unwrap();
-    tokio::process::Command::new(env!("CARGO_BIN_EXE_yanuget"))
+    std::fs::write(&config, config_toml(data, port, feeds)).unwrap();
+    yanuget_command()
         .arg("--config")
         .arg(&config)
         .args(args)
@@ -387,14 +382,6 @@ async fn silent_port() -> u16 {
         }
     });
     port
-}
-
-fn text(out: &std::process::Output) -> String {
-    format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    )
 }
 
 #[tokio::test]
@@ -647,82 +634,6 @@ async fn a_rename_into_a_gated_feed_confirms_the_approvals_it_carries() {
 
 /// The real binary serving `data`, on a port the system picked: killed when
 /// dropped.
-struct ServerProcess {
-    child: tokio::process::Child,
-    port: u16,
-}
-
-/// The command that serves `data` with the feeds `feeds`, on port 0. Its
-/// configuration is a file of its own, so the CLI helpers above can write
-/// theirs beside it.
-fn server_command(data: &std::path::Path, feeds: &[&str]) -> tokio::process::Command {
-    let config = data.join("server.toml");
-    let mut toml = format!(
-        "data_dir = '{}'\ntls_enabled = false\nhost = '127.0.0.1'\nport = 0\n",
-        data.display()
-    );
-    for name in feeds {
-        toml.push_str(&format!("[[feeds]]\nname = '{name}'\n"));
-    }
-    std::fs::write(&config, toml).unwrap();
-    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_yanuget"));
-    for (name, _) in std::env::vars() {
-        if name.starts_with("YANUGET_") {
-            command.env_remove(name);
-        }
-    }
-    command
-        .arg("--config")
-        .arg(&config)
-        .env("NO_COLOR", "1")
-        .kill_on_drop(true);
-    command
-}
-
-/// Start the real server on `data` and wait until it listens.
-async fn start_server(data: &std::path::Path, feeds: &[&str]) -> ServerProcess {
-    use tokio::io::AsyncBufReadExt;
-
-    let mut child = server_command(data, feeds)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .unwrap();
-    let mut lines = tokio::io::BufReader::new(child.stdout.take().unwrap()).lines();
-    let listening = async {
-        while let Some(line) = lines.next_line().await.unwrap() {
-            // "YANuget listening on http://127.0.0.1:{port}"
-            if let Some((_, addr)) = line.split_once("listening on http://127.0.0.1:") {
-                let digits: String = addr.chars().take_while(char::is_ascii_digit).collect();
-                return digits.parse::<u16>().unwrap();
-            }
-        }
-        panic!("the server exited before it listened");
-    };
-    let port = tokio::time::timeout(std::time::Duration::from_secs(60), listening)
-        .await
-        .expect("the server never listened");
-    // Keep reading, so the server never blocks on a full pipe.
-    tokio::spawn(async move { while let Ok(Some(_)) = lines.next_line().await {} });
-    ServerProcess { child, port }
-}
-
-/// Run the server command to its end: its output, or a panic when it is
-/// still running after a minute (it then started, which the callers assert
-/// it does not).
-async fn server_exits(mut command: tokio::process::Command) -> std::process::Output {
-    let running = command
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap()
-        .wait_with_output();
-    tokio::time::timeout(std::time::Duration::from_secs(60), running)
-        .await
-        .expect("the server started and kept running")
-        .unwrap()
-}
-
 /// `COR-43`: a running server holds the data lock for as long as it runs, so
 /// the offline commands refuse wherever it answers, and no second server
 /// starts on the same data. The in-process harness above never takes the

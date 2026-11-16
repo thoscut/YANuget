@@ -190,3 +190,22 @@ cargo audit bin ./yanuget
 docker buildx imagetools inspect ghcr.io/thoscut/yanuget:X.Y.Z \
   --format '{{ json .SBOM }}'
 ```
+
+The two answer different questions. The CycloneDX file lists `Cargo.lock`:
+every crate the workspace resolves for any target, compiled into the binary
+or not. `cargo audit bin` reads the list the binary carries, which is only
+what it was built from. An advisory the bill of materials shows and the
+binary does not is in a crate the binary does not contain.
+
+#### Known advisories
+
+These are reported for current releases, have been looked at, and are
+accepted until a fix can be taken; `cargo audit` in CI ignores them, each
+with its reason next to the ignore. Each goes when it is fixed, and a release
+that still carries one says so in its changelog.
+
+| Advisory | Crate | `cargo audit bin` | Bill of materials | Why it is accepted |
+| --- | --- | --- | --- | --- |
+| RUSTSEC-2026-0459 | `libsqlite3-sys` 0.30 (bundled SQLite before 3.54.0) | reported | reported | Compiled in. The fix is in `libsqlite3-sys` 0.39, which no sqlx release accepts yet. The attack needs a crafted `-wal` file next to a database YANuget opens; the changelog's *Security* section says where that could happen and why it is accepted (ROADMAP `DEP-14`). |
+| RUSTSEC-2023-0071 | `rsa` (Marvin attack) | not reported | reported | Not compiled: it is in the lockfile only through sqlx's MySQL driver, which this SQLite-only build never builds. There is no fixed release. |
+| RUSTSEC-2026-0538 | `quinn-udp` 0.5.15 | not reported | reported, 0.10.0 only | Not compiled: listed for reqwest's optional HTTP/3 support, which YANuget does not enable. The lockfile has 0.5.16 since. |

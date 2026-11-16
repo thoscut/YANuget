@@ -53,6 +53,12 @@ pub const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const HTTP2_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(60);
 const HTTP2_KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// How many requests one HTTP/2 connection may have open at once. hyper's
+/// default of 200 lets a single connection hold 200 open files and their send
+/// buffers with downloads it never reads; a restore or a browser loading the
+/// gallery needs far fewer at a time, and the client queues the rest.
+pub const HTTP2_MAX_CONCURRENT_STREAMS: u32 = 32;
+
 /// The connection-level limits a server runs with.
 #[derive(Debug, Clone, Copy)]
 pub struct ServeLimits {
@@ -128,7 +134,8 @@ fn limit_headers(builder: &mut Builder<TokioExecutor>, limits: ServeLimits) {
         .http2()
         .timer(TokioTimer::new())
         .keep_alive_interval(HTTP2_KEEP_ALIVE_INTERVAL)
-        .keep_alive_timeout(HTTP2_KEEP_ALIVE_TIMEOUT);
+        .keep_alive_timeout(HTTP2_KEEP_ALIVE_TIMEOUT)
+        .max_concurrent_streams(HTTP2_MAX_CONCURRENT_STREAMS);
 }
 
 /// An acceptor that holds one permit per open connection and turns away

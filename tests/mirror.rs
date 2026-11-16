@@ -880,18 +880,17 @@ async fn migrate_holds_downloads_to_the_disk_reserve() {
     let temp = dir.path().join("packages").join(".migrate");
     std::fs::create_dir_all(&temp).unwrap();
     let feeds = Config::default().resolved_feeds().unwrap();
-    let summary = yanuget::migrate::run(
+    let summary = yanuget::migrate::run_with_space(
         &storage,
         &db,
         &feeds[0],
-        &temp,
         mirror_config(&upstream),
         yanuget::migrate::MigrateOptions {
             quiet: true,
-            min_free_disk_bytes: u64::MAX / 2,
             ..Default::default()
         },
         indicatif::ProgressDrawTarget::hidden(),
+        Arc::new(yanuget::space::SpaceGuard::new(&temp, u64::MAX / 2)),
     )
     .await
     .unwrap();
@@ -976,6 +975,21 @@ async fn a_package_is_read_through_once_and_then_served_locally() {
     server.download("happy.pkg", "1.0.0").await;
     assert_eq!(upstream.hits("happy.pkg.1.0.0.nupkg"), 1);
     assert_eq!(upstream.hits("/flat/happy.pkg/index.json"), 1);
+}
+
+/// `COR-48`: the feed's holdings are read once per refresh, so a version
+/// the upstream lists under two spellings (or twice) used to be downloaded
+/// once for each.
+#[tokio::test]
+async fn a_version_the_upstream_lists_twice_is_downloaded_once() {
+    let upstream = Upstream::start().await;
+    upstream.publish("Twice.Pkg", "1.0.0");
+    upstream.serve("Twice.Pkg", "1.0", build_nupkg("Twice.Pkg", "1.0.0"));
+    upstream.publish("Twice.Pkg", "1.0.0");
+    let server = spawn_mirror(&upstream, |_| {}).await;
+
+    assert_eq!(server.versions("twice.pkg").await.unwrap(), ["1.0.0"]);
+    assert_eq!(upstream.hits("twice.pkg.1.0.0.nupkg"), 1);
 }
 
 #[tokio::test]

@@ -292,7 +292,11 @@ Any compiler since Visual Studio 15.9 / the .NET Core 2.1 SDK writes both, so
 unchanged; symbols for older assemblies, or for assemblies the package does not
 contain, are refused with a `400`. A symbol key is claimed once: the first
 version to store it owns it, a re-push of the same bytes is a no-op, and a push
-that would give the key to another package or replace its bytes is refused. The
+that would give the key to another package or replace its bytes is refused.
+When the owning version is deleted or overwritten, the key passes to the newest
+other version of the same package whose own symbol package holds the same PDB
+(checked against that version's assemblies again); only without one is the
+file deleted. The
 push is all-or-nothing — one refused PDB stores none of them — and it holds the
 owning version's lock, so it cannot interleave with a delete or overwrite of that
 version.
@@ -372,7 +376,8 @@ multi-gigabyte files from anyone. The version must be in the feed (`404`).
 Once a feed with `requires_approval` (or `allow_overwrite = "pending-only"`)
 has approved the version, its files stay as they are (`403`) from every feed
 holding it, unless the request also carries the admin key of each feed that
-approved it as HTTP Basic credentials. Under `pending-only` that holds for an
+approved it: one as HTTP Basic credentials, any further ones in
+`X-YANuget-Admin-Key` headers (one key each). Under `pending-only` that holds for an
 approval in any feed. See
 [Attached files of an approved version](configuration.md#attached-files-of-an-approved-version).
 
@@ -417,17 +422,27 @@ upload on a mismatch, `400`) and attaches the file.
 
 Unfinished uploads expire after `[files].upload_expiry_hours` (`Upload-Expires`
 says when) and are swept. Each counts against `min_free_disk_bytes` with what
-it has still to receive, for an hour after it was created or after its last `PATCH`
-that brought bytes ended: an upload a client abandoned without a `DELETE` does not keep other
-uploads out until it expires. Idle for longer, its next `PATCH` is checked
-again like a new upload of what is left. A feed holds at most
-`[files].max_open_uploads` of them (`429` for another), and together they
-hold at most `[files].max_upload_space_percent` of the free space (`507` for
-more). [`scripts/Send-YanugetFile.ps1`](https://github.com/thoscut/yanuget/blob/main/scripts/Send-YanugetFile.ps1)
-is a PowerShell 7 function that uploads resumably:
+it has still to receive, for an hour after it was created; each `PATCH`
+renews that hold by as much of the hour as its bytes are of the upload's
+pace (its length over `upload_expiry_hours`). An upload a client abandoned,
+or one that trickles, does not keep other uploads out until it expires: past
+its hold, its next `PATCH` is checked again like a new upload of what is
+left. A feed holds at most `[files].max_open_uploads` of them (`429` for
+another), and the feeds of one push key together, counting pushes and `PUT`s
+in progress, hold at most `[files].max_upload_space_percent` of the free
+space (`507` for more, and so for a single resumable upload larger than that
+share; see [Free space](large-packages.md#free-space)).
+
+`Send-YanugetFile.ps1` is a PowerShell 7 function that uploads resumably. It
+ships in every release archive, next to the binary, so take the copy from the
+archive of your server's version. The container image does not carry it: the
+image is the server, and the script runs on the machine the file is uploaded
+from. In the repository it is `scripts/Send-YanugetFile.ps1`; use the one at
+your server's release tag (`…/blob/vX.Y.Z/scripts/…`), since `main` may
+already speak to a newer server.
 
 ```powershell
-. ./scripts/Send-YanugetFile.ps1
+. ./Send-YanugetFile.ps1
 # The key comes from $env:YANUGET_API_KEY, from -ApiKey as a SecureString,
 # or from a prompt.
 Send-YanugetFile -Feed https://nuget.example.com `

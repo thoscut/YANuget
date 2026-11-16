@@ -72,7 +72,20 @@ fn read_archive_blocking(path: &Path) -> Result<ArchiveContents, Error> {
         };
         let normalized = normalize_entry(&name);
         // The nuspec is a root-level `*.nuspec` (no directory separators).
-        if normalized.ends_with(".nuspec") && !normalized.contains('/') {
+        // NuGet asks that of the percent-decoded name ([`extracted_name`]), so
+        // `x%2Fa.nuspec` is in a folder to it and `b%2Enuspec` is a manifest.
+        // An entry that is the manifest in one reading but not in the other
+        // would have this server check one identity and the client restore
+        // another, so it is refused rather than resolved either way.
+        let is_root_nuspec = |n: &str| n.ends_with(".nuspec") && !n.contains('/');
+        let root = is_root_nuspec(&normalized);
+        if root != is_root_nuspec(&normalize_entry(&extracted_name(&name))) {
+            return Err(Error::InvalidPackage(format!(
+                "archive entry {name} is a root .nuspec only once percent-decoded, or only \
+                 before; NuGet would read another manifest than this server, so it is refused"
+            )));
+        }
+        if root {
             // NuGet refuses a package with more than one; picking one of them
             // would be guessing which identity the client sees.
             if nuspec_index.replace(i).is_some() {
@@ -999,6 +1012,33 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("lib/b.pdb"), "{err}");
         assert_eq!(files_in(out.path()), 0, "partial output left behind");
+    }
+
+    /// `SEC-50`: NuGet finds the manifest by the percent-decoded name, so an
+    /// entry that is the root `.nuspec` in only one reading would have the
+    /// server and the client read different manifests.
+    #[tokio::test]
+    async fn a_manifest_that_percent_decoding_moves_in_or_out_of_the_root_is_refused() {
+        let (good, evil) = (manifest("Good.Id"), manifest("Evil.Id"));
+        for entries in [
+            // Server: `x%2fgood.nuspec`; client: `evil.nuspec`.
+            [("x%2Fgood.nuspec", &good), ("evil%2Enuspec", &evil)],
+            // Two manifests for the client, one for the server.
+            [("good.nuspec", &good), ("evil%2Enuspec", &evil)],
+            // The manifest to the server; to the client, a file in folder `x`.
+            [("x%5Cgood.nuspec", &good), ("lib/x.dll", &evil)],
+        ] {
+            let entries: Vec<(&str, &[u8])> =
+                entries.iter().map(|(n, b)| (*n, b.as_slice())).collect();
+            refused(
+                read_bytes(&zip_with_entries(&entries)).await,
+                "only once percent-decoded",
+            );
+        }
+        // Encoded characters that leave it at the root are a manifest either way.
+        let bytes = zip_with_entries(&[("My%20Pkg.nuspec", &good), ("lib/x.dll", b"MZ")]);
+        let contents = read_bytes(&bytes).await.unwrap();
+        assert!(contents.nuspec_xml.contains("Good.Id"));
     }
 
     #[tokio::test]

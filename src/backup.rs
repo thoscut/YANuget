@@ -28,7 +28,10 @@
 //! Every file is copied to a temp name, synced and renamed, so the backup never
 //! holds a partial file, and files that left the live store are removed only
 //! after the new snapshot is in place: an interrupted run leaves the previous
-//! snapshot with a superset of its files, and no manifest.
+//! snapshot with a superset of its files, and no manifest. A file the new
+//! snapshot references is never removed: when the live store has lost it, the
+//! backup's copy from an earlier run is the last one there is. It is kept,
+//! and logged, rather than deleted after the check had counted it present.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -94,6 +97,9 @@ pub struct BackupSummary {
     pub copied_bytes: u64,
     /// Files removed from the backup because the live store no longer has them.
     pub removed: u64,
+    /// Files the snapshot references that the live store no longer has, kept
+    /// from an earlier run's copy: relative to the package store.
+    pub kept: Vec<String>,
     /// Snapshot-and-copy passes it took.
     pub attempts: usize,
 }
@@ -159,7 +165,7 @@ pub async fn backup(
     // Every file any pass copied: the ones whose content is new to the backup.
     let mut fresh = HashSet::new();
     let mut attempts = 0;
-    let (tree, missing, created) = loop {
+    let (tree, Checked { missing, present }, created) = loop {
         attempts += 1;
         progress.set_message(format!("pass {attempts}: snapshotting the database"));
         let created = chrono::Utc::now();
@@ -178,12 +184,12 @@ pub async fn backup(
         fresh.extend(tree.fresh.iter().cloned());
 
         progress.set_message(format!("pass {attempts}: checking the copy"));
-        let missing = verify(&snapshot, &packages, &fresh).await?;
-        if missing.is_empty() || attempts == ATTEMPTS {
-            break (tree, missing, created);
+        let checked = check(&snapshot, &packages, &fresh).await?;
+        if checked.missing.is_empty() || attempts == ATTEMPTS {
+            break (tree, checked, created);
         }
         tracing::info!(
-            missing = missing.len(),
+            missing = checked.missing.len(),
             "files changed while copying; taking a fresh snapshot"
         );
     };
@@ -192,10 +198,32 @@ pub async fn backup(
     std::fs::rename(&snapshot, dest.join(DATABASE))?;
     sync_dir(dest);
 
+    // What the check found present stays, whether or not the live store
+    // still has it: the check ran before this, and a file it counted must
+    // not go afterwards.
+    let mut kept: Vec<String> = present
+        .difference(&tree.seen)
+        .map(|rel| rel.to_string_lossy().into_owned())
+        .collect();
+    kept.sort();
+    let kept_bytes: u64 = kept
+        .iter()
+        .filter_map(|rel| std::fs::metadata(packages.join(rel)).ok())
+        .map(|m| m.len())
+        .sum();
+    if !kept.is_empty() {
+        tracing::warn!(
+            files = kept.len(),
+            first = %kept[0],
+            "the live store lacks files its database references; the backup keeps \
+             its copies from an earlier run"
+        );
+    }
     progress.set_message("removing files the live store no longer has");
     let removed = {
-        let (dst, seen) = (packages.clone(), tree.seen);
-        tokio::task::spawn_blocking(move || prune(&dst, &seen)).await??
+        let (dst, mut keep) = (packages.clone(), tree.seen);
+        keep.extend(present);
+        tokio::task::spawn_blocking(move || prune(&dst, &keep)).await??
     };
 
     let live_tls = config.data_dir.join(TLS);
@@ -218,8 +246,8 @@ pub async fn backup(
         yanuget_version: env!("CARGO_PKG_VERSION").to_string(),
         created,
         packages: stats,
-        files: tree.files,
-        bytes: tree.bytes,
+        files: tree.files + kept.len() as u64,
+        bytes: tree.bytes + kept_bytes,
         missing,
         tls,
     };
@@ -229,6 +257,7 @@ pub async fn backup(
         copied,
         copied_bytes,
         removed,
+        kept,
         attempts,
     })
 }
@@ -301,9 +330,7 @@ pub async fn restore(
     copy_file(&backup_db, &staged)?;
     // A write-ahead log left by the old database would be replayed into the
     // restored one on the next open, corrupting it.
-    for suffix in ["-wal", "-shm", "-journal"] {
-        remove_if_present(&with_suffix(&live_db, suffix))?;
-    }
+    remove_sidecars(&live_db)?;
     std::fs::rename(&staged, &live_db)?;
     if let Some(parent) = live_db.parent() {
         sync_dir(parent);
@@ -457,6 +484,7 @@ fn lock(dest: &Path) -> anyhow::Result<std::fs::File> {
 /// however many writes the server makes meanwhile, and does not block them.
 async fn snapshot_database(live: &Path, to: &Path) -> anyhow::Result<()> {
     remove_if_present(to)?;
+    remove_sidecars(to)?;
     let mut conn = SqliteConnectOptions::new()
         .filename(live)
         .create_if_missing(false)
@@ -474,7 +502,13 @@ async fn snapshot_database(live: &Path, to: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Open the snapshot in the backup directory. That directory is often a
+/// share other systems write to, and SQLite replays a `-wal` or hot
+/// `-journal` it finds beside a database into what it reads, so whatever lies
+/// there is removed first, as `restore` does beside the live database. The
+/// snapshot is a single file whenever no connection to it is open.
 async fn open_snapshot(path: &Path) -> anyhow::Result<SqliteConnection> {
+    remove_sidecars(path)?;
     SqliteConnectOptions::new()
         .filename(path)
         .create_if_missing(false)
@@ -527,6 +561,15 @@ struct Expected {
     digest: Option<Digest>,
 }
 
+/// What [`check`] found.
+struct Checked {
+    /// See [`verify`].
+    missing: Vec<String>,
+    /// Every file the snapshot references that `store` holds as recorded,
+    /// relative to it.
+    present: HashSet<PathBuf>,
+}
+
 /// Every file the snapshot at `db` references that `store` lacks, or holds
 /// with a size other than the one recorded, as a path relative to `store`.
 /// The files in `hash` (relative to `store`) must also have the recorded
@@ -541,6 +584,11 @@ pub async fn verify(
     store: &Path,
     hash: &HashSet<PathBuf>,
 ) -> anyhow::Result<Vec<String>> {
+    Ok(check(db, store, hash).await?.missing)
+}
+
+/// [`verify`], and which referenced files it found in place.
+async fn check(db: &Path, store: &Path, hash: &HashSet<PathBuf>) -> anyhow::Result<Checked> {
     let mut conn = open_snapshot(db).await?;
     let mut expected: Vec<Expected> = Vec::new();
     for row in sqlx::query(
@@ -595,23 +643,27 @@ pub async fn verify(
 
     let (store, hash) = (store.to_path_buf(), hash.clone());
     Ok(tokio::task::spawn_blocking(move || {
-        expected
-            .into_iter()
-            .filter(|e| {
-                let path = store.join(&e.rel);
-                let sized = std::fs::metadata(&path)
-                    .is_ok_and(|m| m.is_file() && e.size.is_none_or(|s| s == m.len()));
-                // A file of the wrong size is not read at all.
-                !sized
-                    || match &e.digest {
-                        Some(digest) if hash.contains(Path::new(&e.rel)) => {
-                            !has_digest(&path, digest)
-                        }
-                        _ => false,
-                    }
-            })
-            .map(|e| e.rel)
-            .collect()
+        let mut out = Checked {
+            missing: Vec::new(),
+            present: HashSet::new(),
+        };
+        for e in expected {
+            let path = store.join(&e.rel);
+            let sized = std::fs::metadata(&path)
+                .is_ok_and(|m| m.is_file() && e.size.is_none_or(|s| s == m.len()));
+            // A file of the wrong size is not read at all.
+            let good = sized
+                && match &e.digest {
+                    Some(digest) if hash.contains(Path::new(&e.rel)) => has_digest(&path, digest),
+                    _ => true,
+                };
+            if good {
+                out.present.insert(PathBuf::from(e.rel));
+            } else {
+                out.missing.push(e.rel);
+            }
+        }
+        out
     })
     .await?)
 }
@@ -842,6 +894,14 @@ fn remove_if_present(path: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Remove the journal files SQLite may keep beside the database at `db`.
+fn remove_sidecars(db: &Path) -> std::io::Result<()> {
+    for suffix in ["-wal", "-shm", "-journal"] {
+        remove_if_present(&with_suffix(db, suffix))?;
+    }
+    Ok(())
+}
+
 fn remove_dir_if_present(path: &Path) -> std::io::Result<()> {
     match std::fs::remove_dir_all(path) {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
@@ -938,6 +998,59 @@ mod tests {
         assert_eq!(prune(dir.path(), &keep).unwrap(), 1);
         assert!(dir.path().join("a/1.0.0/a.1.0.0.nupkg").exists());
         assert!(!dir.path().join("b").exists());
+    }
+
+    /// `DEP-17`: SQLite replays a `-wal` it finds beside a database into what
+    /// it reads, and the backup directory is not the server's to trust. A
+    /// log planted beside the snapshot while the store is copied must not
+    /// reach the check (or the backup it turns into).
+    #[tokio::test]
+    async fn a_log_planted_beside_the_snapshot_is_not_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = dir.path().join("snapshot.db");
+        let store = dir.path().join("packages");
+        std::fs::create_dir_all(&store).unwrap();
+        let mut conn = SqliteConnectOptions::new()
+            .filename(&snapshot)
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Delete)
+            .connect()
+            .await
+            .unwrap();
+        for table in [
+            "CREATE TABLE packages (lower_id TEXT, normalized_version TEXT, \
+             package_size INTEGER, package_hash TEXT, package_hash_algorithm TEXT)",
+            "CREATE TABLE package_files (sha256 TEXT, size INTEGER)",
+            "CREATE TABLE symbols (ssqp_key TEXT, filename TEXT)",
+        ] {
+            sqlx::query(table).execute(&mut conn).await.unwrap();
+        }
+        conn.close().await.unwrap();
+
+        // A log that adds a row, written against a byte-identical copy and
+        // taken before that copy checkpoints it.
+        let twin = dir.path().join("twin.db");
+        std::fs::copy(&snapshot, &twin).unwrap();
+        let mut writer = SqliteConnectOptions::new()
+            .filename(&twin)
+            .journal_mode(SqliteJournalMode::Wal)
+            .pragma("wal_autocheckpoint", "0")
+            .connect()
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO packages VALUES ('planted', '1.0.0', 1, 'x', 'SHA512')")
+            .execute(&mut writer)
+            .await
+            .unwrap();
+        std::fs::copy(with_suffix(&twin, "-wal"), with_suffix(&snapshot, "-wal")).unwrap();
+        writer.close().await.unwrap();
+        std::fs::write(with_suffix(&snapshot, "-shm"), b"stale").unwrap();
+
+        let missing = verify(&snapshot, &store, &HashSet::new()).await.unwrap();
+        assert!(missing.is_empty(), "the planted log was read: {missing:?}");
+        for suffix in ["-wal", "-shm", "-journal"] {
+            assert!(!with_suffix(&snapshot, suffix).exists(), "{suffix} is left");
+        }
     }
 
     #[test]

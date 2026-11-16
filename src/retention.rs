@@ -25,7 +25,7 @@
 use chrono::{DateTime, Duration, Utc};
 
 use crate::config::{id_has_prefix, RetentionConfig};
-use crate::database::{canonical_id, FeedVersion, PackageDatabase};
+use crate::database::{canonical_id, FeedVersion, PackageDatabase, RetentionVersion};
 use crate::error::Result;
 use crate::models::Package;
 use crate::storage::PackageStorage;
@@ -108,7 +108,9 @@ pub struct Pruned {
 /// One version as retention sees it.
 #[derive(Debug, Clone, Copy)]
 pub struct Candidate<'a> {
-    pub package: &'a Package,
+    /// The id as published.
+    pub id: &'a str,
+    pub version: &'a NuGetVersion,
     /// Kept whatever the rules say (see [`Membership::pinned`](crate::database::Membership::pinned)).
     pub pinned: bool,
     /// Enabled and approved: what a client can download. Unlisted versions
@@ -123,7 +125,8 @@ impl<'a> Candidate<'a> {
     /// A servable, unpinned version, added when it was published.
     pub fn ranked(package: &'a Package) -> Self {
         Self {
-            package,
+            id: &package.id,
+            version: &package.version,
             pinned: false,
             servable: true,
             added: package.published,
@@ -146,7 +149,7 @@ pub fn prune_plan(
         return Vec::new();
     }
     // All versions share one id; the first one names it.
-    if policy.excludes(&versions[0].package.id) {
+    if policy.excludes(versions[0].id) {
         return Vec::new();
     }
 
@@ -157,8 +160,8 @@ pub fn prune_plan(
     let newest = |pre: bool| {
         versions
             .iter()
-            .filter(|c| c.servable && c.package.is_prerelease() == pre)
-            .map(|c| &c.package.version)
+            .filter(|c| c.servable && c.version.is_prerelease() == pre)
+            .map(|c| c.version)
             .max()
     };
     let protected: Option<&NuGetVersion> = newest(false).or_else(|| newest(true));
@@ -167,12 +170,12 @@ pub fn prune_plan(
     let ranked = versions.iter().filter(|c| c.servable && !c.pinned);
     let mut stable: Vec<&Candidate<'_>> = ranked
         .clone()
-        .filter(|c| !c.package.is_prerelease())
+        .filter(|c| !c.version.is_prerelease())
         .collect();
     let mut prerelease: Vec<&Candidate<'_>> =
-        ranked.filter(|c| c.package.is_prerelease()).collect();
-    stable.sort_by(|a, b| b.package.version.cmp(&a.package.version));
-    prerelease.sort_by(|a, b| b.package.version.cmp(&a.package.version));
+        ranked.filter(|c| c.version.is_prerelease()).collect();
+    stable.sort_by(|a, b| b.version.cmp(a.version));
+    prerelease.sort_by(|a, b| b.version.cmp(a.version));
 
     // `Duration::days` panics outside its representable range, and a `u64` day
     // count from configuration can easily exceed it — so build the cutoff with
@@ -191,7 +194,7 @@ pub fn prune_plan(
         (&prerelease, policy.keep_latest_prerelease, true),
     ] {
         for (rank, c) in channel.iter().enumerate() {
-            if protected.is_some_and(|v| *v == c.package.version) {
+            if protected.is_some_and(|v| v == c.version) {
                 continue;
             }
             let reason = PruneReason {
@@ -202,7 +205,7 @@ pub fn prune_plan(
             };
             if reason.beyond_newest.is_some() || reason.older_than_days.is_some() {
                 prune.push(Pruned {
-                    version: c.package.version.clone(),
+                    version: c.version.clone(),
                     reason,
                 });
             }
@@ -240,16 +243,33 @@ pub fn plan_for(
 
 fn candidate(v: &FeedVersion) -> Candidate<'_> {
     Candidate {
-        package: &v.package,
+        id: &v.package.id,
+        version: &v.package.version,
         pinned: v.pinned,
-        servable: is_servable(v),
+        // Enabled and approved. `FeedVersion::package.enabled` is the
+        // membership's.
+        servable: v.package.enabled && !v.pending,
         added: v.added,
     }
 }
 
-/// Enabled and approved. `FeedVersion::package.enabled` is the membership's.
-fn is_servable(v: &FeedVersion) -> bool {
-    v.package.enabled && !v.pending
+/// [`plan_for`] over the narrow rows a sweep or preview reads.
+pub fn plan_for_rows(
+    versions: &[RetentionVersion],
+    policy: &RetentionPolicy,
+    now: DateTime<Utc>,
+) -> Vec<Pruned> {
+    let candidates: Vec<Candidate<'_>> = versions
+        .iter()
+        .map(|v| Candidate {
+            id: &v.id,
+            version: &v.version,
+            pinned: v.pinned,
+            servable: v.enabled && !v.pending,
+            added: v.added,
+        })
+        .collect();
+    prune_plan(&candidates, policy, now)
 }
 
 /// Remove one package version from a single feed.
@@ -361,9 +381,12 @@ pub async fn sweep_orphans(storage: &dyn PackageStorage, db: &dyn PackageDatabas
 /// and the bytes. Nothing else would ever find them again. Returns how many
 /// were removed.
 ///
-/// Each is counted and deleted under its blob lock, which an attach holds
-/// from storing a blob to writing the row that references it, so bytes being
-/// attached right now are never taken.
+/// The referenced blobs are read in one statement up front, and nearly every
+/// stored blob is among them. The few that are not are counted again and
+/// deleted under their blob lock, which an attach holds from storing a blob
+/// to writing the row that references it, so bytes being attached right now
+/// are never taken. A reference dropped after the up-front read only leaves
+/// its blob for the next sweep.
 pub async fn sweep_unreferenced_blobs(
     storage: &dyn PackageStorage,
     db: &dyn PackageDatabase,
@@ -375,8 +398,18 @@ pub async fn sweep_unreferenced_blobs(
             return 0;
         }
     };
+    let referenced = match db.referenced_blobs().await {
+        Ok(referenced) => referenced,
+        Err(e) => {
+            tracing::error!(error = %e, "blob sweep could not read which blobs are referenced");
+            return 0;
+        }
+    };
     let mut removed = 0;
     for sha in blobs {
+        if referenced.contains(&sha) {
+            continue;
+        }
         let _blob = crate::locks::lock_blob(&sha).await;
         if !matches!(db.blob_references(&sha).await, Ok(0)) {
             continue;
@@ -450,7 +483,9 @@ pub(crate) async fn purge_file_blobs(
 }
 
 /// Drop every symbol file and mapping belonging to one version, leaving the
-/// package itself alone.
+/// package itself alone. A mapping another version of the package pushed the
+/// same PDB for is handed to that version instead, file and all
+/// ([`crate::symbols::successor`]).
 ///
 /// Separate from [`purge_global_data`] because an overwriting push needs exactly
 /// this and nothing else: the replacement build's PDBs have different SSQP keys,
@@ -466,6 +501,20 @@ pub(crate) async fn purge_symbols(
     version: &NuGetVersion,
 ) -> Result<()> {
     for sym in db.find_symbols(id, version).await? {
+        // Under the key's lock, as a claim is made: a push of the same key
+        // cannot decide on the mapping while it moves or goes.
+        let _key = crate::locks::lock_symbol(&sym.key, &sym.filename).await;
+        let next =
+            crate::symbols::successor(storage, db, id, version, &sym.key, &sym.filename).await?;
+        if let Some(next) = next {
+            if db
+                .hand_over_symbol(&sym.key, &sym.filename, id, version, &next)
+                .await?
+            {
+                tracing::info!(%id, from = %version.normalized(), to = %next.normalized(), key = %sym.key, "handed a symbol over to another version with the same PDB");
+                continue;
+            }
+        }
         storage.delete_symbol(&sym.key, &sym.filename).await?;
     }
     db.delete_symbols(id, version).await?;
@@ -493,22 +542,27 @@ async fn attached_bytes(db: &dyn PackageDatabase, id: &str, version: &NuGetVersi
 }
 
 /// Delete one planned version from `feed`, counting what it freed.
+/// `package_size` is the version's, when the caller read it already.
 async fn delete_planned(
     storage: &dyn PackageStorage,
     db: &dyn PackageDatabase,
     feed: &str,
     id: &str,
     version: &NuGetVersion,
+    package_size: Option<u64>,
     outcome: &mut Outcome,
 ) {
-    let size = db
-        .get_package_data(id, version)
-        .await
-        .ok()
-        .flatten()
-        .map(|p| p.package_size)
-        .unwrap_or(0)
-        + attached_bytes(db, id, version).await;
+    let package_size = match package_size {
+        Some(size) => size,
+        None => db
+            .get_package_data(id, version)
+            .await
+            .ok()
+            .flatten()
+            .map(|p| p.package_size)
+            .unwrap_or(0),
+    };
+    let size = package_size + attached_bytes(db, id, version).await;
     match purge_planned(storage, db, feed, id, version).await {
         Ok(true) => {
             outcome.deleted += 1;
@@ -558,15 +612,38 @@ async fn prune_package_outcome(
     if !policy.has_limits() {
         return Ok(outcome);
     }
-    let versions = db.find_all_versions(feed, id).await?;
-    for planned in plan_for(&versions, policy, Utc::now()) {
+    let versions = db.retention_versions(feed, &[canonical_id(id)]).await?;
+    prune_rows(storage, db, feed, id, &versions, policy, stop, &mut outcome).await;
+    Ok(outcome)
+}
+
+/// Plan one id's `versions` and delete what the plan names, into `outcome`.
+#[allow(clippy::too_many_arguments)]
+async fn prune_rows(
+    storage: &dyn PackageStorage,
+    db: &dyn PackageDatabase,
+    feed: &str,
+    id: &str,
+    versions: &[RetentionVersion],
+    policy: &RetentionPolicy,
+    stop: &(dyn Fn() -> bool + Sync),
+    outcome: &mut Outcome,
+) {
+    for planned in plan_for_rows(versions, policy, Utc::now()) {
         if stop() {
             break;
         }
-        delete_planned(storage, db, feed, id, &planned.version, &mut outcome).await;
+        let size = versions
+            .iter()
+            .find(|v| v.version == planned.version)
+            .map(|v| v.package_size);
+        delete_planned(storage, db, feed, id, &planned.version, size, outcome).await;
     }
-    Ok(outcome)
 }
+
+/// How many ids a sweep or preview reads at a time: a few statements per
+/// chunk rather than one per id.
+const ID_CHUNK: usize = 200;
 
 /// Apply the policy to every package id in `feed`. Returns the total pruned.
 pub async fn prune_all(
@@ -591,20 +668,29 @@ async fn prune_all_outcome(
     if !policy.has_limits() {
         return Ok(total);
     }
-    for id in db.all_package_ids(feed).await? {
-        if stop() {
-            tracing::info!(%feed, "retention sweep stopped early for shutdown");
-            break;
-        }
-        match prune_package_outcome(storage, db, feed, &id, policy, stop).await {
-            Ok(o) => {
-                total.deleted += o.deleted;
-                total.freed += o.freed;
-                total.errors += o.errors;
-            }
+    let ids = db.all_package_ids(feed).await?;
+    'chunks: for chunk in ids.chunks(ID_CHUNK) {
+        let lower: Vec<String> = chunk.iter().map(|id| canonical_id(id)).collect();
+        let rows = match db.retention_versions(feed, &lower).await {
+            Ok(rows) => rows,
             Err(e) => {
                 total.errors += 1;
-                tracing::error!(%feed, %id, error = %e, "retention sweep failed for package");
+                tracing::error!(%feed, ids = chunk.len(), error = %e, "retention sweep failed for packages");
+                continue;
+            }
+        };
+        let mut by_id: std::collections::HashMap<String, Vec<RetentionVersion>> =
+            std::collections::HashMap::new();
+        for row in rows {
+            by_id.entry(canonical_id(&row.id)).or_default().push(row);
+        }
+        for (id, lower) in chunk.iter().zip(&lower) {
+            if stop() {
+                tracing::info!(%feed, "retention sweep stopped early for shutdown");
+                break 'chunks;
+            }
+            if let Some(versions) = by_id.get(lower) {
+                prune_rows(storage, db, feed, id, versions, policy, stop, &mut total).await;
             }
         }
     }
@@ -669,34 +755,33 @@ impl Preview {
 ///
 /// Every GET of the admin page runs this, so it reads the feed a chunk of ids
 /// at a time — a few statements per chunk — rather than several per id and
-/// per planned version.
+/// per planned version, and only the columns a plan needs rather than every
+/// version's full metadata.
 pub async fn preview(
     db: &dyn PackageDatabase,
     feed: &str,
     policy: &RetentionPolicy,
     now: DateTime<Utc>,
 ) -> Result<Preview> {
-    const CHUNK: usize = 200;
     let mut out = Preview::default();
     let ids = db.all_package_ids(feed).await?;
-    for chunk in ids.chunks(CHUNK) {
+    for chunk in ids.chunks(ID_CHUNK) {
         let lower: Vec<String> = chunk.iter().map(|id| canonical_id(id)).collect();
-        let mut by_id: std::collections::HashMap<String, Vec<FeedVersion>> =
+        let mut by_id: std::collections::HashMap<String, Vec<RetentionVersion>> =
             std::collections::HashMap::new();
-        for v in db.find_all_versions_of(feed, &lower).await? {
-            by_id.entry(v.package.lower_id()).or_default().push(v);
+        for v in db.retention_versions(feed, &lower).await? {
+            by_id.entry(canonical_id(&v.id)).or_default().push(v);
         }
-        let mut planned: Vec<(&FeedVersion, Pruned)> = Vec::new();
+        let mut planned: Vec<(&RetentionVersion, Pruned)> = Vec::new();
         for id in &lower {
             let Some(versions) = by_id.get(id) else {
                 continue;
             };
             for v in versions.iter().filter(|v| v.pinned) {
-                out.pinned
-                    .push((v.package.id.clone(), v.package.version.clone()));
+                out.pinned.push((v.id.clone(), v.version.clone()));
             }
-            for p in plan_for(versions, policy, now) {
-                if let Some(fv) = versions.iter().find(|v| v.package.version == p.version) {
+            for p in plan_for_rows(versions, policy, now) {
+                if let Some(fv) = versions.iter().find(|v| v.version == p.version) {
                     planned.push((fv, p));
                 }
             }
@@ -711,14 +796,14 @@ pub async fn preview(
             .map(|f| ((f.lower_id, f.normalized_version), (f.feeds, f.file_bytes)))
             .collect();
         for (fv, p) in planned {
-            let key = (fv.package.lower_id(), fv.package.normalized_version());
+            let key = (canonical_id(&fv.id), fv.version.normalized());
             let frees = match footprints.get(&key) {
-                Some(&(feeds, files)) if feeds <= 1 => fv.package.package_size + files,
+                Some(&(feeds, files)) if feeds <= 1 => fv.package_size + files,
                 Some(_) => 0,
-                None => fv.package.package_size,
+                None => fv.package_size,
             };
             out.planned.push(Planned {
-                id: fv.package.id.clone(),
+                id: fv.id.clone(),
                 version: p.version,
                 added: fv.added,
                 reason: p.reason,
@@ -738,7 +823,7 @@ pub async fn apply(
 ) -> Outcome {
     let mut outcome = Outcome::default();
     for p in &plan.planned {
-        delete_planned(storage, db, feed, &p.id, &p.version, &mut outcome).await;
+        delete_planned(storage, db, feed, &p.id, &p.version, None, &mut outcome).await;
     }
     outcome
 }
@@ -1574,6 +1659,41 @@ mod tests {
         .unwrap();
         drop(held);
         assert_eq!(sweep.await.unwrap(), 0);
+        assert!(storage.get_blob(&sha).await.is_ok());
+    }
+
+    /// `PERF-20`: the references are read once for the whole sweep, so a
+    /// referenced blob is passed over without being counted on its own, or
+    /// waited for while something else holds its lock.
+    #[tokio::test]
+    async fn the_blob_sweep_passes_over_a_referenced_blob_without_its_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FilesystemStorage::new(dir.path()).await.unwrap();
+        let db = SqliteDatabase::in_memory().await.unwrap();
+        db.add_to_feed(FEED, &pkg("1.0.0", 0)).await.unwrap();
+        let sha = "f".repeat(64);
+        let tmp = dir.path().join("blob.tmp");
+        tokio::fs::write(&tmp, b"in use").await.unwrap();
+        storage.store_blob(&sha, tmp).await.unwrap();
+        db.add_file(&crate::database::PackageFile {
+            lower_id: "pkg".into(),
+            normalized_version: "1.0.0".into(),
+            name: "in-use.wim".into(),
+            sha256: sha.clone(),
+            size: 6,
+            uploaded: Utc::now(),
+            downloads: 0,
+        })
+        .await
+        .unwrap();
+        let _held = crate::locks::lock_blob(&sha).await;
+        let swept = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            sweep_unreferenced_blobs(&storage, &db),
+        )
+        .await
+        .expect("the sweep waited on a referenced blob's lock");
+        assert_eq!(swept, 0);
         assert!(storage.get_blob(&sha).await.is_ok());
     }
 

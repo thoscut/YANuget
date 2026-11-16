@@ -87,7 +87,7 @@ pub enum ConfigCommand {
     /// the sandbox host (/dev/kvm, QEMU, the golden images), the directories
     /// and the target feed. Exits 1 on any error.
     Check {
-        /// Do not ask the target feed.
+        /// Do not ask the target feed or the upstream.
         #[arg(long)]
         offline: bool,
     },

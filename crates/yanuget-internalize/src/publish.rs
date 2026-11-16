@@ -140,7 +140,12 @@ impl Publisher {
             // A push key goes to the feed and nowhere else.
             .redirect(reqwest::redirect::Policy::none())
             .build()
-            .map_err(|e| PublishError::Feed(format!("cannot build an HTTP client: {e}")))?;
+            .map_err(|e| {
+                PublishError::Feed(format!(
+                    "cannot build an HTTP client: {}",
+                    crate::error_chain(&e)
+                ))
+            })?;
         let target = Target::new(config)
             .map_err(|e| PublishError::Feed(crate::error_chain(&e)))?
             .expect("target.url is set");
@@ -378,7 +383,11 @@ impl Publisher {
             Ok(Some(_)) => Visibility::Withheld,
             Ok(None) => Visibility::Unknown,
             Err(e) => {
-                tracing::warn!(%id, error = %e, "cannot tell whether the feed serves the version");
+                tracing::warn!(
+                    %id,
+                    error = %crate::error_chain(&e),
+                    "cannot tell whether the feed serves the version"
+                );
                 Visibility::Unknown
             }
         }

@@ -221,8 +221,23 @@ pub struct Throttle {
 /// challenge a NuGet client waits for before it sends its key — a restore
 /// against a read-gated feed produces one per package — and must not count.
 fn carries_credential(headers: &HeaderMap) -> bool {
-    headers.contains_key(header::AUTHORIZATION) || headers.contains_key(crate::auth::API_KEY_HEADER)
+    headers.contains_key(header::AUTHORIZATION)
+        || headers.contains_key(crate::auth::API_KEY_HEADER)
+        || headers.contains_key(crate::auth::ADMIN_KEY_HEADER)
 }
+
+/// A response extension saying that the request presented a credential
+/// that is wrong, though the answer is not a `401`: [`enforce`] counts it
+/// against the failed-auth budget all the same.
+///
+/// A refusal to change the files of an approved version is a `403` (the
+/// push key was right, and the message names the feeds whose admin key is
+/// missing), but the admin key it was offered may be a guess. Counted only
+/// by its status, such guesses had the general budget (by default over 300
+/// times as large), and each one was compared with the admin key of every
+/// feed.
+#[derive(Debug, Clone, Copy)]
+pub struct FailedAuth;
 
 fn too_many(window_secs: u64) -> Response {
     (
@@ -258,7 +273,9 @@ pub async fn enforce(State(throttle): State<Throttle>, req: Request, next: Next)
     }
     let response = next.run(req).await;
     if let Some(failures) = failures {
-        if response.status() == StatusCode::UNAUTHORIZED {
+        if response.status() == StatusCode::UNAUTHORIZED
+            || response.extensions().get::<FailedAuth>().is_some()
+        {
             failures.check(ip);
         }
     }

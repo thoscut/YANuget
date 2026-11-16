@@ -184,7 +184,7 @@ async fn run_migrate_command(
         ),
     )
     .unwrap();
-    tokio::process::Command::new(env!("CARGO_BIN_EXE_yanuget"))
+    common::binary::yanuget_command()
         .arg("--config")
         .arg(&config)
         .arg("migrate")

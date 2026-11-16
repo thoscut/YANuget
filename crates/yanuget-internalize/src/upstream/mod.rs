@@ -478,7 +478,9 @@ impl Upstream {
         let mut size: u64 = 0;
         let mut body = resp.bytes_stream();
         while let Some(chunk) = body.next().await {
-            let chunk = chunk.map_err(|e| UpstreamError::Http(format!("{what}: {e}")))?;
+            let chunk = chunk.map_err(|e| {
+                UpstreamError::Http(format!("{what}: {}", crate::error_chain(&e.without_url())))
+            })?;
             size += chunk.len() as u64;
             if size > limit {
                 return Err(UpstreamError::Integrity(format!(
@@ -604,8 +606,12 @@ impl Upstream {
         let mut stream = resp.bytes_stream();
         let read = async {
             while let Some(chunk) = stream.next().await {
-                let chunk =
-                    chunk.map_err(|e| UpstreamError::Http(format!("upstream {what}: {e}")))?;
+                let chunk = chunk.map_err(|e| {
+                    UpstreamError::Http(format!(
+                        "upstream {what}: {}",
+                        crate::error_chain(&e.without_url())
+                    ))
+                })?;
                 if body.len() as u64 + chunk.len() as u64 > MAX_DOCUMENT_BYTES {
                     return Err(too_large());
                 }

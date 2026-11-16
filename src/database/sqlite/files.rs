@@ -106,6 +106,15 @@ pub(super) async fn blob_references(db: &SqliteDatabase, sha256: &str) -> Result
     )
 }
 
+pub(super) async fn referenced_blobs(
+    db: &SqliteDatabase,
+) -> Result<std::collections::HashSet<String>> {
+    let rows: Vec<String> = sqlx::query_scalar("SELECT DISTINCT sha256 FROM package_files")
+        .fetch_all(&db.pool)
+        .await?;
+    Ok(rows.into_iter().collect())
+}
+
 pub(super) async fn increment_file_downloads(
     db: &SqliteDatabase,
     id: &str,

@@ -262,14 +262,20 @@ async fn the_target_has_to_answer_and_take_pushes() {
     let r = online(Some(url.clone())).await;
     assert!(r.errors.iter().any(|e| e.contains("500")), "{r:?}");
     let r = online(Some(url.clone())).await;
+    // `MNT-33`: with the cause, which reqwest keeps out of its own text.
     assert!(
-        r.errors.iter().any(|e| e.contains("service index")),
+        r.errors
+            .iter()
+            .any(|e| e.contains("service index") && e.contains("expected value")),
         "{r:?}"
     );
-    // Nobody listens any more.
+    // Nobody listens any more, and the report says that it was the
+    // connection that failed, not just that sending did.
     let r = online(Some(url)).await;
     assert!(
-        r.errors.iter().any(|e| e.contains("does not answer")),
+        r.errors
+            .iter()
+            .any(|e| e.contains("does not answer") && e.to_lowercase().contains("connect")),
         "{r:?}"
     );
 

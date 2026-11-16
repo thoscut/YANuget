@@ -287,10 +287,11 @@ pub struct FilesConfig {
     /// is no limit. Each holds a partial file and the space it declared.
     pub max_open_uploads: u64,
     /// The most of the storage volume's free space (what is free above
-    /// `min_free_disk_bytes`) that the unfinished resumable uploads of one
-    /// feed may hold together, in percent; 0 or 100 is no cap. Space is
-    /// promised to an upload before any of it arrives, so without a cap one
-    /// feed's push key could promise all of it away from every other feed.
+    /// `min_free_disk_bytes`) that the feeds of one push key may promise
+    /// together to uploads that have not arrived (resumable uploads, and
+    /// pushes and `PUT`s in progress), in percent; 0 or 100 is no cap. Space
+    /// is promised to an upload before any of it arrives, so without a cap
+    /// one push key could promise all of it away from every other key.
     pub max_upload_space_percent: u8,
     /// A directory scanned for files dropped over SSH (`scp`, `sftp`,
     /// `rsync`). Unset turns the inbox off.

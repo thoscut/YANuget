@@ -92,11 +92,18 @@ pub async fn build(
         return Ok(None);
     };
     let nupkg: PathBuf = nupkg.to_path_buf();
-    let scripts = tokio::task::spawn_blocking(move || package_scripts(&nupkg))
-        .await
-        .map_err(|e| {
-            yanuget_pkg::Error::Task(format!("reading the package scripts panicked: {e}"))
-        })??;
+    let scripts = tokio::task::spawn_blocking(move || {
+        package_scripts(&nupkg).map_err(|e| match e {
+            PreludeError::Pkg(e) => PreludeError::Pkg(crate::io_context(|| {
+                format!("cannot read the package {}", nupkg.display())
+            })(e)),
+            e => e,
+        })
+    })
+    .await
+    .map_err(|e| {
+        yanuget_pkg::Error::Task(format!("reading the package scripts panicked: {e}"))
+    })??;
     let mut entries = vec![(
         PRELUDE_PATH.to_string(),
         Source::Bytes(prelude.into_bytes()),

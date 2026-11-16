@@ -49,10 +49,6 @@ pub struct MigrateOptions {
     pub dry_run: bool,
     /// Suppress the human-facing header/summary prints (used by tests).
     pub quiet: bool,
-    /// Free space the downloads must leave on the storage volume (the
-    /// server's `min_free_disk_bytes`); 0 checks nothing. For [`run`], which
-    /// builds the run's [`SpaceGuard`] from it.
-    pub min_free_disk_bytes: u64,
 }
 
 impl Default for MigrateOptions {
@@ -63,7 +59,6 @@ impl Default for MigrateOptions {
             overwrite: OverwriteMode::Disabled,
             dry_run: false,
             quiet: false,
-            min_free_disk_bytes: 0,
         }
     }
 }
@@ -158,6 +153,9 @@ struct Outcome {
 /// indexing pipeline can move each download into place with an atomic rename;
 /// callers pass a subdirectory of the storage root. `draw` controls where the
 /// progress bars render — pass [`ProgressDrawTarget::hidden`] in tests.
+///
+/// The downloads keep no free space in reserve: a reserve belongs to the
+/// run's [`SpaceGuard`], which [`run_with_space`] takes.
 pub async fn run(
     storage: &dyn PackageStorage,
     db: &dyn PackageDatabase,
@@ -167,7 +165,7 @@ pub async fn run(
     opts: MigrateOptions,
     draw: ProgressDrawTarget,
 ) -> Result<MigrateSummary> {
-    let space = Arc::new(SpaceGuard::new(temp_dir, opts.min_free_disk_bytes));
+    let space = Arc::new(SpaceGuard::new(temp_dir, 0));
     run_with_space(storage, db, feed, source, opts, draw, space).await
 }
 
