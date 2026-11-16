@@ -241,6 +241,7 @@ jobs:
       # differently would turn CI red with no change here. Dependabot does not
       # see these; bump them by hand.
       - name: Install cargo-audit and cargo-deny
+        id: tools
         uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: cargo-audit@0.22.2,cargo-deny@0.20.2
@@ -270,17 +271,27 @@ jobs:
       # Licenses, sources and duplicate crates, as set out in deny.toml. A
       # dependency under a license nobody has looked at, or from a git
       # repository or another registry, fails here rather than in a release.
+      #
+      # This and the bill of materials below run after a failed audit too
+      # (`!cancelled()` instead of the default `success()`): an advisory stays
+      # red until someone fixes or ignores it, and a pull request merged in
+      # that time would otherwise bring in a license or source nobody
+      # checked. The failed audit step still fails the job.
       - name: Check licenses and sources
+        if: ${{ !cancelled() && steps.tools.outcome == 'success' }}
         run: cargo deny check licenses bans sources
 
       # The release attaches this bill of materials; generating it here finds
       # a tool or metadata problem on the pull request rather than at tag time.
       - name: Install cargo-cyclonedx
+        id: cyclonedx
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
         uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: cargo-cyclonedx@0.5.9
 
       - name: Generate the software bill of materials
+        if: ${{ !cancelled() && steps.cyclonedx.outcome == 'success' }}
         run: |
           set -euo pipefail
           cargo cyclonedx --format json --spec-version 1.5 --target all \

@@ -213,9 +213,12 @@ docker compose run --rm --no-deps yanuget restore --force /backup
 docker compose start yanuget
 ```
 
-Stop the service first even though the restore would refuse a running server:
-it looks for one on its own loopback address, and in a one-off container there
-is none to find. Leave out `--force` when restoring into a new, empty volume.
+Stop the service first. From 0.10.0 on the restore refuses while a server
+holds the [data lock](cli.md#offline-commands-and-a-running-server) on the
+volume, but an older release's image, the one you use to roll back an upgrade,
+only looks for a server on its own loopback address, and in a one-off
+container there is none to find. Leave out `--force` when restoring into a
+new, empty volume.
 
 Without Compose, the same with `docker run`, passing the configuration the
 server uses (its `-e`, `--env-file` and `YANUGET_CONFIG` mount) as well:

@@ -200,8 +200,10 @@ systemctl start yanuget
 
 In a container, `docker compose exec` is refused because the server is
 running in it. Stop the service and run the command in a one-off container on
-the same volume, as for [restore](backup.md#in-a-container); stop it first, because in a
-one-off container the check finds no server:
+the same volume, as for [restore](backup.md#in-a-container). Stop it first:
+from 0.10.0 on the command refuses while a server holds the data lock on that
+volume, but an older release's image only asks its own loopback address, and
+in a one-off container there is no server to find:
 
 ```bash
 docker compose stop yanuget

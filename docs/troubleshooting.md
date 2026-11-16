@@ -12,7 +12,7 @@ generic message to the client and the cause in the server log
 | --- | --- | --- |
 | `400` | The package, its `.nuspec`, the id or the version is malformed; or a symbol package's PDBs do not match the assemblies in its package. | The message names the problem. Versions must be ones NuGet itself accepts; see [Push a package](api.md#push-a-package). |
 | `401` | No API key or the wrong one; on a read-gated feed, no read credential. | Check which key the action needs: push key to push, read key to restore, admin key for `/admin`. See [Keys per feed](feeds.md#keys-per-feed). |
-| `403` | A license policy with `action = "block"`; an id under another feed's `reserved_id_prefixes`; a browser request marked cross-site; attaching or removing a file of a version that is approved in a feed. | Push to the feed that reserves the prefix, or adjust the policy. Files of an approved version are changed with the admin key; see [Attached files](feeds.md). |
+| `403` | A license policy with `action = "block"`; an id under another feed's `reserved_id_prefixes`; a browser request marked cross-site; attaching or removing a file of a version that is approved in a feed. | Push to the feed that reserves the prefix, or adjust the policy. Files of an approved version are changed with the admin key of every feed that approved it, sent along with the push key; see [Attached files of an approved version](configuration.md#attached-files-of-an-approved-version). |
 | `404` on restore | The version is disabled or still pending in this feed, or not in this feed at all. | Look the package up in the feed's admin area. Approve or enable it, or promote it into this feed. |
 | `404` on a symbol push | The package the symbols belong to has not been pushed. | Push the `.nupkg` first; `dotnet nuget push` does this in the right order. |
 | `406` | The client refused every encoding the server can send (`Accept-Encoding: identity;q=0` and no gzip or brotli). | Let the client accept `gzip`, or drop `identity;q=0`. See [Compression](api.md#compression). |
@@ -85,7 +85,17 @@ exist, a feed named after one of the server's own paths, or a `[feeds.dev.mirror
 table instead of `[feeds.mirror]`. A database written by a newer release is
 refused by an older one; restore the backup taken before the upgrade. A key or
 token variable that is set but blank (`YANUGET_API_KEY=`, often a Compose
-`${UNSET}`) is an error too: unset it, or give it a value.
+`${UNSET}`) is an error too: unset it, or give it a value. So is a blank
+`token = ""` under `[monitoring]` in the file, what a template writes for an
+empty variable, even with `enabled = false`: remove the line, or give it a
+token.
+
+`… yanuget.db.lock is locked` means something else is using the same data:
+another server, or a `restore`, `feeds rename` or `feeds remove` that has not
+finished. Stop it first; with containers, look for another container that
+mounts the same volume. The lock is released when its process exits, however
+it exits, so there is no stale lock file to delete. See
+[Offline commands and a running server](cli.md#offline-commands-and-a-running-server).
 
 ### Admin actions answer `400`
 

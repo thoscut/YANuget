@@ -94,6 +94,13 @@ incompatibly at any version.
    reasonable moment to also run `cargo update` on a branch and see whether
    anything wants upgrading.
 
+7. **Bring `ROADMAP.md` up to the release.** In its *Open items* index, set
+   the date and move the server heading to *after X.Y.Z*; in the
+   [Target releases](ROADMAP.md#target-releases) table, mark the row
+   *Released YYYY-MM-DD* with its schema version; and replace what still says
+   *Unreleased* or *the next release* about work that ships now. Without
+   this step the index was a release behind after both 0.9.0 and 0.10.0.
+
 ## Tagging
 
 ```bash

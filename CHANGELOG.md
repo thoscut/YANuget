@@ -12,6 +12,46 @@ expected to change incompatibly at any version.
 
 ## [Unreleased]
 
+### Security
+
+- RUSTSEC-2026-0459 is not fixed in this release, and `cargo audit` in CI
+  ignores it for now. The SQLite bundled by `libsqlite3-sys` 0.30 (before
+  3.54.0) can return uninitialized page-cache memory when a database is
+  opened with a crafted `-wal` file of another page size next to it. The fix
+  is in `libsqlite3-sys` 0.39, which no sqlx release accepts yet. YANuget
+  opens only its own database in `data_dir`, and `restore` copies just the
+  backup's `yanuget.db` and deletes any `-wal` next to the live file before
+  opening it, so planting such a file takes write access to the data
+  directory, which is control of the server already. The ignore goes when
+  sqlx allows the fixed version. (`DEP-14`)
+
+### Fixed
+
+- `scripts/Send-YanugetFile.ps1` could not attach a file to a version a feed
+  had approved, which since 0.10.0 takes admin credentials next to the push
+  key. It has `-AdminKey` (a `SecureString`) now, sent as HTTP Basic
+  credentials on every request and, like the push key, only to the origin of
+  `-Feed`.
+
+### Changed
+
+- `quinn-udp` 0.5.16 replaces 0.5.15 in `Cargo.lock`, against
+  RUSTSEC-2026-0538 (its receive loop can spin after a truncated datagram).
+  Lockfile only: the crate is listed for reqwest's optional HTTP/3 support,
+  which YANuget does not enable, so it is not compiled into the server or
+  the internalizer and no released binary was exposed.
+- CI: the license and source check (`cargo deny`) and the SBOM run after a
+  failed `cargo audit` too. An open advisory used to skip them, so a pull
+  request merged while the audit was red had its new dependencies' licenses
+  and sources checked by nobody. The job still fails with the audit.
+- Documentation: the 0.10.0 upgrade note names the blank `[monitoring] token`
+  and the admin key for files of an approved version; troubleshooting covers
+  the data lock at startup and links the `403` for attached files to the
+  right section; the container recipes explain stopping the service by the
+  data lock; the architecture page's module map matches the source tree and
+  shows `yanuget-pkg`; `config check`'s list has the mirror proxy warning;
+  RELEASING.md has a step for ROADMAP.md.
+
 ## [0.10.0] — 2026-11-04
 
 **Upgrading:** the database is migrated on first start to schema version 10,
@@ -21,6 +61,13 @@ refuses to open it, so take a `yanuget backup` first and go back with
 server now holds a lock on `<database_path>.lock` while it runs: a second
 server on the same data refuses to start, and so do `restore` and
 `yanuget feeds` while one runs, even where it does not answer on loopback.
+A blank `token = ""` under `[monitoring]` now stops startup, even with
+`enabled = false`: remove the line or give it a token (`yanuget config check`
+reports it). Once a feed with `requires_approval` has approved a version,
+attaching or deleting its files with the push key alone is `403` from every
+feed that holds it, where it used to be so only under `pending-only`: send
+the admin key of each feed that approved it as well (see *Attached files of
+an approved version* in `docs/configuration.md`).
 
 ### Security
 

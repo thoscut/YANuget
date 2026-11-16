@@ -401,7 +401,9 @@ DELETE  /api/v2/uploads/{upload} # abandon
 The [tus 1.0.0](https://tus.io/protocols/resumable-upload) protocol with the
 creation, expiration and termination extensions, so stock clients work
 (`tuspy`, `TusDotNetClient`, `tusc`). Every request carries `Tus-Resumable:
-1.0.0` (`412` otherwise) and the push key, under the same rules as `PUT`.
+1.0.0` (`412` otherwise) and the push key, under the same rules as `PUT`: for
+a version a feed has approved, `POST` and the `PATCH` that brings the last
+byte also need the admin credentials described there.
 
 `POST` takes `Upload-Length` and `Upload-Metadata` with `id`, `version`,
 `filename` and optionally `sha256` (base64 values, as tus specifies). `PATCH`
@@ -435,6 +437,22 @@ It sends the key only over https (`-AllowHttp` for a local test server) and
 only to the scheme, host and port of `-Feed`: an upload URL anywhere else,
 whether handed back by the server or passed as `-Resume`, is refused, and
 redirects are not followed.
+
+For a version a feed has already approved, the push key alone is `403` (see
+[Upload in one request](#upload-in-one-request)). `-AdminKey` sends the admin
+key along as HTTP Basic credentials on every request, under the same rules as
+the push key:
+
+```powershell
+Send-YanugetFile -Feed https://nuget.example.com `
+    -Id Contoso.Images -Version 1.2.0 -Path .\base.wim `
+    -AdminKey (Read-Host -AsSecureString 'Admin key')
+```
+
+It is taken only from the parameter, as a `SecureString`, never from the
+environment. A request carries one set of Basic credentials, so where several
+feeds approved the version this works when they share an admin key (the
+global `admin_api_key`, say).
 
 ### Over SSH
 

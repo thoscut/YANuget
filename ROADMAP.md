@@ -10,10 +10,10 @@ requests can reference them, and ticked off rather than deleted when they land.
 ## Open items
 
 Everything still open across this file and the project's working threads, as
-of 2026-11-03 (after the review of that day). The entries further down hold
+of 2026-11-16 (0.10.0 is the latest release). The entries further down hold
 the detail; this list is the index.
 
-**Server, after 0.9.0** ([Target releases](#target-releases))
+**Server, after 0.10.0** ([Target releases](#target-releases))
 
 - `INT-31` Attached files on read-gated feeds: the premise holds (Chocolatey's
   helpers never send source credentials); a security review of the token
@@ -53,9 +53,10 @@ the detail; this list is the index.
 **For the repository owner**
 
 - The settings under [For the repository owner](#for-the-repository-owner),
-  checked on 2026-11-03: the `release` environment exists; there is no tag
-  ruleset for `v*` yet, and neither `yanuget` nor `yanuget-pkg` is on
-  crates.io.
+  checked on 2026-11-16: there is no tag ruleset for `v*` yet, and neither
+  `yanuget` nor `yanuget-pkg` is on crates.io. The `release` environment
+  exists (the 0.10.0 release ran in it); its restriction to `v*` tags was
+  last looked at on 2026-11-03.
 - An open question from the review of 2026-09-30: move its `SEC-…` findings
   from this public file (now `reviews/2026-09-30.md`) into a private security
   advisory? Every one of them is fixed and released since 0.6.0.
@@ -67,20 +68,23 @@ the detail; this list is the index.
 
 A multi-expert review of `main` at 0.9.0 (`544e2f0`): architecture and
 correctness, security, Rust code, tests and CI, operations and
-documentation. Every finding was fixed with it, with tests. The changelog's *Unreleased* section describes them
-for operators.
+documentation. Every finding was fixed with it, with tests, and released as
+0.10.0 on 2026-11-04. The changelog's 0.10.0 section describes them for
+operators.
 
 ### Security and integrity
 
-- [x] **`SEC-32` One resumable upload could hold all free space.** A tus
+- [x] **`SEC-32` (also `COR-41`) One resumable upload could hold all free
+  space.** A tus
   session without a size cap reserved its whole `Upload-Length` until it
   expired (72 h), and a push reserved its `Content-Length` unchecked: either
   blocked every push on the volume with `507`. *Done:* a push over
   `max_package_size_bytes` is `413` before it reserves; a resumable upload
   holds its space for an hour after its last request (`uploads.held_since`,
   schema 10); the log says what holds the space.
-- [x] **`SEC-33` Files of an approved version were protected only under
-  `pending-only`,** and a source feed's admin key could always change them.
+- [x] **`SEC-33` (also `COR-40`) Files of an approved version were protected
+  only under `pending-only`,** and a source feed's admin key could always
+  change them.
   *Done:* an approval in a feed that reviews what it serves
   (`requires_approval` or `pending-only`) holds the files against the push
   key of every feed and the inbox; only the admin key of each approving feed
@@ -320,7 +324,11 @@ These need settings no commit can change; the release workflow expects them
 
 Exercised by the 0.7.0 release: build provenance for the archives and the
 image, and the image's cosign signature (`cosign verify` from SECURITY.md
-passes with cosign 3; see `DOC-09`). Not yet exercised: crates.io trusted
+passes with cosign 3; see `DOC-09`). Exercised by the 0.10.0 release for the
+first time: the CycloneDX SBOM attached to the release and attested with the
+archives, the `cargo auditable` builds, the image's BuildKit SBOM
+attestation, and the version check of every binary and image platform before
+anything is published (`CI-04`, `CI-17`). Not yet exercised: crates.io trusted
 publishing (`PUBLISH_TO_CRATES_IO` is unset), and
 `scripts/Send-YanugetFile.ps1`, which was reviewed but not run.
 
@@ -911,8 +919,8 @@ packages whose downloads go through Chocolatey's helpers.
   The answer decides whether KVM can be the default for every operator, and is
   needed before `INT-13` ships in a release.
 - **Requests on the server or in the watch list?** `INT-33` needs a schema
-  migration (step 11 in `src/database/sqlite/schema.rs`; the next release
-  takes step 10), after which older
+  migration (step 11 in `src/database/sqlite/schema.rs`; 0.10.0 took step
+  10), after which older
   builds refuse the database (`check_known`), and it widens `PackageDatabase`
   for every future backend. The watch list of `INT-27`, kept in a reviewed
   repository, covers the same need without touching the server; what is lost
@@ -927,7 +935,7 @@ A proposal on top of 0.7.0, in the order the items depend on each other.
 | --- | --- | --- |
 | YANuget 0.8.0 | `INT-01`–`INT-05`, `INT-30`, `INT-32` | Released 2026-10-20, together with the fixes from the review of 2026-10-19, some of which need attention when upgrading (see CHANGELOG.md). |
 | YANuget 0.9.0 | review fixes of 2026-10-19 and 2026-10-27 | Released 2026-10-28, schema 9. |
-| YANuget 0.10.0 | review fixes of 2026-11-03, `retention.exclude_id_prefixes` | Prepared 2026-11-04, schema 10. |
+| YANuget 0.10.0 | review fixes of 2026-11-03, `retention.exclude_id_prefixes` | Released 2026-11-04, schema 10. |
 | YANuget, after 0.10.0 | `INT-31`, the server side of `INT-21` | The rest of what the tool needs. `INT-31` waits on the security review of its token design. |
 | internalizer 0.1.0 | `INT-10`–`INT-22` | KVM backend; needs YANuget 0.8.0, and the release with `INT-31` for read-gated feeds. |
 | internalizer 0.2.0 | `INT-23`–`INT-28` | Needs nothing beyond YANuget 0.8.0. |
